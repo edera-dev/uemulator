@@ -848,6 +848,21 @@ impl Vcpu {
         });
         let ram = core::mem::take(&mut self.ram);
         let ram_bytes = ram.len();
+        // This thread runs the devices from here on: the vCPU of a one-processor machine (its
+        // idle wait parks) or the device thread of a threaded one (`run_threaded`). A frame from
+        // the host unparks it at once instead of waiting out the sleep.
+        #[cfg(not(freestanding))]
+        let nets: Vec<NetHandle> = self
+            .devcfg
+            .nets
+            .iter()
+            .map(|(_, net)| net.clone())
+            .collect();
+        #[cfg(not(freestanding))]
+        for net in &nets {
+            let thread = std::thread::current();
+            net.set_device_waker(Some(Arc::new(move || thread.unpark())));
+        }
         let mut cpu = Cpu::new(
             ram,
             self.boot,
@@ -939,6 +954,10 @@ impl Vcpu {
             self.debug || matches!(reason, ExitReason::TripleFault | ExitReason::Internal(_)),
         ) {
             l(&format!("{vcpu_summary}{}", cpu.dump()));
+        }
+        #[cfg(not(freestanding))]
+        for net in &nets {
+            net.set_device_waker(None);
         }
         let finished = Finished {
             ram_bytes,

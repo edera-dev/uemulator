@@ -21,6 +21,9 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream, UdpSocket};
 use std::ops::Range;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, RawFd};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
@@ -63,9 +66,19 @@ const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// used one; the guest sees that as a lost datagram, which UDP applications already tolerate.
 const MAX_UDP_FLOWS: usize = 128;
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Longest wait for a guest frame in the worker loop, which is also how often host sockets are
-/// polled (they are nonblocking and have no wakeup path into this thread).
+/// Longest wait for a guest frame in the worker loop where there is no `poll(2)`, which is also
+/// how often host sockets are looked at there.
+#[cfg(not(unix))]
 const POLL_INTERVAL: Duration = Duration::from_millis(2);
+/// The worker's wait when nothing is pending: only UDP flow expiry needs the time to pass.
+#[cfg(unix)]
+const IDLE_WAIT: Duration = Duration::from_millis(500);
+/// The wait while frames are left over because the guest's receive queue was full.
+#[cfg(unix)]
+const BACKLOG_RETRY: Duration = Duration::from_millis(1);
+/// Wake bytes carry no data; one read drains this many.
+#[cfg(unix)]
+const WAKE_DRAIN_LEN: usize = 64;
 /// Step between initial sequence numbers of successive connections. Only needs to keep them
 /// distinct; this is not a security boundary.
 const ISN_STEP: u32 = 0x10000;
@@ -679,6 +692,8 @@ pub struct UserNet {
     isn: u32,
     connect_tx: Sender<(FlowKey, io::Result<TcpStream>)>,
     connect_rx: Receiver<(FlowKey, io::Result<TcpStream>)>,
+    /// Ends the worker's wait when a connect thread has a result.
+    wake: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Default for UserNet {
@@ -705,6 +720,7 @@ impl UserNet {
             isn,
             connect_tx,
             connect_rx,
+            wake: None,
         }
     }
 
@@ -945,9 +961,13 @@ impl UserNet {
                 host_addr(ip.dst, segment.dport)
             };
             let connect_tx = self.connect_tx.clone();
+            let wake = self.wake.clone();
             std::thread::spawn(move || {
                 let result = TcpStream::connect_timeout(&target, TCP_CONNECT_TIMEOUT);
                 let _ = connect_tx.send((key, result));
+                if let Some(wake) = wake {
+                    wake();
+                }
             });
             return;
         }
@@ -1174,6 +1194,39 @@ impl UserNet {
         }
     }
 
+    /// The host sockets the worker's wait must watch, with `libc::poll` events: reads only where
+    /// `poll` could forward the data (the guest's window is open and the queue has room), writes
+    /// only where guest data is waiting. Anything else would wake the wait with nothing to do.
+    #[cfg(unix)]
+    fn poll_interest(&self) -> Vec<(RawFd, libc::c_short)> {
+        let queue_has_room = self.out.len() < OUT_QUEUE_LIMIT;
+        let mut interest = Vec::new();
+        for flow in self.tcp.values() {
+            let Conn::Open(stream) = &flow.conn else {
+                continue;
+            };
+            let mut events = 0;
+            let in_flight = flow.snd_nxt.wrapping_sub(flow.snd_una);
+            if queue_has_room && !flow.dead && !flow.fin_sent && flow.guest_window > in_flight {
+                events |= libc::POLLIN;
+            }
+            if !flow.to_host.is_empty() {
+                events |= libc::POLLOUT;
+            }
+            if events != 0 {
+                interest.push((stream.as_raw_fd(), events));
+            }
+        }
+        if queue_has_room {
+            interest.extend(
+                self.udp
+                    .values()
+                    .map(|flow| (flow.sock.as_raw_fd(), libc::POLLIN)),
+            );
+        }
+        interest
+    }
+
     pub fn pop_frame(&mut self) -> Option<Vec<u8>> {
         self.out.pop_front()
     }
@@ -1184,6 +1237,94 @@ impl UserNet {
     }
 }
 
+/// Moves frames from `usernet` to the guest until the guest's queue is full. Returns whether
+/// frames are left over.
+fn deliver(usernet: &mut UserNet, net: &NetHandle) -> bool {
+    while let Some(frame) = usernet.pop_frame() {
+        if !net.send_frame(&frame) {
+            usernet.requeue_frame(frame);
+            return true;
+        }
+    }
+    false
+}
+
+/// The worker waits in `poll(2)` on the host sockets and on one end of a socket pair that guest
+/// frames and finished connects write to, so a reply from the host reaches the guest as soon as
+/// it arrives. A timed wait would add its whole period to every round trip, and with TCP's
+/// fixed 64 KiB window that period is what bounds throughput.
+#[cfg(unix)]
+pub fn spawn(net: NetHandle) {
+    use std::os::unix::net::UnixStream;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (wake_rx, wake_tx) = UnixStream::pair().expect("socketpair");
+    wake_rx
+        .set_nonblocking(true)
+        .expect("nonblocking socketpair");
+    wake_tx
+        .set_nonblocking(true)
+        .expect("nonblocking socketpair");
+    let wake_tx = Arc::new(wake_tx);
+    // Set while the worker is about to wait or waiting: a guest frame writes the wake byte only
+    // then, so a busy transfer does not cost the vCPU a syscall per frame. The worker sets it
+    // before its last look at the queue and the guest side queues before it reads it, so one of
+    // the two always sees the other.
+    let waiting = Arc::new(AtomicBool::new(false));
+    {
+        let (wake_tx, waiting) = (wake_tx.clone(), waiting.clone());
+        net.on_guest_frame(move || {
+            if waiting.swap(false, Ordering::SeqCst) {
+                let _ = (&*wake_tx).write(&[0]);
+            }
+        });
+    }
+    std::thread::spawn(move || {
+        let mut usernet = UserNet::new();
+        usernet.wake = Some(Arc::new(move || {
+            let _ = (&*wake_tx).write(&[0]);
+        }));
+        let mut drain = [0u8; WAKE_DRAIN_LEN];
+        loop {
+            while matches!((&wake_rx).read(&mut drain), Ok(n) if n > 0) {}
+            while let Some(frame) = net.try_recv_frame() {
+                usernet.input(&frame);
+            }
+            usernet.poll();
+            let backlog = deliver(&mut usernet, &net);
+            waiting.store(true, Ordering::SeqCst);
+            if let Some(frame) = net.try_recv_frame() {
+                waiting.store(false, Ordering::SeqCst);
+                usernet.input(&frame);
+                continue;
+            }
+            // The guest's queue has no "room again" signal, so a backlog is retried on a short
+            // timer.
+            let timeout = if backlog { BACKLOG_RETRY } else { IDLE_WAIT };
+            let mut fds: Vec<libc::pollfd> = std::iter::once((wake_rx.as_raw_fd(), libc::POLLIN))
+                .chain(usernet.poll_interest())
+                .map(|(fd, events)| libc::pollfd {
+                    fd,
+                    events,
+                    revents: 0,
+                })
+                .collect();
+            // SAFETY: `fds` is a live, correctly sized array of `pollfd` for the whole call.
+            unsafe {
+                libc::poll(
+                    fds.as_mut_ptr(),
+                    fds.len() as libc::nfds_t,
+                    timeout.as_millis() as libc::c_int,
+                );
+            }
+            waiting.store(false, Ordering::SeqCst);
+        }
+    });
+}
+
+/// Without `poll(2)` the worker waits for guest frames only, and looks at the host sockets every
+/// `POLL_INTERVAL`.
+#[cfg(not(unix))]
 pub fn spawn(net: NetHandle) {
     std::thread::spawn(move || {
         let mut usernet = UserNet::new();
@@ -1195,12 +1336,7 @@ pub fn spawn(net: NetHandle) {
                 }
             }
             usernet.poll();
-            while let Some(frame) = usernet.pop_frame() {
-                if !net.send_frame(&frame) {
-                    usernet.requeue_frame(frame);
-                    break;
-                }
-            }
+            deliver(&mut usernet, &net);
         }
     });
 }

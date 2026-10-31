@@ -73,6 +73,9 @@ mod api_tests {
         let _: fn(&EmulatedMachine) -> StopHandle = EmulatedMachine::stop_handle;
         let _: fn(&EmulatedMachine) -> ConsoleHandle = EmulatedMachine::console;
         let _: fn(&EmulatedMachine) -> Option<NetHandle> = EmulatedMachine::net;
+        let _: fn(&NetHandle, &[u8]) -> bool = NetHandle::send_frame;
+        let _: fn(&NetHandle) -> Option<Vec<u8>> = NetHandle::try_recv_frame;
+        let _ = |net: &NetHandle| net.on_guest_frame(|| {});
         let _: fn(&StopHandle) = StopHandle::stop;
         let _: fn() -> MachineConfig = MachineConfig::new;
         let _: fn(MachineConfig, bool) -> MachineConfig = MachineConfig::reboot;

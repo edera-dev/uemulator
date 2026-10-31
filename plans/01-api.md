@@ -42,6 +42,14 @@ impl ConsoleHandle {
     pub fn resize(&self, cols: u16, rows: u16);              // delivered to the guest with ConsoleKind::Virtio
     pub fn size(&self) -> (u16, u16);
 }
+
+pub struct NetHandle { .. }                                  // one per NIC, cloneable, Send + Sync
+impl NetHandle {
+    pub fn send_frame(&self, frame: &[u8]) -> bool;          // host → guest; false when the queue is full; wakes the halted vCPU (or the device thread) at once
+    pub fn recv_frame(&self, timeout: Duration) -> Option<Vec<u8>>; // guest → host, waiting once
+    pub fn try_recv_frame(&self) -> Option<Vec<u8>>;
+    pub fn on_guest_frame(&self, f: impl Fn() + Send + Sync + 'static); // called after each guest frame is queued, for a host that waits on sockets too (the CLI's usernet `poll(2)`)
+}
 ```
 
 ## Rules

@@ -1303,9 +1303,11 @@ impl Cpu {
     fn wait_on_host(&mut self, wait_ns: u64) {
         #[cfg(not(freestanding))]
         {
-            // Short sleeps keep the stop flag and host console responsive.
+            // Short sleeps keep the stop flag and host console responsive. Parking, not
+            // sleeping: a frame from the host network unparks this thread (`NetHandle`), so a
+            // halted guest gets it now rather than at the end of the slice.
             const MAX_SLEEP_NS: u64 = 2_000_000;
-            std::thread::sleep(std::time::Duration::from_nanos(wait_ns.min(MAX_SLEEP_NS)));
+            std::thread::park_timeout(std::time::Duration::from_nanos(wait_ns.min(MAX_SLEEP_NS)));
         }
         #[cfg(freestanding)]
         {
@@ -1361,7 +1363,7 @@ impl Cpu {
                     return None;
                 }
                 #[cfg(not(freestanding))]
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                std::thread::park_timeout(std::time::Duration::from_millis(1));
                 #[cfg(freestanding)]
                 if let Some(poll) = &self.poll {
                     poll(true);

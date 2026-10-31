@@ -10,10 +10,19 @@ use crate::sync::{Arc, Condvar, Mutex};
 /// oldest.
 const QUEUE_FRAMES: usize = 1024;
 
+/// Called after a frame is queued, outside the lock, so it may use the handle itself.
+type Notify = Arc<dyn Fn() + Send + Sync>;
+
 #[derive(Default)]
 struct NetState {
     to_guest: VecDeque<Vec<u8>>,
     from_guest: VecDeque<Vec<u8>>,
+    /// Wakes whichever thread runs the devices (the vCPU of a one-processor machine, else the
+    /// device thread), which otherwise only looks at `to_guest` when its sleep ends: without it a
+    /// halted guest sees each frame up to 2 ms late, and that latency is what limits TCP.
+    wake_devices: Option<Notify>,
+    /// Set by the host (`on_guest_frame`) when it waits on more than the condvar.
+    wake_host: Option<Notify>,
 }
 
 /// Ethernet frames between the host and the virtio-net device, shared by clones. One lock covers
@@ -26,12 +35,31 @@ pub struct NetHandle {
 impl NetHandle {
     /// Host to guest. Returns false when the queue is full; the frame is not queued.
     pub fn send_frame(&self, frame: &[u8]) -> bool {
-        let mut state = self.inner.0.lock().unwrap();
-        if state.to_guest.len() >= QUEUE_FRAMES {
-            return false;
+        let wake = {
+            let mut state = self.inner.0.lock().unwrap();
+            if state.to_guest.len() >= QUEUE_FRAMES {
+                return false;
+            }
+            state.to_guest.push_back(frame.to_vec());
+            state.wake_devices.clone()
+        };
+        if let Some(wake) = wake {
+            wake();
         }
-        state.to_guest.push_back(frame.to_vec());
         true
+    }
+
+    /// Calls `notify` every time the guest queues a frame, from the emulator's thread and after
+    /// the frame can be received. For a host that waits on other things too (its sockets) and so
+    /// cannot block in `recv_frame`. Replaces an earlier notifier.
+    pub fn on_guest_frame(&self, notify: impl Fn() + Send + Sync + 'static) {
+        self.inner.0.lock().unwrap().wake_host = Some(Arc::new(notify));
+    }
+
+    /// See `NetState::wake_devices`. A freestanding host has no thread to wake.
+    #[cfg(not(freestanding))]
+    pub(crate) fn set_device_waker(&self, wake: Option<Notify>) {
+        self.inner.0.lock().unwrap().wake_devices = wake;
     }
 
     pub fn try_recv_frame(&self) -> Option<Vec<u8>> {
@@ -50,12 +78,18 @@ impl NetHandle {
 
     pub(crate) fn guest_send(&self, frame: Vec<u8>) {
         let (lock, frame_ready) = &*self.inner;
-        let mut state = lock.lock().unwrap();
-        if state.from_guest.len() >= QUEUE_FRAMES {
-            state.from_guest.pop_front();
+        let wake = {
+            let mut state = lock.lock().unwrap();
+            if state.from_guest.len() >= QUEUE_FRAMES {
+                state.from_guest.pop_front();
+            }
+            state.from_guest.push_back(frame);
+            frame_ready.notify_one();
+            state.wake_host.clone()
+        };
+        if let Some(wake) = wake {
+            wake();
         }
-        state.from_guest.push_back(frame);
-        frame_ready.notify_one();
     }
 
     pub(crate) fn has_pending(&self) -> bool {
@@ -276,6 +310,60 @@ mod tests {
             net.guest_send(b"only one".to_vec());
             let results = [first.join().unwrap(), second.join().unwrap()];
             assert_eq!(results.iter().filter(|frame| frame.is_some()).count(), 1);
+        }
+    }
+
+    mod notifiers {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        fn counter() -> (Arc<AtomicUsize>, Notify) {
+            let count = Arc::new(AtomicUsize::new(0));
+            let bump = count.clone();
+            (
+                count,
+                Arc::new(move || {
+                    bump.fetch_add(1, Ordering::SeqCst);
+                }),
+            )
+        }
+
+        #[test]
+        fn a_frame_for_the_guest_wakes_the_devices() {
+            let net = NetHandle::default();
+            let (count, wake) = counter();
+            net.set_device_waker(Some(wake));
+            net.send_frame(b"x");
+            net.send_frame(b"y");
+            assert_eq!(count.load(Ordering::SeqCst), 2);
+        }
+
+        #[test]
+        fn a_rejected_frame_wakes_nobody() {
+            let net = NetHandle::default();
+            for id in 0..QUEUE_FRAMES {
+                net.send_frame(&frame(id));
+            }
+            let (count, wake) = counter();
+            net.set_device_waker(Some(wake));
+            assert!(!net.send_frame(b"full"));
+            assert_eq!(count.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn a_guest_frame_notifies_the_host_once_it_can_be_received() {
+            let net = NetHandle::default();
+            let probe = net.clone();
+            let seen = Arc::new(AtomicUsize::new(0));
+            let seen_by_notifier = seen.clone();
+            // Receiving inside the notifier proves the lock is released and the frame queued.
+            net.on_guest_frame(move || {
+                if probe.try_recv_frame().is_some() {
+                    seen_by_notifier.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            net.guest_send(b"up".to_vec());
+            assert_eq!(seen.load(Ordering::SeqCst), 1);
         }
     }
 
