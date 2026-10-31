@@ -282,6 +282,12 @@ pub(crate) fn is_inline_terminator(insn: &Insn) -> bool {
     ) || (insn.op == 0xff && matches!(insn.reg & 7, 2 | 4))
 }
 
+/// Register forms of `0f 01` (group 7) that the block compilers continue past.
+pub(crate) const MODRM_SWAPGS: u8 = 0xf8;
+pub(crate) const MODRM_RDTSCP: u8 = 0xf9;
+pub(crate) const MODRM_CLAC: u8 = 0xca;
+pub(crate) const MODRM_STAC: u8 = 0xcb;
+
 /// True if the block must end after `insn`. The set is an allow-list of what the block compilers
 /// cannot continue past: control transfers; string and I/O instructions (they loop on `rep` or
 /// have device side effects); and instructions that change interrupt delivery, segmentation,
@@ -304,17 +310,31 @@ pub(crate) fn ends_block(insn: &Insn) -> bool {
         | 0xcd
         | 0xcf
         | 0xf4 => true,
-        // ins/outs, movs/cmps, stos/lods/scas, in/out imm8, in/out dx, cli, sti, popf,
-        // mov sreg
+        // ins/outs, movs/cmps, stos/lods/scas, in/out imm8, in/out dx, sti, popf, mov sreg.
+        // `cli` is not here: interrupts are only taken between blocks, so the rest of the block
+        // runs exactly as it would with IF already clear. `sti` must stay: its shadow covers one
+        // instruction, after which a pending interrupt has to be taken.
         0x6c..=0x6f
         | 0xa4..=0xa7
         | 0xaa..=0xaf
         | 0xe4..=0xe7
         | 0xec..=0xef
-        | 0xfa
         | 0xfb
         | 0x9d
         | 0x8e => true,
+        // swapgs, rdtscp, clac and stac change nothing a block caches: generated code reads the
+        // GS base from `Cpu` on every access, and the soft TLB never caches a supervisor access
+        // to a user page while SMAP is on (`Cpu::translate`), so AC is looked at afresh. They
+        // sit on the syscall entry and exit paths, where ending a block at each one costs a
+        // trip through the run loop.
+        0x101
+            if matches!(
+                insn.modrm,
+                MODRM_SWAPGS | MODRM_RDTSCP | MODRM_CLAC | MODRM_STAC
+            ) =>
+        {
+            false
+        }
         // group 5: call/jmp indirect, near and far
         0xff => matches!(insn.reg & 7, 2..=5),
         // syscall, clts, sysret, ud2, jcc rel32, pop fs, pop gs, mov to/from cr/dr, wrmsr,
@@ -875,9 +895,43 @@ mod tests {
 
     #[test]
     fn instructions_that_change_interrupt_or_segment_state_end_a_block() {
-        // cli, sti, popf, mov sreg, pop fs, pop gs
-        for op in [0xfa, 0xfb, 0x9d, 0x8e, 0x1a1, 0x1a9] {
+        // sti, popf, mov sreg, pop fs, pop gs
+        for op in [0xfb, 0x9d, 0x8e, 0x1a1, 0x1a9] {
             assert!(ends(op), "opcode {op:#x}");
+        }
+    }
+
+    #[test]
+    fn cli_does_not_end_a_block() {
+        assert!(!ends(0xfa));
+    }
+
+    fn group_seven(modrm: u8) -> Insn {
+        Insn {
+            op: 0x101,
+            modrm,
+            md: modrm >> 6,
+            reg: (modrm >> 3) & 7,
+            rm: modrm & 7,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn swapgs_rdtscp_clac_and_stac_do_not_end_a_block() {
+        for modrm in [0xf8, 0xf9, 0xca, 0xcb] {
+            assert!(!ends_block(&group_seven(modrm)), "0f 01 {modrm:02x}");
+        }
+    }
+
+    #[test]
+    fn the_rest_of_group_seven_ends_a_block() {
+        // sgdt [rax], lgdt [rax], invlpg [rax], vmrun, stgi, clgi, monitor, mwait, xsetbv, smsw
+        // eax, lmsw ax
+        for modrm in [
+            0x00, 0x10, 0x38, 0xd8, 0xdc, 0xdd, 0xc8, 0xc9, 0xd1, 0xe0, 0xf0,
+        ] {
+            assert!(ends_block(&group_seven(modrm)), "0f 01 {modrm:02x}");
         }
     }
 

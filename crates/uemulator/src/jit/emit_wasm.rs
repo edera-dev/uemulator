@@ -1571,6 +1571,12 @@ impl<'a> Gen<'a> {
                 self.push_value(k, rip);
                 store = true;
             }
+            // push imm32 / imm8, sign-extended to 64 bits by the decoder.
+            0x68 | 0x6a if !insn.p66 && !insn.lock => {
+                self.c.i64_const(insn.imm).local_set(VALUE);
+                self.push_value(k, rip);
+                store = true;
+            }
             // pop r64. The register is written last so `pop rsp` ends up with the popped value.
             0x58..=0x5f if !insn.p66 => {
                 self.pop_value(k, rip);

@@ -26,7 +26,7 @@ use super::helpers::*;
 use super::native::LinkSite;
 use super::x64::*;
 use crate::cpu::decode::{Insn, NO_REG, VEX_OP_FLAG};
-use crate::cpu::flags::{LazyFlagsOp, SZP_CF_OF_SRC_CF_BIT, SZP_CF_OF_SRC_OF_BIT};
+use crate::cpu::flags::{AC, IF, LazyFlagsOp, SZP_CF_OF_SRC_CF_BIT, SZP_CF_OF_SRC_OF_BIT};
 use crate::cpu::xsave::{XCR0_AVX, XCR0_AVX512, XCR0_SSE};
 use crate::cpu::{
     CR0_EM, CR0_TS, CR4_OSFXSR, CR4_OSXSAVE, Cpu, SEG_FS, SEG_GS, Seg, TLB_ENTRIES_PER_MODE,
@@ -97,6 +97,10 @@ const HOST_XMM_ZERO: u8 = 2;
 // `Seg` is not `repr(C)`; `offset_of!` and `size_of` still report the real layout.
 const SEG_BASE: i32 = (offset_of!(Cpu, seg) + offset_of!(Seg, base)) as i32;
 const SEG_SIZE: i32 = size_of::<Seg>() as i32;
+const GS_BASE: i32 = SEG_BASE + SEG_SIZE * SEG_GS as i32;
+const KGSBASE: i32 = offset_of!(Cpu, kgsbase) as i32;
+const CPL: i32 = offset_of!(Cpu, cpl) as i32;
+const EFLAGS: i32 = offset_of!(Cpu, eflags) as i32;
 
 const _: () = assert!(size_of::<LazyFlagsOp>() == 1);
 const _: () = assert!(offset_of!(Cpu, lazy_size) == offset_of!(Cpu, lazy_op) + 1);
@@ -1973,6 +1977,22 @@ impl<'a> Gen<'a> {
                 self.st_gpr(GUEST_RSP, ADDR);
                 store = true;
             }
+            // swapgs, clac, stac and cli: the kernel's syscall entry and exit. Only CPL 0 is
+            // lowered; anywhere else the interpreter raises the fault.
+            0x101 if !insn.lock && matches!(insn.modrm, MODRM_SWAPGS | MODRM_CLAC | MODRM_STAC) => {
+                self.ring0_system(&insn, insn_index, rip)
+            }
+            0xfa if !insn.lock => self.ring0_system(&insn, insn_index, rip),
+            // push imm32 / imm8, sign-extended to 64 bits by the decoder. The kernel's syscall
+            // and interrupt entries build their frames with these.
+            0x68 | 0x6a if !insn.p66 && !insn.lock => {
+                self.ld_gpr(ADDR, GUEST_RSP);
+                self.a.lea(ADDR, mem(ADDR, -PUSH_POP_SIZE));
+                self.a.mov_imm(VALUE, insn.imm as u64);
+                self.stack_store(insn_index, rip);
+                self.st_gpr(GUEST_RSP, ADDR);
+                store = true;
+            }
             // pop r64. The register is written last so `pop rsp` ends up with the popped value.
             0x58..=0x5f if !insn.p66 => {
                 let r = opcode_register(&insn);
@@ -2073,6 +2093,42 @@ impl<'a> Gen<'a> {
         }
         self.inlined += 1;
         true
+    }
+
+    /// swapgs, clac, stac or cli, inline at CPL 0. At any other CPL (or, for cli, CPL > IOPL,
+    /// which CPL 0 never is) the out-of-line interpreter fallback raises #GP or #UD. None of the
+    /// four can be intercepted by an SVM guest's host, so a nested guest runs them here too.
+    fn ring0_system(&mut self, insn: &Insn, insn_index: u32, rip: u64) {
+        let slow = self.a.label();
+        let resume = self.a.label();
+        self.slows.push(Slow {
+            slow,
+            resume,
+            kind: SlowKind::Exec,
+            insn_index,
+            rip,
+        });
+        self.a.cmp_m8_imm(mem(CPU, CPL), 0);
+        self.a.jcc(NE, slow);
+        if insn.op == 0x101 && insn.modrm == MODRM_SWAPGS {
+            self.a.ld(SCRATCH_A, mem(CPU, GS_BASE));
+            self.a.ld(SCRATCH_B, mem(CPU, KGSBASE));
+            self.a.st(mem(CPU, GS_BASE), SCRATCH_B, 8);
+            self.a.st(mem(CPU, KGSBASE), SCRATCH_A, 8);
+        } else {
+            // `!IF` and `!AC` fit a sign-extended imm32, so the and keeps the upper half.
+            let (op, bits) = match (insn.op, insn.modrm) {
+                (0xfa, _) => (AND, !IF as i32),
+                (_, MODRM_CLAC) => (AND, !AC as i32),
+                _ => (OR, AC as i32),
+            };
+            self.a.ld(SCRATCH_A, mem(CPU, EFLAGS));
+            self.a.alu_ri(op, SCRATCH_A, bits, true);
+            self.a.st(mem(CPU, EFLAGS), SCRATCH_A, 8);
+        }
+        self.a.bind(resume);
+        // The compare (and the fallback's call) clobbered the host flags.
+        self.live = false;
     }
 
     /// Starts an inline SSE instruction: registers its out-of-line interpreter fallback and, for

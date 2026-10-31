@@ -289,6 +289,113 @@ fn cli_and_sti_toggle_the_interrupt_flag() {
 }
 
 #[test]
+fn cli_continues_the_block() {
+    // cli; add rax, rcx; pushfq; pop rbx; hlt
+    check(&[0xfa, 0x48, 0x01, 0xc8, 0x9c, 0x5b, 0xf4]);
+}
+
+#[test]
+fn push_immediates_sign_extend_to_64_bits() {
+    // push 0x7f; push -2; push 0x7fffffff; push -0x80000000; pop rax; pop rbx; pop rcx; pop rdx;
+    // hlt
+    check(&[
+        0x6a, 0x7f, 0x6a, 0xfe, 0x68, 0xff, 0xff, 0xff, 0x7f, 0x68, 0x00, 0x00, 0x00, 0x80, 0x58,
+        0x5b, 0x59, 0x5a, 0xf4,
+    ]);
+}
+
+#[test]
+fn push_word_immediate() {
+    // push word 0x1234 (66 68); push word -2 (66 6a); pop ax; pop bx; hlt
+    check(&[
+        0x66, 0x68, 0x34, 0x12, 0x66, 0x6a, 0xfe, 0x66, 0x58, 0x66, 0x5b, 0xf4,
+    ]);
+}
+
+#[test]
+fn swapgs_changes_what_the_rest_of_the_block_reads_through_gs() {
+    // swapgs; mov rax, gs:[8]; swapgs; mov rbx, gs:[8]; hlt
+    check_with(
+        &[
+            0x0f, 0x01, 0xf8, 0x65, 0x48, 0x8b, 0x04, 0x25, 0x08, 0x00, 0x00, 0x00, 0x0f, 0x01,
+            0xf8, 0x65, 0x48, 0x8b, 0x1c, 0x25, 0x08, 0x00, 0x00, 0x00, 0xf4,
+        ],
+        |harness| {
+            seed_registers_and_memory(harness);
+            harness.cpu.kgsbase = SEED_FS_BASE;
+        },
+    );
+}
+
+/// Seeds like `check` does, then drops to CPL 3 with every boot page-table entry made
+/// user-accessible, so the snippet can run there and the ring-0-only instructions fault.
+fn ring3_setup(harness: &mut Harness) {
+    /// Where `boot::load` puts its tables: PML4, first PDPT, four page directories, second PDPT.
+    const BOOT_PAGE_TABLES: std::ops::Range<u64> = 0x9000..0x1_0000;
+    const PTE_PRESENT: u64 = 1;
+    const PTE_USER: u64 = 4;
+    seed_registers_and_memory(harness);
+    for entry in BOOT_PAGE_TABLES.step_by(8) {
+        let value = harness.read_u64(entry);
+        if value & PTE_PRESENT != 0 {
+            harness.write_u64(entry, value | PTE_USER);
+        }
+    }
+    harness.cpu.cpl = 3;
+}
+
+#[track_caller]
+fn check_ring3_fault(code: &[u8], vector: u8, error_code: Option<u32>) {
+    check_stop_with(
+        code,
+        ring3_setup,
+        Stop::Fault {
+            vector,
+            error_code,
+            software: false,
+        },
+    );
+}
+
+#[test]
+fn swapgs_cli_clac_and_stac_fault_outside_ring_zero() {
+    use crate::cpu::exception::{VECTOR_GENERAL_PROTECTION, VECTOR_INVALID_OPCODE};
+    // Each after an inline instruction, so the fault comes out of the middle of a block.
+    // add rax, rcx; swapgs; hlt
+    check_ring3_fault(
+        &[0x48, 0x01, 0xc8, 0x0f, 0x01, 0xf8, 0xf4],
+        VECTOR_GENERAL_PROTECTION,
+        Some(0),
+    );
+    // add rax, rcx; cli; hlt (IOPL is 0)
+    check_ring3_fault(
+        &[0x48, 0x01, 0xc8, 0xfa, 0xf4],
+        VECTOR_GENERAL_PROTECTION,
+        Some(0),
+    );
+    // add rax, rcx; clac; hlt
+    check_ring3_fault(
+        &[0x48, 0x01, 0xc8, 0x0f, 0x01, 0xca, 0xf4],
+        VECTOR_INVALID_OPCODE,
+        None,
+    );
+    // add rax, rcx; stac; hlt
+    check_ring3_fault(
+        &[0x48, 0x01, 0xc8, 0x0f, 0x01, 0xcb, 0xf4],
+        VECTOR_INVALID_OPCODE,
+        None,
+    );
+}
+
+#[test]
+fn stac_and_clac_set_and_clear_ac_within_a_block() {
+    // stac; pushfq; pop rax; clac; pushfq; pop rbx; hlt
+    check(&[
+        0x0f, 0x01, 0xcb, 0x9c, 0x58, 0x0f, 0x01, 0xca, 0x9c, 0x5b, 0xf4,
+    ]);
+}
+
+#[test]
 fn sti_then_a_block_of_instructions_then_hlt() {
     // sti; add rax, rcx; add rax, rcx; hlt
     check(&[0xfb, 0x48, 0x01, 0xc8, 0x48, 0x01, 0xc8, 0xf4]);

@@ -13949,10 +13949,20 @@ mod exec_tests {
         );
     }
 
+    /// `cli` does not end a JIT block, so a JIT run of these snippets cannot stop after one
+    /// instruction; `jit::diff_misc` compares the JIT's cli (and its faults) instead.
+    fn one_instruction_pair(snippet: &[u8]) -> Pair {
+        if snippet == code::CLI {
+            Pair::interpreter_only(snippet)
+        } else {
+            Pair::new(snippet)
+        }
+    }
+
     #[test]
     fn cli_and_sti_toggle_if_and_sti_opens_a_one_instruction_shadow() {
         let run = |snippet: &[u8], flags: u64| {
-            let mut pair = Pair::new(snippet);
+            let mut pair = one_instruction_pair(snippet);
             let stop = pair.run_for(1, |h| {
                 h.cpu.eflags = RESERVED_ONE | flags;
             });
@@ -13986,7 +13996,7 @@ mod exec_tests {
                 (3, 2, false),
                 (3, 3, true),
             ] {
-                let mut pair = Pair::new(snippet);
+                let mut pair = one_instruction_pair(snippet);
                 let stop = pair.run_for(1, |h| {
                     enter_cpl(h, cpl);
                     h.cpu.eflags = RESERVED_ONE | iopl << IOPL_SHIFT;
