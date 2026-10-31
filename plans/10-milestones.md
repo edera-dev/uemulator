@@ -17,6 +17,8 @@
 
 - SVM done for 64-bit guests (see 03): vmrun/vmload/vmsave/stgi/clgi/invlpga, intercepts, event injection, nested paging, TSC offset; tested with hand-built VMCBs (interpreter and JIT); since validated against KVM and Xen (see 18, step 6).
 
+- Guest I/O round 1 done (see 23): network round trips no longer wait out sleep timers (29x TCP request/response), the syscall path's `swapgs`/`clac`/`stac`/`cli` continue JIT blocks and are inlined with `push imm` (1.3x syscalls), `rep stos` of wide elements is one host fill (2.6x memset), realtime device ticks are rate-limited.
+
 - ERMS/FSRM done: byte-sized rep slices make `rep movsb` copy-heavy guest workloads ~12x faster (03).
 
 - AVX, AVX2, FMA and F16C done (see 03): VEX.128/256 through the SSE kernels, YMM upper state in XSAVE, gathers, masked moves, a fused multiply-add on the soft-float engine, half-precision conversion. Found while booting Debian: a register-collision bug in the VEX staging that broke glibc's AVX2 `strcmp`, now covered by tests.

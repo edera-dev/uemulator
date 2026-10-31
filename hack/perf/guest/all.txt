@@ -1,0 +1,6 @@
+# One line per prompt; `netsrv.py` serves the binary and the network peers on the host.
+wget -q -O /tmp/ubench http://10.0.2.2:8099/ubench && chmod +x /tmp/ubench
+/tmp/ubench sys
+/tmp/ubench mem
+cd /root && /tmp/ubench disk
+/tmp/ubench net
