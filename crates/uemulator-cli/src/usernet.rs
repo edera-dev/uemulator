@@ -651,11 +651,38 @@ struct TcpFlow {
     fin_sent: bool,
     /// Removed at the end of the next `poll`.
     dead: bool,
+    /// Window in the last segment sent to the guest, so `poll` knows when draining `to_host`
+    /// opened it enough to be worth a window update.
+    window_sent: u16,
 }
 
 /// Window to advertise given how many guest bytes are still buffered for the host socket.
 fn advertised_window(buffered: usize) -> u16 {
     ADVERTISED_WINDOW_MAX.saturating_sub(buffered) as u16
+}
+
+/// Writes as much of `to_host` to the host socket as it takes without blocking. Err when the
+/// socket failed and the flow is over.
+fn write_backlog(stream: &mut TcpStream, to_host: &mut VecDeque<u8>) -> Result<(), ()> {
+    while !to_host.is_empty() {
+        let (contiguous, _) = to_host.as_slices();
+        match stream.write(contiguous) {
+            Ok(0) => break,
+            Ok(written) => {
+                to_host.drain(..written);
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return Err(()),
+        }
+    }
+    Ok(())
+}
+
+/// How far the window must have opened since the last advertised one before `poll` sends an
+/// update on its own: the receiver side of silly window avoidance (RFC 1122 section 4.2.3.3).
+fn window_update_threshold(mss: usize) -> usize {
+    mss.min(ADVERTISED_WINDOW_MAX / 2)
 }
 
 impl TcpFlow {
@@ -953,6 +980,7 @@ impl UserNet {
                     host_write_shutdown: false,
                     fin_sent: false,
                     dead: false,
+                    window_sent: 0,
                 },
             );
             let target = if ip.dst == DNS_IP {
@@ -999,6 +1027,13 @@ impl UserNet {
                 let fresh = &segment.data[already_received as usize..];
                 flow.to_host.extend(fresh);
                 flow.rcv_nxt = flow.rcv_nxt.wrapping_add(fresh.len() as u32);
+                // Written now so the ACK below advertises the window the host socket left: a
+                // segment that fills the window would otherwise be acknowledged with a zero one.
+                if let Conn::Open(stream) = &mut flow.conn
+                    && write_backlog(stream, &mut flow.to_host).is_err()
+                {
+                    flow.dead = true;
+                }
                 if segment.flags & FIN != 0 && !flow.guest_fin {
                     flow.guest_fin = true;
                     flow.rcv_nxt = flow.rcv_nxt.wrapping_add(1);
@@ -1011,6 +1046,7 @@ impl UserNet {
         }
         if need_ack {
             let header = flow.header(&key, ACK, flow.snd_nxt, false);
+            flow.window_sent = header.window;
             let reply = tcp_segment(&header, &[]);
             let guest_ip = flow.guest_ip;
             self.emit_ip(key.remote_ip, guest_ip, IP_PROTO_TCP, &reply);
@@ -1048,6 +1084,7 @@ impl UserNet {
                     let _ = stream.set_nodelay(true);
                     flow.conn = Conn::Open(stream);
                     let header = flow.header(&key, SYN | ACK, flow.snd_nxt, true);
+                    flow.window_sent = header.window;
                     flow.snd_nxt = flow.snd_nxt.wrapping_add(1);
                     let (reply, guest_ip) = (tcp_segment(&header, &[]), flow.guest_ip);
                     self.emit_ip(key.remote_ip, guest_ip, IP_PROTO_TCP, &reply);
@@ -1072,20 +1109,8 @@ impl UserNet {
             let Conn::Open(stream) = &mut flow.conn else {
                 continue;
             };
-            while !flow.to_host.is_empty() {
-                let (contiguous, _) = flow.to_host.as_slices();
-                match stream.write(contiguous) {
-                    Ok(0) => break,
-                    Ok(written) => {
-                        flow.to_host.drain(..written);
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                    Err(_) => {
-                        flow.dead = true;
-                        break;
-                    }
-                }
+            if write_backlog(stream, &mut flow.to_host).is_err() {
+                flow.dead = true;
             }
             if flow.guest_fin && flow.to_host.is_empty() && !flow.host_write_shutdown {
                 let _ = stream.shutdown(Shutdown::Write);
@@ -1104,6 +1129,7 @@ impl UserNet {
                 window: advertised_window(flow.to_host.len()),
                 advertise_mss: false,
             };
+            let packets_before = packets.len();
             let mut read_buf = [0u8; MSS];
             while !flow.dead && !flow.fin_sent && budget > 0 {
                 let in_flight = flow.snd_nxt.wrapping_sub(flow.snd_una);
@@ -1161,6 +1187,31 @@ impl UserNet {
                         flow.dead = true;
                     }
                 }
+            }
+            // Every segment above carries the current window; without one, tell the guest
+            // about a window that opened since the last segment it got.
+            let window = segment_template.window;
+            if packets.len() > packets_before {
+                flow.window_sent = window;
+            } else if !flow.dead
+                && budget > 0
+                && window as usize >= flow.window_sent as usize + window_update_threshold(flow.mss)
+            {
+                flow.window_sent = window;
+                budget -= 1;
+                packets.push(PendingPacket {
+                    proto: IP_PROTO_TCP,
+                    src: key.remote_ip,
+                    dst: flow.guest_ip,
+                    payload: tcp_segment(
+                        &TcpHeader {
+                            flags: ACK,
+                            seq: flow.snd_nxt,
+                            ..segment_template
+                        },
+                        &[],
+                    ),
+                });
             }
         }
         self.tcp.retain(|_, flow| !flow.dead);

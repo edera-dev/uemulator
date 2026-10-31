@@ -2980,18 +2980,53 @@ mod tcp {
     }
 
     #[test]
-    fn acknowledgements_advertise_a_window_shrunk_by_the_unwritten_backlog() {
+    fn data_the_host_socket_takes_at_once_leaves_the_acknowledged_window_open() {
         let (listener, port) = listener();
         let mut un = UserNet::new();
         let mut guest = Guest::new(5000, port, 1000);
-        let (_server, _) = handshake(&mut un, &mut guest, &listener);
+        let (mut server, _) = handshake(&mut un, &mut guest, &listener);
         guest.send(&mut un, ACK, &[0u8; 1000]);
         let ack = tcp_view(&drain(&mut un).remove(0)).unwrap();
         assert_eq!(
-            ack.window,
-            65535 - 1000,
-            "nothing has been polled to the host yet"
+            ack.window, 65535,
+            "written to the host before the ACK was built"
         );
+        assert_eq!(read_exactly(&mut server, 1000), vec![0u8; 1000]);
+    }
+
+    /// A guest that filled the window must hear that it opened again once `poll` moves the
+    /// backlog to the host; without the update it waits for its persist timer (200 ms or more).
+    #[test]
+    fn a_window_reopened_by_poll_is_announced_to_the_guest() {
+        const CHUNK: usize = MSS;
+        const MAX_BYTES: usize = 64 << 20;
+        let (listener, port) = listener();
+        let mut un = UserNet::new();
+        let mut guest = Guest::new(5000, port, 1000);
+        let (mut server, _) = handshake(&mut un, &mut guest, &listener);
+        // The host never reads, so its socket fills and the backlog builds up behind it.
+        let mut sent = 0;
+        loop {
+            guest.send(&mut un, ACK, &[0x5a; CHUNK]);
+            sent += CHUNK;
+            un.poll();
+            let window = drain(&mut un)
+                .iter()
+                .filter_map(|f| tcp_view(f))
+                .map(|v| v.window)
+                .min()
+                .unwrap();
+            if (window as usize) < ADVERTISED_WINDOW_MAX / 2 {
+                break;
+            }
+            assert!(sent < MAX_BYTES, "the host socket never filled");
+        }
+        let reader = std::thread::spawn(move || read_exactly(&mut server, sent).len());
+        let update = wait_for_tcp(&mut un, |v| {
+            v.flags == ACK && v.data.is_empty() && v.window as usize == ADVERTISED_WINDOW_MAX
+        });
+        assert_eq!(update.ack, 1001u32.wrapping_add(sent as u32));
+        assert_eq!(reader.join().unwrap(), sent);
     }
 
     #[test]
@@ -3329,6 +3364,7 @@ mod tcp {
             host_write_shutdown: false,
             fin_sent: false,
             dead: false,
+            window_sent: ADVERTISED_WINDOW_MAX as u16,
         }
     }
 
