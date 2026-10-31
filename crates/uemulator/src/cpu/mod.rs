@@ -127,6 +127,13 @@ pub(crate) const NS_PER_INSN: u64 = 1;
 /// Instructions between `service_events` polls (stop flag, device timers). The check happens
 /// at step boundaries, so with the JIT it can overshoot by up to one block.
 const EVENT_INTERVAL: u64 = 4096;
+/// On the realtime clock, the least host time between two device ticks from `service_events`.
+/// A tick polls every device (virtio queues, interrupt lines, the UART) and costs a few hundred
+/// nanoseconds, while `EVENT_INTERVAL` instructions can take less than a microsecond (a bulk
+/// `rep stos` slice counts as 32K), so ticking on instructions alone spent a tenth of the time
+/// on it. Timers fire up to this much late; host input does not wait on it when the guest is
+/// halted (`idle` ticks on its own).
+const MIN_DEVICE_TICK_NS: u64 = 20_000;
 /// Vector of the non-maskable interrupt.
 const NMI_VECTOR: u8 = 2;
 
@@ -513,6 +520,9 @@ pub(crate) struct Cpu {
     pub time_carry: u64,
     /// `icount` at which `service_events` runs next.
     pub next_event: u64,
+    /// Host time before which `service_events` leaves the devices alone (`MIN_DEVICE_TICK_NS`).
+    /// Per CPU even when time-sharing: each CPU ticking on its own turn only ticks more often.
+    next_device_tick_ns: u64,
     pub stop: Arc<AtomicBool>,
     pub log: Option<LogFn>,
     /// Host callback run on every device tick; its argument is true when the guest is idle with
@@ -855,6 +865,7 @@ impl Cpu {
             time_divisor: 1,
             time_carry: 0,
             next_event: 0,
+            next_device_tick_ns: 0,
             stop,
             log,
             poll: None,
@@ -977,6 +988,13 @@ impl Cpu {
             return None;
         }
         let now = self.now_ns();
+        if self.wall_clock.is_some() {
+            if now < self.next_device_tick_ns {
+                self.next_event = self.icount + EVENT_INTERVAL;
+                return None;
+            }
+            self.next_device_tick_ns = now + MIN_DEVICE_TICK_NS;
+        }
         self.tick_devices(now);
         if self.dev.lock().reset_requested {
             return Some(ExitReason::Reset);
@@ -1939,6 +1957,7 @@ mod cpu_tests {
 
     mod event_servicing {
         use super::*;
+        use std::sync::atomic::AtomicU64;
 
         #[test]
         fn stop_flag_is_honoured_by_service_events() {
@@ -1953,6 +1972,46 @@ mod cpu_tests {
             h.cpu.icount = 12_345;
             assert!(h.cpu.service_events().is_none());
             assert_eq!(h.cpu.next_event, 12_345 + EVENT_INTERVAL);
+        }
+
+        /// A realtime CPU on a clock the test moves, with a poll hook counting device ticks.
+        fn realtime_harness_counting_ticks() -> (Harness, Arc<AtomicU64>, Arc<AtomicUsize>) {
+            const START_NS: u64 = 1_000_000;
+            let mut h = harness();
+            let now = Arc::new(AtomicU64::new(START_NS));
+            let clock = now.clone();
+            h.cpu.wall_clock = Some(WallClock::new(Arc::new(move || {
+                clock.load(Ordering::SeqCst)
+            })));
+            let ticks = Arc::new(AtomicUsize::new(0));
+            let counter = ticks.clone();
+            h.cpu.poll = Some(Arc::new(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }));
+            (h, now, ticks)
+        }
+
+        #[test]
+        fn a_realtime_cpu_ticks_the_devices_at_most_once_per_tick_interval() {
+            let (mut h, now, ticks) = realtime_harness_counting_ticks();
+            for _ in 0..3 {
+                assert!(h.cpu.service_events().is_none());
+            }
+            assert_eq!(ticks.load(Ordering::SeqCst), 1);
+            now.fetch_add(MIN_DEVICE_TICK_NS, Ordering::SeqCst);
+            assert!(h.cpu.service_events().is_none());
+            assert_eq!(ticks.load(Ordering::SeqCst), 2);
+        }
+
+        #[test]
+        fn a_skipped_tick_still_schedules_the_next_poll_and_honours_the_stop_flag() {
+            let (mut h, _now, _ticks) = realtime_harness_counting_ticks();
+            h.cpu.service_events();
+            h.cpu.icount = 777;
+            assert!(h.cpu.service_events().is_none());
+            assert_eq!(h.cpu.next_event, 777 + EVENT_INTERVAL);
+            h.cpu.stop.store(true, Ordering::Relaxed);
+            assert!(matches!(h.cpu.service_events(), Some(ExitReason::Stopped)));
         }
 
         #[test]

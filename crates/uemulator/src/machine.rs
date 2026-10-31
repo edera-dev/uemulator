@@ -445,8 +445,10 @@ impl MachineConfig {
 }
 
 impl MachineConfig {
-    /// Called from the vCPU loop. The flag is true while the guest is halted with nothing to
-    /// do, when the host may wait. Single-threaded hosts use it to pump their console.
+    /// Called from the vCPU loop (with threads, the device thread) whenever it ticks the devices:
+    /// on a busy realtime machine at most every 20 us, not every few thousand instructions. The
+    /// flag is true while the guest is halted with nothing to do, when the host may wait.
+    /// Single-threaded hosts use it to pump their console.
     pub fn poll(mut self, f: impl Fn(&ConsoleHandle, bool) + Send + Sync + 'static) -> Self {
         self.poll = Some(Arc::new(f));
         self

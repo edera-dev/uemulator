@@ -969,21 +969,23 @@ impl Cpu {
             }
             self.gpr[GPR_RSI] = self.gpr[GPR_RSI].wrapping_add(bytes);
         } else {
-            let value = self.read_gpr(0, size, true);
-            // SAFETY: the destination range lies inside `ram`.
+            let pattern = self.read_gpr(0, size, true).to_le_bytes();
+            let element = &pattern[..size as usize];
+            let bytes = bytes as usize;
+            // SAFETY: the destination range lies inside `ram`. Each doubling copies a prefix that
+            // already holds whole elements onto the bytes right after it, so the two never overlap.
             unsafe {
                 let dst = ram.add(dst_pa as usize);
-                match size {
-                    1 => core::ptr::write_bytes(dst, value as u8, bytes as usize),
-                    _ => {
-                        for k in 0..elements as usize {
-                            let at = dst.add(k * size as usize);
-                            match size {
-                                2 => (at as *mut u16).write_unaligned(value as u16),
-                                4 => (at as *mut u32).write_unaligned(value as u32),
-                                _ => (at as *mut u64).write_unaligned(value),
-                            }
-                        }
+                if element.iter().all(|&byte| byte == element[0]) {
+                    // musl's and the kernel's memset widen the fill byte, so this is the usual case.
+                    core::ptr::write_bytes(dst, element[0], bytes);
+                } else {
+                    core::ptr::copy_nonoverlapping(element.as_ptr(), dst, element.len());
+                    let mut filled = element.len();
+                    while filled < bytes {
+                        let chunk = filled.min(bytes - filled);
+                        core::ptr::copy_nonoverlapping(dst, dst.add(filled), chunk);
+                        filled += chunk;
                     }
                 }
             }
@@ -8905,10 +8907,18 @@ mod exec_tests {
     /// unaligned ones that cross several pages and elements that straddle a page boundary.
     #[test]
     fn rep_stos_of_every_size_fills_across_page_boundaries_and_straddling_elements() {
+        // A fill value of distinct bytes, and one that repeats a byte (the memset case).
+        for fill in [0x1122_3344_5566_7788u64, 0x5a5a_5a5a_5a5a_5a5a] {
+            rep_stos_fills_with(fill);
+        }
+    }
+
+    fn rep_stos_fills_with(fill: u64) {
         for (snippet, size) in [
             (code::REP_STOS_1, 1usize),
             (code::REP_STOS_2, 2),
             (code::REP_STOS_4, 4),
+            (code::REP_STOS_8, 8),
         ] {
             // Starts 3 bytes before a page end, so for sizes above 1 the first element straddles.
             let start = DATA + 0x1000 - 3;
@@ -8918,11 +8928,11 @@ mod exec_tests {
                 h.write(DATA, &vec![0u8; 0x4000]);
                 h.cpu.gpr[RDI] = start;
                 h.cpu.gpr[RCX] = elements;
-                h.cpu.gpr[RAX] = 0x1122_3344_5566_7788;
+                h.cpu.gpr[RAX] = fill;
             });
             let bytes = elements as usize * size;
             let written = pair.interp.read(start, bytes + 4);
-            let pattern = 0x1122_3344_5566_7788u64.to_le_bytes();
+            let pattern = fill.to_le_bytes();
             for (k, byte) in written[..bytes].iter().enumerate() {
                 assert_eq!(*byte, pattern[k % size], "size {size} byte {k}");
             }
