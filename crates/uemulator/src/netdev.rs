@@ -42,8 +42,8 @@ struct NetState {
     to_guest: VecDeque<HostFrame>,
     from_guest: VecDeque<Vec<u8>>,
     offloads: NetOffloads,
-    /// The guest's driver accepted `GUEST_CSUM` and `GUEST_TSO4`; set by the device when the
-    /// features are negotiated and cleared on reset.
+    /// The guest's driver accepted `GUEST_CSUM`, `GUEST_TSO4` and `MRG_RXBUF`; set by the device
+    /// when the features are negotiated and cleared on reset.
     guest_takes_segments: bool,
     /// Wakes whichever thread runs the devices (the vCPU of a one-processor machine, else the
     /// device thread), which otherwise only looks at `to_guest` when its sleep ends: without it a
@@ -108,9 +108,9 @@ impl NetHandle {
     }
 
     /// True while the guest's driver takes TCP segments longer than the MSS with an unfinished
-    /// checksum, so `send_tcp_segment` frames reach it whole. False before the driver has
-    /// negotiated, after a reset, and always unless `sends_large_segments` was declared. A
-    /// large segment still queued when this turns false is dropped.
+    /// checksum, in merged receive buffers, so `send_tcp_segment` frames reach it whole. False
+    /// before the driver has negotiated, after a reset, and always unless `sends_large_segments`
+    /// was declared. A large segment still queued when this turns false is dropped.
     pub fn guest_takes_tcp_segments(&self) -> bool {
         self.inner.0.lock().unwrap().guest_takes_segments
     }

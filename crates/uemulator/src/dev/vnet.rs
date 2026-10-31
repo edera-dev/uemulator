@@ -345,8 +345,11 @@ impl VirtioDev for VirtioNet {
 
     fn features_negotiated(&mut self, features: u64) {
         self.negotiated = features;
+        // MRG_RXBUF too: without it a long segment has to fit one posted chain, and a driver may
+        // post only MTU-sized ones (the spec says SHOULD for 64 KiB). The device then drops every
+        // long segment, and since usernet never retransmits, that connection hangs for good.
         self.net.set_guest_takes_tcp_segments(
-            features & (F_GUEST_CSUM | F_GUEST_TSO4) == F_GUEST_CSUM | F_GUEST_TSO4,
+            features & HOST_TO_GUEST_OFFLOADS == HOST_TO_GUEST_OFFLOADS,
         );
     }
 
@@ -1231,8 +1234,13 @@ mod tests {
         fn the_host_learns_whether_the_guest_takes_segments() {
             let mut rig = Rig::negotiated(BOTH_WAYS, 0);
             assert!(!rig.net.guest_takes_tcp_segments());
-            rig.dev.features_negotiated(F_GUEST_CSUM | F_GUEST_TSO4);
+            rig.dev.features_negotiated(HOST_TO_GUEST);
             assert!(rig.net.guest_takes_tcp_segments());
+            rig.dev.features_negotiated(F_GUEST_CSUM | F_GUEST_TSO4);
+            assert!(
+                !rig.net.guest_takes_tcp_segments(),
+                "without merged buffers a long segment needs one buffer the driver may never post"
+            );
             rig.dev.features_negotiated(F_GUEST_CSUM | F_MRG_RXBUF);
             assert!(
                 !rig.net.guest_takes_tcp_segments(),

@@ -51,7 +51,7 @@ impl NetHandle {
     pub fn on_guest_frame(&self, f: impl Fn() + Send + Sync + 'static); // called after each guest frame is queued, for a host that waits on sockets too (the CLI's usernet `poll(2)`)
     pub fn set_offloads(&self, offloads: NetOffloads);       // before start: what the host handles in the guest's place; virtio-net offers the matching offloads only then
     pub fn send_tcp_segment(&self, frame: &[u8], segment_size: u16) -> bool; // host → guest TCP/IPv4 frame, checksum field = pseudo-header sum, payload may exceed segment_size (the MSS)
-    pub fn guest_takes_tcp_segments(&self) -> bool;          // the driver negotiated GUEST_CSUM + GUEST_TSO4, so send_tcp_segment frames reach it whole
+    pub fn guest_takes_tcp_segments(&self) -> bool;          // the driver negotiated GUEST_CSUM + GUEST_TSO4 + MRG_RXBUF, so send_tcp_segment frames reach it whole
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
