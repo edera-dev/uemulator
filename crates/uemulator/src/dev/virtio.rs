@@ -166,6 +166,7 @@ pub(crate) struct Chain {
 
 impl Chain {
     /// Concatenates the device-readable segments, truncated to `limit` bytes.
+    #[cfg(not(freestanding))]
     pub fn read_all(&self, mem: &GuestMem, limit: usize) -> Vec<u8> {
         let mut out = Vec::new();
         for seg in self.segs.iter().filter(|seg| !seg.device_writable) {
@@ -179,7 +180,6 @@ impl Chain {
 
     /// Fills `out` with the device-readable bytes from `offset` on (counted across segments) and
     /// returns how many there were, at most `out.len()`.
-    #[cfg(not(freestanding))]
     pub fn read_from(&self, mem: &GuestMem, mut offset: usize, out: &mut [u8]) -> usize {
         let mut done = 0;
         for seg in self.segs.iter().filter(|seg| !seg.device_writable) {
@@ -338,19 +338,35 @@ impl Queue {
         None
     }
 
-    /// Hands the most recently popped chain back to the driver as still available.
-    pub fn unpop(&mut self) {
-        self.last_avail = self.last_avail.wrapping_sub(1);
+    /// Hands every chain popped since `last_avail` had the value `mark` back to the driver as
+    /// still available, so a device can take several chains and change its mind.
+    pub fn rewind_to(&mut self, mark: u16) {
+        self.last_avail = mark;
     }
 
     /// Completes the chain headed at `head`; `len` is the number of bytes the device wrote
     /// into its writable segments. The used `idx` is published last, after the entry.
     pub fn push_used(&mut self, mem: &mut GuestMem, head: u16, len: u32) {
+        self.push_used_all(mem, &[(head, len)]);
+    }
+
+    /// Completes several chains, as (head, length written) in order, behind a single update of
+    /// the used `idx`. A driver that reads one entry as the start of a group (virtio-net's
+    /// merged receive buffers) may look at the ring at any time from another vCPU, and must never
+    /// find the first entry published without the rest.
+    pub fn push_used_all(&mut self, mem: &mut GuestMem, entries: &[(u16, u32)]) {
+        if entries.is_empty() {
+            return;
+        }
         let used_idx = mem.read_u16(self.used + USED_IDX);
-        let entry = self.used + USED_RING + USED_ENTRY_SIZE * (used_idx % self.size) as u64;
-        mem.write_u32(entry, head as u32);
-        mem.write_u32(entry + USED_ENTRY_LEN, len);
-        mem.write_u16(self.used + USED_IDX, used_idx.wrapping_add(1));
+        let mut next = used_idx;
+        for &(head, len) in entries {
+            let entry = self.used + USED_RING + USED_ENTRY_SIZE * (next % self.size) as u64;
+            mem.write_u32(entry, head as u32);
+            mem.write_u32(entry + USED_ENTRY_LEN, len);
+            next = next.wrapping_add(1);
+        }
+        mem.write_u16(self.used + USED_IDX, next);
         // Read after publishing `idx`, as the spec orders it: the driver may toggle the flag
         // concurrently and we must see the value that applies to this completion.
         let suppressed = mem.read_u16(self.avail + AVAIL_FLAGS) & AVAIL_F_NO_INTERRUPT != 0;
@@ -380,6 +396,9 @@ pub(crate) trait VirtioDev: Send {
         false
     }
     fn reset(&mut self) {}
+    /// The driver's feature set once FEATURES_OK is accepted (and again each time the driver
+    /// rewrites the status with FEATURES_OK set). A reset undoes it.
+    fn features_negotiated(&mut self, _features: u64) {}
     /// Gives the backing disk back when the device is torn down for a machine reboot, so the
     /// next incarnation of the device can serve the same image. Only virtio-blk has one.
     #[cfg(not(freestanding))]
@@ -818,6 +837,8 @@ impl Transport {
                         let wanted = self.driver_features;
                         if wanted & VIRTIO_F_VERSION_1 == 0 || wanted & !self.dev_features() != 0 {
                             accepted &= !STATUS_FEATURES_OK;
+                        } else {
+                            self.dev.features_negotiated(wanted);
                         }
                     }
                     self.status = accepted;
@@ -971,6 +992,8 @@ mod tests {
         popped: Vec<PoppedChain>,
         poll_pops_queue: Option<usize>,
         config_event: bool,
+        /// Every feature set `features_negotiated` was told about.
+        negotiated: Vec<u64>,
     }
 
     struct ProbeDev(Arc<Mutex<Probe>>);
@@ -1025,6 +1048,9 @@ mod tests {
         }
         fn reset(&mut self) {
             self.0.lock().unwrap().resets += 1;
+        }
+        fn features_negotiated(&mut self, features: u64) {
+            self.0.lock().unwrap().negotiated.push(features);
         }
     }
 
@@ -1373,6 +1399,24 @@ mod tests {
         let mut rig = Rig::new(1, OFFERED_FEATURES);
         let status = negotiate(&mut rig, 0x24, (1 << 8) | VERSION_1_HIGH_WORD_BIT);
         assert_ne!(status & STATUS_FEATURES_OK, 0);
+    }
+
+    #[test]
+    fn the_device_learns_the_features_once_features_ok_sticks() {
+        let mut rig = Rig::new(1, OFFERED_FEATURES);
+        negotiate(&mut rig, 0x24, VERSION_1_HIGH_WORD_BIT);
+        assert_eq!(
+            rig.probe.lock().unwrap().negotiated,
+            vec![0x24 | VIRTIO_F_VERSION_1]
+        );
+    }
+
+    #[test]
+    fn a_refused_feature_set_is_not_passed_to_the_device() {
+        let mut rig = Rig::new(1, OFFERED_FEATURES);
+        negotiate(&mut rig, 0x24 | 0x100, VERSION_1_HIGH_WORD_BIT);
+        negotiate(&mut rig, 0x24, 0);
+        assert!(rig.probe.lock().unwrap().negotiated.is_empty());
     }
 
     #[test]
@@ -2481,6 +2525,31 @@ mod tests {
         assert_eq!(used_entry(&q.ram, USED0, 2), (7, u32::MAX));
     }
 
+    /// A merged receive buffer is several chains the driver must see all at once: the entries go
+    /// in first and `idx` moves once, past all of them.
+    #[test]
+    fn push_used_all_publishes_every_entry_with_one_index_update() {
+        let mut q = QueueRig::new(4);
+        let used = USED0 as usize;
+        q.ram[used + 2..used + 4].copy_from_slice(&u16::MAX.to_le_bytes());
+        let mut mem = test_mem(&mut q.ram);
+        q.queue.push_used_all(&mut mem, &[(3, 30), (0, 1), (2, 22)]);
+        assert_eq!(used_idx(&q.ram, USED0), 2, "65535 + 3 wraps to 2");
+        assert_eq!(used_entry(&q.ram, USED0, 3), (3, 30));
+        assert_eq!(used_entry(&q.ram, USED0, 0), (0, 1));
+        assert_eq!(used_entry(&q.ram, USED0, 1), (2, 22));
+        assert!(q.queue.interrupt_due);
+    }
+
+    #[test]
+    fn push_used_all_of_nothing_changes_nothing() {
+        let mut q = QueueRig::new(4);
+        let mut mem = test_mem(&mut q.ram);
+        q.queue.push_used_all(&mut mem, &[]);
+        assert_eq!(used_idx(&q.ram, USED0), 0);
+        assert!(!q.queue.interrupt_due);
+    }
+
     #[test]
     fn push_used_wraps_the_slot_by_queue_size() {
         let mut q = QueueRig::new(2);
@@ -2515,20 +2584,26 @@ mod tests {
     }
 
     #[test]
-    fn unpop_returns_the_chain_to_the_ring() {
+    fn rewind_returns_the_chains_to_the_ring_in_order() {
         let mut q = QueueRig::new(8);
         put_desc(&mut q.ram, DESC0, 3, BUF_A, 4, 0, 0);
+        put_desc(&mut q.ram, DESC0, 5, BUF_B, 4, 0, 0);
         post(&mut q.ram, AVAIL0, 8, 3);
+        post(&mut q.ram, AVAIL0, 8, 5);
+        let mark = q.queue.last_avail;
         assert_eq!(q.pop().unwrap().head, 3);
-        q.queue.unpop();
+        assert_eq!(q.pop().unwrap().head, 5);
+        q.queue.rewind_to(mark);
         assert_eq!(q.pop().unwrap().head, 3);
+        assert_eq!(q.pop().unwrap().head, 5);
         assert!(q.pop().is_none());
     }
 
     #[test]
-    fn unpop_wraps_below_zero() {
+    fn rewind_works_across_the_index_wrap() {
         let mut q = QueueRig::new(8);
-        q.queue.unpop();
+        q.queue.last_avail = 1;
+        q.queue.rewind_to(u16::MAX);
         assert_eq!(q.queue.last_avail, u16::MAX);
     }
 

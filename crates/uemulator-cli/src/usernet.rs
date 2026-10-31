@@ -16,6 +16,11 @@
 //! timer, no congestion control, no window scaling, no SACK/timestamps, no urgent data and no
 //! TIME_WAIT. Out-of-order guest segments are dropped and answered with a duplicate ACK. IPv4
 //! fragments from the guest, IPv6 and checksums on received packets are not handled or verified.
+//!
+//! Because nothing checks a checksum and TCP is terminated here, the NIC is told it may hand over
+//! the guest's TSO segments (up to 64 KiB, checksum unfinished) as they are, and host data goes
+//! back in segments as large as the guest's window when its driver takes them (`OFFLOADS`). That
+//! removes the guest kernel's per-1500-byte cost, which bounded bulk TCP before.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
@@ -27,7 +32,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
-use uemulator::NetHandle;
+use uemulator::{NetHandle, NetOffloads};
 
 use crate::run::GUEST_MAC;
 
@@ -54,6 +59,9 @@ const MSS: usize = 1460;
 /// A guest that advertises a tiny (or zero) MSS would make the per-read size 0, and a zero-length
 /// read is indistinguishable from EOF.
 const MIN_MSS: usize = 64;
+/// Most TCP payload one large segment to the guest carries (`UserNet::large_segments`): what
+/// fits an IPv4 packet behind a 20-byte TCP header.
+const LARGE_SEGMENT_DATA_MAX: usize = IPV4_PAYLOAD_LEN_MAX - TCP_HEADER_LEN;
 /// Largest window we can advertise without window scaling (16-bit field). The advertised window
 /// shrinks by the bytes still waiting to be written to the host socket, which throttles the guest.
 const ADVERTISED_WINDOW_MAX: usize = 65535;
@@ -226,12 +234,16 @@ pub(crate) fn internet_checksum(data: &[u8]) -> u16 {
     checksum_finish(checksum_add(0, data))
 }
 
+/// The IPv4 pseudo-header part of a TCP/UDP checksum (addresses, protocol, segment length), as
+/// an unfolded running sum.
+fn pseudo_header_sum(src: [u8; 4], dst: [u8; 4], proto: u8, segment_len: usize) -> u32 {
+    checksum_add(0, &src) + checksum_add(0, &dst) + proto as u32 + segment_len as u32
+}
+
 /// TCP/UDP checksum: covers the IPv4 pseudo-header (addresses, protocol, segment length) too.
 fn transport_checksum(src: [u8; 4], dst: [u8; 4], proto: u8, segment: &[u8]) -> u16 {
-    let mut acc =
-        checksum_add(0, &src) + checksum_add(0, &dst) + proto as u32 + segment.len() as u32;
-    acc = checksum_add(acc, segment);
-    checksum_finish(acc)
+    let acc = pseudo_header_sum(src, dst, proto, segment.len());
+    checksum_finish(checksum_add(acc, segment))
 }
 
 fn be_u16(bytes: &[u8]) -> u16 {
@@ -337,6 +349,24 @@ struct TcpHeader {
 }
 
 fn tcp_segment(header: &TcpHeader, data: &[u8]) -> Vec<u8> {
+    let mut segment = tcp_segment_unchecked(header, data);
+    let checksum = transport_checksum(header.src, header.dst, IP_PROTO_TCP, &segment);
+    segment[TCP_CHECKSUM].copy_from_slice(&checksum.to_be_bytes());
+    segment
+}
+
+/// A segment whose checksum field holds only the folded pseudo-header sum, not complemented:
+/// what a NIC doing checksum offload expects, finished by whoever takes it
+/// (`NetHandle::send_tcp_segment`). Saves summing a 64 KiB payload here.
+fn tcp_segment_partial(header: &TcpHeader, data: &[u8]) -> Vec<u8> {
+    let mut segment = tcp_segment_unchecked(header, data);
+    let sum = pseudo_header_sum(header.src, header.dst, IP_PROTO_TCP, segment.len());
+    segment[TCP_CHECKSUM].copy_from_slice(&(!checksum_finish(sum)).to_be_bytes());
+    segment
+}
+
+/// The segment with a zero checksum field.
+fn tcp_segment_unchecked(header: &TcpHeader, data: &[u8]) -> Vec<u8> {
     let header_len = TCP_HEADER_LEN
         + if header.advertise_mss {
             TCP_OPT_MSS_LEN
@@ -358,8 +388,6 @@ fn tcp_segment(header: &TcpHeader, data: &[u8]) -> Vec<u8> {
         segment.extend_from_slice(&(MSS as u16).to_be_bytes());
     }
     segment.extend_from_slice(data);
-    let checksum = transport_checksum(header.src, header.dst, IP_PROTO_TCP, &segment);
-    segment[TCP_CHECKSUM].copy_from_slice(&checksum.to_be_bytes());
     segment
 }
 
@@ -474,6 +502,25 @@ struct PendingPacket {
     src: [u8; 4],
     dst: [u8; 4],
     payload: Vec<u8>,
+    /// A TCP segment from `tcp_segment_partial` for `NetHandle::send_tcp_segment`, with this MSS.
+    segment_size: Option<u16>,
+}
+
+/// A frame queued for the guest. `segment_size` marks a TCP segment whose checksum is only the
+/// pseudo-header sum and whose payload may exceed that MSS; it goes out through
+/// `NetHandle::send_tcp_segment`, everything else through `send_frame`.
+pub struct OutFrame {
+    pub bytes: Vec<u8>,
+    pub segment_size: Option<u16>,
+}
+
+impl OutFrame {
+    fn plain(bytes: Vec<u8>) -> OutFrame {
+        OutFrame {
+            bytes,
+            segment_size: None,
+        }
+    }
 }
 
 /// The gateway address stands for the host itself.
@@ -706,7 +753,13 @@ pub struct UserNet {
     /// host data) go to it.
     guest_mac: [u8; 6],
     /// Frames queued for the guest, oldest first.
-    out: VecDeque<Vec<u8>>,
+    out: VecDeque<OutFrame>,
+    /// The guest takes TCP segments longer than the MSS with an unfinished checksum
+    /// (`NetHandle::guest_takes_tcp_segments`), so host data goes out in segments as large as its
+    /// window. The worker sets it before every `poll`; the driver can renegotiate at any time.
+    pub large_segments: bool,
+    /// Where host socket reads land; one segment's worth.
+    read_buf: Vec<u8>,
     udp: HashMap<FlowKey, UdpFlow>,
     udp_flow_limit: usize,
     tcp: HashMap<FlowKey, TcpFlow>,
@@ -738,6 +791,8 @@ impl UserNet {
         UserNet {
             guest_mac: GUEST_MAC,
             out: VecDeque::new(),
+            large_segments: false,
+            read_buf: vec![0; LARGE_SEGMENT_DATA_MAX],
             udp: HashMap::new(),
             udp_flow_limit: MAX_UDP_FLOWS,
             tcp: HashMap::new(),
@@ -754,13 +809,24 @@ impl UserNet {
     fn emit_ip(&mut self, src: [u8; 4], dst: [u8; 4], proto: u8, payload: &[u8]) {
         self.ip_id = self.ip_id.wrapping_add(1);
         for packet in ipv4_packets(self.ip_id, src, dst, proto, payload) {
-            self.out.push_back(ethernet_frame(
+            self.out.push_back(OutFrame::plain(ethernet_frame(
                 self.guest_mac,
                 GATEWAY_MAC,
                 ETHERTYPE_IPV4,
                 &packet,
-            ));
+            )));
         }
+    }
+
+    /// A TCP segment from `tcp_segment_partial`, in one IPv4 packet with DF set however long
+    /// it is: the guest splits it, so it must not be fragmented here.
+    fn emit_segment(&mut self, src: [u8; 4], dst: [u8; 4], segment: &[u8], segment_size: u16) {
+        self.ip_id = self.ip_id.wrapping_add(1);
+        let packet = ipv4_packet(self.ip_id, src, dst, IP_PROTO_TCP, segment);
+        self.out.push_back(OutFrame {
+            bytes: ethernet_frame(self.guest_mac, GATEWAY_MAC, ETHERTYPE_IPV4, &packet),
+            segment_size: Some(segment_size),
+        });
     }
 
     pub fn input(&mut self, frame: &[u8]) {
@@ -810,12 +876,12 @@ impl UserNet {
         reply.extend_from_slice(target_ip);
         reply.extend_from_slice(&arp[ARP_SENDER_MAC]);
         reply.extend_from_slice(&arp[ARP_SENDER_IP]);
-        self.out.push_back(ethernet_frame(
+        self.out.push_back(OutFrame::plain(ethernet_frame(
             self.guest_mac,
             GATEWAY_MAC,
             ETHERTYPE_ARP,
             &reply,
-        ));
+        )));
     }
 
     /// Echo requests to any destination are answered locally and never leave the host, so ping
@@ -911,12 +977,12 @@ impl UserNet {
             IP_PROTO_UDP,
             &datagram,
         );
-        self.out.push_back(ethernet_frame(
+        self.out.push_back(OutFrame::plain(ethernet_frame(
             BROADCAST_MAC,
             GATEWAY_MAC,
             ETHERTYPE_IPV4,
             &packet,
-        ));
+        )));
     }
 
     /// Reset for a segment that matches no flow (RFC 793 section 3.4, "reset generation"). Never
@@ -1102,6 +1168,7 @@ impl UserNet {
 
         let mut packets: Vec<PendingPacket> = Vec::new();
         let mut budget = OUT_QUEUE_LIMIT.saturating_sub(self.out.len());
+        let large_segments = self.large_segments;
         for key in self.tcp_service_order() {
             let Some(flow) = self.tcp.get_mut(&key) else {
                 continue;
@@ -1130,15 +1197,20 @@ impl UserNet {
                 advertise_mss: false,
             };
             let packets_before = packets.len();
-            let mut read_buf = [0u8; MSS];
+            let segment_limit = if large_segments {
+                LARGE_SEGMENT_DATA_MAX
+            } else {
+                flow.mss
+            };
             while !flow.dead && !flow.fin_sent && budget > 0 {
                 let in_flight = flow.snd_nxt.wrapping_sub(flow.snd_una);
                 let window_left = flow.guest_window.saturating_sub(in_flight) as usize;
                 if window_left == 0 {
                     break;
                 }
-                let want = window_left.min(flow.mss).min(read_buf.len());
-                match stream.read(&mut read_buf[..want]) {
+                let want = window_left.min(segment_limit);
+                let read_buf = &mut self.read_buf[..want];
+                match stream.read(read_buf) {
                     Ok(0) => {
                         let header = TcpHeader {
                             flags: FIN | ACK,
@@ -1152,6 +1224,7 @@ impl UserNet {
                             src: key.remote_ip,
                             dst: flow.guest_ip,
                             payload: tcp_segment(&header, &[]),
+                            segment_size: None,
                         });
                         budget -= 1;
                     }
@@ -1162,11 +1235,18 @@ impl UserNet {
                             ..segment_template
                         };
                         flow.snd_nxt = flow.snd_nxt.wrapping_add(n as u32);
+                        let data = &read_buf[..n];
+                        let (payload, segment_size) = if large_segments {
+                            (tcp_segment_partial(&header, data), Some(flow.mss as u16))
+                        } else {
+                            (tcp_segment(&header, data), None)
+                        };
                         packets.push(PendingPacket {
                             proto: IP_PROTO_TCP,
                             src: key.remote_ip,
                             dst: flow.guest_ip,
-                            payload: tcp_segment(&header, &read_buf[..n]),
+                            payload,
+                            segment_size,
                         });
                         budget -= 1;
                     }
@@ -1183,6 +1263,7 @@ impl UserNet {
                             src: key.remote_ip,
                             dst: flow.guest_ip,
                             payload: tcp_segment(&header, &[]),
+                            segment_size: None,
                         });
                         flow.dead = true;
                     }
@@ -1211,6 +1292,7 @@ impl UserNet {
                         },
                         &[],
                     ),
+                    segment_size: None,
                 });
             }
         }
@@ -1233,6 +1315,7 @@ impl UserNet {
                             key.guest_port,
                             &recv_buf[..n],
                         ),
+                        segment_size: None,
                     });
                 }
             }
@@ -1241,7 +1324,10 @@ impl UserNet {
             .retain(|_, flow| now.duration_since(flow.last_activity) < UDP_IDLE_TIMEOUT);
 
         for packet in packets {
-            self.emit_ip(packet.src, packet.dst, packet.proto, &packet.payload);
+            match packet.segment_size {
+                Some(size) => self.emit_segment(packet.src, packet.dst, &packet.payload, size),
+                None => self.emit_ip(packet.src, packet.dst, packet.proto, &packet.payload),
+            }
         }
     }
 
@@ -1278,21 +1364,32 @@ impl UserNet {
         interest
     }
 
-    pub fn pop_frame(&mut self) -> Option<Vec<u8>> {
+    pub fn pop_frame(&mut self) -> Option<OutFrame> {
         self.out.pop_front()
     }
 
     /// Puts a frame the guest could not take yet back at the head, keeping frame order.
-    pub fn requeue_frame(&mut self, frame: Vec<u8>) {
+    pub fn requeue_frame(&mut self, frame: OutFrame) {
         self.out.push_front(frame);
     }
 }
+
+/// What usernet handles for the guest: it terminates TCP, so the guest's segments need neither
+/// splitting nor a checksum (nothing here verifies one), and it sends large segments itself.
+const OFFLOADS: NetOffloads = NetOffloads {
+    takes_guest_segments: true,
+    sends_large_segments: true,
+};
 
 /// Moves frames from `usernet` to the guest until the guest's queue is full. Returns whether
 /// frames are left over.
 fn deliver(usernet: &mut UserNet, net: &NetHandle) -> bool {
     while let Some(frame) = usernet.pop_frame() {
-        if !net.send_frame(&frame) {
+        let queued = match frame.segment_size {
+            Some(size) => net.send_tcp_segment(&frame.bytes, size),
+            None => net.send_frame(&frame.bytes),
+        };
+        if !queued {
             usernet.requeue_frame(frame);
             return true;
         }
@@ -1308,6 +1405,8 @@ fn deliver(usernet: &mut UserNet, net: &NetHandle) -> bool {
 pub fn spawn(net: NetHandle) {
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    net.set_offloads(OFFLOADS);
 
     let (wake_rx, wake_tx) = UnixStream::pair().expect("socketpair");
     wake_rx
@@ -1341,6 +1440,7 @@ pub fn spawn(net: NetHandle) {
             while let Some(frame) = net.try_recv_frame() {
                 usernet.input(&frame);
             }
+            usernet.large_segments = net.guest_takes_tcp_segments();
             usernet.poll();
             let backlog = deliver(&mut usernet, &net);
             waiting.store(true, Ordering::SeqCst);
@@ -1377,6 +1477,7 @@ pub fn spawn(net: NetHandle) {
 /// `POLL_INTERVAL`.
 #[cfg(not(unix))]
 pub fn spawn(net: NetHandle) {
+    net.set_offloads(OFFLOADS);
     std::thread::spawn(move || {
         let mut usernet = UserNet::new();
         loop {
@@ -1386,6 +1487,7 @@ pub fn spawn(net: NetHandle) {
                     usernet.input(&frame);
                 }
             }
+            usernet.large_segments = net.guest_takes_tcp_segments();
             usernet.poll();
             deliver(&mut usernet, &net);
         }

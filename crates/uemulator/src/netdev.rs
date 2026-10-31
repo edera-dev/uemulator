@@ -13,10 +13,38 @@ const QUEUE_FRAMES: usize = 1024;
 /// Called after a frame is queued, outside the lock, so it may use the handle itself.
 type Notify = Arc<dyn Fn() + Send + Sync>;
 
+/// What the host end of a NIC does in the guest's place, declared with `NetHandle::set_offloads`
+/// before the machine starts. The virtio-net device offers the guest the matching offloads only
+/// then; a host that forwards frames to something expecting real Ethernet (another machine, a
+/// socket link) declares nothing and keeps getting checksummed frames of at most one MTU.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NetOffloads {
+    /// The host takes guest frames as a NIC doing checksum and TCP segmentation offload would:
+    /// TCP/IPv4 segments of up to 64 KiB with any MSS, and TCP or UDP checksums that hold only
+    /// the pseudo-header sum. Right for a host that terminates TCP itself and never checks a
+    /// checksum (virtio-net `CSUM` and `HOST_TSO4`).
+    pub takes_guest_segments: bool,
+    /// The host may hand the guest TCP segments longer than the MSS (`send_tcp_segment`); the
+    /// guest is offered to take them whole (virtio-net `GUEST_CSUM`, `GUEST_TSO4`, `MRG_RXBUF`).
+    pub sends_large_segments: bool,
+}
+
+/// A frame queued for the guest. `tcp_segment_size` marks a TCP/IPv4 segment from
+/// `send_tcp_segment`: its checksum holds only the pseudo-header sum and its payload may be
+/// longer than this MSS.
+pub(crate) struct HostFrame {
+    pub bytes: Vec<u8>,
+    pub tcp_segment_size: Option<u16>,
+}
+
 #[derive(Default)]
 struct NetState {
-    to_guest: VecDeque<Vec<u8>>,
+    to_guest: VecDeque<HostFrame>,
     from_guest: VecDeque<Vec<u8>>,
+    offloads: NetOffloads,
+    /// The guest's driver accepted `GUEST_CSUM` and `GUEST_TSO4`; set by the device when the
+    /// features are negotiated and cleared on reset.
+    guest_takes_segments: bool,
     /// Wakes whichever thread runs the devices (the vCPU of a one-processor machine, else the
     /// device thread), which otherwise only looks at `to_guest` when its sleep ends: without it a
     /// halted guest sees each frame up to 2 ms late, and that latency is what limits TCP.
@@ -35,18 +63,60 @@ pub struct NetHandle {
 impl NetHandle {
     /// Host to guest. Returns false when the queue is full; the frame is not queued.
     pub fn send_frame(&self, frame: &[u8]) -> bool {
+        self.queue_for_guest(HostFrame {
+            bytes: frame.to_vec(),
+            tcp_segment_size: None,
+        })
+    }
+
+    /// Host to guest: one Ethernet/IPv4/TCP frame whose TCP checksum field holds the folded
+    /// pseudo-header sum (not complemented) instead of the checksum, and whose payload may be
+    /// longer than `segment_size`, the connection's MSS. When `guest_takes_tcp_segments` is true
+    /// the guest gets it whole and finishes the checksum itself. Otherwise the device completes
+    /// the checksum, and drops the frame if its payload is longer than `segment_size`; a frame
+    /// that is not TCP/IPv4 is dropped. Returns false when the queue is full.
+    pub fn send_tcp_segment(&self, frame: &[u8], segment_size: u16) -> bool {
+        self.queue_for_guest(HostFrame {
+            bytes: frame.to_vec(),
+            tcp_segment_size: Some(segment_size),
+        })
+    }
+
+    fn queue_for_guest(&self, frame: HostFrame) -> bool {
         let wake = {
             let mut state = self.inner.0.lock().unwrap();
             if state.to_guest.len() >= QUEUE_FRAMES {
                 return false;
             }
-            state.to_guest.push_back(frame.to_vec());
+            state.to_guest.push_back(frame);
             state.wake_devices.clone()
         };
         if let Some(wake) = wake {
             wake();
         }
         true
+    }
+
+    /// Declares what the host end handles for the guest (`NetOffloads`). Takes effect at the
+    /// guest's next feature negotiation, so call it before the machine starts.
+    pub fn set_offloads(&self, offloads: NetOffloads) {
+        self.inner.0.lock().unwrap().offloads = offloads;
+    }
+
+    pub(crate) fn offloads(&self) -> NetOffloads {
+        self.inner.0.lock().unwrap().offloads
+    }
+
+    /// True while the guest's driver takes TCP segments longer than the MSS with an unfinished
+    /// checksum, so `send_tcp_segment` frames reach it whole. False before the driver has
+    /// negotiated, after a reset, and always unless `sends_large_segments` was declared. A
+    /// large segment still queued when this turns false is dropped.
+    pub fn guest_takes_tcp_segments(&self) -> bool {
+        self.inner.0.lock().unwrap().guest_takes_segments
+    }
+
+    pub(crate) fn set_guest_takes_tcp_segments(&self, takes: bool) {
+        self.inner.0.lock().unwrap().guest_takes_segments = takes;
     }
 
     /// Calls `notify` every time the guest queues a frame, from the emulator's thread and after
@@ -92,12 +162,24 @@ impl NetHandle {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn has_pending(&self) -> bool {
         !self.inner.0.lock().unwrap().to_guest.is_empty()
     }
 
-    pub(crate) fn guest_recv(&self) -> Option<Vec<u8>> {
+    pub(crate) fn guest_recv(&self) -> Option<HostFrame> {
         self.inner.0.lock().unwrap().to_guest.pop_front()
+    }
+
+    /// Puts back a frame `guest_recv` took that the guest had no room for yet, ahead of the rest
+    /// and regardless of the queue limit (it held that place already).
+    pub(crate) fn guest_unrecv(&self, frame: HostFrame) {
+        self.inner.0.lock().unwrap().to_guest.push_front(frame);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn guest_recv_bytes(&self) -> Option<Vec<u8>> {
+        self.guest_recv().map(|frame| frame.bytes)
     }
 }
 
@@ -127,9 +209,12 @@ mod tests {
             let net = NetHandle::default();
             assert!(net.send_frame(b"first"));
             assert!(net.send_frame(b"second frame"));
-            assert_eq!(net.guest_recv().as_deref(), Some(&b"first"[..]));
-            assert_eq!(net.guest_recv().as_deref(), Some(&b"second frame"[..]));
-            assert_eq!(net.guest_recv(), None);
+            assert_eq!(net.guest_recv_bytes().as_deref(), Some(&b"first"[..]));
+            assert_eq!(
+                net.guest_recv_bytes().as_deref(),
+                Some(&b"second frame"[..])
+            );
+            assert_eq!(net.guest_recv_bytes(), None);
         }
 
         #[test]
@@ -138,7 +223,7 @@ mod tests {
             assert!(!net.has_pending());
             net.send_frame(b"x");
             assert!(net.has_pending());
-            net.guest_recv();
+            net.guest_recv_bytes();
             assert!(!net.has_pending());
         }
 
@@ -148,7 +233,7 @@ mod tests {
             let mut buffer = vec![1u8, 2, 3];
             net.send_frame(&buffer);
             buffer.fill(9);
-            assert_eq!(net.guest_recv().unwrap(), [1, 2, 3]);
+            assert_eq!(net.guest_recv_bytes().unwrap(), [1, 2, 3]);
         }
 
         #[test]
@@ -157,8 +242,8 @@ mod tests {
             let jumbo = vec![0x5au8; 70_000];
             assert!(net.send_frame(&[]));
             assert!(net.send_frame(&jumbo));
-            assert_eq!(net.guest_recv().unwrap(), Vec::<u8>::new());
-            assert_eq!(net.guest_recv().unwrap(), jumbo);
+            assert_eq!(net.guest_recv_bytes().unwrap(), Vec::<u8>::new());
+            assert_eq!(net.guest_recv_bytes().unwrap(), jumbo);
         }
 
         #[test]
@@ -166,8 +251,8 @@ mod tests {
             let net = NetHandle::default();
             net.send_frame(b"ab");
             net.send_frame(b"cd");
-            assert_eq!(net.guest_recv().unwrap(), b"ab");
-            assert_eq!(net.guest_recv().unwrap(), b"cd");
+            assert_eq!(net.guest_recv_bytes().unwrap(), b"ab");
+            assert_eq!(net.guest_recv_bytes().unwrap(), b"cd");
         }
 
         #[test]
@@ -180,9 +265,9 @@ mod tests {
             assert!(!net.send_frame(&frame(QUEUE_FRAMES + 1)));
             // The first frame is still first, the rejected ones never appear.
             for id in 0..QUEUE_FRAMES {
-                assert_eq!(id_of(&net.guest_recv().unwrap()), id);
+                assert_eq!(id_of(&net.guest_recv_bytes().unwrap()), id);
             }
-            assert_eq!(net.guest_recv(), None);
+            assert_eq!(net.guest_recv_bytes(), None);
         }
 
         #[test]
@@ -192,11 +277,11 @@ mod tests {
                 net.send_frame(&frame(id));
             }
             assert!(!net.send_frame(&frame(9999)));
-            assert_eq!(id_of(&net.guest_recv().unwrap()), 0);
+            assert_eq!(id_of(&net.guest_recv_bytes().unwrap()), 0);
             assert!(net.send_frame(&frame(9999)));
             assert!(!net.send_frame(&frame(10_000)));
             let mut last = 0;
-            while let Some(received) = net.guest_recv() {
+            while let Some(received) = net.guest_recv_bytes() {
                 last = id_of(&received);
             }
             assert_eq!(last, 9999);
@@ -375,7 +460,7 @@ mod tests {
             let net = NetHandle::default();
             let clone = net.clone();
             clone.send_frame(b"down");
-            assert_eq!(net.guest_recv().unwrap(), b"down");
+            assert_eq!(net.guest_recv_bytes().unwrap(), b"down");
             net.guest_send(b"up".to_vec());
             assert_eq!(clone.try_recv_frame().unwrap(), b"up");
         }
@@ -430,7 +515,7 @@ mod tests {
             let mut ids = Vec::new();
             let started = Instant::now();
             while ids.len() < TOTAL && started.elapsed() < REASONABLE {
-                match net.guest_recv() {
+                match net.guest_recv_bytes() {
                     Some(received) => ids.push(id_of(&received)),
                     None => std::thread::yield_now(),
                 }

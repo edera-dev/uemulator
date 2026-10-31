@@ -50,7 +50,7 @@ fn echo_request_payload(identifier: u16, sequence: u16, data: &[u8]) -> Vec<u8> 
 }
 
 fn drain(un: &mut UserNet) -> Vec<Vec<u8>> {
-    std::iter::from_fn(|| un.pop_frame()).collect()
+    std::iter::from_fn(|| un.pop_frame().map(|frame| frame.bytes)).collect()
 }
 
 fn wait_for(un: &mut UserNet, mut pred: impl FnMut(&[u8]) -> bool) -> Vec<u8> {
@@ -58,8 +58,8 @@ fn wait_for(un: &mut UserNet, mut pred: impl FnMut(&[u8]) -> bool) -> Vec<u8> {
     while Instant::now() < end {
         un.poll();
         while let Some(f) = un.pop_frame() {
-            if pred(&f) {
-                return f;
+            if pred(&f.bytes) {
+                return f.bytes;
             }
         }
         std::thread::sleep(Duration::from_millis(2));
@@ -1082,10 +1082,15 @@ mod link_and_network_layer {
     #[test]
     fn requeued_frames_return_to_the_head_in_order() {
         let mut un = UserNet::new();
-        un.out.push_back(vec![3]);
-        un.requeue_frame(vec![2]);
-        un.requeue_frame(vec![1]);
-        assert_eq!(drain(&mut un), vec![vec![1], vec![2], vec![3]]);
+        un.out.push_back(OutFrame::plain(vec![3]));
+        un.requeue_frame(OutFrame::plain(vec![2]));
+        un.requeue_frame(OutFrame {
+            bytes: vec![1],
+            segment_size: Some(9),
+        });
+        let first = un.pop_frame().unwrap();
+        assert_eq!((first.bytes, first.segment_size), (vec![1], Some(9)));
+        assert_eq!(drain(&mut un), vec![vec![2], vec![3]]);
     }
 
     #[test]
@@ -3393,7 +3398,7 @@ mod tcp {
     fn poll_with_room(un: &mut UserNet, room: usize) -> Vec<u16> {
         un.out.clear();
         for _ in 0..OUT_QUEUE_LIMIT - room {
-            un.out.push_back(Vec::new());
+            un.out.push_back(OutFrame::plain(Vec::new()));
         }
         un.poll();
         drain(un)
@@ -3538,6 +3543,137 @@ mod tcp {
         guest.send(&mut un, ACK, &[]);
         un.poll();
         assert!(un.tcp.is_empty(), "flow closed after both FINs are acked");
+    }
+}
+
+/// With a guest that takes TCP segments (`NetHandle::guest_takes_tcp_segments`) host data goes
+/// out in segments as large as the guest's window allows, checksummed only over the pseudo header
+/// for the guest (or the device) to finish.
+mod large_segments {
+    use super::*;
+
+    /// The data segments `un` queues until `want` bytes arrived, acknowledging each, with the
+    /// checksum finished the way the guest would (from the header the device builds: everything
+    /// from the TCP header on, the pseudo-header sum already in place).
+    fn receive_segments(un: &mut UserNet, guest: &mut Guest, want: usize) -> Vec<(TcpView, u16)> {
+        let mut segments = Vec::new();
+        let mut received = 0;
+        let end = Instant::now() + IO_TIMEOUT;
+        while received < want {
+            assert!(Instant::now() < end, "timed out after {received} bytes");
+            un.poll();
+            while let Some(frame) = un.pop_frame() {
+                let Some(segment_size) = frame.segment_size else {
+                    continue;
+                };
+                let mut bytes = frame.bytes;
+                let tcp_start = ETH_HEADER_LEN + IPV4_HEADER_LEN;
+                let sum = checksum_add(0, &bytes[tcp_start..]);
+                let checksum = checksum_finish(sum);
+                bytes[tcp_start + TCP_CHECKSUM.start..tcp_start + TCP_CHECKSUM.end]
+                    .copy_from_slice(&checksum.to_be_bytes());
+                let view = tcp_view(&bytes).expect("a TCP/IPv4 frame");
+                assert_eq!(view.seq, guest.ack, "in-order delivery");
+                guest.ack = guest.ack.wrapping_add(view.data.len() as u32);
+                received += view.data.len();
+                guest.send(un, ACK, &[]);
+                segments.push((view, segment_size));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        segments
+    }
+
+    fn connected(window: u16) -> (UserNet, Guest, TcpStream) {
+        let (listener, port) = listener();
+        let mut un = UserNet::new();
+        un.large_segments = true;
+        let mut guest = Guest::new(5000, port, 1000);
+        guest.window = window;
+        let (server, isn) = handshake(&mut un, &mut guest, &listener);
+        guest.ack = isn.wrapping_add(1);
+        (un, guest, server)
+    }
+
+    #[test]
+    fn host_data_fills_the_guests_window_in_one_segment() {
+        let (mut un, mut guest, mut server) = connected(u16::MAX);
+        let data = splitmix_bytes(71, 60_000);
+        server.write_all(&data).unwrap();
+        let segments = receive_segments(&mut un, &mut guest, data.len());
+        let received: Vec<u8> = segments.iter().flat_map(|(v, _)| v.data.clone()).collect();
+        assert_eq!(received, data);
+        assert!(
+            segments.iter().any(|(v, _)| v.data.len() > MSS),
+            "some segment is longer than the MSS: {:?}",
+            segments
+                .iter()
+                .map(|(v, _)| v.data.len())
+                .collect::<Vec<_>>()
+        );
+        assert!(segments.iter().all(|(_, size)| *size == MSS as u16));
+    }
+
+    #[test]
+    fn a_large_segment_is_one_unfragmented_ipv4_packet_with_dont_fragment() {
+        let (mut un, _guest, mut server) = connected(u16::MAX);
+        server.write_all(&splitmix_bytes(72, 30_000)).unwrap();
+        let frame = wait_for_frame(&mut un, |frame| frame.segment_size.is_some());
+        let ip = &frame.bytes[ETH_HEADER_LEN..];
+        assert_eq!(be_u16(&ip[IPV4_FLAGS_FRAGMENT]), IPV4_FLAG_DONT_FRAGMENT);
+        assert_eq!(be_u16(&ip[IPV4_TOTAL_LEN]) as usize, ip.len());
+        assert_eq!(reference_checksum(&ip[..IPV4_HEADER_LEN]), 0);
+        assert!(ip.len() > ETHERNET_MTU, "{} bytes", ip.len());
+    }
+
+    #[test]
+    fn segments_never_exceed_the_guests_window_or_the_ipv4_limit() {
+        for window in [3000u16, 20_000, u16::MAX] {
+            let (mut un, mut guest, mut server) = connected(window);
+            let data = splitmix_bytes(73, 200_000);
+            let writer = std::thread::spawn(move || server.write_all(&data).map(|_| server));
+            for (view, _) in receive_segments(&mut un, &mut guest, 200_000) {
+                assert!(view.data.len() <= window as usize, "window {window}");
+                assert!(view.data.len() <= LARGE_SEGMENT_DATA_MAX);
+            }
+            writer.join().unwrap().unwrap();
+        }
+    }
+
+    #[test]
+    fn the_checksum_field_holds_the_pseudo_header_sum() {
+        let (mut un, _guest, mut server) = connected(u16::MAX);
+        server.write_all(b"partial").unwrap();
+        let frame = wait_for_frame(&mut un, |frame| frame.segment_size.is_some());
+        let tcp = &frame.bytes[ETH_HEADER_LEN + IPV4_HEADER_LEN..];
+        let pseudo = checksum_add(0, &LOOPBACK_IP)
+            + checksum_add(0, &GUEST_IP)
+            + IP_PROTO_TCP as u32
+            + tcp.len() as u32;
+        assert_eq!(be_u16(&tcp[TCP_CHECKSUM]), !checksum_finish(pseudo));
+    }
+
+    #[test]
+    fn without_large_segments_data_frames_stay_mss_sized_and_checksummed() {
+        let (mut un, mut guest, mut server) = connected(u16::MAX);
+        un.large_segments = false;
+        server.write_all(&splitmix_bytes(74, 10_000)).unwrap();
+        let received = receive_data(&mut un, &mut guest, 10_000, MSS);
+        assert_eq!(received.len(), 10_000);
+    }
+
+    fn wait_for_frame(un: &mut UserNet, mut pred: impl FnMut(&OutFrame) -> bool) -> OutFrame {
+        let end = Instant::now() + IO_TIMEOUT;
+        while Instant::now() < end {
+            un.poll();
+            while let Some(frame) = un.pop_frame() {
+                if pred(&frame) {
+                    return frame;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        panic!("timed out waiting for frame");
     }
 }
 

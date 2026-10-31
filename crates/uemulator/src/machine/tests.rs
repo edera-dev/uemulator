@@ -716,7 +716,7 @@ mod multiple_devices {
         assert!(handles[1].send_frame(b"to the second"));
         assert!(!devices[0].1.has_pending());
         assert_eq!(
-            devices[1].1.guest_recv().as_deref(),
+            devices[1].1.guest_recv_bytes().as_deref(),
             Some(&b"to the second"[..])
         );
         devices[0].1.guest_send(b"from the first".to_vec());
@@ -1597,7 +1597,10 @@ mod lifecycle {
         let net = machine.net().unwrap();
         assert!(net.send_frame(b"frame"));
         let device_side = &vcpu.devcfg.nets[0].1;
-        assert_eq!(device_side.guest_recv().as_deref(), Some(&b"frame"[..]));
+        assert_eq!(
+            device_side.guest_recv_bytes().as_deref(),
+            Some(&b"frame"[..])
+        );
         // And the other direction.
         device_side.guest_send(b"reply".to_vec());
         assert_eq!(net.try_recv_frame().as_deref(), Some(&b"reply"[..]));

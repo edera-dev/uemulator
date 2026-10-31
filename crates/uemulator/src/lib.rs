@@ -45,7 +45,7 @@ pub use machine::{
     ClockMode, ConsoleKind, EmulatedMachine, Error, ExitReason, JitMode, MAX_MEMORY_MIB,
     MIN_MEMORY_MIB, MachineConfig, SmpMode, StopHandle,
 };
-pub use netdev::NetHandle;
+pub use netdev::{NetHandle, NetOffloads};
 pub use platform::{DEFAULT_CMDLINE, DEFAULT_SERIAL_CMDLINE, Platform, load_linux};
 
 #[cfg(test)]
@@ -76,6 +76,13 @@ mod api_tests {
         let _: fn(&NetHandle, &[u8]) -> bool = NetHandle::send_frame;
         let _: fn(&NetHandle) -> Option<Vec<u8>> = NetHandle::try_recv_frame;
         let _ = |net: &NetHandle| net.on_guest_frame(|| {});
+        let _: fn(&NetHandle, &[u8], u16) -> bool = NetHandle::send_tcp_segment;
+        let _: fn(&NetHandle, NetOffloads) = NetHandle::set_offloads;
+        let _: fn(&NetHandle) -> bool = NetHandle::guest_takes_tcp_segments;
+        let _ = NetOffloads {
+            takes_guest_segments: true,
+            sends_large_segments: true,
+        };
         let _: fn(&StopHandle) = StopHandle::stop;
         let _: fn() -> MachineConfig = MachineConfig::new;
         let _: fn(MachineConfig, bool) -> MachineConfig = MachineConfig::reboot;
@@ -107,6 +114,8 @@ mod api_tests {
         is_copy::<ClockMode>();
         is_copy::<ConsoleKind>();
         is_copy::<BootState>();
+        is_copy::<NetOffloads>();
+        is_default::<NetOffloads>();
         is_default::<JitMode>();
         is_default::<ClockMode>();
         is_default::<ConsoleKind>();
