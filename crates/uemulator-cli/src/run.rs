@@ -2,7 +2,8 @@ use std::io::{IsTerminal, Read, Write};
 use std::time::Duration;
 
 use uemulator::{
-    ConsoleKind, Disk, EmulatedMachine, ExitReason, JitMode, MachineConfig, NetHandle, SmpMode,
+    ConsoleKind, Disk, EmulatedMachine, ExitReason, JitMode, MachineConfig, NetHandle, NetOffloads,
+    SmpMode,
 };
 
 use crate::args::{ConsoleArg, NetLink, RuntimeArgs, Settings, SmpArg};
@@ -80,6 +81,20 @@ fn enter_raw_mode(stty: impl Fn(&[&str]) -> Option<String>) -> Option<String> {
         return None;
     }
     Some(saved)
+}
+
+/// What each link handles in the guest's place, which decides the offloads its NIC offers.
+/// usernet terminates TCP and never checks a checksum, so it takes the guest's 64 KiB segments
+/// and sends large ones back. A UDP link's far end is another machine expecting real Ethernet,
+/// and the loop gateway reads frames itself: both get MTU-sized checksummed frames.
+fn offloads_for(link: &NetLink) -> NetOffloads {
+    match link {
+        NetLink::User => NetOffloads {
+            takes_guest_segments: true,
+            sends_large_segments: true,
+        },
+        NetLink::Udp(_) | NetLink::Loop => NetOffloads::default(),
+    }
 }
 
 fn spawn_udp(net: NetHandle, spec: &str) -> Result<(), String> {
@@ -253,6 +268,10 @@ fn run_config(
     }
     // `build_config` made one NIC per entry, in this order.
     for (net, nic) in machine.nets().into_iter().zip(&settings.networks) {
+        if let Some(link) = &nic.link {
+            // Before `start`: the guest's driver reads the features once it probes the NIC.
+            net.set_offloads(offloads_for(link));
+        }
         match &nic.link {
             Some(NetLink::Udp(spec)) => spawn_udp(net, spec)?,
             Some(NetLink::Loop) => spawn_gateway(net),
@@ -333,6 +352,22 @@ mod tests {
     use super::*;
     use crate::test_support::TempDir;
     use crate::{AdvancedCmd, Cmd};
+
+    #[test]
+    fn only_usernet_gets_offloads() {
+        assert_eq!(
+            offloads_for(&NetLink::User),
+            NetOffloads {
+                takes_guest_segments: true,
+                sends_large_segments: true,
+            }
+        );
+        assert_eq!(offloads_for(&NetLink::Loop), NetOffloads::default());
+        assert_eq!(
+            offloads_for(&NetLink::Udp("127.0.0.1:1,127.0.0.1:2".into())),
+            NetOffloads::default()
+        );
+    }
 
     const SAVED_SETTINGS: &str = "4500:5:bf:8a3b:3:1c:7f:15:4:0:1:0:11:13:1a:0:12:f:17:16:0:0";
     use uemulator::{MAX_MEMORY_MIB, MIN_MEMORY_MIB};

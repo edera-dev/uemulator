@@ -19,7 +19,8 @@
 //!
 //! Because nothing checks a checksum and TCP is terminated here, the NIC is told it may hand over
 //! the guest's TSO segments (up to 64 KiB, checksum unfinished) as they are, and host data goes
-//! back in segments as large as the guest's window when its driver takes them (`OFFLOADS`). That
+//! back in segments as large as the guest's window when its driver takes them
+//! (`run::offloads_for` declares this on the NIC). That
 //! removes the guest kernel's per-1500-byte cost, which bounded bulk TCP before.
 
 use std::collections::{HashMap, VecDeque};
@@ -32,7 +33,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
-use uemulator::{NetHandle, NetOffloads};
+use uemulator::NetHandle;
 
 use crate::run::GUEST_MAC;
 
@@ -1374,13 +1375,6 @@ impl UserNet {
     }
 }
 
-/// What usernet handles for the guest: it terminates TCP, so the guest's segments need neither
-/// splitting nor a checksum (nothing here verifies one), and it sends large segments itself.
-const OFFLOADS: NetOffloads = NetOffloads {
-    takes_guest_segments: true,
-    sends_large_segments: true,
-};
-
 /// Moves frames from `usernet` to the guest until the guest's queue is full. Returns whether
 /// frames are left over.
 fn deliver(usernet: &mut UserNet, net: &NetHandle) -> bool {
@@ -1405,8 +1399,6 @@ fn deliver(usernet: &mut UserNet, net: &NetHandle) -> bool {
 pub fn spawn(net: NetHandle) {
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::{AtomicBool, Ordering};
-
-    net.set_offloads(OFFLOADS);
 
     let (wake_rx, wake_tx) = UnixStream::pair().expect("socketpair");
     wake_rx
@@ -1477,7 +1469,6 @@ pub fn spawn(net: NetHandle) {
 /// `POLL_INTERVAL`.
 #[cfg(not(unix))]
 pub fn spawn(net: NetHandle) {
-    net.set_offloads(OFFLOADS);
     std::thread::spawn(move || {
         let mut usernet = UserNet::new();
         loop {
