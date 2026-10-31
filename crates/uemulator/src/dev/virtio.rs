@@ -177,6 +177,28 @@ impl Chain {
         out
     }
 
+    /// Fills `out` with the device-readable bytes from `offset` on (counted across segments) and
+    /// returns how many there were, at most `out.len()`.
+    #[cfg(not(freestanding))]
+    pub fn read_from(&self, mem: &GuestMem, mut offset: usize, out: &mut [u8]) -> usize {
+        let mut done = 0;
+        for seg in self.segs.iter().filter(|seg| !seg.device_writable) {
+            let len = seg.len as usize;
+            if offset >= len {
+                offset -= len;
+                continue;
+            }
+            let n = (len - offset).min(out.len() - done);
+            mem.read(seg.addr + offset as u64, &mut out[done..done + n]);
+            done += n;
+            offset = 0;
+            if done == out.len() {
+                break;
+            }
+        }
+        done
+    }
+
     /// Total bytes in device-readable segments.
     pub fn readable(&self) -> usize {
         self.segs
@@ -2695,6 +2717,23 @@ mod tests {
         assert_eq!(chain.read_all(&mem, usize::MAX), b"abcdef");
         assert_eq!(chain.readable(), 6);
         assert_eq!(chain.writable(), 3);
+    }
+
+    #[test]
+    fn read_from_skips_into_and_across_readable_segments() {
+        let mut ram = vec![0u8; RAM_BYTES];
+        ram[0x100..0x104].copy_from_slice(b"abcd");
+        ram[0x200..0x203].copy_from_slice(b"efg");
+        ram[0x300..0x303].copy_from_slice(b"zzz");
+        let chain = chain_of(&[(0x100, 4, false), (0x300, 3, true), (0x200, 3, false)]);
+        let mem = test_mem(&mut ram);
+        let mut out = [0u8; 4];
+        assert_eq!(chain.read_from(&mem, 2, &mut out), 4);
+        assert_eq!(&out, b"cdef");
+        let mut rest = [0u8; 8];
+        assert_eq!(chain.read_from(&mem, 5, &mut rest), 2);
+        assert_eq!(&rest[..2], b"fg");
+        assert_eq!(chain.read_from(&mem, 7, &mut rest), 0);
     }
 
     #[test]

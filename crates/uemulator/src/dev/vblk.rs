@@ -47,13 +47,20 @@ const MAX_REQUEST_BYTES: usize = 16 << 20;
 pub(crate) struct VirtioBlk {
     disk: Disk,
     id: [u8; ID_BYTES],
+    /// Data of the request being served, kept between requests: a fresh zeroed buffer per
+    /// request cost as much host time as the read or write it carried.
+    scratch: Vec<u8>,
 }
 
 impl VirtioBlk {
     pub fn new(disk: Disk) -> Self {
         let mut id = [0u8; ID_BYTES];
         id[..ID_STRING.len()].copy_from_slice(ID_STRING);
-        VirtioBlk { disk, id }
+        VirtioBlk {
+            disk,
+            id,
+            scratch: Vec::new(),
+        }
     }
 
     fn capacity(&self) -> u64 {
@@ -70,6 +77,14 @@ impl VirtioBlk {
     /// A data length the device will transfer: whole sectors, within `MAX_REQUEST_BYTES`.
     fn valid_transfer_len(len: usize) -> bool {
         len.is_multiple_of(SECTOR_SIZE as usize) && len <= MAX_REQUEST_BYTES
+    }
+
+    /// `len` bytes of `scratch`, grown (never shrunk) to fit. What it held before is left in it.
+    fn scratch(scratch: &mut Vec<u8>, len: usize) -> &mut [u8] {
+        if scratch.len() < len {
+            scratch.resize(len, 0);
+        }
+        &mut scratch[..len]
     }
 
     /// Executes one request synchronously and returns the number of bytes written into the
@@ -97,10 +112,10 @@ impl VirtioBlk {
         let status: u8 = match request_type {
             REQUEST_IN => match self.range_in_disk(sector, in_len) {
                 Some(offset) if Self::valid_transfer_len(in_len) => {
-                    let mut buf = vec![0u8; in_len];
-                    match self.disk.backend.read_at(offset, &mut buf) {
+                    let buf = Self::scratch(&mut self.scratch, in_len);
+                    match self.disk.backend.read_at(offset, buf) {
                         Ok(()) => {
-                            written = chain.write_at(mem, 0, &buf);
+                            written = chain.write_at(mem, 0, buf);
                             STATUS_OK
                         }
                         Err(_) => STATUS_IOERR,
@@ -112,13 +127,9 @@ impl VirtioBlk {
                 Some(offset)
                     if Self::valid_transfer_len(out_len) && !self.disk.backend.read_only() =>
                 {
-                    let data = chain.read_all(mem, REQUEST_HEADER_SIZE + out_len);
-                    if self
-                        .disk
-                        .backend
-                        .write_at(offset, &data[REQUEST_HEADER_SIZE..])
-                        .is_ok()
-                    {
+                    let data = Self::scratch(&mut self.scratch, out_len);
+                    chain.read_from(mem, REQUEST_HEADER_SIZE, data);
+                    if self.disk.backend.write_at(offset, data).is_ok() {
                         STATUS_OK
                     } else {
                         STATUS_IOERR
