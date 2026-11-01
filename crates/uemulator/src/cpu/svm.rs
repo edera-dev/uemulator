@@ -1140,6 +1140,24 @@ const NPT_LEVELS: u32 = 4;
 const NPT_INDEX_BITS: u32 = 9;
 const NPT_PAGE_SHIFT: u32 = 12;
 
+/// What the nested leaf behind a guest-physical page allows beyond the access that walked it.
+/// The soft TLB keeps one entry per page for both levels, so a guest walk folds these into the
+/// flags it caches (`Cpu::restrict_to_nested`): a page filled by a read must not take a store the
+/// nested tables refuse or one that has to set their Dirty bit, nor a fetch they forbid.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) struct NestedRights {
+    /// Writable at every level and Dirty already: a store needs no walk.
+    pub(crate) store: bool,
+    /// Not no-execute at any level (or NX not enabled in the host's EFER).
+    pub(crate) fetch: bool,
+}
+
+/// Outside a guest, or without nested paging.
+pub(crate) const ALL_NESTED_RIGHTS: NestedRights = NestedRights {
+    store: true,
+    fetch: true,
+};
+
 impl Cpu {
     /// Guest-physical to host-physical through the nested page tables; the identity outside a
     /// guest or without nested paging. A fault is a #VMEXIT(NPF), reported as `Exception::Vmexit`.
@@ -1151,8 +1169,19 @@ impl Cpu {
         access: super::mem::AccessKind,
         guest_table_walk: bool,
     ) -> ExecResult<u64> {
+        self.nested_translate_with_rights(guest_physical, access, guest_table_walk)
+            .map(|(address, _)| address)
+    }
+
+    /// `nested_translate` of the page a guest walk ends at, with what the nested leaf allows.
+    pub(crate) fn nested_translate_with_rights(
+        &mut self,
+        guest_physical: u64,
+        access: super::mem::AccessKind,
+        guest_table_walk: bool,
+    ) -> ExecResult<(u64, NestedRights)> {
         let Some(root) = self.svm.guest.as_ref().and_then(|guest| guest.nested_cr3) else {
-            return Ok(guest_physical);
+            return Ok((guest_physical, ALL_NESTED_RIGHTS));
         };
         let write = access == super::mem::AccessKind::Write;
         let fetch = access == super::mem::AccessKind::Exec;
@@ -1211,17 +1240,25 @@ impl Cpu {
                     // Dirty for dirty logging, say): update it as hardware does, and walk again
                     // if it changed under us.
                     if !self.update_ram_u64(entry_address, entry, updated) {
-                        return self.nested_translate(guest_physical, access, guest_table_walk);
+                        return self.nested_translate_with_rights(
+                            guest_physical,
+                            access,
+                            guest_table_walk,
+                        );
                     }
                     entry = updated;
                 }
                 let base = entry & NPT_ADDRESS_MASK & !alignment_mask;
-                return Ok(base | (guest_physical & alignment_mask));
+                let rights = NestedRights {
+                    store: writable && entry & NPT_DIRTY != 0,
+                    fetch: !(no_execute && nx_enabled),
+                };
+                return Ok((base | (guest_physical & alignment_mask), rights));
             }
             if entry & NPT_ACCESSED == 0
                 && !self.update_ram_u64(entry_address, entry, entry | NPT_ACCESSED)
             {
-                return self.nested_translate(guest_physical, access, guest_table_walk);
+                return self.nested_translate_with_rights(guest_physical, access, guest_table_walk);
             }
             table = entry & NPT_ADDRESS_MASK;
         }
@@ -2256,6 +2293,47 @@ mod tests {
         );
     }
 
+    /// mov [0x801000], rax; mov rax, [0x800000]; mov [0x800000], rax; cpuid. The first store
+    /// makes the guest's 2 MiB leaf dirty, so the read fills a TLB entry the guest's own tables
+    /// would let a store use.
+    const DIRTY_LEAF_THEN_READ_THEN_WRITE: &[u8] = &[
+        0x48, 0xa3, 0x00, 0x10, 0x80, 0, 0, 0, 0, 0, 0x48, 0xa1, 0, 0, 0x80, 0, 0, 0, 0, 0, 0x48,
+        0xa3, 0, 0, 0x80, 0, 0, 0, 0, 0, 0x0f, 0xa2,
+    ];
+
+    /// The soft TLB holds one entry per page for both levels. Filled by a read, it must not let
+    /// a store through that the nested tables refuse: hypervisors write-protect guest memory in
+    /// the nested tables (Xen's log-dirty mode, read-only p2m types) and rely on the fault.
+    #[test]
+    fn a_store_after_a_read_still_faults_on_a_read_only_nested_page() {
+        let mut h = nested_rig(DIRTY_LEAF_THEN_READ_THEN_WRITE);
+        h.write(NPT + 0x3000, &(NESTED_REMAPPED_HPA | 5).to_le_bytes()); // present, user, not writable
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_NPF);
+        assert_eq!(get(&h, VMCB_EXITINFO2, 8), NESTED_REMAPPED_GPA);
+        let info = get(&h, VMCB_EXITINFO1, 8);
+        assert_eq!(
+            (info & NPF_PRESENT != 0, info & NPF_WRITE != 0),
+            (true, true)
+        );
+        assert_eq!(
+            get(&h, SAVE_RIP, 8),
+            GUEST_CODE + 20,
+            "the third instruction"
+        );
+    }
+
+    /// Likewise a store must reach the nested walk that sets the nested Dirty bit, even after a
+    /// read cached the page.
+    #[test]
+    fn a_store_after_a_read_sets_the_nested_dirty_bit() {
+        let mut h = nested_rig(DIRTY_LEAF_THEN_READ_THEN_WRITE);
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_CPUID);
+        let entry = u64::from_le_bytes(h.read(NPT + 0x3000, 8).try_into().unwrap());
+        assert_ne!(entry & NPT_DIRTY, 0);
+    }
+
     #[test]
     fn a_nested_fault_in_the_middle_of_a_block_saves_the_guest_and_restores_the_host() {
         // The #VMEXIT happens inside the memory access, with earlier instructions of the same
@@ -2523,6 +2601,8 @@ mod tests {
         nested_paging_remaps_guest_physical_addresses,
         nested_page_faults_exit_with_the_gpa_and_error_code,
         a_nested_fault_in_the_middle_of_a_block_saves_the_guest_and_restores_the_host,
+        a_store_after_a_read_still_faults_on_a_read_only_nested_page,
+        a_store_after_a_read_sets_the_nested_dirty_bit,
         a_pending_virtual_interrupt_is_injected_when_the_guest_can_take_it,
         a_guest_keeps_its_translations_across_an_exit_unless_a_flush_is_asked_for,
         invlpga_drops_the_guests_translations,

@@ -85,6 +85,21 @@ const PF_INSTRUCTION_FETCH: u32 = 1 << 4;
 const LOG_KEY_UNMAPPED_READ: u64 = 1 << 62;
 const LOG_KEY_UNMAPPED_WRITE: u64 = 1 << 61;
 
+/// Narrows the TLB flags of a guest walk by what the nested leaf behind its page allows
+/// (`svm::NestedRights`): without the store right the entry gets no write tag (clearing Dirty is
+/// what withholds it whatever CR0.WP says), without the fetch right no exec tag, so those
+/// accesses walk again and meet the nested fault or set the nested Dirty bit.
+fn restrict_to_nested(flags: u8, nested: super::svm::NestedRights) -> u8 {
+    let mut flags = flags;
+    if !nested.store {
+        flags &= !TLB_FLAG_DIRTY;
+    }
+    if !nested.fetch {
+        flags |= TLB_FLAG_NO_EXECUTE;
+    }
+    flags
+}
+
 /// The physical page an entry's write tag lets stores reach: tag + addend is the page's host
 /// address, minus `ram_base` its physical address.
 pub(super) fn write_tag_page(entry: &TlbEntry, ram_base: u64) -> usize {
@@ -302,10 +317,14 @@ impl Cpu {
         }
         match self.paging_mode() {
             // Linear is guest-physical; a nested-paging guest's addresses still go through nCR3.
-            PagingMode::Off => Ok((
-                self.nested_translate(linear & !PAGE_OFFSET_MASK, access, false)?,
-                TLB_FLAG_WRITABLE | TLB_FLAG_USER | TLB_FLAG_DIRTY,
-            )),
+            PagingMode::Off => {
+                let (page_pa, nested) =
+                    self.nested_translate_with_rights(linear & !PAGE_OFFSET_MASK, access, false)?;
+                Ok((
+                    page_pa,
+                    restrict_to_nested(TLB_FLAG_WRITABLE | TLB_FLAG_USER | TLB_FLAG_DIRTY, nested),
+                ))
+            }
             PagingMode::Legacy => self.walk_legacy(linear, access, user),
             mode => self.walk_wide(linear, access, user, mode == PagingMode::Pae),
         }
@@ -465,7 +484,8 @@ impl Cpu {
                 let leaf_offset_mask = (1u64 << leaf_shift) - 1;
                 let leaf_base = pte & PTE_ADDRESS_MASK & !leaf_offset_mask;
                 let guest_page = leaf_base | (linear & leaf_offset_mask & !PAGE_OFFSET_MASK);
-                let page_pa = self.nested_translate(guest_page, access, false)?;
+                let (page_pa, nested) =
+                    self.nested_translate_with_rights(guest_page, access, false)?;
                 if level > 0 {
                     self.large_page_insert(
                         linear,
@@ -479,7 +499,10 @@ impl Cpu {
                 }
                 return Ok((
                     page_pa,
-                    self.leaf_tlb_flags(writable, user_allowed, no_execute, pte),
+                    restrict_to_nested(
+                        self.leaf_tlb_flags(writable, user_allowed, no_execute, pte),
+                        nested,
+                    ),
                 ));
             }
             if pte & PTE_ACCESSED == 0 {
@@ -553,11 +576,17 @@ impl Cpu {
                 } else {
                     pte & LEGACY_TABLE_MASK
                 };
-                let page_pa =
-                    self.nested_translate(leaf_base | page_offset_in_leaf, access, false)?;
+                let (page_pa, nested) = self.nested_translate_with_rights(
+                    leaf_base | page_offset_in_leaf,
+                    access,
+                    false,
+                )?;
                 return Ok((
                     page_pa,
-                    self.leaf_tlb_flags(writable, user_allowed, false, pte),
+                    restrict_to_nested(
+                        self.leaf_tlb_flags(writable, user_allowed, false, pte),
+                        nested,
+                    ),
                 ));
             }
             if pte & PTE_ACCESSED == 0 {
