@@ -1426,19 +1426,8 @@ impl Cpu {
         s
     }
 
-    /// State dump for `--debug` and fatal exits. Also scans guest RAM for the kernel's
-    /// `Linux version` banner: the printk ring buffer starts with it, so the text that follows
-    /// is the kernel log even though the guest never got to flush it to the serial port.
+    /// State dump for `--debug` and fatal exits, with the kernel log `kernel_log_matches` finds.
     pub fn dump(&self) -> String {
-        // The banner also appears in the kernel image, hence several matches.
-        const MAX_BANNER_MATCHES: usize = 6;
-        // Log text extracted after each match.
-        const LOG_SCAN_BYTES: usize = 6000;
-        // Ring-buffer records have binary headers between the text; shorter printable runs
-        // are noise from those.
-        const MIN_PRINTABLE_RUN: usize = 6;
-        const BANNER: &[u8] = b"Linux version";
-
         let mut s = format!(
             "flushes={} icount={} rip={:016x} cpl={} eflags={:x} cr0={:x} cr3={:x} cr4={:x} efer={:x}\n",
             self.flushes,
@@ -1463,49 +1452,7 @@ impl Cpu {
             self.interrupt_shadow,
             self.dev.lock().state(self.now_ns())
         );
-        let mut found = 0;
-        // Each RAM range on its own: the PCI hole inside the buffer is not memory, and walking
-        // a terabyte of high RAM would take minutes.
-        let ram_bytes = self.ram.len() as u64;
-        let ranges = [
-            (0, crate::ram::low_ram_end(ram_bytes) as usize),
-            (
-                crate::ram::PCI_HOLE_END as usize,
-                crate::ram::high_ram_end(ram_bytes) as usize,
-            ),
-        ];
-        'scan: for (range_start, range_end) in ranges {
-            let mut search_from = range_start;
-            while search_from + BANNER.len() < range_end {
-                if found == MAX_BANNER_MATCHES {
-                    break 'scan;
-                }
-                let Some(relative) = self.ram[search_from..range_end]
-                    .windows(BANNER.len())
-                    .position(|window| window == BANNER)
-                else {
-                    break;
-                };
-                let start = search_from + relative;
-                let end = (start + LOG_SCAN_BYTES).min(range_end);
-                let mut text = String::new();
-                let mut printable_run = String::new();
-                for &byte in &self.ram[start..end] {
-                    if (b' '..0x7f).contains(&byte) {
-                        printable_run.push(byte as char);
-                    } else {
-                        if printable_run.len() >= MIN_PRINTABLE_RUN {
-                            text += &printable_run;
-                            text.push('\n');
-                        }
-                        printable_run.clear();
-                    }
-                }
-                s += &format!("--- ram match at {start:#x}\n{text}\n");
-                found += 1;
-                search_from = start + BANNER.len();
-            }
-        }
+        s += &self.kernel_log_matches();
         #[cfg(all(feature = "jit", target_arch = "wasm32"))]
         if let Some(jit) = &self.jit {
             s += &format!("jit: {:?}\n", jit.stats());
@@ -1525,6 +1472,81 @@ impl Cpu {
                 s += &format!(" {rip:x}");
             }
             s += "\n";
+        }
+        s
+    }
+
+    /// Scans guest RAM for the kernel's `Linux version` banner: the printk ring buffer starts
+    /// with it, so the text that follows is the kernel log even though the guest never got to
+    /// flush it to the serial port. The banner is also in the kernel image and in whatever copied
+    /// it (syslog, `dmesg` output in the page cache), and with KASLR the kernel can sit above any
+    /// number of those copies. So the scan runs until it finds the log, which it recognises by
+    /// the record after the banner: on x86 that is always `Command line:` (`setup_arch`), and
+    /// reports it first, then the other matches below it in address order.
+    fn kernel_log_matches(&self) -> String {
+        // Matches reported, the log included.
+        const MAX_BANNER_MATCHES: usize = 6;
+        // Log text extracted after each match.
+        const LOG_SCAN_BYTES: usize = 6000;
+        // Ring-buffer records have binary headers between the text; shorter printable runs
+        // are noise from those.
+        const MIN_PRINTABLE_RUN: usize = 6;
+        const BANNER: &[u8] = b"Linux version";
+        const RECORD_AFTER_BANNER: &str = "Command line:";
+
+        let mut log = None;
+        let mut others = Vec::new();
+        // Each RAM range on its own: the PCI hole inside the buffer is not memory, and walking
+        // a terabyte of high RAM would take minutes.
+        let ram_bytes = self.ram.len() as u64;
+        let ranges = [
+            (0, crate::ram::low_ram_end(ram_bytes) as usize),
+            (
+                crate::ram::PCI_HOLE_END as usize,
+                crate::ram::high_ram_end(ram_bytes) as usize,
+            ),
+        ];
+        'scan: for (range_start, range_end) in ranges {
+            let mut search_from = range_start;
+            while search_from + BANNER.len() < range_end {
+                let Some(relative) = self.ram[search_from..range_end]
+                    .windows(BANNER.len())
+                    .position(|window| window == BANNER)
+                else {
+                    break;
+                };
+                let start = search_from + relative;
+                search_from = start + BANNER.len();
+                let end = (start + LOG_SCAN_BYTES).min(range_end);
+                let mut text = String::new();
+                let mut printable_run = String::new();
+                for &byte in &self.ram[start..end] {
+                    if (b' '..0x7f).contains(&byte) {
+                        printable_run.push(byte as char);
+                    } else {
+                        if printable_run.len() >= MIN_PRINTABLE_RUN {
+                            text += &printable_run;
+                            text.push('\n');
+                        }
+                        printable_run.clear();
+                    }
+                }
+                let is_log = text
+                    .lines()
+                    .nth(1)
+                    .is_some_and(|line| line.starts_with(RECORD_AFTER_BANNER));
+                if is_log {
+                    log = Some((start, text));
+                    break 'scan;
+                }
+                if others.len() < MAX_BANNER_MATCHES {
+                    others.push((start, text));
+                }
+            }
+        }
+        let mut s = String::new();
+        for (start, text) in log.into_iter().chain(others).take(MAX_BANNER_MATCHES) {
+            s += &format!("--- ram match at {start:#x}\n{text}\n");
         }
         s
     }
@@ -2894,6 +2916,28 @@ mod cpu_tests {
                 h.write(SCRATCH + copy * 0x100, b"Linux version 1.2.3 banner\0");
             }
             let dump = h.cpu.dump();
+            assert_eq!(dump.matches("--- ram match at").count(), 6);
+        }
+
+        #[test]
+        fn dump_finds_the_log_above_more_banner_copies_than_it_reports() {
+            // With KASLR the kernel, and its log buffer with it, can sit above page-cache and
+            // user copies of the banner (syslog, dmesg output), so the log is not the first match.
+            let mut h = harness();
+            for copy in 0..9u64 {
+                h.write(SCRATCH + copy * 0x100, b"Linux version 1.2.3 copy\0");
+            }
+            let log_at = SCRATCH + 0x1000;
+            h.write(
+                log_at,
+                b"Linux version 1.2.3 banner\0\0\0\0\0\0\0\0Command line: console=ttyS0\0",
+            );
+            let dump = h.cpu.dump();
+            assert!(
+                dump.contains(&format!("--- ram match at {log_at:#x}\n")),
+                "{dump}"
+            );
+            assert!(dump.contains("Command line: console=ttyS0\n"), "{dump}");
             assert_eq!(dump.matches("--- ram match at").count(), 6);
         }
 

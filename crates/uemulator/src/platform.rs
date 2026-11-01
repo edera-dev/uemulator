@@ -11,12 +11,12 @@ use crate::machine::Error;
 /// still comes from the 16550 through `earlyprintk`. A `Platform` has no virtio devices, so a host
 /// driving one needs `DEFAULT_SERIAL_CMDLINE`.
 pub const DEFAULT_CMDLINE: &str =
-    "console=hvc0 earlyprintk=serial,ttyS0 nokaslr acpi=off panic=-1";
+    "console=hvc0 earlyprintk=serial,ttyS0 acpi=off panic=-1";
 /// `DEFAULT_CMDLINE` with the console on the UART: what `EmulatedMachine` builds for
 /// `ConsoleKind::Serial` and what a `Platform` host must use. Differs from `DEFAULT_CMDLINE` only
 /// in the `console=` word (pinned by a test).
 pub const DEFAULT_SERIAL_CMDLINE: &str =
-    "console=ttyS0 earlyprintk=serial,ttyS0 nokaslr acpi=off panic=-1";
+    "console=ttyS0 earlyprintk=serial,ttyS0 acpi=off panic=-1";
 
 /// Lays out a bzImage, an optional initramfs, the command line, boot parameters, a GDT and
 /// identity-mapped page tables in `ram` (guest physical address 0 is `ram[0]`), and returns the
@@ -178,7 +178,7 @@ mod tests {
     fn default_command_lines_differ_only_in_the_console_word() {
         assert_eq!(
             DEFAULT_CMDLINE,
-            "console=hvc0 earlyprintk=serial,ttyS0 nokaslr acpi=off panic=-1"
+            "console=hvc0 earlyprintk=serial,ttyS0 acpi=off panic=-1"
         );
         assert_eq!(
             DEFAULT_SERIAL_CMDLINE,

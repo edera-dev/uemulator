@@ -426,9 +426,12 @@ impl MachineConfig {
     /// Seeds the generator behind the guest's `rdrand` and `rdseed`. The library has no entropy
     /// source of its own (it is `no_std` on some targets), so without this the sequence is fixed
     /// and every boot of the same image reads the same "random" numbers: fine for tests and
-    /// reproducible runs, wrong for a guest that generates keys. An embedder that cares passes
-    /// bytes from the host's CSPRNG. The generator is splitmix64, not a cryptographic one, and
-    /// the guest kernel mixes it with its other entropy sources instead of trusting it alone.
+    /// reproducible runs, wrong for a guest that generates keys, and on the virtual clock KASLR
+    /// picks the same kernel base every time. The UEFI firmware's EFI_RNG_PROTOCOL, which the
+    /// EFI stub randomizes the physical placement with, is seeded from it too. An embedder that
+    /// cares passes bytes from the host's CSPRNG. The generator is splitmix64, not a
+    /// cryptographic one, and the guest kernel mixes it with its other entropy sources instead
+    /// of trusting it alone.
     pub fn random_seed(mut self, seed: u64) -> Self {
         self.random_seed = Some(seed);
         self

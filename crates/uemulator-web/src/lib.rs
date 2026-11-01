@@ -228,6 +228,10 @@ pub unsafe extern "C" fn uw_create(
     let initrd = unsafe { take_buffer(initrd, initrd_len) };
     let cmdline = unsafe { take_buffer(cmdline, cmdline_len) };
     let option = |bit: u32| options & bit != 0;
+    // Seeds rdrand and the firmware's EFI_RNG_PROTOCOL: without it every page load would hand
+    // KASLR the library's fixed default seed.
+    let mut random_seed = [0u8; 8];
+    unsafe { host_random(random_seed.as_mut_ptr(), random_seed.len()) };
 
     let mut config = MachineConfig::new()
         .kernel(kernel)
@@ -254,6 +258,7 @@ pub unsafe extern "C" fn uw_create(
         .clock(ClockMode::Realtime)
         .host_clock(|| (unsafe { host_now_ms() } * NS_PER_MS) as u64)
         .unix_time(unix_time as u64)
+        .random_seed(u64::from_le_bytes(random_seed))
         .log(|message| unsafe { host_log(message.as_ptr(), message.len()) })
         // virtio-rng feeds the guest's entropy pool from the browser's.
         .entropy(|bytes| unsafe { host_random(bytes.as_mut_ptr(), bytes.len()) })

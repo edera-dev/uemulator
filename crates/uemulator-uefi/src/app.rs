@@ -7,6 +7,7 @@ use core::time::Duration;
 use uefi::fs::FileSystem;
 use uefi::prelude::*;
 use uefi::proto::loaded_image::LoadedImage;
+use uefi::proto::rng::Rng;
 use uefi::runtime::{Daylight, ResetType};
 use uemulator::{EmulatedMachine, ExitReason, JitMode, MachineConfig};
 
@@ -138,6 +139,7 @@ fn run() -> Result<ExitReason, String> {
     if let Some(t) = unix_time() {
         mc = mc.unix_time(t);
     }
+    mc = mc.random_seed(random_seed());
     if let Some(i) = initrd {
         mc = mc.initrd(i);
     }
@@ -151,6 +153,43 @@ fn run() -> Result<ExitReason, String> {
     let reason = machine.wait();
     console::flush();
     Ok(reason)
+}
+
+/// Seed for the guest's rdrand and the emulated firmware's EFI_RNG_PROTOCOL, which is all the
+/// entropy the guest's KASLR gets: the library's clock is virtual under UEFI, so with its default
+/// seed every boot would pick the same kernel base. Comes from the platform's EFI_RNG_PROTOCOL;
+/// a firmware without one gets the time of day and the cycle counter, which at least differ
+/// from boot to boot.
+fn random_seed() -> u64 {
+    let from_platform = || {
+        let handle = uefi::boot::get_handle_for_protocol::<Rng>().ok()?;
+        let mut rng = uefi::boot::open_protocol_exclusive::<Rng>(handle).ok()?;
+        let mut bytes = [0u8; 8];
+        rng.get_rng(None, &mut bytes).ok()?;
+        Some(u64::from_le_bytes(bytes))
+    };
+    from_platform().unwrap_or_else(|| {
+        let nanoseconds = uefi::runtime::get_time().map_or(0, |time| time.nanosecond() as u64);
+        unix_time().unwrap_or(0) ^ nanoseconds.rotate_left(32) ^ cycle_counter()
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+fn cycle_counter() -> u64 {
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn cycle_counter() -> u64 {
+    let count: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {}, cntvct_el0",
+            out(reg) count,
+            options(nomem, nostack, preserves_flags)
+        )
+    };
+    count
 }
 
 /// The firmware's real-time clock as seconds since the Unix epoch, with its time zone and daylight
