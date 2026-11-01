@@ -28,6 +28,7 @@ Index. Read in order; each file ends with open questions where the answer needs 
 | 20-jit-perf.md | JIT performance: direct chaining, inline integer ops, SIMD fast paths, measured against the initramfs unpack |
 | 22-smp-threads.md | one host thread per vCPU: shared RAM and devices, the exclusive section, code invalidation across threads, atomics and x86 ordering, the thread-spawn provider |
 | 23-guest-io-perf.md | guest-visible performance (syscalls, memcpy/memset, disk, network): the in-guest benchmarks in `hack/perf/guest/`, what bounded each and what changed |
+| 24-display-input.md | graphical console: virtio-gpu (2D), virtio-input keyboard and tablet, the boot framebuffer and the firmware's GOP and screen console, the display/input handles, `--display`, the CLI's web viewer |
 | 21-ryzen-7000-parity.md | feature parity with a Ryzen 5 7000-class (Zen 4) part from public documentation: instruction sets, LA57, PKU, CET, SVM extras, PerfMonV2, CPU profile |
 
 Rules for implementers: `../ext/qemu-uplink` is read-only reference. Behaviour and algorithms are studied there; code is written fresh in Rust, not transliterated. Zero crate dependencies.
