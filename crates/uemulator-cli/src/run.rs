@@ -2,11 +2,15 @@ use std::io::{IsTerminal, Read, Write};
 use std::time::Duration;
 
 use uemulator::{
-    ConsoleKind, Disk, EmulatedMachine, ExitReason, JitMode, MachineConfig, NetHandle, NetOffloads,
-    SmpMode,
+    ConsoleKind, Disk, DisplayMode, EmulatedMachine, ExitReason, JitMode, MachineConfig, NetHandle,
+    NetOffloads, SmpMode,
 };
 
-use crate::args::{ConsoleArg, NetLink, RuntimeArgs, Settings, SmpArg};
+use crate::args::{
+    ConsoleArg, DEFAULT_VIEWER_ADDRESS, DisplayArg, NetLink, RuntimeArgs, Settings, SmpArg,
+};
+use crate::frontend::web::WebViewer;
+use crate::frontend::{Frontend, Screen};
 use crate::netgw;
 use crate::term::{stty, term_size};
 
@@ -161,6 +165,9 @@ fn build_config(
     for console in console_list(settings) {
         cfg = cfg.console(console_kind(console));
     }
+    if settings.display == Some(DisplayArg::Framebuffer) {
+        cfg = cfg.display(DisplayMode::Framebuffer);
+    }
     if let Some(t) = runtime.time {
         cfg = cfg.unix_time(t);
     }
@@ -256,6 +263,15 @@ pub fn run_uefi(
     run_config(cfg, settings, runtime, tty)
 }
 
+/// The viewer for a machine with a display: where `--viewer-address` says, or the default
+/// address, or any free loopback port when something else holds the default one.
+fn bind_viewer(runtime: &RuntimeArgs) -> Result<WebViewer, String> {
+    match &runtime.viewer_address {
+        Some(address) => WebViewer::bind(address),
+        None => WebViewer::bind(DEFAULT_VIEWER_ADDRESS).or_else(|_| WebViewer::bind("127.0.0.1:0")),
+    }
+}
+
 fn run_config(
     cfg: MachineConfig,
     settings: &Settings,
@@ -263,6 +279,11 @@ fn run_config(
     tty: bool,
 ) -> Result<ExitReason, String> {
     let mut machine = EmulatedMachine::new(cfg).map_err(|e| e.to_string())?;
+    if let (Some(display), Some(input)) = (machine.display(), machine.input()) {
+        let viewer: Box<dyn Frontend> = Box::new(bind_viewer(runtime)?);
+        // Before raw mode, so a plain newline ends the line.
+        eprintln!("{}", viewer.start(Screen { display, input })?);
+    }
     let console = machine.console();
     if machine.consoles().len() > 1 {
         eprintln!(
@@ -629,6 +650,67 @@ mod tests {
         // The empty kernel fails only after the configuration (device count, console rules)
         // was accepted.
         assert!(!machine_error(cfg).contains("virtio devices"));
+    }
+
+    #[test]
+    fn the_display_option_and_the_viewer_address_parse() {
+        let (settings, runtime) = boot_args(&[
+            "--display",
+            "framebuffer",
+            "--viewer-address",
+            "0.0.0.0:6000",
+        ]);
+        assert_eq!(settings.display, Some(DisplayArg::Framebuffer));
+        assert_eq!(runtime.viewer_address.as_deref(), Some("0.0.0.0:6000"));
+        let (settings, runtime) = boot_args(&[]);
+        assert_eq!(settings.display, None, "serial unless asked");
+        assert_eq!(runtime.viewer_address, None);
+        assert!(
+            crate::parse_cli([
+                "uemulator",
+                "advanced",
+                "boot",
+                "--kernel",
+                "k",
+                "--display",
+                "vga"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_framebuffer_machine_takes_three_more_pci_functions() {
+        // 31 functions: the console, 26 NICs, the entropy source, and the display's three.
+        let mut flags = vec!["--display", "framebuffer"];
+        for _ in 0..27 {
+            flags.extend(["--network", "virtio"]);
+        }
+        let message = machine_error(build(&flags, None).unwrap());
+        assert!(message.contains("display"), "{message}");
+        let message = machine_error(build(&flags[2..], None).unwrap());
+        assert!(!message.contains("virtio devices"), "{message}");
+    }
+
+    #[test]
+    fn the_default_viewer_address_falls_back_to_a_free_port_but_an_explicit_one_does_not() {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = taken.local_addr().unwrap().to_string();
+        let explicit = RuntimeArgs {
+            viewer_address: Some(address.clone()),
+            ..RuntimeArgs::default()
+        };
+        assert!(bind_viewer(&explicit).is_err());
+        let any = RuntimeArgs {
+            viewer_address: Some("127.0.0.1:0".into()),
+            ..RuntimeArgs::default()
+        };
+        assert!(
+            bind_viewer(&any)
+                .unwrap()
+                .url()
+                .starts_with("http://127.0.0.1:")
+        );
     }
 
     #[test]

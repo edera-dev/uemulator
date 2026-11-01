@@ -1,0 +1,343 @@
+use super::*;
+use std::io::{Cursor, Read};
+
+const KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
+const ACCEPT: &str = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
+const IO_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn parse(head: &str) -> Request {
+    read_request(&mut Cursor::new(head.as_bytes()))
+        .unwrap()
+        .unwrap()
+}
+
+/// Where the requests in these tests were sent: the default viewer address.
+fn default_viewer() -> SocketAddr {
+    "127.0.0.1:5800".parse().unwrap()
+}
+
+fn route_default(request: &Request) -> Route {
+    route(request, default_viewer())
+}
+
+fn upgrade_request(origin: Option<&str>) -> String {
+    upgrade_request_to("127.0.0.1:5800", origin)
+}
+
+/// A browser's WebSocket handshake for the viewer at `host`.
+fn upgrade_request_to(host: &str, origin: Option<&str>) -> String {
+    let mut head = format!(
+        "GET /ws HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n\
+         Connection: keep-alive, Upgrade\r\nSec-WebSocket-Key: {KEY}\r\n\
+         Sec-WebSocket-Version: 13\r\n"
+    );
+    if let Some(origin) = origin {
+        head.push_str(&format!("Origin: {origin}\r\n"));
+    }
+    head.push_str("\r\n");
+    head
+}
+
+#[test]
+fn a_request_head_is_split_into_method_path_and_lowercased_headers() {
+    let request =
+        parse("GET /index.html?x=1 HTTP/1.1\r\nHost: a:1\r\nX-Thing:  value \r\n\r\nbody");
+    assert_eq!(request.method, "GET");
+    assert_eq!(request.path, "/index.html");
+    assert_eq!(request.header("host"), Some("a:1"));
+    assert_eq!(request.header("x-thing"), Some("value"));
+    assert_eq!(request.header("missing"), None);
+}
+
+#[test]
+fn a_closed_connection_is_no_request_and_a_cut_one_is_an_error() {
+    assert_eq!(read_request(&mut Cursor::new(b"")).unwrap(), None);
+    assert!(read_request(&mut Cursor::new(b"GET / HTTP/1.1\r\nHost: x\r\n")).is_err());
+    assert!(
+        read_request(&mut Cursor::new(b"\r\n")).is_err(),
+        "no request line"
+    );
+    let endless = format!("GET / HTTP/1.1\r\n{}", "X: y\r\n".repeat(MAX_REQUEST_HEAD));
+    assert!(read_request(&mut Cursor::new(endless.as_bytes())).is_err());
+}
+
+#[test]
+fn the_page_and_the_socket_are_the_only_routes() {
+    assert_eq!(
+        route_default(&parse("GET / HTTP/1.1\r\nHost: 127.0.0.1:5800\r\n\r\n")),
+        Route::Page
+    );
+    assert_eq!(
+        route_default(&parse(
+            "GET /index.html HTTP/1.1\r\nHost: localhost:5800\r\n\r\n"
+        )),
+        Route::Page
+    );
+    assert_eq!(
+        route_default(&parse(
+            "GET /etc/passwd HTTP/1.1\r\nHost: 127.0.0.1:5800\r\n\r\n"
+        )),
+        Route::NotFound
+    );
+    assert_eq!(
+        route_default(&parse("POST / HTTP/1.1\r\n\r\n")),
+        Route::MethodNotAllowed
+    );
+    assert_eq!(
+        route_default(&parse(&upgrade_request(None))),
+        Route::Upgrade(ACCEPT.to_string())
+    );
+}
+
+#[test]
+fn the_socket_needs_a_complete_handshake() {
+    assert_eq!(
+        route_default(&parse("GET /ws HTTP/1.1\r\nHost: 127.0.0.1:5800\r\n\r\n")),
+        Route::BadRequest
+    );
+    let old_version = upgrade_request(None).replace("Version: 13", "Version: 8");
+    assert_eq!(route_default(&parse(&old_version)), Route::BadRequest);
+    let no_upgrade = upgrade_request(None).replace("keep-alive, Upgrade", "keep-alive");
+    assert_eq!(route_default(&parse(&no_upgrade)), Route::BadRequest);
+}
+
+#[test]
+fn only_the_viewer_page_itself_may_open_the_socket() {
+    assert_eq!(
+        route_default(&parse(&upgrade_request(Some("http://127.0.0.1:5800")))),
+        Route::Upgrade(ACCEPT.to_string())
+    );
+    assert_eq!(
+        route_default(&parse(&upgrade_request(Some("https://evil.example")))),
+        Route::Forbidden
+    );
+    assert_eq!(
+        route_default(&parse(&upgrade_request(Some("http://127.0.0.1:5801")))),
+        Route::Forbidden
+    );
+}
+
+#[test]
+fn a_rebinding_site_is_refused_even_when_origin_and_host_agree() {
+    let rebound = upgrade_request(Some("http://evil.example:5800"))
+        .replace("Host: 127.0.0.1:5800", "Host: evil.example:5800");
+    assert_eq!(route_default(&parse(&rebound)), Route::Forbidden);
+    let page = parse("GET / HTTP/1.1\r\nHost: evil.example:5800\r\n\r\n");
+    assert_eq!(route_default(&page), Route::Forbidden, "the page too");
+    assert_eq!(
+        route_default(&parse("GET / HTTP/1.1\r\n\r\n")),
+        Route::Forbidden,
+        "no Host"
+    );
+}
+
+#[test]
+fn the_host_must_name_the_viewer() {
+    let loopback = default_viewer();
+    for host in [
+        "127.0.0.1:5800",
+        "localhost:5800",
+        "LOCALHOST:5800",
+        "[::1]:5800",
+        "127.0.0.2:5800",
+    ] {
+        assert!(host_allowed(host, loopback), "{host}");
+    }
+    for host in [
+        "127.0.0.1:5801",
+        "127.0.0.1",
+        "evil.example:5800",
+        "10.0.0.1:5800",
+        "[::1]",
+    ] {
+        assert!(!host_allowed(host, loopback), "{host}");
+    }
+    let lan: SocketAddr = "192.168.1.5:5800".parse().unwrap();
+    assert!(host_allowed("192.168.1.5:5800", lan));
+    assert!(!host_allowed("localhost:5800", lan));
+    assert!(!host_allowed("192.168.1.6:5800", lan));
+    let every: SocketAddr = "0.0.0.0:5800".parse().unwrap();
+    assert!(host_allowed("10.1.2.3:5800", every));
+    assert!(host_allowed("localhost:5800", every));
+    assert!(!host_allowed("evil.example:5800", every));
+}
+
+#[test]
+fn commands_parse_and_nonsense_is_ignored() {
+    assert_eq!(
+        parse_command("k 4 1"),
+        Some(Command::Key {
+            usage: 4,
+            pressed: true
+        })
+    );
+    assert_eq!(
+        parse_command("k 224 0"),
+        Some(Command::Key {
+            usage: 224,
+            pressed: false
+        })
+    );
+    assert_eq!(
+        parse_command("m 10 20"),
+        Some(Command::Move { x: 10, y: 20 })
+    );
+    assert_eq!(
+        parse_command("b 1 1"),
+        Some(Command::Button {
+            button: PointerButton::Right,
+            pressed: true
+        })
+    );
+    assert_eq!(parse_command("w -3"), Some(Command::Wheel { clicks: -3 }));
+    assert_eq!(parse_command("r"), Some(Command::ReleaseAll));
+    assert_eq!(parse_command("a"), Some(Command::Ack));
+    for nonsense in [
+        "",
+        "k",
+        "k x 1",
+        "k 70000 1",
+        "m -1 0",
+        "b 9 1",
+        "z 1",
+        "w 99999999999",
+    ] {
+        assert_eq!(parse_command(nonsense), None, "{nonsense:?}");
+    }
+}
+
+#[test]
+fn an_update_message_is_the_header_then_a_png() {
+    let update = FrameUpdate {
+        generation: 3,
+        width: 1280,
+        height: 800,
+        rect: Rect {
+            x: 16,
+            y: 32,
+            width: 2,
+            height: 1,
+        },
+    };
+    let message = update_message(&update, &[1, 2, 3, 0, 4, 5, 6, 0]);
+    assert_eq!(message[0], UPDATE_KIND_RECT);
+    let word = |index: usize| u16::from_le_bytes([message[1 + 2 * index], message[2 + 2 * index]]);
+    assert_eq!(
+        [word(0), word(1), word(2), word(3), word(4), word(5)],
+        [1280, 800, 16, 32, 2, 1]
+    );
+    assert_eq!(
+        &message[UPDATE_HEADER_BYTES..UPDATE_HEADER_BYTES + 4],
+        b"\x89PNG"
+    );
+}
+
+/// A viewer on a free loopback port with a blank screen.
+fn start_viewer() -> SocketAddr {
+    let viewer = WebViewer::bind("127.0.0.1:0").unwrap();
+    let address = viewer.address;
+    let message = Box::new(viewer)
+        .start(Screen {
+            display: DisplayHandle::default(),
+            input: InputHandle::default(),
+        })
+        .unwrap();
+    assert!(message.contains(&format!("http://{address}/")), "{message}");
+    address
+}
+
+fn connect(address: SocketAddr) -> TcpStream {
+    let stream = TcpStream::connect(address).unwrap();
+    stream.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+    stream
+}
+
+/// Reads the response head, up to the empty line.
+fn response_head(stream: &mut TcpStream) -> String {
+    let mut head = Vec::new();
+    let mut byte = [0u8];
+    while !head.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).unwrap();
+        head.push(byte[0]);
+    }
+    String::from_utf8(head).unwrap()
+}
+
+/// A text frame as a browser sends it (masked).
+fn client_text(text: &str) -> Vec<u8> {
+    const MASK: [u8; 4] = [0x11, 0x22, 0x33, 0x44];
+    let mut frame = vec![0x80 | OPCODE_TEXT, 0x80 | text.len() as u8];
+    frame.extend_from_slice(&MASK);
+    frame.extend(text.bytes().enumerate().map(|(i, b)| b ^ MASK[i % 4]));
+    frame
+}
+
+#[test]
+fn the_server_serves_the_page() {
+    let address = start_viewer();
+    let mut stream = connect(address);
+    let request = format!("GET / HTTP/1.1\r\nHost: {address}\r\n\r\n");
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert!(response.contains("Content-Type: text/html"));
+    assert!(response.contains("<canvas"));
+    assert!(response.contains(&format!("Content-Length: {}", VIEWER_PAGE.len())));
+}
+
+#[test]
+fn a_socket_gets_the_whole_screen_first_and_answers_pings() {
+    let address = start_viewer();
+    let mut stream = connect(address);
+    let origin = format!("http://{address}");
+    let handshake = upgrade_request_to(&address.to_string(), Some(&origin));
+    stream.write_all(handshake.as_bytes()).unwrap();
+    let head = response_head(&mut stream);
+    assert!(head.starts_with("HTTP/1.1 101 "), "{head}");
+    assert!(
+        head.contains(&format!("Sec-WebSocket-Accept: {ACCEPT}")),
+        "{head}"
+    );
+    let mut messages = MessageReader::default();
+    let first = messages.read(&mut stream).unwrap();
+    assert_eq!(first.opcode, OPCODE_BINARY);
+    let word = |index: usize| {
+        u16::from_le_bytes([first.payload[1 + 2 * index], first.payload[2 + 2 * index]])
+    };
+    assert_eq!(
+        [word(0), word(1), word(2), word(3), word(4), word(5)],
+        [1280, 800, 0, 0, 1280, 800]
+    );
+    // Input and acks are accepted without an answer; a ping gets its pong.
+    stream.write_all(&client_text("k 4 1")).unwrap();
+    stream.write_all(&client_text("a")).unwrap();
+    let ping = [0x80 | OPCODE_PING, 0x80 | 2, 0, 0, 0, 0, b'h', b'i'];
+    stream.write_all(&ping).unwrap();
+    let pong = messages.read(&mut stream).unwrap();
+    assert_eq!((pong.opcode, pong.payload), (OPCODE_PONG, b"hi".to_vec()));
+    // Closing ends the session with a close frame back.
+    stream
+        .write_all(&[0x80 | OPCODE_CLOSE, 0x80, 0, 0, 0, 0])
+        .unwrap();
+    assert_eq!(messages.read(&mut stream).unwrap().opcode, OPCODE_CLOSE);
+}
+
+#[test]
+fn another_sites_socket_is_refused() {
+    let address = start_viewer();
+    let mut stream = connect(address);
+    let handshake = upgrade_request_to(&address.to_string(), Some("http://evil.example"));
+    stream.write_all(handshake.as_bytes()).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 403 "), "{response}");
+}
+
+#[test]
+fn binding_an_address_in_use_says_which() {
+    let taken = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = taken.local_addr().unwrap().to_string();
+    let error = WebViewer::bind(&address).err().unwrap();
+    assert!(error.contains(&address), "{error}");
+}

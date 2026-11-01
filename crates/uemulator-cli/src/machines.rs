@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::args::{
-    BootSource, ConsoleArg, DiskSpec, DiskStep, Firmware, HardwareArgs, LinuxArgs, NetLink,
-    NetModel, Nic, RemoveArgs, Settings, attach_only,
+    BootSource, ConsoleArg, DiskSpec, DiskStep, DisplayArg, Firmware, HardwareArgs, LinuxArgs,
+    NetLink, NetModel, Nic, RemoveArgs, Settings, attach_only,
 };
 use crate::images;
 use crate::quick::{Artifacts, Distro, artifacts_present, ensure_in, write_atomically};
@@ -583,6 +583,9 @@ pub fn describe(machine: &Machine) -> String {
     };
     out.push_str(&format!("  boots     {boot}\n"));
     out.push_str(&format!("  firmware  {}\n", machine.firmware.name()));
+    if settings.display == Some(DisplayArg::Framebuffer) {
+        out.push_str("  display   framebuffer\n");
+    }
     for (index, disk) in settings.disks.iter().enumerate() {
         let mode = if disk.read_only { "ro" } else { "rw" };
         out.push_str(&format!(
@@ -1516,6 +1519,19 @@ mod tests {
         let error = create_disk_image(&dir.path().join("big.udisk"), u64::MAX).unwrap_err();
         assert!(error.contains("too large"), "{error}");
         assert!(!dir.path().join("big.udisk").exists());
+    }
+
+    #[test]
+    fn a_framebuffer_display_is_saved_with_the_machine_and_shown() {
+        let home = TempDir::new("machines-display");
+        let machine = create_machine(home.path(), &["--display", "framebuffer"]);
+        let saved = std::fs::read_to_string(home.path().join("machines/m/machine.toml")).unwrap();
+        assert!(saved.contains("display = \"framebuffer\""), "{saved}");
+        let loaded = load(home.path(), "m").unwrap();
+        assert_eq!(loaded.settings.display, Some(DisplayArg::Framebuffer));
+        assert!(describe(&machine).contains("display   framebuffer"));
+        let plain = create_machine(&home.path().join("other"), &[]);
+        assert!(!describe(&plain).contains("display   "));
     }
 
     #[test]
