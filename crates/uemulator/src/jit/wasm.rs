@@ -123,6 +123,7 @@ fn addrs(out: *mut u64, chain: u32, chain_link: u32, valid: &[AtomicU8]) -> Addr
         ld_stack: helpers::helper_load_stack_via_out as *const () as usize as u32,
         st_stack: helpers::helper_store_stack_x64 as *const () as usize as u32,
         cond: helpers::helper_cond as *const () as usize as u32,
+        rotate_flags: helpers::helper_set_rotate_flags as *const () as usize as u32,
         out: out as usize as u32,
         chain,
         chain_link,
@@ -1164,7 +1165,7 @@ mod tests {
     }
 
     #[test]
-    fn imul_64_and_rotates_are_inline_only_when_their_flags_are_overwritten() {
+    fn imul_64_is_inline_only_when_its_flags_are_overwritten_and_rotates_always_are() {
         // sbb eax, eax; adc rcx, 7; hlt: adc and sbb are inline whatever their flags
         assert_eq!(inlined_in(&[0x19, 0xc0, 0x48, 0x83, 0xd1, 0x07, 0xf4]), 2);
         // imul rax, rcx; add rdx, 1; hlt
@@ -1174,17 +1175,18 @@ mod tests {
         );
         // imul rax, rcx; hlt: the successor may read the flags
         assert_eq!(inlined_in(&[0x48, 0x0f, 0xaf, 0xc1, 0xf4]), 0);
-        // rol rax, 13; ror ecx, cl; sub rdx, rax; hlt: the ror and the sub (a rotate counts as
-        // reading the flags, so the rol is not one of them)
+        // rol rax, 13; ror ecx, cl; sub rdx, rax; hlt
         assert_eq!(
             inlined_in(&[0x48, 0xc1, 0xc0, 0x0d, 0xd3, 0xc9, 0x48, 0x29, 0xc2, 0xf4]),
-            2
+            3
         );
-        // rol rax, 13; adc rdx, rax; hlt: adc reads CF
+        // rol rax, 13; adc rdx, rax; hlt: adc reads the CF the rol merged into the flags
         assert_eq!(
             inlined_in(&[0x48, 0xc1, 0xc0, 0x0d, 0x48, 0x11, 0xc2, 0xf4]),
-            1
+            2
         );
+        // rol rbx, 25; jmp next; next: hlt: the successor may read the flags
+        assert_eq!(inlined_in(&[0x48, 0xc1, 0xc3, 0x19, 0xeb, 0x00, 0xf4]), 2);
     }
 
     #[test]
