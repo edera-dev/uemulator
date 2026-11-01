@@ -26,7 +26,7 @@
 - **SMP with threads** (`plans/22-smp-threads.md`): MTTCG's ideas, written fresh. `start_exclusive`/`end_exclusive` and `cpu_exec_step_atomic` (`Cpu::with_exclusive`, the retry of locked instructions), `tlb_protect_code` (revoking write tags for a page that gains code, here inside the exclusive section), the big lock around devices, and `TCG_GUEST_DEFAULT_MO` (x86 is TSO, so the aarch64 backend needs acquire loads and release stores; QEMU refuses MTTCG for that pairing by default, here it is on).
 - **Perf features, JIT phase notes only**: x-tblookup, x-tblayout, x-iofast, x-edgesys, x-slowthunk, x-ssefp, lazy INC/DEC CC_OP, x-vexzero/regcache/superblock.
 - **Not applicable**: x-hyperv, x-user, x-versal/zynqmp/zcu/aio/blockdev, `[DEV]` stats commits.
-- **CPU identity**: AMD Zen 4 (family 0x19 model 0x11, EPYC-Genoa; see 03 "CPUID/MSR contract"), no hypervisor bit. Read its leaves, then subtract (03).
+- **CPU identity**: AMD Zen 5 (family 0x1a model 0x02 stepping 1, EPYC-Turin; see 03 "CPUID/MSR contract"; QEMU's `EPYC-Turin` says model 0 stepping 0), no hypervisor bit. Read its leaves, then subtract (03).
 
 ## Open questions to answer from the tree
 

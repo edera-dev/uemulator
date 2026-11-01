@@ -35,6 +35,8 @@
 
 - Zen 4 CPU model done (see 03, "CPUID/MSR contract"; `cpu/cpuid.rs`): family 19h model 11h (EPYC 9004 Genoa), cache, TLB and topology leaves (0xB, 0x8000001D/1E) consistent with a configurable processor count and x2APIC id, SHA-NI, ADX, CLWB/CLFLUSHOPT, RDPID, CLZERO, WBNOINVD, AVX512_BF16, XSAVEC/XSAVES/XGETBV1 with the compacted format, 1 GiB pages, and the AMD configuration MSRs Linux and Xen touch. Linux reports "AMD EPYC-Genoa Processor", `sha_ni avx512_bf16 xsavec xsaves clzero rdpid ...` and the compacted XSAVE format.
 
+- Zen 5 CPU model done, replacing Zen 4 (see 03, "CPUID/MSR contract" and "Speculation control", and 21, "Zen 5 Turin model"): family 1Ah model 02h stepping 1 (EPYC 9005 Turin), Zen 5 caches and leaf 0x80000026, Turin's speculation controls in the AMD spelling only (automatic IBRS, SBPB, PSFD, BTC_NO...), AVX-VNNI, MOVDIRI, MOVDIR64B, AVX512_VP2INTERSECT and PREFETCHI. Linux 6.18 reports no vulnerability as "Vulnerable" without `mitigations=off`, which the default command line no longer passes; boot time is unchanged.
+
 - UMIP, SMEP/SMAP, PCID/INVPCID, MONITOR/MWAIT, RDTSCP done (see 03).
 
 - VEX decoding, BMI1 and BMI2 done (see 03, "VEX and BMI").
