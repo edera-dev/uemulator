@@ -223,10 +223,11 @@ enum QuickCmd {
 
 #[derive(Subcommand)]
 enum AdvancedCmd {
-    /// Boot a kernel (bzImage) and optional initramfs
+    /// Boot a kernel (bzImage) and optional initramfs, optionally under a hypervisor
     ///
     /// The UEFI firmware boots them, which needs a kernel with an EFI stub; `--firmware none`
-    /// enters any bzImage directly.
+    /// enters any bzImage directly. With `--hypervisor` the firmware boots Xen and the kernel
+    /// becomes its dom0.
     Boot {
         /// Linux bzImage
         #[arg(long)]
@@ -234,6 +235,14 @@ enum AdvancedCmd {
         /// Initial ramdisk
         #[arg(long)]
         initramfs: Option<PathBuf>,
+        /// A hypervisor to boot with the kernel as its dom0: Xen as xen.gz (or the uncompressed
+        /// xen), or xen.efi. Needs the UEFI firmware; the console defaults to serial (Xen owns
+        /// the 16550 and gives dom0 hvc0), and --cmdline/--append are dom0's
+        #[arg(long)]
+        hypervisor: Option<PathBuf>,
+        /// The hypervisor's own command line [default: console=com1 com1=115200,8n1]
+        #[arg(long, requires = "hypervisor")]
+        hypervisor_cmdline: Option<String>,
         #[command(flatten)]
         hardware: HardwareArgs,
         #[command(flatten)]
@@ -501,6 +510,8 @@ fn advanced_command(cmd: AdvancedCmd) -> Result<ExitReason, String> {
         AdvancedCmd::Boot {
             kernel,
             initramfs,
+            hypervisor,
+            hypervisor_cmdline,
             hardware,
             linux,
             firmware,
@@ -509,6 +520,24 @@ fn advanced_command(cmd: AdvancedCmd) -> Result<ExitReason, String> {
             let kernel_image = read(&kernel)?;
             let initramfs_image = initramfs.as_ref().map(read).transpose()?;
             let settings = settings_of(&hardware, &linux)?;
+            if let Some(hypervisor) = hypervisor {
+                if firmware.firmware.unwrap_or_default() != args::Firmware::Uefi {
+                    return Err(
+                        "--hypervisor is booted by the UEFI firmware; use --firmware uefi".into(),
+                    );
+                }
+                let hypervisor = run::Hypervisor {
+                    image: read(&hypervisor)?,
+                    cmdline: hypervisor_cmdline,
+                };
+                return run::run_hypervisor(
+                    kernel_image,
+                    initramfs_image,
+                    hypervisor,
+                    &settings,
+                    &runtime,
+                );
+            }
             match firmware.firmware.unwrap_or_default() {
                 args::Firmware::Uefi => run::run_uefi(
                     kernel_image,
@@ -701,6 +730,8 @@ mod tests {
     struct Advanced {
         kernel: PathBuf,
         initramfs: Option<PathBuf>,
+        hypervisor: Option<PathBuf>,
+        hypervisor_cmdline: Option<String>,
         hardware: HardwareArgs,
         linux: LinuxArgs,
         runtime: RuntimeArgs,
@@ -713,6 +744,8 @@ mod tests {
                     AdvancedCmd::Boot {
                         kernel,
                         initramfs,
+                        hypervisor,
+                        hypervisor_cmdline,
                         hardware,
                         linux,
                         firmware: _,
@@ -721,6 +754,8 @@ mod tests {
             } => Advanced {
                 kernel,
                 initramfs,
+                hypervisor,
+                hypervisor_cmdline,
                 hardware,
                 linux,
                 runtime,
@@ -938,6 +973,41 @@ mod tests {
         assert_eq!(runtime.time, None);
         assert_eq!(runtime.timeout, None);
         assert!(!runtime.verify && !runtime.debug);
+    }
+
+    #[test]
+    fn advanced_boot_takes_a_hypervisor_and_its_command_line() {
+        let boot = advanced_boot(&[
+            "advanced",
+            "boot",
+            "--kernel",
+            "k",
+            "--hypervisor",
+            "xen.gz",
+            "--hypervisor-cmdline",
+            "console=com1 dom0_mem=512M",
+        ]);
+        assert_eq!(boot.hypervisor, Some(PathBuf::from("xen.gz")));
+        assert_eq!(
+            boot.hypervisor_cmdline.as_deref(),
+            Some("console=com1 dom0_mem=512M")
+        );
+        assert_eq!(
+            advanced_boot(&["advanced", "boot", "--kernel", "k"]).hypervisor,
+            None
+        );
+        // A hypervisor command line without a hypervisor would be silently ignored.
+        assert_eq!(
+            error_kind(&[
+                "advanced",
+                "boot",
+                "--kernel",
+                "k",
+                "--hypervisor-cmdline",
+                "x"
+            ]),
+            ErrorKind::MissingRequiredArgument
+        );
     }
 
     #[test]

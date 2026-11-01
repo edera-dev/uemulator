@@ -157,6 +157,11 @@ const DEFAULT_MEMORY_MIB: usize = 512;
 const BYTES_PER_MIB_SHIFT: usize = 20;
 /// The word `DEFAULT_CMDLINE` carries for hosts without ACPI tables.
 const ACPI_OFF_WORD: &str = "acpi=off";
+/// Xen's console on the machine's 16550, which is where the host terminal is.
+pub const DEFAULT_HYPERVISOR_CMDLINE: &str = "console=com1 com1=115200,8n1";
+/// dom0's default under a hypervisor: Xen's console is `hvc0`, and the 16550 belongs to Xen (a
+/// PV dom0 that touched it for `earlyprintk=serial` would fault), so early text goes through Xen.
+const DEFAULT_DOM0_CMDLINE: &str = "console=hvc0 earlyprintk=xen acpi=off panic=-1";
 
 pub(crate) type LogFn = Arc<dyn Fn(&str) + Send + Sync>;
 /// The poll hook as the CPU sees it: the console is already bound, the flag means "guest is
@@ -176,6 +181,8 @@ pub struct MachineConfig {
     initrd: Option<Vec<u8>>,
     cmdline: Option<String>,
     cmdline_extra: Vec<String>,
+    hypervisor: Option<Vec<u8>>,
+    hypervisor_cmdline: Option<String>,
     memory_mib: usize,
     cpus: usize,
     disks: Vec<Disk>,
@@ -215,6 +222,8 @@ impl Default for MachineConfig {
             initrd: None,
             cmdline: None,
             cmdline_extra: Vec::new(),
+            hypervisor: None,
+            hypervisor_cmdline: None,
             memory_mib: DEFAULT_MEMORY_MIB,
             cpus: MIN_CPUS,
             disks: Vec::new(),
@@ -311,6 +320,29 @@ impl MachineConfig {
     /// Appended to the command line, whether it is the default or set by `cmdline`.
     pub fn cmdline_append(mut self, s: impl Into<String>) -> Self {
         self.cmdline_extra.push(s.into());
+        self
+    }
+
+    /// Boots a hypervisor (Xen) with the `kernel`, `initrd` and command line as its first
+    /// domain, dom0. Takes Xen as it ships: `xen.gz` (or the uncompressed `xen`), an ELF with a
+    /// Multiboot2 header, or `xen.efi`. Needs `uefi_firmware` and a kernel; the kernel then needs
+    /// no EFI stub. The firmware loads `xen.gz` the way GRUB's `multiboot2` does on UEFI (boot
+    /// services kept, Xen's EFI entry point), and starts `xen.efi` with its configuration, the
+    /// kernel and the initramfs behind Xen's `LoadFile2` media loaders, as Edera's boot loader
+    /// does (`docs/plans/18-xen-dom0.md`).
+    ///
+    /// Xen owns the 16550 and gives dom0 its console as `hvc0`, so with a hypervisor the default
+    /// console is `ConsoleKind::Serial` and the default command line puts dom0's console on
+    /// `hvc0`.
+    pub fn hypervisor(mut self, image: impl Into<Vec<u8>>) -> Self {
+        self.hypervisor = Some(image.into());
+        self
+    }
+
+    /// The hypervisor's own command line, `DEFAULT_HYPERVISOR_CMDLINE` (Xen's console on the
+    /// 16550) when not set.
+    pub fn hypervisor_cmdline(mut self, s: impl Into<String>) -> Self {
+        self.hypervisor_cmdline = Some(s.into());
         self
     }
 
@@ -609,6 +641,8 @@ struct RebootImage {
     initrd: Option<Vec<u8>>,
     /// The final command line, defaults and `cmdline_append` already applied.
     cmdline: String,
+    /// Decompressed, with its final command line.
+    hypervisor: Option<(Vec<u8>, String)>,
     /// The embedder's handle shares its queues with the device, so the new device must be built
     /// around this very handle.
     nets: Vec<([u8; 6], NetHandle)>,
@@ -625,16 +659,18 @@ struct RebootImage {
     uefi: Option<(Vec<u8>, boot::FirmwareParams)>,
 }
 
-/// The kernel the UEFI firmware is to boot, if the machine was given one.
+/// The kernel (and hypervisor) the UEFI firmware is to boot, if the machine was given one.
 fn uefi_payload<'a>(
     kernel: &'a [u8],
     initrd: Option<&'a [u8]>,
     cmdline: &'a str,
+    hypervisor: Option<&'a (Vec<u8>, String)>,
 ) -> Option<boot::UefiPayload<'a>> {
     (!kernel.is_empty()).then_some(boot::UefiPayload {
         kernel,
         initrd,
         cmdline,
+        hypervisor: hypervisor.map(|(image, text)| (image.as_slice(), text.as_str())),
     })
 }
 
@@ -880,7 +916,13 @@ impl Vcpu {
                     firmware,
                     params,
                     image.acpi.as_ref(),
-                    uefi_payload(&image.kernel, image.initrd.as_deref(), &image.cmdline).as_ref(),
+                    uefi_payload(
+                        &image.kernel,
+                        image.initrd.as_deref(),
+                        &image.cmdline,
+                        image.hypervisor.as_ref(),
+                    )
+                    .as_ref(),
                 ),
                 None => boot::load_with_acpi(
                     &mut ram,
@@ -1143,7 +1185,11 @@ impl EmulatedMachine {
             }
         }
         let mut ram = allocate_ram(cfg.memory_mib)?;
-        let kinds = if cfg.consoles.is_empty() {
+        // Xen keeps the 16550 for itself and hands dom0 its console as `hvc0`; a virtio console
+        // would be a second `hvc` that never sees Xen's output.
+        let kinds = if cfg.consoles.is_empty() && cfg.hypervisor.is_some() {
+            vec![ConsoleKind::Serial]
+        } else if cfg.consoles.is_empty() {
             vec![ConsoleKind::Virtio]
         } else {
             cfg.consoles.clone()
@@ -1205,7 +1251,9 @@ impl EmulatedMachine {
         }
         let mut cmdline = cfg.cmdline.clone().unwrap_or_else(|| {
             // The first console is the guest's primary one.
-            let default = if kinds[0] == ConsoleKind::Virtio {
+            let default = if cfg.hypervisor.is_some() {
+                DEFAULT_DOM0_CMDLINE
+            } else if kinds[0] == ConsoleKind::Virtio {
                 DEFAULT_CMDLINE
             } else {
                 DEFAULT_SERIAL_CMDLINE
@@ -1236,12 +1284,35 @@ impl EmulatedMachine {
                         .into(),
                 ));
             }
-            if !cfg.kernel.is_empty() && !boot::has_efi_header(&cfg.kernel) {
+            if !cfg.kernel.is_empty()
+                && cfg.hypervisor.is_none()
+                && !boot::has_efi_header(&cfg.kernel)
+            {
                 return Err(Error::BadConfig(
                     "kernel has no EFI stub; boot it with firmware none".into(),
                 ));
             }
         }
+        let hypervisor = match &cfg.hypervisor {
+            Some(_) if cfg.kernel.is_empty() => {
+                return Err(Error::BadConfig(
+                    "a hypervisor needs a kernel to boot as its dom0".into(),
+                ));
+            }
+            Some(_) if cfg.uefi_firmware.is_none() => {
+                return Err(Error::BadConfig(
+                    "a hypervisor is booted by the UEFI firmware: it needs uefi_firmware".into(),
+                ));
+            }
+            Some(image) => {
+                let text = cfg
+                    .hypervisor_cmdline
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_HYPERVISOR_CMDLINE.into());
+                Some((boot::hypervisor::prepare(image)?, text))
+            }
+            None => None,
+        };
         if cfg.boot_disk {
             if cfg.firmware.is_some() || !cfg.kernel.is_empty() {
                 return Err(Error::BadConfig(
@@ -1284,7 +1355,13 @@ impl EmulatedMachine {
                     image,
                     params,
                     acpi.as_ref(),
-                    uefi_payload(&cfg.kernel, cfg.initrd.as_deref(), &cmdline).as_ref(),
+                    uefi_payload(
+                        &cfg.kernel,
+                        cfg.initrd.as_deref(),
+                        &cmdline,
+                        hypervisor.as_ref(),
+                    )
+                    .as_ref(),
                 )?
             }
             Some(image) => boot::load_firmware(&mut ram, image)?,
@@ -1342,6 +1419,7 @@ impl EmulatedMachine {
                     kernel: cfg.kernel,
                     initrd: cfg.initrd,
                     cmdline,
+                    hypervisor,
                     nets: devcfg.nets.clone(),
                     virtio_consoles: devcfg.virtio_consoles.clone(),
                     iommu: cfg.iommu,

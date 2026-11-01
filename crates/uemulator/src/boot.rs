@@ -480,6 +480,8 @@ pub(crate) fn load_firmware(ram: &mut [u8], image: &[u8]) -> Result<BootState, E
     })
 }
 
+pub(crate) mod hypervisor;
+mod inflate;
 pub(crate) mod uefi;
 pub(crate) use uefi::{
     FirmwareParams, UefiPayload, framebuffer_region, has_efi_header, load_uefi_firmware,

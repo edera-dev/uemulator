@@ -16,7 +16,9 @@ use crate::load_option::{Candidate, parse, u16_list};
 use crate::tables::BOOT_SERVICES;
 use crate::uefi::variable_attribute::{BOOTSERVICE_ACCESS, NON_VOLATILE, RUNTIME_ACCESS};
 use crate::uefi::*;
-use crate::{console, cpu, images, kernel_boot, protocols, runtime, time, variables};
+use crate::{
+    console, cpu, hypervisor_boot, images, kernel_boot, protocols, runtime, time, variables,
+};
 
 const REMOVABLE_MEDIA_PATH: &str = "\\EFI\\BOOT\\BOOTX64.EFI";
 /// What `Boot####`, `BootOrder`, `Timeout` and `OsIndications` are stored with (UEFI 2.9 3.3).
@@ -299,9 +301,15 @@ pub fn run(payload: Option<&Payload>) -> ! {
     if let Some(payload) = payload {
         // A kernel the machine was given is the whole boot: failing to start it must not turn
         // into a boot from some disk the caller did not ask for.
-        println!("Booting the supplied kernel");
-        let status = kernel_boot::run(payload);
-        println!("the supplied kernel returned with status {status:#x}");
+        if let Some(hypervisor) = &payload.hypervisor {
+            println!("Booting the supplied hypervisor with the kernel as dom0");
+            let status = hypervisor_boot::run(payload, hypervisor);
+            println!("the supplied hypervisor returned with status {status:#x}");
+        } else {
+            println!("Booting the supplied kernel");
+            let status = kernel_boot::run(payload);
+            println!("the supplied kernel returned with status {status:#x}");
+        }
         cpu::halt_forever()
     }
     let volumes = volumes();

@@ -240,6 +240,37 @@ pub fn run_firmware(
     run_config(cfg, settings, runtime, tty)
 }
 
+/// A hypervisor for `run_hypervisor`, as read from disk (gzipped or not).
+pub struct Hypervisor {
+    pub image: Vec<u8>,
+    /// `None` is the library's default (Xen's console on the 16550).
+    pub cmdline: Option<String>,
+}
+
+/// Like `run_uefi` with a kernel, but the firmware boots `hypervisor` with the kernel as its
+/// dom0. Without a `--console` the console is the 16550: Xen keeps it and passes dom0's console
+/// (`hvc0`) through it, while a virtio console would be a second `hvc` Xen never writes to.
+pub fn run_hypervisor(
+    kernel: Vec<u8>,
+    initramfs: Option<Vec<u8>>,
+    hypervisor: Hypervisor,
+    settings: &Settings,
+    runtime: &RuntimeArgs,
+) -> Result<ExitReason, String> {
+    let tty = std::io::stdin().is_terminal();
+    let mut settings = settings.clone();
+    if settings.consoles.is_empty() {
+        settings.consoles.push(ConsoleArg::Serial);
+    }
+    let mut cfg = build_config(kernel, initramfs, &settings, runtime)?
+        .uefi_firmware(crate::firmware::IMAGE)
+        .hypervisor(hypervisor.image);
+    if let Some(cmdline) = hypervisor.cmdline {
+        cfg = cfg.hypervisor_cmdline(cmdline);
+    }
+    run_config(cfg, &settings, runtime, tty)
+}
+
 /// Like `run`, through the built-in UEFI firmware. An empty `kernel` boots the machine's disks;
 /// otherwise the firmware boots that kernel (an EFI-stub bzImage) with `initramfs`. `nvram` keeps
 /// the firmware's variables in a file; `boot_entry` (loader path, load options) is written into

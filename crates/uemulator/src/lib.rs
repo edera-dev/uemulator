@@ -52,8 +52,8 @@ pub use display::{
 pub use kv::FileKeyValueStore;
 pub use kv::{KeyValueError, KeyValueStore, MemoryKeyValueStore};
 pub use machine::{
-    ClockMode, ConsoleKind, DisplayMode, EmulatedMachine, Error, ExitReason, JitMode,
-    MAX_MEMORY_MIB, MIN_MEMORY_MIB, MachineConfig, SmpMode, StopHandle,
+    ClockMode, ConsoleKind, DEFAULT_HYPERVISOR_CMDLINE, DisplayMode, EmulatedMachine, Error,
+    ExitReason, JitMode, MAX_MEMORY_MIB, MIN_MEMORY_MIB, MachineConfig, SmpMode, StopHandle,
 };
 pub use netdev::{NetHandle, NetOffloads};
 pub use platform::{DEFAULT_CMDLINE, DEFAULT_SERIAL_CMDLINE, Platform, load_linux};

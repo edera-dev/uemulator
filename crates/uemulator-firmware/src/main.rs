@@ -18,6 +18,7 @@ mod eltorito;
 mod fat;
 mod gpt;
 mod handoff;
+mod hypervisor;
 mod keymap;
 mod keys;
 mod load_option;
@@ -46,11 +47,15 @@ mod files;
 #[cfg(target_os = "none")]
 mod gop;
 #[cfg(target_os = "none")]
+mod hypervisor_boot;
+#[cfg(target_os = "none")]
 mod images;
 #[cfg(target_os = "none")]
 mod kernel_boot;
 #[cfg(target_os = "none")]
 mod kv;
+#[cfg(target_os = "none")]
+mod media;
 #[cfg(target_os = "none")]
 mod memory;
 #[cfg(target_os = "none")]
