@@ -288,6 +288,169 @@ mod tests {
         assert_eq!(exit, ExitReason::Shutdown);
     }
 
+    /// Runs `cfg` to its end (at most a minute) and returns why it ended and its console output.
+    fn run_capturing(cfg: MachineConfig) -> (ExitReason, Vec<u8>) {
+        let mut machine = EmulatedMachine::new(cfg).expect("config is valid");
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = output.clone();
+        machine
+            .console()
+            .on_output(move |bytes| sink.lock().unwrap().extend_from_slice(bytes));
+        let stop = machine.stop_handle();
+        let watchdog = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            stop.stop();
+        });
+        machine.start().expect("machine starts");
+        let exit = machine.wait();
+        drop(watchdog);
+        let output = output.lock().unwrap().clone();
+        (exit, output)
+    }
+
+    /// Written with `hack/asm.sh`. A Multiboot2 EFI amd64 entry point: checks the magic in eax,
+    /// then walks the boot information at rbx and writes the command line tag's string and each
+    /// module's string to the 16550, each followed by `|`, then halts with interrupts off.
+    const ECHO_MULTIBOOT2_STRINGS: [u8; 72] = [
+        0x3d, 0x89, 0x62, 0xd7, 0x36, 0x75, 0x3f, 0x48, 0x8d, 0x73, 0x08, 0x8b, 0x0e, 0x85, 0xc9,
+        0x74, 0x35, 0x48, 0x8d, 0x7e, 0x08, 0x83, 0xf9, 0x01, 0x74, 0x09, 0x48, 0x8d, 0x7e, 0x10,
+        0x83, 0xf9, 0x03, 0x75, 0x13, 0x66, 0xba, 0xf8, 0x03, 0x8a, 0x07, 0x84, 0xc0, 0x74, 0x06,
+        0xee, 0x48, 0xff, 0xc7, 0xeb, 0xf4, 0xb0, 0x7c, 0xee, 0x8b, 0x4e, 0x04, 0x48, 0x01, 0xce,
+        0x48, 0x83, 0xc6, 0x07, 0x48, 0x83, 0xe6, 0xf8, 0xeb, 0xc5, 0xfa, 0xf4,
+    ];
+    /// Where the test image is linked, as Xen is: 2 MiB, so the firmware has to relocate it.
+    const MULTIBOOT2_LINK_ADDRESS: u32 = 0x20_0000;
+    const MULTIBOOT2_HEADER_OFFSET: usize = 0x60;
+    const MULTIBOOT2_CODE_OFFSET: usize = 0x100;
+    const MULTIBOOT2_HEADER_MAGIC: u32 = 0xe852_50d6;
+
+    /// An ELF32 shaped like Xen's `xen`: one PT_LOAD at `MULTIBOOT2_LINK_ADDRESS` with a
+    /// Multiboot2 header asking for basic memory and the map, a relocatable placement (2 MiB
+    /// aligned, highest), boot services kept and the EFI amd64 entry at `code`.
+    fn multiboot2_hypervisor(code: &[u8]) -> Vec<u8> {
+        let entry = MULTIBOOT2_LINK_ADDRESS + MULTIBOOT2_CODE_OFFSET as u32;
+        let tags: [(u16, u16, Vec<u32>); 5] = [
+            (1, 0, vec![4, 6]),
+            (
+                10,
+                1,
+                vec![MULTIBOOT2_LINK_ADDRESS, 0xffff_ffff, 0x20_0000, 2],
+            ),
+            (7, 1, vec![]),
+            (9, 1, vec![entry]),
+            (0, 0, vec![]),
+        ];
+        let mut header = vec![0u8; 16];
+        for (kind, flags, words) in tags {
+            header.extend_from_slice(&kind.to_le_bytes());
+            header.extend_from_slice(&flags.to_le_bytes());
+            header.extend_from_slice(&(8 + 4 * words.len() as u32).to_le_bytes());
+            for word in words {
+                header.extend_from_slice(&word.to_le_bytes());
+            }
+            header.resize(header.len().next_multiple_of(8), 0);
+        }
+        let length = header.len() as u32;
+        put(&mut header, 0, &MULTIBOOT2_HEADER_MAGIC.to_le_bytes());
+        put(&mut header, 8, &length.to_le_bytes());
+        let checksum = 0u32
+            .wrapping_sub(MULTIBOOT2_HEADER_MAGIC)
+            .wrapping_sub(length);
+        put(&mut header, 12, &checksum.to_le_bytes());
+
+        let file_bytes = MULTIBOOT2_CODE_OFFSET + code.len();
+        let mut image = vec![0u8; file_bytes];
+        put(&mut image, 0, b"\x7fELF\x01\x01\x01");
+        put(&mut image, 0x10, &2u16.to_le_bytes());
+        put(&mut image, 0x12, &3u16.to_le_bytes());
+        put(&mut image, 0x18, &entry.to_le_bytes());
+        put(&mut image, 0x1c, &0x34u32.to_le_bytes());
+        put(&mut image, 0x2a, &32u16.to_le_bytes());
+        put(&mut image, 0x2c, &1u16.to_le_bytes());
+        let segment = [
+            1,
+            0,
+            MULTIBOOT2_LINK_ADDRESS,
+            MULTIBOOT2_LINK_ADDRESS,
+            file_bytes as u32,
+            0x1_0000,
+            7,
+            0x20_0000,
+        ];
+        for (index, word) in segment.iter().enumerate() {
+            put(&mut image, 0x34 + index * 4, &word.to_le_bytes());
+        }
+        put(&mut image, MULTIBOOT2_HEADER_OFFSET, &header);
+        put(&mut image, MULTIBOOT2_CODE_OFFSET, code);
+        image
+    }
+
+    #[test]
+    fn the_firmware_enters_a_multiboot2_hypervisor_with_the_kernel_as_a_module() {
+        let (exit, output) = run_capturing(
+            MachineConfig::new()
+                .uefi_firmware(IMAGE)
+                .hypervisor(multiboot2_hypervisor(&ECHO_MULTIBOOT2_STRINGS))
+                .hypervisor_cmdline("console=com1 hv-test")
+                // dom0 needs no EFI stub: the hypervisor loads it.
+                .kernel(vec![0x4b; 0x3000])
+                .initrd(vec![0x49; 0x1000])
+                .cmdline("console=hvc0 dom0-test")
+                .memory_mib(64)
+                .reboot(false),
+        );
+        let output = String::from_utf8_lossy(&output);
+        // Xen drops the first word of each unless the loader is GRUB 2, so the firmware puts
+        // the file names there, as GRUB 1 did.
+        assert!(
+            output
+                .contains("xen.gz console=com1 hv-test|vmlinuz console=hvc0 dom0-test|initramfs|"),
+            "boot information strings not echoed: {output:?}"
+        );
+        assert_eq!(exit, ExitReason::Shutdown);
+    }
+
+    /// Written with `hack/asm.sh`. An EFI application that finds the `LoadFile2` under
+    /// `XEN_EFI_RAMDISK_MEDIA_GUID`'s device path with `LocateDevicePath` and echoes the low two
+    /// bytes of the size it reports, then halts with interrupts off.
+    const ECHO_XEN_RAMDISK_SIZE: [u8; 169] = [
+        0x48, 0x83, 0xec, 0x48, 0x48, 0x8b, 0x5a, 0x60, 0x48, 0x8d, 0x05, 0x82, 0x00, 0x00, 0x00,
+        0x48, 0x89, 0x44, 0x24, 0x30, 0x48, 0x8d, 0x0d, 0x66, 0x00, 0x00, 0x00, 0x48, 0x8d, 0x54,
+        0x24, 0x30, 0x4c, 0x8d, 0x44, 0x24, 0x38, 0xff, 0x93, 0xb8, 0x00, 0x00, 0x00, 0x48, 0x85,
+        0xc0, 0x75, 0x4f, 0x48, 0x8b, 0x4c, 0x24, 0x38, 0x48, 0x8d, 0x15, 0x45, 0x00, 0x00, 0x00,
+        0x4c, 0x8d, 0x44, 0x24, 0x20, 0xff, 0x93, 0x98, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x4c, 0x24,
+        0x20, 0x48, 0x8b, 0x54, 0x24, 0x30, 0x45, 0x31, 0xc0, 0x4c, 0x8d, 0x4c, 0x24, 0x28, 0x48,
+        0xc7, 0x44, 0x24, 0x28, 0x00, 0x00, 0x00, 0x00, 0x48, 0xc7, 0x44, 0x24, 0x20, 0x00, 0x00,
+        0x00, 0x00, 0x48, 0x8b, 0x01, 0xff, 0xd0, 0x48, 0x8b, 0x44, 0x24, 0x28, 0x66, 0xba, 0xf8,
+        0x03, 0xee, 0x48, 0xc1, 0xe8, 0x08, 0xee, 0xfa, 0xf4, 0xc1, 0xc0, 0x06, 0x40, 0xb3, 0xfc,
+        0x3e, 0x40, 0x99, 0x6d, 0x4a, 0x6c, 0x87, 0x24, 0xe0, 0x6d, 0x04, 0x03, 0x14, 0x00, 0x01,
+        0xfd, 0xb1, 0x5d, 0xcb, 0xc3, 0x12, 0x48, 0xb2, 0xba, 0x87, 0x91, 0xe5, 0x2d, 0x4a, 0x89,
+        0x7f, 0xff, 0x04, 0x00,
+    ];
+
+    #[test]
+    fn xen_efi_finds_each_payload_under_its_own_media_loader() {
+        // Three loaders are published (configuration, kernel, ramdisk) with different sizes; the
+        // one under the ramdisk's device path must answer with the ramdisk's.
+        const RAMDISK_BYTES: usize = 0x2345;
+        let (exit, output) = run_capturing(
+            MachineConfig::new()
+                .uefi_firmware(IMAGE)
+                .hypervisor(efi_application(&ECHO_XEN_RAMDISK_SIZE))
+                .kernel(vec![0x4b; 0x3000])
+                .initrd(vec![0x49; RAMDISK_BYTES])
+                .memory_mib(64)
+                .reboot(false),
+        );
+        let expected = (RAMDISK_BYTES as u16).to_le_bytes();
+        assert!(
+            output.windows(2).any(|window| window == expected),
+            "ramdisk size not echoed: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+        assert_eq!(exit, ExitReason::Shutdown);
+    }
+
     #[test]
     fn the_boot_menu_request_keeps_the_other_indications() {
         let mut store = MemoryKeyValueStore::new();

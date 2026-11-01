@@ -6,9 +6,10 @@
 #   hack/web.sh          build only
 #   hack/web.sh serve    build, then serve
 #
-# WEB_DEMO=1 also builds the demo machine (hack/web/demo.py: Alpine's kernel and minirootfs, pinned
-# and downloaded once into target/web-demo-cache) into demo/, which puts the page in demo mode: one
-# button that boots it. The Pages workflow sets it.
+# WEB_DEMO=1 also builds the demo machines (hack/web/demo.py: Alpine's kernel and minirootfs, and
+# Edera's Xen from the image hack/web/demo-xen.ref pins, downloaded once into
+# target/web-demo-cache) into demo/, which puts the page in demo mode: buttons that boot Alpine,
+# and Xen with Alpine as dom0. The Pages workflow sets it.
 #
 # Kernel and initramfs: pick files on the page, or run `uemulator quick create alpine --install alpine`
 # once; that machine's netboot files are linked under assets/ and prefilled (UEMULATOR_MACHINE names

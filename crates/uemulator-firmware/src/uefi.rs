@@ -208,6 +208,26 @@ pub mod guids {
         0x4f3d,
         [0xac, 0x74, 0xca, 0x55, 0x52, 0x31, 0xcc, 0x68],
     );
+    /// Xen's EFI loader looks for its configuration file, dom0 kernel and ramdisk under these
+    /// vendor-media nodes before it looks on disk (Edera's Xen, xen/common/efi/boot.c).
+    pub const XEN_EFI_CONFIG_MEDIA: Guid = Guid::new(
+        0xbf61f458,
+        0xa28e,
+        0x46cd,
+        [0x93, 0xd7, 0x07, 0xda, 0xc5, 0xe8, 0xcd, 0x66],
+    );
+    pub const XEN_EFI_KERNEL_MEDIA: Guid = Guid::new(
+        0x4010c8bf,
+        0x6ced,
+        0x40f5,
+        [0xa5, 0x3f, 0xe8, 0x20, 0xae, 0xe8, 0xf3, 0x4b],
+    );
+    pub const XEN_EFI_RAMDISK_MEDIA: Guid = Guid::new(
+        0x5db1fd01,
+        0xc3cb,
+        0x4812,
+        [0xb2, 0xba, 0x87, 0x91, 0xe5, 0x2d, 0x4a, 0x89],
+    );
     pub const LOAD_FILE2: Guid = Guid::new(
         0x4006c0c1,
         0xfcb3,

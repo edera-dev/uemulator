@@ -3261,6 +3261,94 @@ mod uefi_kernel {
         assert!(EmulatedMachine::new(config).is_err());
     }
 
+    // Writes the kernel command line from the handoff page to the 16550, then the low byte of
+    // the hypervisor's size, then resets: mov rsi, [rdi + 0x328]; mov rcx, [rdi + 0x330];
+    // mov dx, 0x3f8; rep outsb; mov al, [rdi + 0x360]; out dx, al; mov dx, 0xcf9; mov al, 6;
+    // out dx, al; hlt
+    const REPORT_CMDLINE_AND_HYPERVISOR_SIZE_THEN_RESET: [u8; 35] = [
+        0x48, 0x8b, 0xb7, 0x28, 0x03, 0x00, 0x00, 0x48, 0x8b, 0x8f, 0x30, 0x03, 0x00, 0x00, 0x66,
+        0xba, 0xf8, 0x03, 0xf3, 0x6e, 0x8a, 0x87, 0x60, 0x03, 0x00, 0x00, 0xee, 0x66, 0xba, 0xf9,
+        0x0c, 0xb0, 0x06, 0xee, 0xf4,
+    ];
+
+    /// `data` in a gzip file of stored blocks, which is all a test needs to exercise the
+    /// decompression path.
+    fn gzip_stored(data: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff];
+        let chunks: Vec<&[u8]> = data.chunks(u16::MAX as usize).collect();
+        for (index, chunk) in chunks.iter().enumerate() {
+            out.push((index + 1 == chunks.len()) as u8);
+            let length = chunk.len() as u16;
+            out.extend_from_slice(&length.to_le_bytes());
+            out.extend_from_slice(&(!length).to_le_bytes());
+            out.extend_from_slice(chunk);
+        }
+        out.extend_from_slice(&crate::kv::crc32(data).to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn a_hypervisor_takes_a_dom0_kernel_without_an_efi_stub_and_needs_the_firmware() {
+        let hypervisor = crate::boot::hypervisor::tests::multiboot2_image(0x98);
+        let base = || {
+            MachineConfig::new()
+                .kernel(FakeKernel::new(&HELLO_RESET).build())
+                .hypervisor(hypervisor.clone())
+                .memory_mib(64)
+        };
+        let firmware = firmware_image(&REPORT_KERNEL_SIZE_THEN_RESET);
+        assert!(EmulatedMachine::new(base().uefi_firmware(firmware.clone())).is_ok());
+        let error = EmulatedMachine::new(base()).err().expect("no firmware");
+        assert!(error.to_string().contains("uefi_firmware"), "{error}");
+        let no_kernel = MachineConfig::new()
+            .uefi_firmware(firmware.clone())
+            .hypervisor(hypervisor.clone())
+            .memory_mib(64);
+        let error = EmulatedMachine::new(no_kernel).err().expect("no kernel");
+        assert!(error.to_string().contains("dom0"), "{error}");
+        let not_xen = base().uefi_firmware(firmware).hypervisor(vec![0u8; 64]);
+        assert!(EmulatedMachine::new(not_xen).is_err());
+    }
+
+    #[test]
+    fn a_gzipped_hypervisor_is_placed_decompressed_with_xens_dom0_defaults_and_again_after_a_reset()
+    {
+        let hypervisor = crate::boot::hypervisor::tests::multiboot2_image(0x98);
+        let decompressed_low_byte = hypervisor.len() as u8;
+        let gzipped = gzip_stored(&hypervisor);
+        assert_ne!(gzipped.len() as u8, decompressed_low_byte);
+        let run = run_machine(
+            FakeKernel::new(&HELLO_RESET).build(),
+            JitMode::Off,
+            Duration::from_millis(500),
+            |config| {
+                config
+                    .uefi_firmware(firmware_image(
+                        &REPORT_CMDLINE_AND_HYPERVISOR_SIZE_THEN_RESET,
+                    ))
+                    .hypervisor(gzipped)
+                    .reboot(true)
+            },
+        );
+        // dom0's console is Xen's hvc0, and the 16550 is Xen's, so early output goes through Xen.
+        let report = [
+            b"console=hvc0 earlyprintk=xen panic=-1".as_slice(),
+            &[decompressed_low_byte],
+        ]
+        .concat();
+        let reports = run
+            .console_output
+            .windows(report.len())
+            .filter(|window| *window == report)
+            .count();
+        assert!(
+            reports >= 2,
+            "reported {reports} times: {:?}",
+            String::from_utf8_lossy(&run.console_output)
+        );
+    }
+
     #[test]
     fn a_guest_reset_places_the_payload_again() {
         let run = run_machine(

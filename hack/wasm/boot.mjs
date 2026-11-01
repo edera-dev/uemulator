@@ -4,6 +4,7 @@
 //
 //   node hack/wasm/boot.mjs [--kernel K] [--initrd I] [--disk D]... [--cdrom ISO]... [--cmdline S] [--memory MiB]
 //                           [--firmware none|uefi|bios] [--cpus N] [--iommu] [--no-acpi] [--serial]
+//                           [--hypervisor XEN [--hypervisor-cmdline S]]
 //                           [--no-jit] [--debug] [--wasm FILE] [--until TEXT] [--seconds N]
 //
 // --disk is a raw or udisk image (a file, or an http(s) URL served with range requests) attached
@@ -15,7 +16,9 @@
 // disk when there is no kernel. --debug turns on the library's debug mode: on exit the state dump,
 // with the JIT's counters and the instructions that went through the interpreter, goes to stderr
 // (it costs time; do not measure with it). --wasm boots another build of the module, for comparing
-// two builds (with --firmware uefi the firmware image is looked for next to it).
+// two builds (with --firmware uefi the firmware image is looked for next to it). --hypervisor
+// boots Xen (xen.gz, xen or xen.efi) through the UEFI firmware with the kernel as its dom0, as the
+// page does; --cmdline is then dom0's and --hypervisor-cmdline Xen's (empty: the library's default).
 //
 // Stops when TEXT shows up on the console or after N seconds, and prints the wall time and what the
 // JIT host did to stderr.
@@ -38,6 +41,8 @@ const { values } = parseArgs({
     iommu: { type: "boolean", default: false },
     "no-acpi": { type: "boolean", default: false },
     serial: { type: "boolean", default: false },
+    hypervisor: { type: "string" },
+    "hypervisor-cmdline": { type: "string", default: "" },
     wasm: { type: "string", default: new URL("../../target/web/uemulator_web.wasm", import.meta.url).pathname },
     "no-jit": { type: "boolean", default: false },
     debug: { type: "boolean", default: false },
@@ -163,6 +168,11 @@ const firmwareImage = firmwareKind === FIRMWARE.UEFI
 if (wasm.uw_set_firmware(firmwareKind, upload(firmwareImage), firmwareImage.length)) {
   console.error("firmware:", decoder.decode(bytes(wasm.uw_error_ptr(), wasm.uw_error_len())));
   process.exit(2);
+}
+if (values.hypervisor) {
+  const hypervisor = readFileSync(values.hypervisor);
+  const hypervisorCmdline = new TextEncoder().encode(values["hypervisor-cmdline"]);
+  wasm.uw_set_hypervisor(upload(hypervisor), hypervisor.length, upload(hypervisorCmdline), hypervisorCmdline.length);
 }
 const options =
   (values["no-jit"] ? 0 : OPTION.JIT) | (values["no-acpi"] ? 0 : OPTION.ACPI) |

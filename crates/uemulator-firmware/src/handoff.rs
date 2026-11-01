@@ -3,10 +3,10 @@
 
 use alloc::vec::Vec;
 
-pub const SIZE: usize = 0x358;
+pub const SIZE: usize = 0x378;
 const MAGIC: &[u8; 8] = b"UEMUHAND";
-/// Version 2 added the framebuffer fields.
-const VERSION: u32 = 2;
+/// Version 2 added the framebuffer fields, version 3 the hypervisor.
+const VERSION: u32 = 3;
 
 const VERSION_OFFSET: usize = 0x08;
 const FIRMWARE_BASE: usize = 0x10;
@@ -42,6 +42,10 @@ const FRAMEBUFFER_SIZE: usize = 0x340;
 const FRAMEBUFFER_WIDTH: usize = 0x348;
 const FRAMEBUFFER_HEIGHT: usize = 0x34c;
 const FRAMEBUFFER_PIXELS_PER_LINE: usize = 0x350;
+const HYPERVISOR_BASE: usize = 0x358;
+const HYPERVISOR_SIZE: usize = 0x360;
+const HYPERVISOR_CMDLINE_BASE: usize = 0x368;
+const HYPERVISOR_CMDLINE_SIZE: usize = 0x370;
 /// Every pixel is four bytes, blue, green, red, unused.
 pub const FRAMEBUFFER_BYTES_PER_PIXEL: u64 = 4;
 
@@ -56,11 +60,20 @@ pub struct RamRegion {
 }
 
 /// A kernel the library put in RAM for the firmware to boot, as (base, size) byte ranges. The
-/// command line is UTF-8 without a NUL.
+/// command lines are UTF-8 without a NUL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Payload {
     pub kernel: (u64, u64),
     pub initrd: Option<(u64, u64)>,
+    pub cmdline: (u64, u64),
+    /// A hypervisor to boot with the kernel as its dom0.
+    pub hypervisor: Option<Hypervisor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hypervisor {
+    /// `xen.efi`, or Xen's Multiboot2 ELF (the library decompressed `xen.gz`).
+    pub image: (u64, u64),
     pub cmdline: (u64, u64),
 }
 
@@ -134,6 +147,10 @@ impl Handoff {
             kernel: range(KERNEL_BASE, KERNEL_SIZE),
             initrd: (u64_at(INITRD_SIZE) != 0).then(|| range(INITRD_BASE, INITRD_SIZE)),
             cmdline: range(CMDLINE_BASE, CMDLINE_SIZE),
+            hypervisor: (u64_at(HYPERVISOR_SIZE) != 0).then(|| Hypervisor {
+                image: range(HYPERVISOR_BASE, HYPERVISOR_SIZE),
+                cmdline: range(HYPERVISOR_CMDLINE_BASE, HYPERVISOR_CMDLINE_SIZE),
+            }),
         });
         let framebuffer = Framebuffer {
             base: u64_at(FRAMEBUFFER_BASE),
@@ -244,6 +261,22 @@ mod tests {
                 kernel: (0x400_0000, 0x1000),
                 initrd: Some((0x500_0000, 0x2000)),
                 cmdline: (0x3ff_0000, 12),
+                hypervisor: None,
+            })
+        );
+        put(&mut with_kernel, HYPERVISOR_BASE, 0x380_0000);
+        put(&mut with_kernel, HYPERVISOR_SIZE, 0x40_0000);
+        put(&mut with_kernel, HYPERVISOR_CMDLINE_BASE, 0x37f_f000);
+        put(&mut with_kernel, HYPERVISOR_CMDLINE_SIZE, 30);
+        assert_eq!(
+            Handoff::parse(&with_kernel)
+                .unwrap()
+                .payload
+                .unwrap()
+                .hypervisor,
+            Some(Hypervisor {
+                image: (0x380_0000, 0x40_0000),
+                cmdline: (0x37f_f000, 30),
             })
         );
         put(&mut with_kernel, INITRD_SIZE, 0);

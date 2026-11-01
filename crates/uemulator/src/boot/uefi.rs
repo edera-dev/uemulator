@@ -28,9 +28,9 @@ const IMAGE_FOOTPRINT_OFFSET: usize = 16;
 const MAX_FOOTPRINT: u64 = 64 << 20;
 
 const HANDOFF_MAGIC: &[u8; 8] = b"UEMUHAND";
-/// Version 2 added the framebuffer fields at 0x338.
-const HANDOFF_VERSION: u32 = 2;
-pub(crate) const HANDOFF_SIZE: usize = 0x358;
+/// Version 2 added the framebuffer fields at 0x338, version 3 the hypervisor at 0x358.
+const HANDOFF_VERSION: u32 = 3;
+pub(crate) const HANDOFF_SIZE: usize = 0x378;
 
 const HANDOFF_VERSION_OFFSET: usize = 0x08;
 const HANDOFF_SIZE_OFFSET: usize = 0x0c;
@@ -72,6 +72,12 @@ const HANDOFF_FRAMEBUFFER_SIZE: usize = 0x340;
 const HANDOFF_FRAMEBUFFER_WIDTH: usize = 0x348;
 const HANDOFF_FRAMEBUFFER_HEIGHT: usize = 0x34c;
 const HANDOFF_FRAMEBUFFER_PIXELS_PER_LINE: usize = 0x350;
+/// A hypervisor the firmware boots with the kernel as its dom0, and the hypervisor's own command
+/// line. Size 0: no hypervisor.
+const HANDOFF_HYPERVISOR_BASE: usize = 0x358;
+const HANDOFF_HYPERVISOR_SIZE: usize = 0x360;
+const HANDOFF_HYPERVISOR_CMDLINE_BASE: usize = 0x368;
+const HANDOFF_HYPERVISOR_CMDLINE_SIZE: usize = 0x370;
 /// The framebuffer starts on a 2 MiB boundary so that the guest can map it with large pages
 /// (Linux's `ioremap` of a firmware framebuffer, an OS's direct map) without splitting one
 /// around RAM it does own.
@@ -158,11 +164,15 @@ fn reserve(regions: Vec<(u64, u64, u32)>, base: u64, size: u64) -> Vec<(u64, u64
 }
 
 /// What the firmware boots instead of looking at the disks: placed at the top of the RAM below
-/// the PCI hole, with the initramfs highest, then the kernel, then the command line.
+/// the PCI hole, with the initramfs highest, then the kernel, then the command line, then the
+/// hypervisor and its command line.
 pub(crate) struct UefiPayload<'a> {
     pub kernel: &'a [u8],
     pub initrd: Option<&'a [u8]>,
     pub cmdline: &'a str,
+    /// The hypervisor image (decompressed: the firmware cannot inflate) and its command line.
+    /// The kernel is then the hypervisor's dom0 and needs no EFI stub.
+    pub hypervisor: Option<(&'a [u8], &'a str)>,
 }
 
 struct Handoff(Vec<u8>);
@@ -209,6 +219,9 @@ struct PlacedPayload {
     /// Size 0 when there is no initramfs.
     initrd: (u64, u64),
     cmdline: (u64, u64),
+    /// Size 0 when there is no hypervisor.
+    hypervisor: (u64, u64),
+    hypervisor_cmdline: (u64, u64),
 }
 
 /// Copies the payload into the top of the low RAM, above `floor` (the end of the firmware's footprint).
@@ -241,13 +254,22 @@ fn place_payload(
     };
     let kernel = place(payload.kernel)?;
     let cmdline = place(payload.cmdline.as_bytes())?;
-    if top.saturating_sub(floor) < initrd.1 + PAYLOAD_HEADROOM_BYTES {
+    let (hypervisor, hypervisor_cmdline) = match payload.hypervisor {
+        Some((image, text)) => (place(image)?, place(text.as_bytes())?),
+        None => ((0, 0), (0, 0)),
+    };
+    // A hypervisor adds its own loaded copy, and xen.efi reads the kernel and the initramfs
+    // into buffers of its own through its media loaders (the initramfs copy is counted already).
+    let copies = initrd.1 + hypervisor.1 + if hypervisor.1 != 0 { kernel.1 } else { 0 };
+    if top.saturating_sub(floor) < copies + PAYLOAD_HEADROOM_BYTES {
         return Err(too_big());
     }
     Ok(PlacedPayload {
         kernel,
         initrd,
         cmdline,
+        hypervisor,
+        hypervisor_cmdline,
     })
 }
 
@@ -360,6 +382,16 @@ pub(crate) fn load_uefi_firmware(
             (HANDOFF_KERNEL_BASE, HANDOFF_KERNEL_SIZE, placed.kernel),
             (HANDOFF_INITRD_BASE, HANDOFF_INITRD_SIZE, placed.initrd),
             (HANDOFF_CMDLINE_BASE, HANDOFF_CMDLINE_SIZE, placed.cmdline),
+            (
+                HANDOFF_HYPERVISOR_BASE,
+                HANDOFF_HYPERVISOR_SIZE,
+                placed.hypervisor,
+            ),
+            (
+                HANDOFF_HYPERVISOR_CMDLINE_BASE,
+                HANDOFF_HYPERVISOR_CMDLINE_SIZE,
+                placed.hypervisor_cmdline,
+            ),
         ] {
             handoff.put_u64(base_at, base);
             handoff.put_u64(size_at, size);
@@ -454,6 +486,7 @@ mod tests {
             kernel,
             initrd,
             cmdline,
+            hypervisor: None,
         };
         load_uefi_firmware(
             &mut ram,
@@ -499,6 +532,39 @@ mod tests {
             initrd_range.0 > kernel_range.0,
             "the initramfs sits at the very top"
         );
+    }
+
+    #[test]
+    fn a_hypervisor_and_its_command_line_are_placed_below_the_kernel() {
+        let kernel = vec![0x4b; 5000];
+        let hypervisor = vec![0x58; 7000];
+        let mut ram = vec![0u8; RAM_BYTES];
+        let payload = UefiPayload {
+            kernel: &kernel,
+            initrd: None,
+            cmdline: "console=hvc0",
+            hypervisor: Some((&hypervisor, "console=com1")),
+        };
+        load_uefi_firmware(
+            &mut ram,
+            &image(ENTRY, 0x2000),
+            &params(),
+            None,
+            Some(&payload),
+        )
+        .unwrap();
+        let bytes = |(base, size): (u64, u64)| ram[base as usize..(base + size) as usize].to_vec();
+        let hypervisor_range = range_at(&ram, HANDOFF_HYPERVISOR_BASE);
+        assert_eq!(bytes(hypervisor_range), hypervisor);
+        assert_eq!(
+            bytes(range_at(&ram, HANDOFF_HYPERVISOR_CMDLINE_BASE)),
+            b"console=com1"
+        );
+        assert!(hypervisor_range.0 < range_at(&ram, HANDOFF_KERNEL_BASE).0);
+        assert_eq!(hypervisor_range.0 % PAYLOAD_ALIGNMENT, 0);
+        // Without one the fields stay zero, which is how the firmware tells.
+        let ram = load_payload(&kernel, None, "x", RAM_BYTES).unwrap();
+        assert_eq!(range_at(&ram, HANDOFF_HYPERVISOR_BASE), (0, 0));
     }
 
     /// (base, size, e820 type) of every RAM region the handoff lists.
@@ -579,6 +645,7 @@ mod tests {
             kernel: &[0x4b; 5000],
             initrd: Some(&initrd),
             cmdline: "x",
+            hypervisor: None,
         };
         let parameters = with_framebuffer();
         load_uefi_firmware(

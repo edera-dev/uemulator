@@ -221,7 +221,6 @@
             <button type="button" data-preset="iso" title="UEFI, 2 GiB, a screen: for installer and live ISOs">Live CD / installer ISO</button>
             <button type="button" data-preset="disk" title="UEFI booting an installed disk image">Disk image</button>
             <button type="button" data-preset="kernel" title="A kernel and initramfs entered directly, to a shell">Linux kernel</button>
-            <button type="button" data-preset="demo" hidden>Alpine demo</button>
           </div>
           <p class="hint" id="preset-hint">Presets set the options below; nothing is downloaded until you press Start.</p>
         </section>
@@ -247,6 +246,9 @@
           <h3>Linux kernel <span class="count" id="kernel-optional">optional</span></h3>
           <div class="source" id="kernel-source" data-name="kernel"></div>
           <div class="source" id="initrd-source" data-name="initrd"></div>
+          <div class="source" id="hypervisor-source" data-name="hypervisor"></div>
+          <label class="field" id="hypervisor-cmdline-group" style="margin-top:8px" hidden>Hypervisor arguments
+            <input id="hypervisor-cmdline" type="text" spellcheck="false" class="mono"></label>
           <p class="hint" id="kernel-hint"></p>
           <div class="stack" id="cmdline-group">
             <label class="switch"><strong>Boot to a shell</strong><span>Adds <code>rdinit=/bin/sh</code>: the initramfs's busybox shell instead of its init.</span><input id="shell" type="checkbox" checked></label>
@@ -330,9 +332,7 @@
       <div class="welcome-inner">
         <h1>Run a PC in this tab</h1>
         <p>Boot an installer or live CD, a disk image or a Linux kernel on an emulated x86_64 machine. Nothing leaves your browser.</p>
-        <div class="welcome-actions">
-          <button id="demo-boot" class="primary big" hidden></button>
-        </div>
+        <div class="welcome-actions" id="demo-actions" hidden></div>
         <div class="drop">
           <svg class="i"><use href="#i-upload"/></svg>
           <span>Drop an ISO, a disk image or a kernel here</span>

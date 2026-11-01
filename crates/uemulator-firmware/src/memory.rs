@@ -118,7 +118,14 @@ pub fn init(handoff: &Handoff) {
     // The kernel, initramfs and command line the library left in RAM stay allocated until the
     // OS reclaims them as boot services data.
     if let Some(payload) = &handoff.payload {
-        let ranges = [Some(payload.kernel), payload.initrd, Some(payload.cmdline)];
+        let hypervisor = payload.hypervisor.as_ref();
+        let ranges = [
+            Some(payload.kernel),
+            payload.initrd,
+            Some(payload.cmdline),
+            hypervisor.map(|hypervisor| hypervisor.image),
+            hypervisor.map(|hypervisor| hypervisor.cmdline),
+        ];
         for (base, size) in ranges.into_iter().flatten().filter(|range| range.1 != 0) {
             mark(base, size, BOOT_SERVICES_DATA, WRITE_BACK);
         }
@@ -141,6 +148,39 @@ pub fn allocate_aligned(kind: u32, pages: u64, alignment: u64) -> Option<u64> {
     MAP.get()
         .allocate_any(pages, u64::MAX, alignment, kind)
         .ok()
+}
+
+/// `pages` aligned to `alignment` at the highest address that lies at or above `min_address` and
+/// ends at or below `max_address` (inclusive), the way a relocatable Multiboot2 image prefers to
+/// be placed.
+pub fn allocate_highest_in(
+    kind: u32,
+    pages: u64,
+    min_address: u64,
+    max_address: u64,
+    alignment: u64,
+) -> Option<u64> {
+    let map = MAP.get();
+    let address = map.allocate_any(pages, max_address, alignment, kind).ok()?;
+    if address < min_address {
+        map.free(address, pages).ok();
+        return None;
+    }
+    Some(address)
+}
+
+/// `pages` at exactly `address`.
+pub fn allocate_at(kind: u32, address: u64, pages: u64) -> bool {
+    MAP.get().allocate_at(address, pages, kind).is_ok()
+}
+
+/// (base, bytes, EFI memory type) of every range in the map, by address.
+pub fn snapshot() -> alloc::vec::Vec<(u64, u64, u32)> {
+    MAP.get()
+        .regions()
+        .iter()
+        .map(|region| (region.start, region.pages * PAGE_SIZE, region.kind))
+        .collect()
 }
 
 /// A zeroed, page-aligned block for a device's rings and the like. Freed with `free_pages`.

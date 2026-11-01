@@ -40,8 +40,9 @@ jobs:
       run: rustup target add wasm32-unknown-unknown x86_64-unknown-none
 
     - name: build the web UI
-      # With the demo machine (hack/web/demo.py), so the published page opens on a button that
-      # boots Alpine.
+      # With the demo machines (hack/web/demo.py), so the published page opens on buttons that
+      # boot Alpine and Edera's Xen with Alpine as dom0. Xen comes from ghcr.io, pinned by the
+      # manifest digest in hack/web/demo-xen.ref and checked against it.
       env:
         WEB_DEMO: 1
       run: ./hack/web.sh

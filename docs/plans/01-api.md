@@ -11,6 +11,8 @@ impl MachineConfig {
     pub fn kernel(self, bzimage: impl Into<Vec<u8>>) -> Self;
     pub fn initrd(self, data: impl Into<Vec<u8>>) -> Self;
     pub fn cmdline(self, s: impl Into<String>) -> Self;
+    pub fn hypervisor(self, image: impl Into<Vec<u8>>) -> Self;  // Xen (xen.gz, xen or xen.efi), booted by uefi_firmware with the kernel as dom0 (docs/plans/18-xen-dom0.md)
+    pub fn hypervisor_cmdline(self, s: impl Into<String>) -> Self; // default DEFAULT_HYPERVISOR_CMDLINE
     pub fn memory_mib(self, n: usize) -> Self;      // default 512
     pub fn jit(self, mode: JitMode) -> Self;        // Auto (default) | Off | On
     pub fn clock(self, mode: ClockMode) -> Self;    // Virtual (default) | Realtime
