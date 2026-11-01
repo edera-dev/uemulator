@@ -670,15 +670,49 @@ fn update_cursor_hands_the_frontend_the_resource_image_with_alpha_and_hotspot() 
 }
 
 #[test]
-fn a_cursor_without_alpha_is_opaque_and_red_blue_formats_are_swapped() {
+fn a_cursor_in_an_x_format_takes_its_alpha_from_the_fourth_byte() {
+    // Linux creates every dumb buffer, the cursor's included, as XRGB8888 (B8G8R8X8) and puts
+    // ARGB pixels in it; QEMU copies the words as ARGB whatever the format says. Forcing the
+    // fourth byte to opaque turned the transparent pixels around the arrow into a black square.
     let mut rig = Rig::new();
-    rig.paint(0, 0, [0x30, 0x20, 0x10, 0x00]);
+    rig.paint(0, 0, [0, 0, 0, 0]);
+    rig.paint(1, 0, [0xff, 0xff, 0xff, 0xff]);
+    rig.show(FORMAT_B8G8R8X8);
+    rig.cursor(CMD_UPDATE_CURSOR, RESOURCE, 0, 0);
+    let Cursor::Image(image) = rig.display.cursor().1 else {
+        panic!("expected an image");
+    };
+    assert_eq!(image.pixels[..4], [0, 0, 0, 0], "transparent, not black");
+    assert_eq!(image.pixels[4..8], [0xff, 0xff, 0xff, 0xff]);
+}
+
+#[test]
+fn red_blue_cursor_formats_are_swapped_and_keep_their_alpha_byte() {
+    let mut rig = Rig::new();
+    rig.paint(0, 0, [0x30, 0x20, 0x10, 0x40]);
     rig.show(FORMAT_R8G8B8X8);
     rig.cursor(CMD_UPDATE_CURSOR, RESOURCE, 0, 0);
     let Cursor::Image(image) = rig.display.cursor().1 else {
         panic!("expected an image");
     };
-    assert_eq!(image.pixels[..4], [0x10, 0x20, 0x30, 0xff]);
+    assert_eq!(image.pixels[..4], [0x10, 0x20, 0x30, 0x40]);
+}
+
+#[test]
+fn every_cursor_format_finds_alpha_in_the_byte_its_colours_leave() {
+    for (format, alpha) in [
+        (FORMAT_B8G8R8A8, 3),
+        (FORMAT_B8G8R8X8, 3),
+        (FORMAT_A8R8G8B8, 0),
+        (FORMAT_X8R8G8B8, 0),
+        (FORMAT_R8G8B8A8, 3),
+        (FORMAT_R8G8B8X8, 3),
+        (FORMAT_A8B8G8R8, 0),
+        (FORMAT_X8B8G8R8, 0),
+    ] {
+        assert_eq!(cursor_alpha_offset(format), Some(alpha), "format {format}");
+    }
+    assert_eq!(cursor_alpha_offset(0), None);
 }
 
 #[test]
