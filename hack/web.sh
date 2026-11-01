@@ -1,6 +1,7 @@
 #!/bin/sh
 # Builds the WebAssembly port into target/web and, with `serve`, serves it on http://127.0.0.1:8080/
-# (PORT overrides). Needs `rustup target add wasm32-unknown-unknown`.
+# (PORT overrides). Needs `rustup target add wasm32-unknown-unknown x86_64-unknown-none` (the second
+# builds the UEFI firmware, which the page fetches as uemulator-firmware.bin when it boots through it).
 #
 #   hack/web.sh          build only
 #   hack/web.sh serve    build, then serve
@@ -17,11 +18,15 @@ cd "$(dirname "${0}")/.." || exit 1
 
 out=target/web
 cargo build --release -p uemulator-web --target wasm32-unknown-unknown
+# Its own target dir, as in crates/uemulator-cli/build.rs: the firmware's build.rs links a flat
+# image only for this target, and the binary is that image.
+cargo build --release -p uemulator-firmware --target x86_64-unknown-none --target-dir target/firmware
 
 rm -rf "$out"
 mkdir -p "$out"
 cp crates/uemulator-web/www/* "$out/"
 cp target/wasm32-unknown-unknown/release/uemulator_web.wasm "$out/"
+cp target/firmware/x86_64-unknown-none/release/uemulator-firmware "$out/uemulator-firmware.bin"
 
 cache="${UEMULATOR_HOME:-$HOME/.uemulator}/machines/${UEMULATOR_MACHINE:-alpine}/artifacts"
 if [ -f "$cache/vmlinuz-virt" ] && [ -f "$cache/initramfs-virt" ]; then

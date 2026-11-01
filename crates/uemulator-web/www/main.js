@@ -1,4 +1,4 @@
-import { CONTROL_BYTES, CTRL, EXIT_NAMES, RING_BYTES, RING_OFFSET } from "./protocol.js";
+import { CONTROL_BYTES, CTRL, EXIT_NAMES, FIRMWARE, OPTION, RING_BYTES, RING_OFFSET, UEFI_FIRMWARE_MAGIC } from "./protocol.js";
 
 const $ = (id) => document.getElementById(id);
 const term = window.term = new Terminal({ convertEol: false, cursorBlink: true, fontSize: 14, scrollback: 5000 });
@@ -7,14 +7,34 @@ term.loadAddon(fit);
 term.open($("terminal"));
 fit.fit();
 
+// The library's DEFAULT_CMDLINE (crates/uemulator/src/platform.rs) as EmulatedMachine adjusts it:
+// `acpi=off` goes when ACPI is on and the console word follows the console kind. Only for showing
+// what the guest will get; the library builds the real one and the page appends to it.
+function defaultCmdline({ serial, acpi }) {
+  return [`console=${serial ? "ttyS0" : "hvc0"}`, "earlyprintk=serial,ttyS0", "nokaslr", "mitigations=off", acpi ? "" : "acpi=off", "panic=-1"]
+    .filter(Boolean).join(" ");
+}
 const DEFAULT_CMDLINE_EXTRA = "earlycon=uart8250,io,0x3f8";
-$("cmdline").value = new URLSearchParams(location.search).get("args") ?? DEFAULT_CMDLINE_EXTRA;
+const BUILT_IN_FIRMWARE_URL = "uemulator-firmware.bin";
+const SETTINGS_KEY = "uemulator.settings.v1";
+const FIRMWARE_LABELS = { uefi: "UEFI", none: "Direct kernel", bios: "BIOS", custom: "Firmware image" };
+
+const SOURCES = ["firmware", "kernel", "initrd", "disk"];
+// Everything that is remembered across visits (files cannot be) and locked while a machine runs.
+const FIELDS = ["firmware-url", "kernel-url", "initrd-url", "disk-url", "cmdline", "shell", "replace-cmdline", "memory", "cpus", "jit", "acpi", "iommu", "rng", "reboot"];
+const RADIOS = ["firmware", "console"];
 
 let worker = null;
+// Set from Launch until the worker exists (downloads happen in between).
+let starting = false;
 let control = null;
 let ring = null;
 let startedAt = 0;
 let clock = null;
+let step = 0;
+// "Boot again" only makes sense once something has booted.
+let hasRun = false;
+const steps = [...document.querySelectorAll(".wizard .step")];
 
 function setStatus(text, kind = "") {
   const status = $("status");
@@ -22,23 +42,220 @@ function setStatus(text, kind = "") {
   status.dataset.kind = kind;
 }
 
-function setRunning(running) {
-  $("start").disabled = running;
-  $("stop").disabled = !running;
-  for (const id of ["kernel-file", "kernel-url", "initrd-file", "initrd-url", "disk-file", "disk-url", "memory", "cmdline", "shell", "jit"]) {
-    $(id).disabled = running;
+const radio = (name) => document.querySelector(`input[name=${name}]:checked`).value;
+
+function sourceOf(name) {
+  const file = $(`${name}-file`).files[0];
+  if (file) return { file, label: file.name };
+  const url = $(`${name}-url`).value.trim();
+  if (url) return { url, label: decodeURIComponent(url.split(/[?#]/)[0].split("/").filter(Boolean).pop() ?? url) };
+  return null;
+}
+
+function readSettings() {
+  const firmware = radio("firmware");
+  // BIOS and a real-mode image replace the kernel; what the BIOS path cannot use is not offered.
+  const usesKernel = firmware !== "bios";
+  const acpi = $("acpi").checked;
+  const extra = [$("cmdline").value.trim(), $("shell").checked ? "rdinit=/bin/sh" : ""].filter(Boolean).join(" ");
+  const settings = {
+    firmware,
+    usesKernel,
+    firmwareImage: firmware === "custom" ? sourceOf("firmware") : null,
+    kernel: usesKernel ? sourceOf("kernel") : null,
+    initrd: usesKernel ? sourceOf("initrd") : null,
+    disk: sourceOf("disk"),
+    extra,
+    replaceCmdline: $("replace-cmdline").checked,
+    serial: radio("console") === "serial",
+    memoryMib: Number($("memory").value),
+    cpus: Number($("cpus").value),
+    jit: $("jit").checked,
+    acpi,
+    iommu: $("iommu").checked,
+    rng: $("rng").checked,
+    reboot: $("reboot").checked,
+  };
+  settings.cmdline = settings.replaceCmdline ? extra : [defaultCmdline(settings), extra].filter(Boolean).join(" ");
+  return settings;
+}
+
+// The combinations EmulatedMachine::new refuses, caught before anything is downloaded. Each names
+// the step that fixes it. The library still has the last word (an EFI stub, a firmware header).
+function problemsWith(s) {
+  const problems = [];
+  if (s.firmware === "none" && !s.kernel) problems.push({ step: 1, text: "Direct kernel boot needs a kernel." });
+  if (s.firmware === "uefi" && !s.kernel && !s.disk) problems.push({ step: 1, text: "UEFI needs a kernel (with an EFI stub) or a disk with an EFI boot loader." });
+  if (s.firmware === "bios" && !s.disk) problems.push({ step: 1, text: "BIOS boot needs a disk." });
+  if (s.firmware === "custom" && !s.firmwareImage) problems.push({ step: 0, text: "Choose a firmware image." });
+  if (s.replaceCmdline && s.kernel && !s.extra) problems.push({ step: 1, text: "Replacing the default command line with nothing leaves the guest without a console." });
+  return problems;
+}
+
+function summaryOf(s) {
+  const media = [s.kernel?.label, s.initrd?.label, s.disk && `disk ${s.disk.label}`].filter(Boolean).join(" + ");
+  return [
+    FIRMWARE_LABELS[s.firmware] + (s.firmwareImage ? ` (${s.firmwareImage.label})` : ""),
+    media || "no media",
+    `${s.memoryMib} MiB`,
+    `${s.cpus} vCPU${s.cpus > 1 ? "s" : ""}`,
+    s.jit ? "JIT" : "interpreter",
+    s.iommu && "IOMMU",
+    s.serial ? "ttyS0" : "hvc0",
+  ].filter(Boolean).join(" · ");
+}
+
+function render() {
+  const firmware = radio("firmware");
+  $("custom-firmware").hidden = firmware !== "custom";
+
+  // More than one vCPU needs the MADT (ACPI) and cannot run under the BIOS shim; the IOMMU is found
+  // through the IVRS table. Disabled controls are reset so they cannot linger in a hidden state.
+  const smpAllowed = $("acpi").checked && firmware !== "bios";
+  $("cpus").disabled = !smpAllowed;
+  if (!smpAllowed) $("cpus").value = "1";
+  $("iommu").disabled = !$("acpi").checked;
+  if ($("iommu").disabled) $("iommu").checked = false;
+
+  const s = readSettings();
+  $("kernel-group").hidden = $("initrd-group").hidden = !s.usesKernel;
+  // A disk's boot loader brings its own command line; the field only matters with a kernel.
+  $("cmdline-group").hidden = !s.usesKernel || (!s.kernel && firmware !== "none");
+  $("disk-optional").hidden = firmware === "bios";
+  $("kernel-hint").textContent = {
+    // U+2011: keeps "-kernel" from breaking after the hyphen.
+    uefi: "An EFI-stub bzImage (most distribution kernels). The firmware boots it before any disk, like OVMF with QEMU's \u2011kernel.",
+    none: "Any x86_64 bzImage.",
+    custom: "Used when the image is UEFI firmware; a real-mode image ignores it.",
+  }[firmware] ?? "";
+  $("media-lead").textContent = {
+    uefi: "A kernel, a disk, or both. With a kernel the firmware boots it and the disk is just attached; without one it boots the disk's EFI system partition.",
+    none: "A kernel and, optionally, an initramfs and a disk.",
+    bios: "The disk's first sector is loaded at 0000:7C00 and its boot loader takes it from there.",
+    custom: "Whatever the image boots from.",
+  }[firmware];
+  $("cmdline-preview").textContent = s.cmdline || "(empty)";
+
+  const problems = problemsWith(s);
+  const nav = $("steps");
+  nav.replaceChildren(...steps.map((section, index) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.innerHTML = `<span class="num">${index + 1}</span>`;
+    button.append(section.dataset.title);
+    if (index === step) button.setAttribute("aria-current", "step");
+    if (problems.some((problem) => problem.step === index) && index < steps.length - 1) button.dataset.problem = "";
+    button.onclick = () => go(index);
+    return button;
+  }));
+  steps.forEach((section, index) => { section.hidden = index !== step; });
+  for (const name of SOURCES) $(`${name}-url`).closest(".source").querySelector(".clear").disabled = starting || worker !== null || (!$(`${name}-file`).files.length && !$(`${name}-url`).value);
+  $("back").disabled = step === 0;
+  $("next").hidden = step === steps.length - 1;
+  $("launch").disabled = problems.length > 0 || starting || worker !== null;
+
+  const rows = [
+    ["Firmware", FIRMWARE_LABELS[s.firmware] + (s.firmwareImage ? `: ${s.firmwareImage.label}` : "")],
+    ["Kernel", s.usesKernel ? s.kernel?.label ?? "none" : "not used"],
+    ["Initramfs", s.usesKernel ? s.initrd?.label ?? "none" : "not used"],
+    ["Disk", s.disk ? `${s.disk.label} (vda, writes kept in memory)` : "none"],
+    ["Memory", `${s.memoryMib} MiB`],
+    ["vCPUs", String(s.cpus)],
+    ["Console", s.serial ? "serial (ttyS0)" : "virtio-console (hvc0)"],
+    ["Execution", s.jit ? "WebAssembly JIT" : "interpreter only"],
+    ["Devices", [s.acpi ? "ACPI" : "no ACPI", s.iommu && "AMD IOMMU", s.rng && "virtio-rng"].filter(Boolean).join(", ")],
+    // The library keeps no image to restart a BIOS boot from: a reset always ends it.
+    ["On guest reset", s.reboot && s.firmware !== "bios" ? "restart" : "stop"],
+  ];
+  if (s.kernel) rows.push(["Command line", s.cmdline]);
+  $("review").replaceChildren(...rows.flatMap(([term, value]) => {
+    const dt = document.createElement("dt");
+    dt.textContent = term;
+    const dd = document.createElement("dd");
+    dd.textContent = value;
+    if (term === "Command line") dd.className = "mono";
+    return [dt, dd];
+  }));
+  $("problems").hidden = problems.length === 0;
+  $("problems").replaceChildren(...problems.map(({ text }) => Object.assign(document.createElement("li"), { textContent: text })));
+  $("summary").textContent = summaryOf(s);
+  saveSettings();
+}
+
+function go(index) {
+  step = Math.max(0, Math.min(steps.length - 1, index));
+  render();
+  steps[step].scrollTop = 0;
+  steps[step].querySelector("input:not([type=radio]):not([disabled]), select:not([disabled]), input[type=radio]:checked")?.focus({ preventScroll: true });
+}
+
+function showWizard(show) {
+  $("wizard").hidden = !show;
+  if (show) render();
+  else {
+    fit.fit();
+    term.focus();
   }
 }
 
-async function load(fileInput, urlInput, label) {
-  const file = fileInput.files[0];
-  if (file) return file.arrayBuffer();
-  const url = urlInput.value.trim();
-  if (!url) return null;
+// Per-visitor convenience only: files cannot be remembered, and storage may be unavailable.
+function saveSettings() {
+  const saved = Object.fromEntries(FIELDS.map((id) => [id, $(id).type === "checkbox" ? $(id).checked : $(id).value]));
+  for (const name of RADIOS) saved[name] = radio(name);
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(saved)); } catch { /* private mode */ }
+}
+
+// Returns what was saved, so the asset prefill below leaves alone a field the visitor cleared.
+function restoreSettings() {
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? "{}") ?? {}; } catch { /* nothing saved */ }
+  for (const id of FIELDS) {
+    if (!(id in saved)) continue;
+    if ($(id).type === "checkbox") $(id).checked = Boolean(saved[id]);
+    else $(id).value = saved[id];
+  }
+  const params = new URLSearchParams(location.search);
+  for (const name of RADIOS) {
+    const value = params.get(name) ?? saved[name];
+    const input = value && document.querySelector(`input[name=${name}][value="${CSS.escape(value)}"]`);
+    if (input) input.checked = true;
+  }
+  if (!("cmdline" in saved)) $("cmdline").value = DEFAULT_CMDLINE_EXTRA;
+  if (params.has("args")) $("cmdline").value = params.get("args");
+  if (params.has("iommu")) $("iommu").checked = $("acpi").checked = true;
+  return saved;
+}
+
+function setRunning(running) {
+  for (const id of [...FIELDS, ...SOURCES.map((name) => `${name}-file`)]) $(id).disabled = running;
+  for (const input of document.querySelectorAll("input[type=radio]")) input.disabled = running;
+  $("stop").hidden = !running;
+  $("configure").disabled = running;
+  $("relaunch").hidden = running || !hasRun;
+  if (!running) render();
+}
+
+async function load(source, label) {
+  if (!source) return null;
+  if (source.file) return source.file.arrayBuffer();
   setStatus(`downloading ${label}…`);
-  const response = await fetch(url);
-  if (!response.ok) throw new Error(`${label}: ${url} returned ${response.status}`);
+  const response = await fetch(source.url);
+  if (!response.ok) throw new Error(`${label}: ${source.url} returned ${response.status}`);
   return response.arrayBuffer();
+}
+
+// The kind is read from the image: crates/uemulator-firmware starts with its magic, and anything
+// else is taken for a real-mode image.
+async function loadFirmware(s) {
+  if (s.firmware === "none") return { kind: FIRMWARE.NONE, image: null };
+  if (s.firmware === "bios") return { kind: FIRMWARE.BIOS, image: null };
+  const image = s.firmware === "uefi"
+    ? await load({ url: BUILT_IN_FIRMWARE_URL }, "UEFI firmware")
+    : await load(s.firmwareImage, "firmware image");
+  const magic = new TextDecoder().decode(new Uint8Array(image, 0, Math.min(8, image.byteLength)));
+  if (magic === UEFI_FIRMWARE_MAGIC) return { kind: FIRMWARE.UEFI, image };
+  if (s.firmware === "uefi") throw new Error(`${BUILT_IN_FIRMWARE_URL} is not uemulator's UEFI firmware; rebuild with hack/web.sh`);
+  return { kind: FIRMWARE.REAL_MODE, image };
 }
 
 function sendKeys(text) {
@@ -69,27 +286,39 @@ term.onResize(sendSize);
 window.addEventListener("resize", () => fit.fit());
 
 function finish(text, kind) {
+  starting = false;
   clearInterval(clock);
   worker?.terminate();
   worker = null;
   control = null;
   ring = null;
+  // The library's wording names the CLI flag; point at the page's own control instead.
+  setStatus(text.replace("boot it with firmware none", "choose Direct kernel under Firmware"), kind);
   setRunning(false);
-  setStatus(text, kind);
 }
 
-async function start() {
+async function launch() {
   if (!crossOriginIsolated) {
     setStatus("page is not cross-origin isolated; serve it with hack/web.sh", "error");
     return;
   }
+  const s = readSettings();
+  const problems = problemsWith(s);
+  if (problems.length) {
+    showWizard(true);
+    go(problems[0].step);
+    return;
+  }
+  showWizard(false);
+  hasRun = true;
+  starting = true;
   setRunning(true);
   term.reset();
-  fit.fit();
   try {
-    const kernel = await load($("kernel-file"), $("kernel-url"), "kernel");
-    if (!kernel) throw new Error("choose a kernel (bzImage) first");
-    const initrd = await load($("initrd-file"), $("initrd-url"), "initramfs");
+    const firmware = await loadFirmware(s);
+    const realMode = firmware.kind === FIRMWARE.REAL_MODE;
+    const kernel = realMode ? null : await load(s.kernel, "kernel");
+    const initrd = realMode ? null : await load(s.initrd, "initramfs");
 
     const shared = new SharedArrayBuffer(CONTROL_BYTES);
     control = new Int32Array(shared, 0, RING_OFFSET / 4);
@@ -98,6 +327,7 @@ async function start() {
     control[CTRL.ROWS] = term.rows;
 
     worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
+    starting = false;
     worker.onmessage = ({ data }) => {
       if (data.type === "output") {
         term.write(new Uint8Array(data.bytes));
@@ -117,46 +347,71 @@ async function start() {
     };
     worker.onerror = (event) => finish(`worker failed: ${event.message}`, "error");
 
-    const extra = [$("cmdline").value.trim(), $("shell").checked ? "rdinit=/bin/sh" : ""].join(" ").trim();
     // The worker reads the disk on demand (a File slice or an HTTP range request per miss), so
-    // neither is downloaded here. A relative URL is resolved against the page, not the worker.
-    const diskFile = $("disk-file").files[0];
-    const diskUrl = $("disk-url").value.trim();
-    const disks = diskFile ? [{ file: diskFile }] : diskUrl ? [{ url: new URL(diskUrl, location.href).href }] : [];
+    // it is not downloaded here. A relative URL is resolved against the page, not the worker.
+    const disks = !s.disk ? [] : s.disk.file ? [{ file: s.disk.file }] : [{ url: new URL(s.disk.url, location.href).href }];
+    const options = (s.jit ? OPTION.JIT : 0) | (s.acpi ? OPTION.ACPI : 0) | (s.iommu ? OPTION.IOMMU : 0) |
+      (s.rng ? OPTION.RNG : 0) | (s.serial ? OPTION.SERIAL_CONSOLE : 0) | (s.reboot ? OPTION.REBOOT : 0) |
+      (s.replaceCmdline ? OPTION.REPLACE_CMDLINE : 0);
     const message = {
+      firmware,
       kernel,
       initrd,
-      cmdline: `console=hvc0 earlyprintk=serial,ttyS0 nokaslr mitigations=off acpi=off panic=-1 ${extra}`.trim(),
-      memoryMib: Number($("memory").value),
+      cmdline: s.extra,
+      memoryMib: s.memoryMib,
+      cpus: realMode ? 1 : s.cpus,
+      options,
       disks,
-      jit: $("jit").checked,
       cols: term.cols,
       rows: term.rows,
       control: shared,
     };
     setStatus("starting…");
-    worker.postMessage(message, [kernel, ...(initrd ? [initrd] : [])]);
+    worker.postMessage(message, [kernel, initrd, firmware.image].filter(Boolean));
   } catch (error) {
     finish(String(error.message ?? error), "error");
   }
 }
 
-$("start").onclick = start;
+for (const input of document.querySelectorAll(".wizard input, .wizard select")) {
+  input.addEventListener(input.type === "text" ? "input" : "change", render);
+}
+for (const button of document.querySelectorAll("button[data-clear]")) {
+  button.onclick = () => {
+    $(`${button.dataset.clear}-file`).value = "";
+    $(`${button.dataset.clear}-url`).value = "";
+    render();
+  };
+}
+$("back").onclick = () => go(step - 1);
+$("next").onclick = () => go(step + 1);
+$("launch").onclick = launch;
+$("relaunch").onclick = launch;
+$("configure").onclick = () => showWizard(true);
+$("wizard-close").onclick = () => showWizard(false);
+$("wizard").addEventListener("keydown", (event) => {
+  if (event.key === "Escape") showWizard(false);
+});
 $("stop").onclick = () => {
   if (control) Atomics.store(control, CTRL.STOP, 1);
 };
 
-// `hack/web.sh` links the cached Alpine netboot files (and WEB_DISK) under assets/; prefill them
-// when present.
-for (const [id, url] of [["kernel-url", "assets/vmlinuz-virt"], ["initrd-url", "assets/initramfs-virt"], ["disk-url", "assets/disk"]]) {
-  fetch(url, { method: "HEAD" })
-    .then((response) => { if (response.ok) $(id).value = url; })
-    .catch(() => {});
-}
+const saved = restoreSettings();
+setRunning(false);
+go(0);
+
+// `hack/web.sh` links the cached Alpine netboot files (and WEB_DISK) under assets/; offer them
+// when present and the visitor has not chosen (or cleared) that field before. Refilling a cleared
+// kernel would quietly turn a UEFI disk boot back into a kernel boot.
+const probes = [["kernel-url", "assets/vmlinuz-virt"], ["initrd-url", "assets/initramfs-virt"], ["disk-url", "assets/disk"]]
+  .filter(([id]) => !(id in saved))
+  .map(([id, url]) => fetch(url, { method: "HEAD" })
+    .then((response) => { if (response.ok && !$(id).value) $(id).value = url; })
+    .catch(() => {}));
+Promise.all(probes).then(render);
 
 if (!crossOriginIsolated) {
   setStatus("page is not cross-origin isolated; serve it with hack/web.sh", "error");
 } else if (new URLSearchParams(location.search).has("autoboot")) {
-  // Wait for the HEAD probes above so the cached kernel is filled in.
-  setTimeout(start, 500);
+  Promise.all(probes).then(launch);
 }

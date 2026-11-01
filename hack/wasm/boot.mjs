@@ -2,11 +2,15 @@
 // module and the same host imports as www/worker.js, with the console on stdout. For measuring
 // and for checking the WebAssembly JIT against a real guest without a browser.
 //
-//   node hack/wasm/boot.mjs --kernel K [--initrd I] [--disk D] [--cmdline S] [--memory MiB]
+//   node hack/wasm/boot.mjs [--kernel K] [--initrd I] [--disk D] [--cmdline S] [--memory MiB]
+//                           [--firmware none|uefi|bios] [--cpus N] [--iommu] [--no-acpi]
 //                           [--no-jit] [--until TEXT] [--seconds N]
 //
 // --disk is a raw or udisk image (a file, or an http(s) URL served with range requests) attached
-// as vda the way the page attaches one: read on demand, writes kept in memory.
+// as vda the way the page attaches one: read on demand, writes kept in memory. --cmdline is
+// appended to the library's default command line, as on the page. --firmware uefi reads
+// target/web/uemulator-firmware.bin (hack/web.sh builds it) and boots the kernel through it, or the
+// disk when there is no kernel.
 //
 // Stops when TEXT shows up on the console or after N seconds, and prints the wall time and what the
 // JIT host did to stderr.
@@ -14,14 +18,19 @@ import { closeSync, fstatSync, openSync, readFileSync, readSync } from "node:fs"
 import { execFileSync } from "node:child_process";
 import { parseArgs } from "node:util";
 import { createJitHost } from "../../crates/uemulator-web/www/jit_host.js";
+import { FIRMWARE, OPTION } from "../../crates/uemulator-web/www/protocol.js";
 
 const { values } = parseArgs({
   options: {
     kernel: { type: "string" },
     initrd: { type: "string" },
     disk: { type: "string" },
-    cmdline: { type: "string", default: "earlycon=uart8250,io,0x3f8 console=hvc0" },
+    cmdline: { type: "string", default: "earlycon=uart8250,io,0x3f8" },
     memory: { type: "string", default: "256" },
+    cpus: { type: "string", default: "1" },
+    firmware: { type: "string", default: "none" },
+    iommu: { type: "boolean", default: false },
+    "no-acpi": { type: "boolean", default: false },
     wasm: { type: "string", default: new URL("../../target/web/uemulator_web.wasm", import.meta.url).pathname },
     "no-jit": { type: "boolean", default: false },
     until: { type: "string" },
@@ -29,7 +38,7 @@ const { values } = parseArgs({
     quiet: { type: "boolean", default: false },
   },
 });
-if (!values.kernel) throw new Error("--kernel is required");
+if (!values.kernel && !values.disk) throw new Error("--kernel or --disk is required");
 
 const start = performance.now();
 const deadline = start + Number(values.seconds) * 1000;
@@ -122,7 +131,7 @@ function upload(data) {
   bytes(ptr, data.byteLength).set(data);
   return ptr;
 }
-const kernel = readFileSync(values.kernel);
+const kernel = values.kernel ? readFileSync(values.kernel) : new Uint8Array(0);
 const initrd = values.initrd ? readFileSync(values.initrd) : new Uint8Array(0);
 const cmdline = new TextEncoder().encode(values.cmdline);
 if (values.disk) {
@@ -132,9 +141,21 @@ if (values.disk) {
     process.exit(2);
   }
 }
+const firmwareKind = FIRMWARE[values.firmware.toUpperCase()];
+if (firmwareKind === undefined) throw new Error(`--firmware ${values.firmware}: none, uefi or bios`);
+const firmwareImage = firmwareKind === FIRMWARE.UEFI
+  ? readFileSync(new URL("uemulator-firmware.bin", `file://${values.wasm}`))
+  : new Uint8Array(0);
+if (wasm.uw_set_firmware(firmwareKind, upload(firmwareImage), firmwareImage.length)) {
+  console.error("firmware:", decoder.decode(bytes(wasm.uw_error_ptr(), wasm.uw_error_len())));
+  process.exit(2);
+}
+const options =
+  (values["no-jit"] ? 0 : OPTION.JIT) | (values["no-acpi"] ? 0 : OPTION.ACPI) |
+  (values.iommu ? OPTION.IOMMU : 0) | OPTION.RNG;
 const failed = wasm.uw_create(
   upload(kernel), kernel.length, upload(initrd), initrd.length, upload(cmdline), cmdline.length,
-  Number(values.memory), Math.floor(Date.now() / 1000), 80, 25, values["no-jit"] ? 0 : 1,
+  Number(values.memory), Number(values.cpus), Math.floor(Date.now() / 1000), 80, 25, options,
 );
 if (failed) {
   console.error("create failed:", decoder.decode(bytes(wasm.uw_error_ptr(), wasm.uw_error_len())));

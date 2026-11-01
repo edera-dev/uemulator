@@ -6,65 +6,214 @@
 <title>uemulator</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css" crossorigin="anonymous">
 <style>
-  :root { --bg: #fff; --fg: #1b1f24; --muted: #667085; --line: #d0d5dd; --accent: #2457d6; --error: #b42318; --panel: #f6f7f9; }
+  :root {
+    --bg: #fff; --fg: #1b1f24; --muted: #667085; --line: #d0d5dd; --accent: #2457d6; --accent-soft: #e8eefc; --on-accent: #fff;
+    --error: #b42318; --ok: #067647; --panel: #f6f7f9; --card: #fff; --shadow: 0 18px 48px rgba(16, 24, 40, .28);
+  }
   @media (prefers-color-scheme: dark) {
-    :root:not([data-theme="light"]) { --bg: #0e1116; --fg: #e6e8eb; --muted: #98a2b3; --line: #2d333b; --accent: #7aa2ff; --error: #ff8a80; --panel: #161b22; }
+    :root:not([data-theme="light"]) {
+      --bg: #0e1116; --fg: #e6e8eb; --muted: #98a2b3; --line: #2d333b; --accent: #7aa2ff; --accent-soft: #1b2640; --on-accent: #0b1220;
+      --error: #ff8a80; --ok: #75e0a7; --panel: #161b22; --card: #12161c; --shadow: 0 18px 48px rgba(0, 0, 0, .6);
+    }
   }
   * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; display: flex; flex-direction: column; height: 100vh; }
-  header, form { padding: 12px 16px; border-bottom: 1px solid var(--line); }
-  h1 { font-size: 16px; margin: 0 0 2px; }
-  p { margin: 0; color: var(--muted); }
-  form { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px 16px; background: var(--panel); }
-  label { display: flex; flex-direction: column; gap: 3px; font-weight: 600; font-size: 12px; }
-  label span.row { display: flex; gap: 6px; font-weight: 400; }
-  input, select, button { font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; min-width: 0; }
-  input[type=text] { flex: 1; }
-  .actions { display: flex; gap: 8px; align-items: end; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 system-ui, sans-serif; display: flex; flex-direction: column; height: 100vh; }
+  [hidden] { display: none !important; }
+  input, select, button { font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px; min-width: 0; }
   button { cursor: pointer; }
-  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
   button:disabled { opacity: .5; cursor: default; }
-  #status { align-self: center; color: var(--muted); }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+  /* Top bar: what is configured, what is running, and the three actions. */
+  .bar { display: flex; align-items: center; gap: 12px; padding: 8px 16px; border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
+  .brand { font-weight: 700; font-size: 15px; }
+  .brand small { font-weight: 400; color: var(--muted); margin-left: 6px; }
+  #summary { color: var(--muted); flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #status { color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  #status::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--line); }
+  #status[data-kind=running]::before { background: var(--ok); }
   #status[data-kind=error] { color: var(--error); }
-  main { flex: 1; min-height: 0; padding: 8px 16px; background: #000; }
-  #terminal { height: 100%; }
+  #status[data-kind=error]::before { background: var(--error); }
+  .bar-actions { display: flex; gap: 8px; }
+
+  main { flex: 1; min-height: 0; position: relative; background: #000; }
+  #terminal { position: absolute; inset: 8px 16px; }
+
+  /* The launch wizard sits over the terminal until the machine starts. */
+  .overlay { position: absolute; inset: 0; background: rgba(0, 0, 0, .55); display: flex; align-items: flex-start; justify-content: center; padding: 24px 16px; }
+  /* Only the step scrolls, so Back, Next and Launch stay in view. */
+  .wizard { width: 100%; max-width: 760px; max-height: 100%; background: var(--card); color: var(--fg); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow); display: flex; flex-direction: column; }
+  .wizard > header { display: flex; align-items: center; justify-content: space-between; padding: 14px 20px 0; }
+  .wizard h2 { font-size: 17px; margin: 0; }
+  .icon-button { border: none; background: none; font-size: 20px; line-height: 1; padding: 2px 6px; color: var(--muted); }
+  .steps { display: flex; gap: 4px; padding: 12px 20px; border-bottom: 1px solid var(--line); overflow-x: auto; }
+  .steps button { flex: none; border: none; background: none; padding: 6px 10px; border-radius: 999px; color: var(--muted); display: flex; gap: 6px; align-items: center; white-space: nowrap; }
+  .steps button .num { flex: none; width: 20px; height: 20px; border-radius: 50%; border: 1px solid var(--line); display: inline-grid; place-items: center; font-size: 12px; }
+  .steps button[aria-current=step] { background: var(--accent-soft); color: var(--fg); font-weight: 600; }
+  .steps button[aria-current=step] .num { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+  .steps button[data-problem] .num { border-color: var(--error); color: var(--error); }
+  .step { padding: 18px 20px; display: flex; flex-direction: column; gap: 14px; overflow-y: auto; min-height: 0; }
+  .step > p.lead { margin: 0; color: var(--muted); }
+
+  .choices { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+  @media (max-width: 560px) { .choices { grid-template-columns: 1fr; } }
+  .choice { position: relative; display: block; border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; cursor: pointer; }
+  .choice:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+  .choice:has(input:disabled) { opacity: .5; cursor: default; }
+  .choice input { position: absolute; opacity: 0; pointer-events: none; }
+  .choice:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .choice strong { display: block; margin-bottom: 2px; }
+  .choice span { color: var(--muted); font-size: 13px; }
+
+  fieldset { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin: 0; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+  legend { font-weight: 600; padding: 0 4px; }
+  .hint { color: var(--muted); font-size: 13px; margin: 0; }
+  .source { display: grid; grid-template-columns: auto 1fr auto; gap: 8px; align-items: center; }
+  .source input[type=text] { width: 100%; }
+  .source .clear { padding: 3px 9px; color: var(--muted); }
+  @media (max-width: 560px) { .source { grid-template-columns: 1fr auto; } .source input[type=file] { grid-column: 1 / -1; } }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+  label.field { display: flex; flex-direction: column; gap: 4px; font-weight: 600; font-size: 13px; }
+  label.field input[type=text] { width: 100%; }
+  .toggles { display: flex; flex-direction: column; gap: 10px; }
+  .toggle { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; align-items: start; cursor: pointer; }
+  .toggle input { margin: 3px 0 0; }
+  .toggle strong { font-weight: 600; }
+  .toggle span { grid-column: 2; color: var(--muted); font-size: 13px; }
+  .toggle:has(input:disabled) { opacity: .55; cursor: default; }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+  .cmdline-preview { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; word-break: break-all; }
+
+  dl.review { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 0; }
+  dl.review dt { color: var(--muted); }
+  dl.review dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+  .problems { margin: 0; padding: 10px 14px 10px 30px; border: 1px solid var(--error); border-radius: 8px; color: var(--error); }
+  .wizard > footer { display: flex; gap: 8px; align-items: center; padding: 12px 20px; border-top: 1px solid var(--line); }
+  .wizard > footer .spacer { flex: 1; }
 </style>
 </head>
 <body>
-<header>
-  <h1>uemulator</h1>
-  <p>x86_64 Linux in WebAssembly (no network). Boots a bzImage and optional initramfs, with an optional disk (vda) streamed on demand; the console is hvc0. Hot code is compiled to WebAssembly by a JIT.</p>
-</header>
-<form onsubmit="return false">
-  <label>Kernel (bzImage)
-    <span class="row"><input id="kernel-file" type="file"></span>
-    <span class="row"><input id="kernel-url" type="text" placeholder="or URL"></span>
-  </label>
-  <label>Initramfs (optional)
-    <span class="row"><input id="initrd-file" type="file"></span>
-    <span class="row"><input id="initrd-url" type="text" placeholder="or URL"></span>
-  </label>
-  <label>Disk (optional; raw or udisk, read on demand, writes kept in memory)
-    <span class="row"><input id="disk-file" type="file"></span>
-    <span class="row"><input id="disk-url" type="text" placeholder="or URL (served with range requests)"></span>
-  </label>
-  <label>Extra kernel arguments
-    <input id="cmdline" type="text">
-    <span class="row"><input id="shell" type="checkbox" checked> Boot to a shell (rdinit=/bin/sh) instead of the distro's init</span>
-    <span class="row"><input id="jit" type="checkbox" checked> JIT (compile hot blocks to WebAssembly; untick to interpret only)</span>
-    <span class="row">Memory
-      <select id="memory">
-        <option>128</option><option>256</option><option selected>512</option><option>1024</option>
-      </select> MiB
-    </span>
-  </label>
-  <div class="actions">
-    <button id="start" class="primary">Boot</button>
-    <button id="stop" disabled>Stop</button>
-    <span id="status">idle</span>
+<header class="bar">
+  <div class="brand">uemulator<small>x86_64 in WebAssembly</small></div>
+  <div id="summary"></div>
+  <div id="status">idle</div>
+  <div class="bar-actions">
+    <button id="configure">Settings</button>
+    <button id="stop" hidden>Stop</button>
+    <button id="relaunch" class="primary" hidden>Boot again</button>
   </div>
-</form>
-<main><div id="terminal"></div></main>
+</header>
+<main>
+  <div id="terminal"></div>
+  <div id="wizard" class="overlay">
+    <section class="wizard" role="dialog" aria-modal="true" aria-labelledby="wizard-title">
+      <header>
+        <h2 id="wizard-title">New machine</h2>
+        <button id="wizard-close" class="icon-button" aria-label="Close settings" title="Close">×</button>
+      </header>
+      <nav class="steps" id="steps" aria-label="Steps"></nav>
+
+      <div class="step" data-title="Firmware">
+        <p class="lead">How the machine starts. No network in the browser; the console is the terminal behind this panel.</p>
+        <div class="choices" role="radiogroup" aria-label="Firmware">
+          <label class="choice"><input type="radio" name="firmware" value="uefi" checked>
+            <strong>UEFI</strong><span>The built-in firmware boots an EFI-stub kernel, or a disk's EFI boot loader (GRUB, shim, <code>\EFI\BOOT\BOOTX64.EFI</code>).</span></label>
+          <label class="choice"><input type="radio" name="firmware" value="none">
+            <strong>Direct kernel</strong><span>No firmware: any bzImage is entered in 64-bit mode. The fastest way to a shell.</span></label>
+          <label class="choice"><input type="radio" name="firmware" value="bios">
+            <strong>BIOS</strong><span>Legacy PC boot: the disk's boot sector runs in real mode (GRUB, syslinux). Needs a disk.</span></label>
+          <label class="choice"><input type="radio" name="firmware" value="custom">
+            <strong>Firmware image</strong><span>Your own build of uemulator's UEFI firmware, or a real-mode image that ends at 1 MiB.</span></label>
+        </div>
+        <fieldset id="custom-firmware" hidden>
+          <legend>Firmware image</legend>
+          <p class="hint">A <code>UEMUFW64</code> image (from <code>crates/uemulator-firmware</code>) is booted as UEFI; anything else is placed below 1 MiB and started at F000:FFF0. OVMF and other EDK2 builds are not supported.</p>
+          <div class="source"><input id="firmware-file" type="file"><input id="firmware-url" type="text" placeholder="or URL" spellcheck="false"><button type="button" class="clear" data-clear="firmware" aria-label="Clear" title="Clear">×</button></div>
+        </fieldset>
+      </div>
+
+      <div class="step" data-title="Boot media" hidden>
+        <p class="lead" id="media-lead"></p>
+        <fieldset id="kernel-group">
+          <legend>Kernel</legend>
+          <p class="hint" id="kernel-hint"></p>
+          <div class="source"><input id="kernel-file" type="file"><input id="kernel-url" type="text" placeholder="or URL" spellcheck="false"><button type="button" class="clear" data-clear="kernel" aria-label="Clear" title="Clear">×</button></div>
+        </fieldset>
+        <fieldset id="initrd-group">
+          <legend>Initramfs <small class="hint">(optional)</small></legend>
+          <div class="source"><input id="initrd-file" type="file"><input id="initrd-url" type="text" placeholder="or URL" spellcheck="false"><button type="button" class="clear" data-clear="initrd" aria-label="Clear" title="Clear">×</button></div>
+        </fieldset>
+        <fieldset id="disk-group">
+          <legend>Disk <small class="hint" id="disk-optional">(optional)</small></legend>
+          <p class="hint">Attached as <code>vda</code>. Raw or udisk, read on demand and never downloaded whole; the guest's writes stay in memory and are gone when it stops. A URL must be served with range requests. Overlays must be flattened first (<code>uemulator disk convert</code>).</p>
+          <div class="source"><input id="disk-file" type="file"><input id="disk-url" type="text" placeholder="or URL" spellcheck="false"><button type="button" class="clear" data-clear="disk" aria-label="Clear" title="Clear">×</button></div>
+        </fieldset>
+        <fieldset id="cmdline-group">
+          <legend>Kernel command line</legend>
+          <label class="toggle"><input id="shell" type="checkbox" checked>
+            <strong>Boot to a shell</strong><span>Adds <code>rdinit=/bin/sh</code>: a busybox shell from the initramfs instead of the distro's init.</span></label>
+          <label class="field">Extra arguments
+            <input id="cmdline" type="text" spellcheck="false" class="mono"></label>
+          <label class="toggle"><input id="replace-cmdline" type="checkbox">
+            <strong>Replace the default command line</strong><span>Pass only what is above instead of appending it to the default.</span></label>
+          <div><p class="hint">The guest gets:</p><div class="cmdline-preview mono" id="cmdline-preview"></div></div>
+        </fieldset>
+      </div>
+
+      <div class="step" data-title="Machine" hidden>
+        <div class="grid2">
+          <label class="field">Memory
+            <select id="memory">
+              <option value="128">128 MiB</option><option value="256">256 MiB</option><option value="512" selected>512 MiB</option><option value="1024">1 GiB</option>
+            </select></label>
+          <label class="field">vCPUs
+            <select id="cpus">
+              <option value="1" selected>1</option><option value="2">2</option><option value="4">4</option><option value="8">8</option>
+            </select></label>
+        </div>
+        <p class="hint">Guest RAM is one block of the module's 4 GiB memory. Several vCPUs take turns on the worker's one thread: the guest gets its SMP code paths, not more speed.</p>
+        <fieldset>
+          <legend>Console</legend>
+          <div class="choices" role="radiogroup" aria-label="Console">
+            <label class="choice"><input type="radio" name="console" value="virtio" checked>
+              <strong>virtio-console (hvc0)</strong><span>Follows the terminal's size. Needs a kernel with <code>virtio_console</code> built in.</span></label>
+            <label class="choice"><input type="radio" name="console" value="serial">
+              <strong>Serial (ttyS0)</strong><span>The 16550 UART, for kernels without virtio-console. Early boot text and the firmware use it either way.</span></label>
+          </div>
+        </fieldset>
+        <fieldset>
+          <legend>Devices and options</legend>
+          <div class="toggles">
+            <label class="toggle"><input id="jit" type="checkbox" checked>
+              <strong>JIT</strong><span>Compile hot blocks to WebAssembly, about 9x faster than interpreting only.</span></label>
+            <label class="toggle"><input id="acpi" type="checkbox" checked>
+              <strong>ACPI</strong><span>Publish ACPI tables: I/O APIC, HPET and ACPI power-off. Needed for more than one vCPU and for the IOMMU.</span></label>
+            <label class="toggle"><input id="iommu" type="checkbox">
+              <strong>IOMMU (AMD-Vi)</strong><span>PCI function 00:00.2 with DMA translation and interrupt remapping, found through the IVRS table. Needs a kernel with <code>AMD_IOMMU</code> (Debian's has it; Alpine's virt kernel does not and ignores it).</span></label>
+            <label class="toggle"><input id="rng" type="checkbox" checked>
+              <strong>virtio-rng</strong><span>Feed the guest's entropy pool from the browser's <code>crypto.getRandomValues</code>.</span></label>
+            <label class="toggle"><input id="reboot" type="checkbox" checked>
+              <strong>Restart on guest reset</strong><span>A reboot inside the guest starts it again. Off ends the run at the reset, which also stops a panicking kernel (<code>panic=-1</code>) from rebooting forever.</span></label>
+          </div>
+        </fieldset>
+      </div>
+
+      <div class="step" data-title="Review" hidden>
+        <dl class="review" id="review"></dl>
+        <ul class="problems" id="problems" hidden></ul>
+      </div>
+
+      <footer>
+        <button id="back">Back</button>
+        <span class="spacer"></span>
+        <button id="next">Next</button>
+        <button id="launch" class="primary">Launch</button>
+      </footer>
+    </section>
+  </div>
+</main>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js" crossorigin="anonymous"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js" crossorigin="anonymous"></script>
 <script type="module" src="main.js"></script>

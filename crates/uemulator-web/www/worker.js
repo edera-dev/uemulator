@@ -161,9 +161,14 @@ async function boot(message) {
   wasm = instance.exports;
   jit.attach(wasm);
 
-  const kernel = new Uint8Array(message.kernel);
+  const kernel = message.kernel ? new Uint8Array(message.kernel) : new Uint8Array(0);
   const initrd = message.initrd ? new Uint8Array(message.initrd) : new Uint8Array(0);
   const cmdline = new TextEncoder().encode(message.cmdline);
+  const firmwareImage = message.firmware.image ? new Uint8Array(message.firmware.image) : new Uint8Array(0);
+  if (wasm.uw_set_firmware(message.firmware.kind, upload(firmwareImage), firmwareImage.length)) {
+    postMessage({ type: "exit", code: -2, message: `firmware: ${lastError()}` });
+    return;
+  }
   const kernelPtr = upload(kernel);
   const initrdPtr = upload(initrd);
   const cmdlinePtr = upload(cmdline);
@@ -176,7 +181,7 @@ async function boot(message) {
   }
   const failed = wasm.uw_create(
     kernelPtr, kernel.length, initrdPtr, initrd.length, cmdlinePtr, cmdline.length,
-    message.memoryMib, Math.floor(Date.now() / 1000), message.cols, message.rows, message.jit ? 1 : 0,
+    message.memoryMib, message.cpus, Math.floor(Date.now() / 1000), message.cols, message.rows, message.options,
   );
   if (failed) {
     postMessage({ type: "exit", code: -2, message: lastError() });

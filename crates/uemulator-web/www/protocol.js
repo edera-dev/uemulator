@@ -18,3 +18,23 @@ export const EXIT_NAMES = {
   3: "stopped",
   4: "internal emulator error",
 };
+// `uw_set_firmware` kinds and `uw_create` option bits: the FIRMWARE_* and OPTION_* constants in
+// src/lib.rs.
+export const FIRMWARE = {
+  NONE: 0,
+  UEFI: 1,
+  BIOS: 2,
+  REAL_MODE: 3,
+};
+export const OPTION = {
+  JIT: 1 << 0,
+  ACPI: 1 << 1,
+  IOMMU: 1 << 2,
+  RNG: 1 << 3,
+  SERIAL_CONSOLE: 1 << 4,
+  REBOOT: 1 << 5,
+  REPLACE_CMDLINE: 1 << 6,
+};
+// The first bytes of a crates/uemulator-firmware image (plans/19-uefi-firmware.md); anything else
+// picked as a firmware image is taken for a real-mode one.
+export const UEFI_FIRMWARE_MAGIC = "UEMUFW64";

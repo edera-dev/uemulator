@@ -12,8 +12,9 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use uemulator::{
-    BlockBackend, ClockMode, Disk, EmulatedMachine, ExitReason, JitMode, MachineConfig, RawImage,
-    RemoteImage, StopHandle, Udisk, UdiskOptions, disk_io,
+    BlockBackend, ClockMode, ConsoleKind, Disk, EmulatedMachine, ExitReason, JitMode,
+    MachineConfig, MemoryKeyValueStore, RawImage, RemoteImage, StopHandle, Udisk, UdiskOptions,
+    disk_io,
 };
 
 const NS_PER_MS: f64 = 1_000_000.0;
@@ -33,6 +34,29 @@ pub const EXIT_STOPPED: i32 = 3;
 pub const EXIT_INTERNAL: i32 = 4;
 /// `uw_run` before a successful `uw_create`.
 pub const EXIT_NO_MACHINE: i32 = -1;
+
+// `uw_set_firmware` kinds; `www/protocol.js` has the same numbers.
+/// No firmware: the kernel is entered directly in 64-bit mode.
+pub const FIRMWARE_NONE: i32 = 0;
+/// The image is `crates/uemulator-firmware` (`MachineConfig::uefi_firmware`).
+pub const FIRMWARE_UEFI: i32 = 1;
+/// The library's BIOS boots the first disk's boot sector (`MachineConfig::boot_disk`); no image.
+pub const FIRMWARE_BIOS: i32 = 2;
+/// A real-mode image placed to end at 1 MiB (`MachineConfig::firmware`).
+pub const FIRMWARE_REAL_MODE: i32 = 3;
+
+// `uw_create` option bits; `www/protocol.js` has the same values.
+pub const OPTION_JIT: u32 = 1 << 0;
+pub const OPTION_ACPI: u32 = 1 << 1;
+pub const OPTION_IOMMU: u32 = 1 << 2;
+pub const OPTION_RNG: u32 = 1 << 3;
+/// The guest's console is the 16550 (`ttyS0`) instead of virtio-console (`hvc0`).
+pub const OPTION_SERIAL_CONSOLE: u32 = 1 << 4;
+/// A guest reset restarts the machine instead of ending the run.
+pub const OPTION_REBOOT: u32 = 1 << 5;
+/// The command line given to `uw_create` replaces the library's default instead of being
+/// appended to it.
+pub const OPTION_REPLACE_CMDLINE: u32 = 1 << 6;
 
 #[link(wasm_import_module = "host")]
 unsafe extern "C" {
@@ -70,6 +94,8 @@ thread_local! {
     static LAST_ERROR: RefCell<String> = const { RefCell::new(String::new()) };
     /// Disks `uw_add_disk` made, for the next `uw_create` to attach.
     static PENDING_DISKS: RefCell<Vec<Disk>> = const { RefCell::new(Vec::new()) };
+    /// What `uw_set_firmware` chose for the next `uw_create`: a `FIRMWARE_*` kind and its image.
+    static PENDING_FIRMWARE: RefCell<(i32, Vec<u8>)> = const { RefCell::new((FIRMWARE_NONE, Vec::new())) };
 }
 
 fn set_error(message: String) {
@@ -150,10 +176,33 @@ fn streamed_disk(source: i32, length: u64) -> Result<Disk, String> {
     Ok(Disk::from_backend(overlay))
 }
 
+/// Chooses the firmware for the next `uw_create`: a `FIRMWARE_*` kind and, for `FIRMWARE_UEFI`
+/// and `FIRMWARE_REAL_MODE`, its image (`len == 0` with the others). Takes ownership of the
+/// buffer. Without a call the kernel is booted directly. Returns 0, or 1 with the message in
+/// `uw_error_*` for a kind it does not know.
+///
+/// # Safety
+/// `image` must come from `uw_alloc(len)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uw_set_firmware(kind: i32, image: *mut u8, len: usize) -> i32 {
+    let image = unsafe { take_buffer(image, len) };
+    if !matches!(
+        kind,
+        FIRMWARE_NONE | FIRMWARE_UEFI | FIRMWARE_BIOS | FIRMWARE_REAL_MODE
+    ) {
+        set_error(format!("unknown firmware kind {kind}"));
+        return 1;
+    }
+    PENDING_FIRMWARE.with(|firmware| *firmware.borrow_mut() = (kind, image));
+    0
+}
+
 /// Builds the machine and loads the kernel. Returns 0, or 1 with the message in `uw_error_*`.
-/// `initrd_len == 0` means no initramfs, `cmdline_len == 0` the library's default command line,
-/// `jit == 0` the interpreter only. Attaches the disks `uw_add_disk` made, in order.
-/// Takes ownership of all three buffers either way.
+/// `kernel_len == 0` means no kernel (the firmware boots a disk), `initrd_len == 0` no initramfs.
+/// The command line is appended to the library's default (which follows `OPTION_ACPI` and
+/// `OPTION_SERIAL_CONSOLE`), or replaces it with `OPTION_REPLACE_CMDLINE`. `options` is a set of
+/// `OPTION_*` bits. Attaches the disks `uw_add_disk` made, in order, and boots through the
+/// firmware `uw_set_firmware` chose. Takes ownership of all three buffers either way.
 ///
 /// # Safety
 /// Every pointer must come from `uw_alloc` with the matching length.
@@ -166,25 +215,36 @@ pub unsafe extern "C" fn uw_create(
     cmdline: *mut u8,
     cmdline_len: usize,
     memory_mib: u32,
+    cpus: u32,
     unix_time: f64,
     cols: u16,
     rows: u16,
-    jit: i32,
+    options: u32,
 ) -> i32 {
     let kernel = unsafe { take_buffer(kernel, kernel_len) };
     let initrd = unsafe { take_buffer(initrd, initrd_len) };
     let cmdline = unsafe { take_buffer(cmdline, cmdline_len) };
+    let option = |bit: u32| options & bit != 0;
 
     let mut config = MachineConfig::new()
         .kernel(kernel)
         .memory_mib(memory_mib as usize)
+        // Without a `thread_spawner` the vCPUs take turns on this thread, which the JIT needs
+        // anyway (its function table belongs to this instance; `plans/13-web.md`).
+        .cpus(cpus as usize)
         // Blocks are compiled to WebAssembly modules the page instantiates; without the page's
         // `host_jit_*` imports working, `Auto` falls back to the interpreter.
-        .jit(if jit != 0 {
+        .jit(if option(OPTION_JIT) {
             JitMode::Auto
         } else {
             JitMode::Off
         })
+        // The IOMMU is found through the ACPI IVRS table, so it is useless without `acpi`;
+        // `EmulatedMachine::new` leaves that combination to the caller.
+        .acpi(option(OPTION_ACPI))
+        .iommu(option(OPTION_IOMMU))
+        .rng(option(OPTION_RNG))
+        .reboot(option(OPTION_REBOOT))
         // Guest time follows the page's clock. A virtual clock jumps over every idle wait and
         // otherwise crawls at one nanosecond per interpreted instruction.
         .clock(ClockMode::Realtime)
@@ -194,15 +254,32 @@ pub unsafe extern "C" fn uw_create(
         // virtio-rng feeds the guest's entropy pool from the browser's.
         .entropy(|bytes| unsafe { host_random(bytes.as_mut_ptr(), bytes.len()) })
         .poll(poll);
+    if option(OPTION_SERIAL_CONSOLE) {
+        config = config.console(ConsoleKind::Serial);
+    }
     if initrd_len != 0 {
         config = config.initrd(initrd);
     }
     for disk in PENDING_DISKS.with(|disks| disks.take()) {
         config = config.disk(disk);
     }
-    if cmdline_len != 0 {
-        config = config.cmdline(String::from_utf8_lossy(&cmdline).into_owned());
+    let cmdline = String::from_utf8_lossy(&cmdline).into_owned();
+    if option(OPTION_REPLACE_CMDLINE) {
+        config = config.cmdline(cmdline);
+    } else if !cmdline.is_empty() {
+        config = config.cmdline_append(cmdline);
     }
+    let (firmware, image) = PENDING_FIRMWARE.with(|firmware| firmware.take());
+    config = match firmware {
+        // The variables (`BootOrder`, what `efibootmgr` writes) then survive a guest reset,
+        // though not the page: nothing here is kept across loads.
+        FIRMWARE_UEFI => config
+            .uefi_firmware(image)
+            .key_value_store(MemoryKeyValueStore::new()),
+        FIRMWARE_BIOS => config.boot_disk(true),
+        FIRMWARE_REAL_MODE => config.firmware(image),
+        _ => config,
+    };
     let mut machine = match EmulatedMachine::new(config) {
         Ok(machine) => machine,
         Err(error) => {
