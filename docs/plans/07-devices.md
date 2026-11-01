@@ -33,7 +33,7 @@ Channels 0 (system timer → IRQ0), 2 (speaker gate, used for TSC calibration). 
 
 ## CMOS RTC (0x70/0x71)
 
-Time registers (BCD, 24h) from host wall clock at boot (optional `fixed_time` config for determinism), status A/B/C/D, NMI mask bit in 0x70, periodic IRQ8 optional, memory-size bytes (0x15–0x18, 0x30/0x31, 0x34/0x35) filled for old probes.
+Time registers (BCD, 24h) from host wall clock at boot (optional `fixed_time` config for determinism), status A/B/C/D, NMI mask bit in 0x70, periodic IRQ8 optional, memory-size bytes (0x15–0x18, 0x30/0x31, 0x34/0x35) filled for old probes. Status A reports update-in-progress (bit 7) for the last 244 µs of every second of `now`, when the time registers are about to change (MC146818, QEMU): Xen reads the clock by waiting for UIP to rise and then fall, for up to a second each way, so an RTC that never raised it cost every Xen boot a full second.
 
 ## Misc ports
 

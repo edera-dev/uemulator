@@ -240,7 +240,8 @@ pub(crate) const SVM_ASIDS: u32 = 64;
 const HOST_ASID: u32 = 0;
 
 /// CPUID 0x8000000A EDX: nested paging, next-RIP save, VMCB clean bits (every VMRUN reloads the
-/// whole VMCB, which clean bits permit), flush-by-ASID (every VMRUN flushes the whole TLB).
+/// whole VMCB, which clean bits permit), flush-by-ASID (any non-zero TLB_CONTROL empties the
+/// guest's whole TLB, `ParkedTlb`).
 pub(crate) const SVM_FEATURES: u32 = (1 << 0) | (1 << 3) | (1 << 5) | (1 << 6);
 
 /// What `vmrun` saved of the host, and restores at #VMEXIT. The other registers (including all
