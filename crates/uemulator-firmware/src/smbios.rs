@@ -66,7 +66,7 @@ const CHASSIS_SECURITY_NONE: u8 = 0x03;
 
 const PROCESSOR_TYPE_CENTRAL: u8 = 0x03;
 /// Processor family byte 0xfe defers to the Processor Family 2 word; 0x6b is "AMD Zen Processor
-/// Family", which matches the family 19h identity the CPUID leaves report.
+/// Family", which covers the family 1Ah (Zen 5) identity the CPUID leaves report.
 const PROCESSOR_FAMILY_USE_FAMILY_2: u8 = 0xfe;
 const PROCESSOR_FAMILY_ZEN: u16 = 0x6b;
 /// Status: socket populated, CPU enabled.
@@ -458,9 +458,9 @@ mod tests {
 
     fn processor_with(cores: u16, threads: u16) -> Processor {
         Processor {
-            signature: 0x00a1_0f11,
+            signature: 0x00b0_0f21,
             feature_edx: 0x178b_fbff,
-            brand: brand("AMD EPYC 9124 16-Core Processor                 "),
+            brand: brand("AMD EPYC 9135 16-Core Processor                 "),
             cores,
             threads,
             mhz: 1000,
@@ -598,11 +598,11 @@ mod tests {
         assert_eq!(cpu.len(), 0x30);
         assert_eq!(cpu[5], 3, "central processor");
         assert_eq!((cpu[6], u16_at(cpu, 0x28)), (0xfe, 0x6b), "Zen family");
-        assert_eq!(u32_at(cpu, 8), 0x00a1_0f11);
+        assert_eq!(u32_at(cpu, 8), 0x00b0_0f21);
         assert_eq!(u32_at(cpu, 12), 0x178b_fbff);
         assert_eq!(
             strings[cpu[0x10] as usize - 1],
-            "AMD EPYC 9124 16-Core Processor"
+            "AMD EPYC 9135 16-Core Processor"
         );
         assert_eq!((u16_at(cpu, 0x14), u16_at(cpu, 0x16)), (1000, 1000));
         assert_eq!(cpu[0x18], 0x41, "populated and enabled");

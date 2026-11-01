@@ -1,13 +1,15 @@
-//! CPUID: an AMD Zen 4 (family 19h, EPYC 9004 "Genoa") with only the features that have tests
+//! CPUID: an AMD Zen 5 (family 1Ah, EPYC 9005 "Turin") with only the features that have tests
 //! behind them. Read `plans/03-cpu.md` ("CPUID/MSR contract") before adding a bit: a set bit is a
 //! promise that the instruction, MSR or table it describes works.
 //!
 //! The identity matters to the software that matters. Linux picks erratum workarounds, mitigation
 //! tables and perf drivers by family and model; Xen additionally builds its CPU policy from the
 //! raw leaves and refuses to run guests that depend on leaves it cannot make sense of. So the
-//! leaves a Zen 4 has are all present and consistent with one another (cache geometry and
+//! leaves a Zen 5 has are all present and consistent with one another (cache geometry and
 //! topology agree with each other and with the configured CPU count), and the ones it does not
-//! (Intel-only leaf 4, the hypervisor range, IBS, SEV) read as zero.
+//! (Intel-only leaf 4, the hypervisor range, IBS, SEV) read as zero. There is one CPU model: the
+//! EPYC 9004 "Genoa" (family 19h model 11h) it replaced is described in
+//! `plans/21-ryzen-7000-parity.md`.
 //!
 //! Deliberate departures from the hardware, each so a guest does not run code the emulator would
 //! only slow down:
@@ -53,6 +55,14 @@ impl CpuTopology {
         ceil_log2(self.logical_processors).max(1)
     }
 
+    /// Bits of the x2APIC id below the core complex (the threads sharing one L3). Never wider than
+    /// the package field, so the shifts of leaf 0x8000_0026 only grow from level to level; with
+    /// fewer than `L3_SHARING_THREADS` processors the whole package is one complex, which is also
+    /// what leaf 0x8000_001D's L3 sharing count says.
+    fn complex_shift(&self) -> u32 {
+        ceil_log2(L3_SHARING_THREADS).min(self.package_shift())
+    }
+
     fn core_id(&self) -> u32 {
         self.x2apic_id >> self.smt_shift()
     }
@@ -82,21 +92,27 @@ const LEAF_TLB_1G: u32 = 0x8000_0019;
 const LEAF_CACHE_PROPERTIES: u32 = 0x8000_001d;
 const LEAF_EXTENDED_APIC_ID: u32 = 0x8000_001e;
 const LEAF_EXT_FEATURES_2: u32 = 0x8000_0021;
+const LEAF_EXTENDED_TOPOLOGY_AMD: u32 = 0x8000_0026;
 
-/// Highest standard leaf. Zen 4 stops at 0x10 (the quality-of-service leaves 0xF and 0x10 read
+/// Highest standard leaf. Zen stops at 0x10 (the quality-of-service leaves 0xF and 0x10 read
 /// as zero here); 2-4, 8-0xA, 0xC, 0xE are within range and zero, as on AMD.
 const MAX_STANDARD_LEAF: u32 = 0x10;
-const MAX_EXTENDED_LEAF: u32 = LEAF_EXT_FEATURES_2;
+/// Leaves 0x8000_0022..=0x8000_0025 (PerfMonV2, memory encryption, platform QoS) are in range and
+/// read as zero: nothing behind them is implemented.
+const MAX_EXTENDED_LEAF: u32 = LEAF_EXTENDED_TOPOLOGY_AMD;
 
 /// Vendor string "AuthenticAMD" is returned in EBX, EDX, ECX order.
 const VENDOR_EBX: u32 = u32::from_le_bytes(*b"Auth");
 const VENDOR_EDX: u32 = u32::from_le_bytes(*b"enti");
 const VENDOR_ECX: u32 = u32::from_le_bytes(*b"cAMD");
 
-/// Leaf 1 and leaf 0x8000_0001 EAX: stepping 1 (bits 3:0), base model 1 (7:4), base family 0xf
-/// (11:8), extended model 1 (19:16), extended family 0xa (27:20): family 0x19, model 0x11. That
-/// is Genoa (EPYC 9004, B1 stepping), the part Xen and Linux name Zen 4.
-pub(super) const SIGNATURE: u32 = 0x00a1_0f11;
+/// Leaf 1 and leaf 0x8000_0001 EAX: stepping 1 (bits 3:0), base model 2 (7:4), base family 0xf
+/// (11:8), extended model 0 (19:16), extended family 0xb (27:20): family 0x1a, model 0x02. That is
+/// Turin (EPYC 9005, the Zen 5 server die; Turin Dense is model 11h), which Linux names Zen 5
+/// (`X86_FEATURE_ZEN5` covers models 00h-2Fh). Linux keys RDSEED on this exact model and stepping
+/// together with the microcode revision (`UCODE_REV_TURIN` in mod.rs), so change them together.
+/// QEMU's `EPYC-Turin` says model 0 stepping 0, which is in no kernel table and would lose RDSEED.
+pub(super) const SIGNATURE: u32 = 0x00b0_0f21;
 /// Leaf 1 EBX: CLFLUSH line size in 8-byte units (bits 15:8).
 const CLFLUSH_LINE_UNITS: u32 = 8;
 const LEAF1_EBX_CLFLUSH_SHIFT: u32 = 8;
@@ -341,6 +357,20 @@ const TOPOLOGY_LEVEL_TYPE_CORE: u32 = 2;
 const TOPOLOGY_SUBLEAF_SMT: u32 = 0;
 const TOPOLOGY_SUBLEAF_CORE: u32 = 1;
 
+// Leaf 0x8000_0026, AMD's extended topology: the same register layout as leaf 0xB but with AMD's
+// level types (AMD PPR for family 1Ah): 1 core (whose shift selects the thread), 2 complex (the
+// cores behind one L3), 3 die, 4 socket. Linux maps them to its SMT, core, tile and die domains
+// (`topo_domain_map_80000026`) and prefers this leaf to 0xB when it exists. One package holds
+// one die here.
+const AMD_TOPOLOGY_LEVEL_CORE: u32 = 1;
+const AMD_TOPOLOGY_LEVEL_COMPLEX: u32 = 2;
+const AMD_TOPOLOGY_LEVEL_DIE: u32 = 3;
+const AMD_TOPOLOGY_LEVEL_SOCKET: u32 = 4;
+const AMD_TOPOLOGY_SUBLEAF_CORE: u32 = 0;
+const AMD_TOPOLOGY_SUBLEAF_COMPLEX: u32 = 1;
+const AMD_TOPOLOGY_SUBLEAF_DIE: u32 = 2;
+const AMD_TOPOLOGY_SUBLEAF_SOCKET: u32 = 3;
+
 // Leaf 0xD subleaf 1 EAX: which of the optional XSAVE instructions exist.
 /// Leaf 0xd subleaf 1 EAX bit 0.
 const XSTATE_FEATURE_XSAVEOPT: u32 = 1 << 0;
@@ -378,26 +408,41 @@ const EXT_FEATURE_LONG_MODE: u32 = 1 << 29;
 /// 48 bytes returned over leaves 0x8000_0002..=0x8000_0004, NUL padded. The name QEMU gives the
 /// same model; the SKU strings carry core counts that would be wrong for a configurable machine.
 const BRAND_STRING: &[u8; 48] =
-    b"AMD EPYC-Genoa Processor\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+    b"AMD EPYC-Turin Processor\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
 
-// Cache and TLB geometry of one Zen 4 core complex die, reported by leaves 0x8000_0005,
-// 0x8000_0006 and 0x8000_001D from the same numbers so they cannot disagree.
+// Cache and TLB geometry of one Zen 5 core complex die, reported by leaves 0x8000_0005,
+// 0x8000_0006 and 0x8000_001D from the same numbers so they cannot disagree. Zen 5 widened the L1
+// data cache to 48 KiB / 12 ways and the L2 to 16 ways (the cache sizes match QEMU's
+// `epyc_turin_cache_info`) and grew the L1 data and L2 instruction TLBs.
 const CACHE_LINE_BYTES: u32 = 64;
-const L1_DATA_BYTES: u32 = 32 * 1024;
-const L1_DATA_WAYS: u32 = 8;
+const L1_DATA_BYTES: u32 = 48 * 1024;
+const L1_DATA_WAYS: u32 = 12;
 const L1_INSTRUCTION_BYTES: u32 = 32 * 1024;
 const L1_INSTRUCTION_WAYS: u32 = 8;
 const L2_BYTES: u32 = 1024 * 1024;
-const L2_WAYS: u32 = 8;
+const L2_WAYS: u32 = 16;
 const L3_BYTES: u32 = 32 * 1024 * 1024;
 const L3_WAYS: u32 = 16;
-/// Logical processors that share one L3: the 8 cores (16 threads) of a die.
+/// Logical processors that share one L3: the 8 cores (16 threads) of a die. Leaf 0x8000_0026
+/// derives its complex level from the same number, so Linux's tiles and LLC domains agree.
 const L3_SHARING_THREADS: u32 = 16;
-const L1_DATA_TLB_ENTRIES: u32 = 72;
+/// TLB entry counts go into 8-bit fields in leaf 0x8000_0005 and 12-bit ones in 0x8000_0006
+/// (asserted below; a larger count would spill into the associativity code). The Zen 5 L2 data
+/// TLB is described as 4096 entries, which the 12-bit field cannot hold, so it keeps the Zen 4
+/// count.
+const L1_DATA_TLB_ENTRIES: u32 = 96;
 const L1_INSTRUCTION_TLB_ENTRIES: u32 = 64;
 const L2_DATA_TLB_ENTRIES: u32 = 3072;
-const L2_INSTRUCTION_TLB_ENTRIES: u32 = 512;
+const L2_INSTRUCTION_TLB_ENTRIES: u32 = 2048;
 const L2_TLB_WAYS: u32 = 8;
+const L1_TLB_ENTRIES_LIMIT: u32 = 0xff;
+const L2_TLB_ENTRIES_LIMIT: u32 = 0xfff;
+const _: () = assert!(
+    L1_DATA_TLB_ENTRIES <= L1_TLB_ENTRIES_LIMIT
+        && L1_INSTRUCTION_TLB_ENTRIES <= L1_TLB_ENTRIES_LIMIT
+        && L2_DATA_TLB_ENTRIES <= L2_TLB_ENTRIES_LIMIT
+        && L2_INSTRUCTION_TLB_ENTRIES <= L2_TLB_ENTRIES_LIMIT
+);
 
 /// Leaf 0x8000_0005 TLB associativity field meaning fully associative.
 const TLB_FULLY_ASSOCIATIVE: u32 = 0xff;
@@ -729,6 +774,40 @@ impl Cpu {
                 EXT_FEATURES_2_TSA_SQ_NO | EXT_FEATURES_2_TSA_L1_NO,
                 0,
             ),
+            // EAX: shift to the next level's id (4:0); the heterogeneous-core and efficiency
+            // fields stay clear. EBX: logical processors at this level. ECX: type and number, as
+            // in leaf 0xB. EDX: the x2APIC id on every subleaf (Linux warns on a mismatch).
+            LEAF_EXTENDED_TOPOLOGY_AMD => {
+                let (shift, count, level_type) = match subleaf {
+                    AMD_TOPOLOGY_SUBLEAF_CORE => (
+                        topology.smt_shift(),
+                        topology.threads_per_core,
+                        AMD_TOPOLOGY_LEVEL_CORE,
+                    ),
+                    AMD_TOPOLOGY_SUBLEAF_COMPLEX => (
+                        topology.complex_shift(),
+                        topology.logical_processors.min(L3_SHARING_THREADS),
+                        AMD_TOPOLOGY_LEVEL_COMPLEX,
+                    ),
+                    AMD_TOPOLOGY_SUBLEAF_DIE => (
+                        topology.package_shift(),
+                        topology.logical_processors,
+                        AMD_TOPOLOGY_LEVEL_DIE,
+                    ),
+                    AMD_TOPOLOGY_SUBLEAF_SOCKET => (
+                        topology.package_shift(),
+                        topology.logical_processors,
+                        AMD_TOPOLOGY_LEVEL_SOCKET,
+                    ),
+                    _ => (0, 0, 0),
+                };
+                (
+                    shift,
+                    count,
+                    level_type << TOPOLOGY_LEVEL_TYPE_SHIFT | subleaf & 0xff,
+                    topology.x2apic_id,
+                )
+            }
             _ => (0, 0, 0, 0),
         };
         self.gpr[RAX] = eax as u64;

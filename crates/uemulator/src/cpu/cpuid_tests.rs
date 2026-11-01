@@ -1,5 +1,5 @@
-//! CPUID leaf contents. Expected values are spelled out from the AMD APM and the Zen 4 (family 19h
-//! model 11h) leaves, independent of the constants in `cpuid.rs`.
+//! CPUID leaf contents. Expected values are spelled out from the AMD APM and the Zen 5 (family 1Ah
+//! model 02h) leaves, independent of the constants in `cpuid.rs`.
 
 use super::*;
 use crate::testkit::Harness;
@@ -44,7 +44,7 @@ fn leaf_0_reports_the_max_standard_leaf_and_vendor_string() {
 }
 
 #[test]
-fn the_signature_is_family_19h_model_11h_stepping_1() {
+fn the_signature_is_family_1ah_model_02h_stepping_1() {
     let mut h = blank();
     for leaf in [1, 0x8000_0001] {
         let [eax, ..] = cpuid(&mut h, leaf, 0);
@@ -58,11 +58,11 @@ fn the_signature_is_family_19h_model_11h_stepping_1() {
                 extended_model,
                 extended_family
             ),
-            (1, 1, 0xf, 1, 0xa)
+            (1, 2, 0xf, 0, 0xb)
         );
-        assert_eq!(base_family + extended_family, 0x19);
-        assert_eq!(model | extended_model << 4, 0x11);
-        assert_eq!(eax, 0x00a1_0f11);
+        assert_eq!(base_family + extended_family, 0x1a);
+        assert_eq!(model | extended_model << 4, 0x02);
+        assert_eq!(eax, 0x00b0_0f21);
     }
 }
 
@@ -249,7 +249,7 @@ fn hypervisor_leaves_are_absent() {
 fn extended_leaf_0_reports_the_max_extended_leaf_and_vendor() {
     let mut h = blank();
     let [eax, ebx, ecx, edx] = cpuid(&mut h, 0x8000_0000, 0);
-    assert_eq!(eax, 0x8000_0021);
+    assert_eq!(eax, 0x8000_0026);
     assert_eq!(
         [ebx, edx, ecx].map(u32::to_le_bytes).concat(),
         b"AuthenticAMD"
@@ -298,7 +298,7 @@ fn brand_string_spans_three_leaves() {
         }
     }
     assert_eq!(brand.len(), 48);
-    assert!(brand.starts_with(b"AMD EPYC-Genoa Processor\0"));
+    assert!(brand.starts_with(b"AMD EPYC-Turin Processor\0"));
     assert!(
         brand[24..].iter().all(|&byte| byte == 0),
         "the rest is NUL padding"
@@ -306,32 +306,33 @@ fn brand_string_spans_three_leaves() {
 }
 
 #[test]
-fn l1_cache_leaf_describes_32k_8way_caches_with_64_byte_lines() {
+fn l1_cache_leaf_describes_48k_12way_data_and_32k_8way_instruction_caches() {
     let mut h = blank();
     let [l1_dtlb_2m, l1_dtlb_4k, l1d, l1i] = cpuid(&mut h, 0x8000_0005, 0);
     assert_eq!(
-        l1d, 0x2008_0140,
-        "32 KiB, 8 ways, 1 line per tag, 64-byte lines"
+        l1d, 0x300c_0140,
+        "48 KiB, 12 ways, 1 line per tag, 64-byte lines"
     );
-    assert_eq!(l1i, 0x2008_0140);
-    // fully associative (0xff) 72-entry data and 64-entry instruction TLBs
-    assert_eq!(l1_dtlb_2m, 0xff48_ff40);
-    assert_eq!(l1_dtlb_4k, 0xff48_ff40);
+    assert_eq!(l1i, 0x2008_0140, "32 KiB, 8 ways");
+    // fully associative (0xff) 96-entry data and 64-entry instruction TLBs
+    assert_eq!(l1_dtlb_2m, 0xff60_ff40);
+    assert_eq!(l1_dtlb_4k, 0xff60_ff40);
 }
 
 #[test]
-fn l2_and_l3_leaf_report_1m_8way_and_32m_16way() {
+fn l2_and_l3_leaf_report_1m_16way_and_32m_16way() {
     let mut h = blank();
     let [l2_itlb, l2_dtlb, l2, l3] = cpuid(&mut h, 0x8000_0006, 0);
     assert_eq!(
-        l2, 0x0400_6140,
-        "1024 KiB, associativity code 6 (8 ways), 64-byte lines"
+        l2, 0x0400_8140,
+        "1024 KiB, associativity code 8 (16 ways), 64-byte lines"
     );
     assert_eq!(
         l3, 0x0100_8140,
         "64 x 512 KiB, associativity code 8 (16 ways)"
     );
-    assert_eq!((l2_itlb, l2_dtlb), (0x6c00_6200, 0x6c00_6200));
+    // data TLB (31:16) 3072 entries, instruction TLB (15:0) 2048 entries, both code 6 (8 ways)
+    assert_eq!((l2_itlb, l2_dtlb), (0x6c00_6800, 0x6c00_6800));
 }
 
 #[test]
@@ -385,9 +386,9 @@ fn cache(harness: &mut Harness, subleaf: u32) -> (u32, u32, u32, u32, u32, u32) 
 fn leaf_0x8000001d_enumerates_the_caches_with_their_sharing() {
     // 1 thread per core, one CPU: every cache is shared by that one thread
     let mut h = blank();
-    assert_eq!(cache(&mut h, 0), (1, 1, 1, 8, 64, 64), "L1D 32 KiB");
+    assert_eq!(cache(&mut h, 0), (1, 1, 1, 12, 64, 64), "L1D 48 KiB");
     assert_eq!(cache(&mut h, 1), (2, 1, 1, 8, 64, 64), "L1I 32 KiB");
-    assert_eq!(cache(&mut h, 2), (3, 2, 1, 8, 2048, 64), "L2 1 MiB");
+    assert_eq!(cache(&mut h, 2), (3, 2, 1, 16, 1024, 64), "L2 1 MiB");
     assert_eq!(cache(&mut h, 3), (3, 3, 1, 16, 32768, 64), "L3 32 MiB");
     assert_eq!(
         cpuid(&mut h, 0x8000_001d, 4),
@@ -496,6 +497,10 @@ fn leaves_past_the_last_extended_leaf_and_the_unused_ones_are_zero() {
         0x8000_001f,
         0x8000_0020,
         0x8000_0022,
+        0x8000_0023,
+        0x8000_0024,
+        0x8000_0025,
+        0x8000_0027,
         0xffff_ffff,
     ] {
         assert_eq!(cpuid(&mut h, leaf, 0), [0, 0, 0, 0], "leaf {leaf:#x}");
@@ -521,10 +526,82 @@ fn advertised_instruction_sets_have_the_state_they_need() {
 #[test]
 fn leaf_0x8000_0019_describes_fully_associative_l1_tlbs_for_1gib_pages_and_no_l2() {
     let mut h = blank();
-    // Data TLB: associativity 0xf (fully), 72 entries; instruction TLB: 0xf, 64 entries.
+    // Data TLB: associativity 0xf (fully), 96 entries; instruction TLB: 0xf, 64 entries.
     assert_eq!(
         cpuid(&mut h, 0x8000_0019, 0),
-        [0xf048_f040, 0, 0, 0],
+        [0xf060_f040, 0, 0, 0],
         "EAX is the L1 pair, EBX the (absent) L2 pair"
     );
+}
+
+#[test]
+fn leaf_0x80000026_describes_one_processor_as_amd_levels() {
+    let mut h = blank();
+    // core level: no thread bits, 1 thread, type 1; complex: 1 bit (never narrower than the
+    // package field of leaf 0xB), 1 processor, type 2; die and socket: the package, types 3 and
+    // 4; then the invalid level echoing the subleaf.
+    assert_eq!(cpuid(&mut h, 0x8000_0026, 0), [0, 1, 0x100, 0]);
+    assert_eq!(cpuid(&mut h, 0x8000_0026, 1), [1, 1, 0x201, 0]);
+    assert_eq!(cpuid(&mut h, 0x8000_0026, 2), [1, 1, 0x302, 0]);
+    assert_eq!(cpuid(&mut h, 0x8000_0026, 3), [1, 1, 0x403, 0]);
+    assert_eq!(cpuid(&mut h, 0x8000_0026, 4), [0, 0, 4, 0]);
+}
+
+#[test]
+fn leaf_0x80000026_splits_a_large_package_into_16_thread_complexes() {
+    // 32 threads, SMT2: thread bit, then 3 core bits per complex, then one complex bit
+    let mut h = with_topology(32, 2, 0x13);
+    assert_eq!(cpuid(&mut h, 0x8000_0026, 0), [1, 2, 0x100, 0x13]);
+    assert_eq!(cpuid(&mut h, 0x8000_0026, 1), [4, 16, 0x201, 0x13]);
+    assert_eq!(cpuid(&mut h, 0x8000_0026, 2), [5, 32, 0x302, 0x13]);
+    assert_eq!(cpuid(&mut h, 0x8000_0026, 3), [5, 32, 0x403, 0x13]);
+    // 6 single-threaded cores fit in one complex
+    let mut h = with_topology(6, 1, 5);
+    assert_eq!(cpuid(&mut h, 0x8000_0026, 0), [0, 1, 0x100, 5]);
+    assert_eq!(cpuid(&mut h, 0x8000_0026, 1), [3, 6, 0x201, 5]);
+    assert_eq!(cpuid(&mut h, 0x8000_0026, 2), [3, 6, 0x302, 5]);
+}
+
+/// What Linux derives from leaf 0x8000_0026 must match leaves 0xB and 0x8000_001D: the SMT width
+/// and count of 0xB, an L3 (LLC) id equal to the complex id, and a package that is the whole
+/// machine. Covers the processor counts on both sides of a complex and SMT on and off.
+#[test]
+fn leaf_0x80000026_agrees_with_the_other_topology_leaves() {
+    for (logical, threads) in [
+        (1, 1),
+        (2, 1),
+        (2, 2),
+        (16, 1),
+        (16, 2),
+        (17, 1),
+        (34, 2),
+        (64, 1),
+        (64, 2),
+    ] {
+        for x2apic_id in 0..logical {
+            let mut h = with_topology(logical, threads, x2apic_id);
+            let levels: Vec<[u32; 4]> = (0..4).map(|n| cpuid(&mut h, 0x8000_0026, n)).collect();
+            assert_eq!(cpuid(&mut h, 0x8000_0026, 4)[1], 0, "the list ends");
+            let mut previous_shift = 0;
+            for (n, [shift, count, ecx, edx]) in levels.iter().copied().enumerate() {
+                assert_eq!(ecx, (n as u32 + 1) << 8 | n as u32, "type and number");
+                assert_eq!(edx, x2apic_id, "the same x2APIC id on every subleaf");
+                assert!(count > 0 && shift >= previous_shift, "{logical}/{threads}");
+                assert!(
+                    1 << shift >= count,
+                    "{logical}/{threads}: {shift} bits for {count}"
+                );
+                previous_shift = shift;
+            }
+            let [smt_shift, smt_count, ..] = cpuid(&mut h, 0xb, 0);
+            let [package_shift, package_count, ..] = cpuid(&mut h, 0xb, 1);
+            assert_eq!((levels[0][0], levels[0][1]), (smt_shift, smt_count));
+            assert_eq!((levels[3][0], levels[3][1]), (package_shift, package_count));
+            let l3_sharing = ((cpuid(&mut h, 0x8000_001d, 3)[0] >> 14) & 0xfff) + 1;
+            assert_eq!(levels[1][1], l3_sharing, "{logical}/{threads}");
+            // Linux: llc_id = apicid >> get_count_order(sharing)
+            let llc_id = x2apic_id >> l3_sharing.next_power_of_two().trailing_zeros();
+            assert_eq!(x2apic_id >> levels[1][0], llc_id, "{logical}/{threads}");
+        }
+    }
 }

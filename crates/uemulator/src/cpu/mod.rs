@@ -704,10 +704,13 @@ impl Cpu {
             with_decode_cache,
         } = parts;
         // Stored-only MSRs; names follow Linux's msr-index.h.
-        /// MSR_AMD64_PATCH_LEVEL: the microcode revision. A plausible Genoa value, because Linux
-        /// treats 0 as "no microcode information" and invents the lowest known revision.
+        /// MSR_AMD64_PATCH_LEVEL: the microcode revision. Linux treats 0 as "no microcode
+        /// information" and invents the lowest known revision. On family 1Ah it also gates RDSEED:
+        /// `init_amd_zen5` clears the CPUID bit (and logs "RDSEED32 is broken") unless the revision
+        /// is at least the fixed one in its `zen5_rdseed_microcode` table, which for Turin (model
+        /// 02h stepping 1, `cpuid::SIGNATURE`) is exactly this value. Lowering it loses `rdseed`.
         const MSR_UCODE_REV: u32 = 0x8b;
-        const UCODE_REV_GENOA: u64 = 0x0a10_113e;
+        const UCODE_REV_TURIN: u64 = 0x0b00_215a;
         const MSR_K7_HWCR: u32 = 0xc001_0015;
         /// IA32_DEBUGCTL: a KVM host saves and restores it around every guest run. Stored only (no
         /// branch recording).
@@ -806,7 +809,7 @@ impl Cpu {
             sysenter: [0; 3],
             dr: [0, 0, 0, 0, 0, 0, DR6_RESET, DR7_RESET],
             msr_misc: [
-                (MSR_UCODE_REV, UCODE_REV_GENOA),
+                (MSR_UCODE_REV, UCODE_REV_TURIN),
                 (MSR_IA32_DEBUGCTL, 0),
                 (MSR_K7_HWCR, HWCR_INITIAL),
                 (MSR_AMD64_NB_CFG, 0),
@@ -1699,7 +1702,7 @@ mod cpu_tests {
         fn stored_only_msrs_are_seeded() {
             let h = harness();
             let expected: [(u32, u64); 25] = [
-                (0x8b, 0x0a10_113e),
+                (0x8b, 0x0b00_215a),
                 (0xc001_0000, 0),
                 (0xc001_0001, 0),
                 (0xc001_0002, 0),

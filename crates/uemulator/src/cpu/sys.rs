@@ -1633,12 +1633,22 @@ mod sys_tests {
                 "hlt at CPL 3 is the only fault"
             );
             assert_eq!(h.cpu.rip, CODE_BASE + 2);
-            assert_eq!(h.cpu.gpr[RAX], 0x00a1_0f11);
+            assert_eq!(h.cpu.gpr[RAX], 0x00b0_0f21);
         }
 
         #[test]
         fn jit_and_interpreter_agree_on_cpuid() {
-            for leaf in [0u64, 1, 7, 0xb, 0xd, 0x8000_0001, 0x8000_001d, 0x8000_001e] {
+            for leaf in [
+                0u64,
+                1,
+                7,
+                0xb,
+                0xd,
+                0x8000_0001,
+                0x8000_001d,
+                0x8000_001e,
+                0x8000_0026,
+            ] {
                 // cpuid; hlt
                 crate::testkit::assert_jit_matches_interpreter(&[0x0f, 0xa2, 0xf4], |h| {
                     h.cpu.gpr[RAX] = leaf
@@ -2031,13 +2041,13 @@ mod sys_tests {
         }
 
         /// Linux's `VULNBL_AMD` names families 0x15-0x17 for RETBLEED (a return thunk on every
-        /// `ret`) and 0x19 for SRSO; the model has family 0x19, so it must also say SRSO_NO.
+        /// `ret`) and 0x19/0x1a for SRSO; the model has family 0x1a, so it must also say SRSO_NO.
         #[test]
-        fn zen_4_says_it_has_neither_retbleed_nor_srso() {
+        fn zen_5_says_it_has_neither_retbleed_nor_srso() {
             let mut h = blank();
             let [eax, _, _, _] = cpuid(&mut h, 1, 0);
             let family = ((eax >> 8) & 0xf) + ((eax >> 20) & 0xff);
-            assert_eq!(family, 0x19);
+            assert_eq!(family, 0x1a);
             let [srso_no, ..] = cpuid(&mut h, 0x8000_0021, 0);
             assert_ne!(srso_no & (1 << 29), 0);
         }
