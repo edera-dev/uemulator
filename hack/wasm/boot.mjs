@@ -4,13 +4,16 @@
 //
 //   node hack/wasm/boot.mjs [--kernel K] [--initrd I] [--disk D] [--cmdline S] [--memory MiB]
 //                           [--firmware none|uefi|bios] [--cpus N] [--iommu] [--no-acpi] [--serial]
-//                           [--no-jit] [--until TEXT] [--seconds N]
+//                           [--no-jit] [--debug] [--wasm FILE] [--until TEXT] [--seconds N]
 //
 // --disk is a raw or udisk image (a file, or an http(s) URL served with range requests) attached
 // as vda the way the page attaches one: read on demand, writes kept in memory. --cmdline is
 // appended to the library's default command line, as on the page. --firmware uefi reads
 // target/web/uemulator-firmware.bin (hack/web.sh builds it) and boots the kernel through it, or the
-// disk when there is no kernel.
+// disk when there is no kernel. --debug turns on the library's debug mode: on exit the state dump,
+// with the JIT's counters and the instructions that went through the interpreter, goes to stderr
+// (it costs time; do not measure with it). --wasm boots another build of the module, for comparing
+// two builds (with --firmware uefi the firmware image is looked for next to it).
 //
 // Stops when TEXT shows up on the console or after N seconds, and prints the wall time and what the
 // JIT host did to stderr.
@@ -34,6 +37,7 @@ const { values } = parseArgs({
     serial: { type: "boolean", default: false },
     wasm: { type: "string", default: new URL("../../target/web/uemulator_web.wasm", import.meta.url).pathname },
     "no-jit": { type: "boolean", default: false },
+    debug: { type: "boolean", default: false },
     until: { type: "string" },
     seconds: { type: "string", default: "120" },
     quiet: { type: "boolean", default: false },
@@ -153,7 +157,8 @@ if (wasm.uw_set_firmware(firmwareKind, upload(firmwareImage), firmwareImage.leng
 }
 const options =
   (values["no-jit"] ? 0 : OPTION.JIT) | (values["no-acpi"] ? 0 : OPTION.ACPI) |
-  (values.iommu ? OPTION.IOMMU : 0) | (values.serial ? OPTION.SERIAL_CONSOLE : 0) | OPTION.RNG;
+  (values.iommu ? OPTION.IOMMU : 0) | (values.serial ? OPTION.SERIAL_CONSOLE : 0) | OPTION.RNG |
+  (values.debug ? OPTION.DEBUG : 0);
 const failed = wasm.uw_create(
   upload(kernel), kernel.length, upload(initrd), initrd.length, upload(cmdline), cmdline.length,
   Number(values.memory), Number(values.cpus), Math.floor(Date.now() / 1000), 80, 25, options,

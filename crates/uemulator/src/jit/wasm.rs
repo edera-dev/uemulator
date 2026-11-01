@@ -7,7 +7,16 @@
 //!
 //! Because compiling a module costs the engine tens of microseconds, a block is only compiled once
 //! its first instruction has run `COMPILE_THRESHOLD` times in the interpreter; until then
-//! `step_block` interprets one instruction. Tests build with a threshold of zero.
+//! `step_block` interprets one instruction. Tests build with a threshold of zero. Measured on an
+//! Alpine boot (V8): about 15 µs per module for `new WebAssembly.Module`, 3 µs to instantiate and
+//! another 18 µs of Liftoff compilation on the block's first call, so 35k blocks cost ~1.8 s;
+//! thresholds of 5, 15 and 100 were no faster than 40.
+//!
+//! There is no code to patch, so the native backends' direct links become link cells: memory a
+//! block's same-page exits read the successor's table slot from (`emit_wasm::LINK_CELL_BLOCK`),
+//! filled by the linking chain stub. A linked transition skips the stub's TLB probe and jump
+//! cache, and each exit gets an indirect call site of its own instead of the stub's one shared
+//! site (likely why two blocks jumping to each other went from 23 to 12 ns per round trip).
 //!
 //! The table belongs to one instance, so a second thread (a wasm worker) cannot call the blocks of
 //! the first: with this backend the vCPUs always take turns on one thread (`runs_on_threads`).
@@ -25,7 +34,7 @@ use super::blocks::{
     BlockKey, Decoded, JUMP_CACHE_BITS, NO_SECOND_PAGE, PAGE_MASK, PAGE_SHIFT, PAGE_SIZE,
     SLOT_BLOCK_BITS, SLOT_BLOCK_MASK, STRADDLER_TAG, decode_block, jump_cache_hash,
 };
-use super::emit_wasm::{self, Addrs, ChainTables};
+use super::emit_wasm::{self, Addrs, ChainTables, LINK_CELL_SIZE, LINKS_PER_BLOCK};
 use super::helpers;
 use super::wasm_encode::{self, Code, op};
 use crate::cpu::Cpu;
@@ -56,6 +65,11 @@ const HEAT_BITS: usize = 16;
 /// so this bounds that memory; the validity table is this long.
 const MAX_BLOCKS: usize = 1 << 16;
 const _: () = assert!(MAX_BLOCKS as u64 <= 1 << SLOT_BLOCK_BITS);
+/// The block an empty link cell names (`emit_wasm::LINK_CELL_BLOCK`): one past the last real
+/// index, whose validity byte is never set, so a linked exit through an empty cell always takes
+/// the stub.
+const NO_BLOCK: u32 = MAX_BLOCKS as u32;
+const _: () = assert!(LINK_CELL_SIZE as usize == size_of::<AtomicU64>());
 
 /// What the probe module returns.
 const PROBE_RESULT: i64 = 0x7e57_ab1e;
@@ -101,7 +115,7 @@ pub(crate) fn probe() -> bool {
 
 /// A function pointer on wasm32 is an index into the function table, which is how generated
 /// code names the helpers.
-fn addrs(out: *mut u64, chain: u32) -> Addrs {
+fn addrs(out: *mut u64, chain: u32, chain_link: u32, valid: &[AtomicU8]) -> Addrs {
     Addrs {
         exec: helpers::helper_exec as *const () as usize as u32,
         ld: helpers::helper_load_via_out as *const () as usize as u32,
@@ -111,6 +125,8 @@ fn addrs(out: *mut u64, chain: u32) -> Addrs {
         cond: helpers::helper_cond as *const () as usize as u32,
         out: out as usize as u32,
         chain,
+        chain_link,
+        valid: valid.as_ptr() as usize as u32,
     }
 }
 
@@ -185,6 +201,10 @@ struct Block {
     /// Generated code calls `helper_exec` with the address of one of these, so they must outlive
     /// the code. Heap storage keeps the addresses stable when `blocks` reallocates.
     _insns: Box<[Insn]>,
+    /// The block's link cells (`emit_wasm::LINK_CELL_BLOCK`), written by the linking chain stub
+    /// and read by the block's exits; same lifetime rule as `_insns`. Empty for a straddling
+    /// block, whose exits are never linked.
+    _links: Box<[AtomicU64]>,
 }
 
 /// A vCPU's handle on the code cache. The cache itself (`SharedJit`) belongs to the machine and
@@ -195,10 +215,13 @@ pub(crate) struct Jit {
 
 struct SharedJit {
     /// Per block index: 1 while the block may run, 0 once its page was written (or after a flush).
+    /// One longer than `MAX_BLOCKS`: the last byte is `NO_BLOCK`'s, which stays 0.
     valid: Box<[AtomicU8]>,
     jump_cache: JumpCache,
     /// Table slot of the chain stub, or 0 without chaining.
     chain_slot: u32,
+    /// Table slot of the linking chain stub, or 0 when exits are not linked.
+    chain_link_slot: u32,
     /// Counts `invalidate_page` calls: a translation decodes outside the lock, so it compares this
     /// before and after to see a write to a page it read (see `native.rs`).
     invalidations: AtomicU64,
@@ -288,8 +311,10 @@ impl Drop for SharedJit {
                 release_slot(block.slot);
             }
         }
-        if self.chain_slot != 0 {
-            release_slot(self.chain_slot);
+        for slot in [self.chain_slot, self.chain_link_slot] {
+            if slot != 0 {
+                release_slot(slot);
+            }
         }
     }
 }
@@ -306,9 +331,9 @@ impl Jit {
         if !probe() {
             return None;
         }
-        let valid: Box<[AtomicU8]> = (0..MAX_BLOCKS).map(|_| AtomicU8::new(0)).collect();
+        let valid: Box<[AtomicU8]> = (0..=MAX_BLOCKS).map(|_| AtomicU8::new(0)).collect();
         let jump_cache = JumpCache::new();
-        let chain_slot = if chaining {
+        let (chain_slot, chain_link_slot) = if chaining {
             let tables = ChainTables {
                 jump_cache: jump_cache.base(),
                 valid: valid.as_ptr() as usize as u32,
@@ -318,15 +343,22 @@ impl Jit {
                 entry_slot: offset_of!(JumpEntry, slot) as u32,
                 index_bits: JUMP_CACHE_BITS as u32,
             };
-            // An engine without tail calls refuses the stub; blocks then return to the run loop.
-            compile_module(&emit_wasm::compile_chain_stub(&tables)).unwrap_or(0)
+            // An engine without tail calls refuses the stubs; blocks then return to the run loop.
+            match compile_module(&emit_wasm::compile_chain_stub(&tables, false)) {
+                Some(chain) => (
+                    chain,
+                    compile_module(&emit_wasm::compile_chain_stub(&tables, true)).unwrap_or(0),
+                ),
+                None => (0, 0),
+            }
         } else {
-            0
+            (0, 0)
         };
         let shared = Arc::new(SharedJit {
             valid,
             jump_cache,
             chain_slot,
+            chain_link_slot,
             invalidations: AtomicU64::new(0),
             out: Box::new(AtomicU64::new(0)),
             compile_threshold: AtomicU32::new(if cfg!(freestanding) {
@@ -357,7 +389,6 @@ impl Jit {
     /// Nothing to do: the vCPUs share one thread, so guest accesses need no ordering.
     pub fn set_ordered_memory(&mut self, _on: bool) {}
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn stats(&self) -> JitStats {
         self.shared.lock().stats
     }
@@ -385,6 +416,33 @@ impl Jit {
     #[cfg(test)]
     fn block_is_valid(&self, index: usize) -> bool {
         self.shared.valid[index].load(Ordering::Acquire) != 0
+    }
+
+    /// Index of the live block for the code at `phys_addr`.
+    #[cfg(test)]
+    fn block_index(&self, phys_addr: u64) -> Option<u32> {
+        let state = self.shared.lock();
+        state.block_map.get(&(phys_addr, NO_SECOND_PAGE)).copied()
+    }
+
+    /// What block `index`'s link cells hold: `(block index, table slot)` each.
+    #[cfg(test)]
+    fn link_cells(&self, index: u32) -> Vec<(u32, u32)> {
+        const SLOT_SHIFT: u32 = 8 * emit_wasm::LINK_CELL_SLOT;
+        let state = self.shared.lock();
+        state.blocks[index as usize]
+            ._links
+            .iter()
+            .map(|cell| {
+                let value = cell.load(Ordering::Relaxed);
+                (value as u32, (value >> SLOT_SHIFT) as u32)
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn slot_of(&self, index: u32) -> u32 {
+        self.shared.lock().blocks[index as usize].slot
     }
 
     /// Called from `Cpu::code_written` when a guest write hits a page that has blocks: they stop
@@ -456,6 +514,28 @@ impl Jit {
             )
             .ok()?;
         ((next_page >> PAGE_SHIFT) == block >> SLOT_BLOCK_BITS).then_some(slot as u64)
+    }
+
+    /// Whether the code at `phys_addr` is known to have no block and to stay interpreted this
+    /// time: its heat entry is its own and still below the threshold after counting this run
+    /// (which it does, as a cold step). Lets a cold step skip `lookup`'s block map search, which
+    /// was most of the cost of the millions of instructions a boot interprets before their block
+    /// is compiled. The heat entry is only made or counted when no block was found (`is_hot`
+    /// runs after a failed lookup), so it never hides a live block for longer than the
+    /// threshold's worth of runs, and even then the block is only interpreted, never wrong.
+    fn known_cold(&self, phys_addr: u64) -> bool {
+        let threshold = self.shared.compile_threshold.load(Ordering::Relaxed);
+        if threshold == 0 {
+            return false;
+        }
+        let mut state = self.shared.lock();
+        let heat = &mut state.heat[heat_index(phys_addr)];
+        if heat.phys != phys_addr || heat.count.saturating_add(1) >= threshold {
+            return false;
+        }
+        heat.count += 1;
+        state.stats.cold_steps += 1;
+        true
     }
 
     /// Whether the block at `phys_addr` has run often enough in the interpreter to be worth
@@ -574,11 +654,28 @@ impl Jit {
             ..
         } = decoded;
         let insns: Box<[Insn]> = insns.into_boxed_slice();
+        let links: Box<[AtomicU64]> = if second_page == NO_SECOND_PAGE {
+            (0..LINKS_PER_BLOCK)
+                .map(|_| AtomicU64::new(NO_BLOCK as u64))
+                .collect()
+        } else {
+            Box::new([])
+        };
         let compiled = emit_wasm::compile_block(
-            &addrs(shared.out.as_ptr(), shared.chain_slot),
+            &addrs(
+                shared.out.as_ptr(),
+                shared.chain_slot,
+                shared.chain_link_slot,
+                &shared.valid,
+            ),
             &insns,
             &insn_rips,
             end_rip,
+            if links.is_empty() {
+                0
+            } else {
+                links.as_ptr() as usize as u32
+            },
         );
         let Some(slot) = compile_module(&compiled.module) else {
             return Install::Refused;
@@ -592,6 +689,7 @@ impl Jit {
             key,
             slot,
             _insns: insns,
+            _links: links,
         });
         shared.valid[index as usize].store(1, Ordering::Release);
         for page in pages {
@@ -655,6 +753,12 @@ impl Cpu {
         let mut jit = self.jit.take().unwrap();
         let cached = match jit.lookup_straddler(self, rip, phys_addr) {
             Some(slot) => Some(slot),
+            // Already counted as a cold step.
+            None if jit.known_cold(phys_addr) => {
+                self.jit = Some(jit);
+                self.last_block_insns = 1;
+                return self.step();
+            }
             None => jit.lookup(rip, phys_addr),
         };
         let slot = match cached {
@@ -841,6 +945,246 @@ mod tests {
         assert!(calls >= 2, "the budget interrupted the chain: {calls}");
         assert!(chained.halted);
         assert_eq!(chained.icount, reference.icount);
+    }
+
+    /// Where the countdown loop's body starts, after the 5-byte `mov ecx, 100`.
+    const LOOP_BODY: u64 = CODE_BASE + 5;
+    /// mov + 100 * (sub, jnz) + hlt.
+    const COUNTDOWN_LOOP_INSNS: u64 = 202;
+
+    /// Runs the countdown loop to its `hlt` and puts the CPU back at its start.
+    fn run_countdown_and_rewind(harness: &mut Harness) {
+        assert_eq!(harness.run(10_000), Stop::Halted);
+        assert_eq!(harness.cpu.gpr[1], 0);
+        harness.cpu.halted = false;
+        harness.cpu.rip = CODE_BASE;
+    }
+
+    #[test]
+    fn a_same_page_exit_links_to_the_block_the_stub_entered() {
+        let mut harness = Harness::new(&COUNTDOWN_LOOP);
+        assert!(harness.enable_jit());
+        assert_eq!(harness.run(10_000), Stop::Halted);
+        let jit = harness.cpu.jit.as_ref().unwrap();
+        let body = jit.block_index(LOOP_BODY).unwrap();
+        // The jnz back to the body went through the stub once and is linked since; its
+        // fall-through ran once, before the hlt block existed, so it is still empty.
+        assert_eq!(
+            jit.link_cells(body),
+            [(body, jit.slot_of(body)), (NO_BLOCK, 0)]
+        );
+        let setup = jit.block_index(CODE_BASE).unwrap();
+        assert_eq!(
+            jit.link_cells(setup)[0],
+            (NO_BLOCK, 0),
+            "the body did not exist yet"
+        );
+    }
+
+    #[test]
+    fn a_linked_chain_stops_at_the_event_budget_with_an_exact_count() {
+        let mut harness = Harness::new(&COUNTDOWN_LOOP);
+        assert!(harness.enable_jit());
+        run_countdown_and_rewind(&mut harness);
+        let warm = harness.cpu.jit.take().unwrap();
+        let body = warm.block_index(LOOP_BODY).unwrap();
+        assert_eq!(warm.link_cells(body)[0].0, body, "the loop is linked");
+        let (calls, linked) = step_block_calls_for(warm.sibling(), 50);
+        let (_, reference) = step_block_calls_for(Jit::new(false).unwrap(), u64::MAX);
+        assert!(calls >= 2, "the budget interrupted the chain: {calls}");
+        assert!(linked.halted);
+        assert_eq!(linked.icount, reference.icount);
+        assert_eq!(linked.icount, COUNTDOWN_LOOP_INSNS);
+    }
+
+    #[test]
+    fn an_invalidated_destination_is_relinked_to_its_new_translation() {
+        let mut harness = Harness::new(&COUNTDOWN_LOOP);
+        assert!(harness.enable_jit());
+        run_countdown_and_rewind(&mut harness);
+        let old_body = harness.cpu.jit.as_ref().unwrap().block_index(LOOP_BODY);
+        let flags = harness.cpu.page_has_code.clone();
+        harness
+            .cpu
+            .jit
+            .as_ref()
+            .unwrap()
+            .invalidate_page(CODE_BASE >> PAGE_SHIFT, &flags);
+        run_countdown_and_rewind(&mut harness);
+        let jit = harness.cpu.jit.as_ref().unwrap();
+        let body = jit.block_index(LOOP_BODY).unwrap();
+        assert_ne!(Some(body), old_body);
+        assert_eq!(jit.link_cells(body)[0], (body, jit.slot_of(body)));
+    }
+
+    #[test]
+    fn a_store_into_the_linked_destination_never_runs_its_stale_code() {
+        // mov ecx, 3; xor eax, eax; again: mov dl, cl; mov [rip + tgt + 2], dl; jmp tgt;
+        // tgt: add eax, 0x7f; dec ecx; jnz again; hlt
+        // Each pass patches the immediate of the `add` to ecx before jumping to it, from a block
+        // whose exit to it is linked after the first pass: 3 + 2 + 1.
+        const PATCH_THEN_JUMP: [u8; 25] = [
+            0xb9, 0x03, 0x00, 0x00, 0x00, 0x31, 0xc0, 0x88, 0xca, 0x88, 0x15, 0x04, 0x00, 0x00,
+            0x00, 0xeb, 0x00, 0x83, 0xc0, 0x7f, 0xff, 0xc9, 0x75, 0xef, 0xf4,
+        ];
+        let mut harness = Harness::new(&PATCH_THEN_JUMP);
+        assert!(harness.enable_jit());
+        assert_eq!(harness.run(1000), Stop::Halted);
+        assert_eq!(harness.cpu.gpr[0], 6);
+    }
+
+    #[test]
+    fn a_flush_with_linked_blocks_starts_over_cleanly() {
+        let mut harness = Harness::new(&COUNTDOWN_LOOP);
+        assert!(harness.enable_jit());
+        run_countdown_and_rewind(&mut harness);
+        let jit = harness.cpu.jit.as_ref().unwrap();
+        // The next translation finds the cache full and flushes every block and its cells.
+        jit.set_block_limit(jit.block_count());
+        let flags = harness.cpu.page_has_code.clone();
+        jit.invalidate_page(CODE_BASE >> PAGE_SHIFT, &flags);
+        run_countdown_and_rewind(&mut harness);
+        let jit = harness.cpu.jit.as_ref().unwrap();
+        assert!(jit.stats().resets >= 1);
+        assert_eq!(harness.cpu.icount, 2 * COUNTDOWN_LOOP_INSNS);
+    }
+
+    const STRADDLER_VIRTUAL_PAGE: u64 = 0x0000_2000_0000_0000;
+    /// Where `l: sub ecx, <imm>` starts: its last byte, the immediate, is the first byte of the
+    /// next page, followed by `jnz l; hlt`.
+    const STRADDLING_LOOP: u64 = STRADDLER_VIRTUAL_PAGE + PAGE_SIZE - 2;
+    /// The `jnz l` after it.
+    const STRADDLING_LOOP_JNZ: u64 = STRADDLER_VIRTUAL_PAGE + PAGE_SIZE + 1;
+
+    /// Writes the second-page half of the loop (`<imm>; jnz l; hlt`) at physical `page`.
+    fn write_loop_tail(harness: &mut Harness, page: u64, decrement: u8) {
+        // jnz rel8 back to the sub: from the end of the jnz (page + 3) to page - 2
+        harness.write(page, &[decrement, 0x75, 0xfb, 0xf4]);
+    }
+
+    /// A harness whose code is that loop, decrementing by 1, over two virtual pages mapped to
+    /// physical `first` and `second`.
+    fn harness_with_a_straddling_loop(
+        first: u64,
+        second: u64,
+    ) -> (Harness, crate::cpu::test_support::PageTables) {
+        use crate::cpu::test_support::{PTE_PRESENT_WRITABLE_USER, PageTables};
+        let mut harness = Harness::new(&[0xf4]);
+        assert!(harness.enable_jit());
+        let mut tables = PageTables::new(&mut harness.cpu);
+        for (page, phys) in [(0, first), (PAGE_SIZE, second)] {
+            tables.map_4k(
+                &mut harness.cpu,
+                STRADDLER_VIRTUAL_PAGE + page,
+                phys,
+                PTE_PRESENT_WRITABLE_USER,
+            );
+        }
+        // sub ecx, imm8 is 83 e9 ib
+        harness.write(first + PAGE_SIZE - 2, &[0x83, 0xe9]);
+        write_loop_tail(&mut harness, second, 1);
+        harness.cpu.rip = STRADDLING_LOOP;
+        (harness, tables)
+    }
+
+    /// Calls `step_block` the way `Cpu::run` does until the guest halts or `budget` instructions
+    /// ran; returns the number of calls.
+    fn step_block_calls_until(harness: &mut Harness, budget: u64) -> u64 {
+        let start = harness.cpu.icount;
+        harness.cpu.next_event = start + budget;
+        let mut calls = 0;
+        while !harness.cpu.halted && harness.cpu.icount - start < budget {
+            harness.cpu.interrupt_shadow = false;
+            harness.cpu.icount += 1;
+            harness.cpu.step_block().unwrap();
+            calls += 1;
+        }
+        calls
+    }
+
+    #[test]
+    fn the_chain_stub_enters_a_straddling_block_whose_second_page_is_unchanged() {
+        let (mut harness, _tables) =
+            harness_with_a_straddling_loop(SCRATCH, SCRATCH + 2 * PAGE_SIZE);
+        harness.cpu.gpr[1] = 100;
+        let calls = step_block_calls_until(&mut harness, 10_000);
+        assert!(harness.cpu.halted);
+        assert_eq!(harness.cpu.gpr[1], 0);
+        // sub, jnz per iteration, then hlt
+        assert_eq!(harness.cpu.icount, 201);
+        // Each block's first visit goes back to the run loop to be translated; after that the
+        // jnz's exit to the straddler goes through the stub, not the run loop.
+        assert!(calls < 10, "{calls} calls");
+    }
+
+    #[test]
+    fn the_chain_stub_does_not_enter_a_straddler_whose_second_page_moved() {
+        use crate::cpu::test_support::PTE_PRESENT_WRITABLE_USER;
+        let (first, second, elsewhere) =
+            (SCRATCH, SCRATCH + 2 * PAGE_SIZE, SCRATCH + 3 * PAGE_SIZE);
+        let (mut harness, mut tables) = harness_with_a_straddling_loop(first, second);
+        harness.cpu.gpr[1] = 1000;
+        step_block_calls_until(&mut harness, 50);
+        assert!(!harness.cpu.halted);
+        // Remap the second page to a copy whose immediate is 2: the straddler cached in the jump
+        // cache was decoded with 1, and must not run again.
+        write_loop_tail(&mut harness, elsewhere, 2);
+        tables.map_4k(
+            &mut harness.cpu,
+            STRADDLER_VIRTUAL_PAGE + PAGE_SIZE,
+            elsewhere,
+            PTE_PRESENT_WRITABLE_USER,
+        );
+        harness.cpu.flush_tlb();
+        // Refill the exec TLB for the first page, so the stub gets as far as the straddler check
+        // when the jnz (translated afresh from the new page) leaves for the loop head.
+        harness
+            .cpu
+            .translate(STRADDLER_VIRTUAL_PAGE, AccessKind::Exec, false)
+            .unwrap();
+        harness.cpu.rip = STRADDLING_LOOP_JNZ;
+        harness.cpu.gpr[1] = 100;
+        let start = harness.cpu.icount;
+        step_block_calls_until(&mut harness, 10_000);
+        assert!(harness.cpu.halted);
+        assert_eq!(harness.cpu.gpr[1], 0);
+        // the jnz, 50 iterations of sub 2 and jnz, then hlt; with the stale straddler's sub 1 it
+        // would take 100
+        assert_eq!(harness.cpu.icount - start, 1 + 2 * 50 + 1);
+    }
+
+    /// Instructions of the one block `code` makes that were lowered inline.
+    fn inlined_in(code: &[u8]) -> u64 {
+        let mut harness = Harness::new(code);
+        assert!(harness.enable_jit());
+        let mut jit = harness.cpu.jit.take().unwrap();
+        jit.translate(&mut harness.cpu, CODE_BASE, CODE_BASE)
+            .unwrap();
+        jit.stats().inlined
+    }
+
+    #[test]
+    fn imul_64_and_rotates_are_inline_only_when_their_flags_are_overwritten() {
+        // sbb eax, eax; adc rcx, 7; hlt: adc and sbb are inline whatever their flags
+        assert_eq!(inlined_in(&[0x19, 0xc0, 0x48, 0x83, 0xd1, 0x07, 0xf4]), 2);
+        // imul rax, rcx; add rdx, 1; hlt
+        assert_eq!(
+            inlined_in(&[0x48, 0x0f, 0xaf, 0xc1, 0x48, 0x83, 0xc2, 0x01, 0xf4]),
+            2
+        );
+        // imul rax, rcx; hlt: the successor may read the flags
+        assert_eq!(inlined_in(&[0x48, 0x0f, 0xaf, 0xc1, 0xf4]), 0);
+        // rol rax, 13; ror ecx, cl; sub rdx, rax; hlt: the ror and the sub (a rotate counts as
+        // reading the flags, so the rol is not one of them)
+        assert_eq!(
+            inlined_in(&[0x48, 0xc1, 0xc0, 0x0d, 0xd3, 0xc9, 0x48, 0x29, 0xc2, 0xf4]),
+            2
+        );
+        // rol rax, 13; adc rdx, rax; hlt: adc reads CF
+        assert_eq!(
+            inlined_in(&[0x48, 0xc1, 0xc0, 0x0d, 0x48, 0x11, 0xc2, 0xf4]),
+            1
+        );
     }
 
     #[test]

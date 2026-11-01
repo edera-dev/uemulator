@@ -34,6 +34,7 @@ export const OPTION = {
   SERIAL_CONSOLE: 1 << 4,
   REBOOT: 1 << 5,
   REPLACE_CMDLINE: 1 << 6,
+  DEBUG: 1 << 7,
 };
 // The first bytes of a crates/uemulator-firmware image (plans/19-uefi-firmware.md); anything else
 // picked as a firmware image is taken for a real-mode one.

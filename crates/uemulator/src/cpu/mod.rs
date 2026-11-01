@@ -1501,6 +1501,10 @@ impl Cpu {
                 search_from = start + BANNER.len();
             }
         }
+        #[cfg(all(feature = "jit", target_arch = "wasm32"))]
+        if let Some(jit) = &self.jit {
+            s += &format!("jit: {:?}\n", jit.stats());
+        }
         if let Some(histogram) = &self.helper_histogram {
             let mut counts: Vec<_> = histogram.iter().collect();
             counts.sort_by_key(|&(_, count)| core::cmp::Reverse(*count));

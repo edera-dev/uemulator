@@ -4,7 +4,7 @@
 
 Backends: **aarch64** (macOS Apple Silicon, Linux), **x86_64** (Linux, macOS, Windows) and **wasm32** (the browser build, `plans/13-web.md`; a different shape: modules instantiated by the host, no executable buffer). Other hosts, and builds without the `jit` feature, run the interpreter. The feature gate is `jit` (default on): it enables the `libc` / `windows-sys` dependencies and every file under `jit/` and `sys.rs`.
 
-`jit/blocks.rs` is what the cache implementations share: how a block is read out of RAM (`decode_block`), its key and the jump cache hash. `native.rs` is the aarch64 and x86-64 cache; `wasm.rs` is the WebAssembly one, with `emit_wasm.rs` as its generator (the same forms as `emit_x64.rs` minus adc/sbb, rotates, narrow shifts, 64-bit imul and BMI) and `wasm_encode.rs` as its encoder.
+`jit/blocks.rs` is what the cache implementations share: how a block is read out of RAM (`decode_block`), its key and the jump cache hash. `native.rs` is the aarch64 and x86-64 cache; `wasm.rs` is the WebAssembly one, with `emit_wasm.rs` as its generator (the same forms as `emit_x64.rs` minus narrow shifts and BMI, with rotates and 64-bit imul only when their flags are dead; link cells instead of patched direct links, `plans/13-web.md`) and `wasm_encode.rs` as its encoder.
 
 ## Runtime probe (`sys::jit_probe`)
 

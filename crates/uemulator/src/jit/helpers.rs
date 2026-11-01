@@ -375,6 +375,24 @@ pub(crate) fn flag_record_needed(insns: &[Insn]) -> Vec<bool> {
     needed
 }
 
+/// Whether the flags instruction `index` would leave are overwritten before anything can read
+/// them: what follows it in the block, up to a register-only writer of every flag, neither reads
+/// flags nor can fault (the rule of `flag_record_needed`, asked about one instruction). The
+/// WebAssembly generator then lowers instructions whose flags it cannot cheaply compute (a 64-bit
+/// `imul`, rotates) without computing them.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn flags_dead_after(insns: &[Insn], index: usize) -> bool {
+    for insn in &insns[index + 1..] {
+        if writes_all_flags(insn) {
+            return true;
+        }
+        if !leaves_flags_alone(insn) {
+            return false;
+        }
+    }
+    false
+}
+
 const ALU_ADC: u16 = 2;
 const ALU_SBB: u16 = 3;
 

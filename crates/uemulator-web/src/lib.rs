@@ -57,6 +57,9 @@ pub const OPTION_REBOOT: u32 = 1 << 5;
 /// The command line given to `uw_create` replaces the library's default instead of being
 /// appended to it.
 pub const OPTION_REPLACE_CMDLINE: u32 = 1 << 6;
+/// The library's `debug` mode: on exit, a state dump with the JIT's counters and the
+/// instructions that went through the interpreter goes to `host_log`.
+pub const OPTION_DEBUG: u32 = 1 << 7;
 
 #[link(wasm_import_module = "host")]
 unsafe extern "C" {
@@ -245,6 +248,7 @@ pub unsafe extern "C" fn uw_create(
         .iommu(option(OPTION_IOMMU))
         .rng(option(OPTION_RNG))
         .reboot(option(OPTION_REBOOT))
+        .debug(option(OPTION_DEBUG))
         // Guest time follows the page's clock. A virtual clock jumps over every idle wait and
         // otherwise crawls at one nanosecond per interpreted instruction.
         .clock(ClockMode::Realtime)

@@ -39,6 +39,7 @@ pub(crate) mod op {
     pub const I64_LOAD16_U: u8 = 0x33;
     pub const I64_LOAD32_S: u8 = 0x34;
     pub const I64_LOAD32_U: u8 = 0x35;
+    pub const I32_STORE: u8 = 0x36;
     pub const I64_STORE: u8 = 0x37;
     pub const I32_STORE16: u8 = 0x3b;
     pub const I64_STORE8: u8 = 0x3c;
@@ -53,11 +54,15 @@ pub(crate) mod op {
     pub const I64_NE: u8 = 0x52;
     pub const I64_LT_S: u8 = 0x53;
     pub const I64_LT_U: u8 = 0x54;
+    pub const I64_GE_S: u8 = 0x59;
     pub const I64_LE_U: u8 = 0x58;
     pub const I32_ADD: u8 = 0x6a;
+    pub const I32_AND: u8 = 0x71;
     pub const I32_OR: u8 = 0x72;
     pub const I32_XOR: u8 = 0x73;
     pub const I32_SHL: u8 = 0x74;
+    pub const I32_ROTL: u8 = 0x77;
+    pub const I32_ROTR: u8 = 0x78;
     pub const I64_POPCNT: u8 = 0x7b;
     pub const I64_ADD: u8 = 0x7c;
     pub const I64_SUB: u8 = 0x7d;
@@ -68,6 +73,8 @@ pub(crate) mod op {
     pub const I64_SHL: u8 = 0x86;
     pub const I64_SHR_S: u8 = 0x87;
     pub const I64_SHR_U: u8 = 0x88;
+    pub const I64_ROTL: u8 = 0x89;
+    pub const I64_ROTR: u8 = 0x8a;
     pub const I32_WRAP_I64: u8 = 0xa7;
     pub const I64_EXTEND_I32_U: u8 = 0xad;
     pub const I64_EXTEND8_S: u8 = 0xc2;
@@ -197,12 +204,16 @@ pub(crate) const EXEC_TYPE: u32 = 1;
 pub(crate) const COND_TYPE: u32 = 2;
 pub(crate) const LOAD_TYPE: u32 = 3;
 pub(crate) const STORE_TYPE: u32 = 4;
-const FUNCTION_TYPES: [(&[u8], &[u8]); 5] = [
+/// The linking chain stub: `(cpu: i32, link_cell: i32) -> i64` (`emit_wasm::compile_chain_stub`).
+/// A tail call only needs the callee's result to match the caller's, so a block can tail-call it.
+pub(crate) const LINK_TYPE: u32 = 5;
+const FUNCTION_TYPES: [(&[u8], &[u8]); 6] = [
     (&[I32], &[I64]),
     (&[I32, I32, I64], &[I64]),
     (&[I32, I64], &[I64]),
     (&[I32, I64, I64, I32], &[I64]),
     (&[I32, I64, I64, I64], &[I64]),
+    (&[I32, I32], &[I64]),
 ];
 
 const SECTION_TYPE: u8 = 1;
@@ -238,6 +249,17 @@ fn section(module: &mut Vec<u8>, id: u8, contents: &[u8]) {
 /// and function table, so the code reads the `Cpu` directly and reaches the helpers through
 /// `call_indirect`. `i32_locals` and `i64_locals` are declared after the parameter, in that order.
 pub(crate) fn block_module(code: &[u8], i32_locals: u32, i64_locals: u32) -> Vec<u8> {
+    module_of_type(BLOCK_TYPE, code, i32_locals, i64_locals)
+}
+
+/// `block_module` for a function of another of the `FUNCTION_TYPES`; its locals follow all of
+/// that type's parameters.
+pub(crate) fn module_of_type(
+    function_type: u32,
+    code: &[u8],
+    i32_locals: u32,
+    i64_locals: u32,
+) -> Vec<u8> {
     let mut module = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
 
     let mut types = Vec::new();
@@ -263,7 +285,7 @@ pub(crate) fn block_module(code: &[u8], i32_locals: u32, i64_locals: u32) -> Vec
 
     let mut functions = Vec::new();
     leb_u32(&mut functions, 1);
-    leb_u32(&mut functions, BLOCK_TYPE);
+    leb_u32(&mut functions, function_type);
     section(&mut module, SECTION_FUNCTION, &functions);
 
     let mut exports = Vec::new();

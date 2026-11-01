@@ -13,8 +13,11 @@
 //! - A block leaves for its successor by a tail call to the chain stub (`compile_chain_stub`), the
 //!   `lookup_and_goto_ptr` of the native backends: it checks the same things (the event budget,
 //!   the exec TLB, the jump cache, the block's validity) and tail-calls the successor, or returns
-//!   to the run loop. Every other way out stores `Cpu::rip` and returns `retired << 8 | status`,
-//!   and so does every exit when chaining is off (`Addrs::chain == 0`, the lockstep verifier).
+//!   to the run loop. An exit to a fixed address in the block's own page goes through a link
+//!   cell instead (`Gen::linked_exit`): once the stub has found the successor it is tail-called
+//!   directly from there. Every other way out stores `Cpu::rip` and returns
+//!   `retired << 8 | status`, and so does every exit when chaining is off (`Addrs::chain == 0`,
+//!   the lockstep verifier).
 //! - The slow path of a memory access is inline (`if`/`else` around the TLB hit), not out of line,
 //!   as wasm has no jump to a label in another place.
 //!
@@ -27,10 +30,11 @@
 use crate::prelude::*;
 use core::mem::{offset_of, size_of};
 
+use super::blocks::{SLOT_BLOCK_BITS, SLOT_BLOCK_MASK, STRADDLER_TAG};
 use super::helpers::*;
 use super::wasm_encode::{
-    BLOCK_I64, BLOCK_TYPE, BLOCK_VOID, COND_TYPE, Code, EXEC_TYPE, LOAD_TYPE, STORE_TYPE,
-    block_module, op,
+    BLOCK_I64, BLOCK_TYPE, BLOCK_VOID, COND_TYPE, Code, EXEC_TYPE, LINK_TYPE, LOAD_TYPE,
+    STORE_TYPE, block_module, module_of_type, op,
 };
 use crate::cpu::decode::{Insn, NO_REG};
 use crate::cpu::flags::LazyFlagsOp;
@@ -53,6 +57,8 @@ const LAZY_OP: u32 = offset_of!(Cpu, lazy_op) as u32;
 const LAZY_SIZE_SHIFT: u32 = 8;
 const LAZY_DST: u32 = offset_of!(Cpu, lazy_dst) as u32;
 const LAZY_SRC: u32 = offset_of!(Cpu, lazy_src) as u32;
+/// The carry-in of an adc or sbb record.
+const LAZY_SRC2: u32 = offset_of!(Cpu, lazy_src2) as u32;
 const SEG_BASE: u32 = (offset_of!(Cpu, seg) + offset_of!(Seg, base)) as u32;
 const SEG_SIZE: u32 = size_of::<Seg>() as u32;
 
@@ -135,6 +141,8 @@ const ALU_CMP: u8 = 7;
 /// `test`: and without writeback. Not a real group-1 number; must stay outside 0..=7.
 const ALU_TEST: u8 = 8;
 
+const SHIFT_ROL: u8 = 0;
+const SHIFT_ROR: u8 = 1;
 const SHIFT_SHL: u8 = 4;
 const SHIFT_SHR: u8 = 5;
 const SHIFT_SAL_ALIAS: u8 = 6;
@@ -156,7 +164,28 @@ pub(crate) struct Addrs {
     pub out: u32,
     /// Table slot of the chain stub, or 0 when blocks return to the run loop between each other.
     pub chain: u32,
+    /// Table slot of the chain stub that also fills a link cell (`compile_chain_stub`), or 0
+    /// when exits are not linked.
+    pub chain_link: u32,
+    /// Address of `SharedJit::valid`, the per-block validity bytes a linked exit checks.
+    pub valid: u32,
 }
+
+/// A link cell: where a block's exit to a fixed address in its own page remembers the block it
+/// leads to, so the next time it can tail-call it directly instead of going through the chain
+/// stub. The block index sits at offset 0 and the table slot at offset 4 (one little-endian
+/// `u64` on the Rust side, `wasm::Block::_links`). Only the linking stub writes a cell, and only
+/// after its full hit path; a cell is trusted as long as the block it names is valid, which is
+/// enough because cells belong to their block and are freed with it at a flush, the only time
+/// block indices are reused.
+pub(crate) const LINK_CELL_BLOCK: u32 = 0;
+pub(crate) const LINK_CELL_SLOT: u32 = 4;
+pub(crate) const LINK_CELL_SIZE: u32 = 8;
+/// A block has at most two exits to fixed addresses: a jcc's two outcomes, or a jmp, a call or
+/// the fall-through after its last instruction.
+pub(crate) const LINKS_PER_BLOCK: u32 = 2;
+/// Page offsets below this are in the block's own page (`Gen::rip_to`).
+const PAGE_SIZE: u64 = 1 << PAGE_SHIFT;
 
 /// What `compile_block` produces.
 pub(crate) struct CompiledBlock {
@@ -287,10 +316,13 @@ pub(crate) struct Gen<'a> {
     flag_record_needed: Vec<bool>,
     skip_flag_record: bool,
     pub flag_records_skipped: u32,
+    /// Address of the block's `LINKS_PER_BLOCK` link cells, or 0 when its exits are not linked.
+    link_cells: u32,
+    links_used: u32,
 }
 
 impl<'a> Gen<'a> {
-    pub fn new(addrs: &'a Addrs, insns: &'a [Insn]) -> Self {
+    pub fn new(addrs: &'a Addrs, insns: &'a [Insn], link_cells: u32) -> Self {
         Gen {
             c: Code::default(),
             addrs,
@@ -302,6 +334,8 @@ impl<'a> Gen<'a> {
             flag_record_needed: flag_record_needed(insns),
             skip_flag_record: false,
             flag_records_skipped: 0,
+            link_cells,
+            links_used: 0,
         }
     }
 
@@ -341,7 +375,79 @@ impl<'a> Gen<'a> {
     /// Ends the block at a fixed guest address.
     fn chain_to(&mut self, rip: u64, retired: u32) {
         self.store_rip(rip);
-        self.chain_exit(retired);
+        match self.next_link_cell(rip) {
+            Some(cell) => self.linked_exit(cell, retired),
+            None => self.chain_exit(retired),
+        }
+    }
+
+    /// A link cell for an exit to page offset `rip`, if it may be linked: a fixed address in
+    /// the block's own page. Same page is what lets a linked exit skip the stub's exec TLB probe
+    /// and jump-cache key check: the block was entered through a validated mapping of this
+    /// physical page, so the target's physical address is this page plus the offset, and the
+    /// block the cell names was found for exactly that address.
+    fn next_link_cell(&mut self, rip: u64) -> Option<u32> {
+        if self.addrs.chain_link == 0
+            || self.link_cells == 0
+            || rip >= PAGE_SIZE
+            || self.links_used == LINKS_PER_BLOCK
+        {
+            return None;
+        }
+        let cell = self.link_cells + self.links_used * LINK_CELL_SIZE;
+        self.links_used += 1;
+        Some(cell)
+    }
+
+    /// `chain_exit` through link cell `cell`, with `Cpu::rip` stored: the event budget and
+    /// `block_exit_requested` checks the stub would make (in that order: a store of this very
+    /// block may have invalidated the target), then the cell's block, if still valid, is
+    /// tail-called directly. Otherwise the linking stub runs the full lookup and, on a hit,
+    /// fills the cell for next time.
+    ///
+    /// The valid byte is checked before the slot is used: an empty cell names the sentinel
+    /// block `wasm::NO_BLOCK`, never valid, and holds slot 0, the null function, which traps.
+    fn linked_exit(&mut self, cell: u32, retired: u32) {
+        let owed = retired - self.prepaid_insns;
+        self.c
+            .local_get(CPU)
+            .local_get(CPU)
+            .mem(op::I64_LOAD, ICOUNT)
+            .i64_const(owed as i64)
+            .op(op::I64_ADD)
+            .local_tee(SCRATCH)
+            .mem(op::I64_STORE, ICOUNT);
+        if self.prepaid_insns > 0 {
+            self.store_cpu_u64(PREPAID_ICOUNT, 0);
+        }
+        self.c.begin_block();
+        self.c
+            .local_get(SCRATCH)
+            .local_get(CPU)
+            .mem(op::I64_LOAD, NEXT_EVENT)
+            .op(op::I64_GE_U)
+            .br_if(0);
+        self.c
+            .local_get(CPU)
+            .mem(op::I32_LOAD8_U, BLOCK_EXIT_REQUESTED)
+            .br_if(0);
+        self.c
+            .i32_const(cell as i32)
+            .mem(op::I32_LOAD, LINK_CELL_BLOCK)
+            .mem(op::I32_LOAD8_U, self.addrs.valid)
+            .op(op::I32_EQZ)
+            .br_if(0);
+        self.c
+            .local_get(CPU)
+            .i32_const(cell as i32)
+            .mem(op::I32_LOAD, LINK_CELL_SLOT)
+            .return_call_indirect(BLOCK_TYPE);
+        self.end();
+        self.c
+            .local_get(CPU)
+            .i32_const(cell as i32)
+            .i32_const(self.addrs.chain_link as i32)
+            .return_call_indirect(LINK_TYPE);
     }
 
     /// Ends the block at the guest address in local `target`.
@@ -907,7 +1013,11 @@ impl<'a> Gen<'a> {
 
     /// Emits `dst = dst <alu_op> src` at `size` (1, 2, 4 or 8) and records its flags. `alu_op` is
     /// a group-1 number or `ALU_TEST`; `ALU_CMP` and `ALU_TEST` discard the result. Returns true
-    /// if it stored to memory (the caller follows with `smc_check`). adc and sbb are not lowered.
+    /// if it stored to memory (the caller follows with `smc_check`).
+    ///
+    /// adc and sbb take CF first, before the operand loads overwrite the fused locals it may be
+    /// computed from, and record `Adc`/`Sbb` with the carry-in in `lazy_src2`. The fused locals
+    /// cannot express a borrow with a carry-in, so conditions after them use the record.
     #[allow(clippy::too_many_arguments)]
     fn alu(
         &mut self,
@@ -920,6 +1030,11 @@ impl<'a> Gen<'a> {
         index: u32,
         rip: u64,
     ) -> bool {
+        let with_carry = matches!(alu_op, ALU_ADC | ALU_SBB);
+        if with_carry {
+            self.condition(CONDITION_BELOW);
+            self.c.op(op::I64_EXTEND_I32_U).local_set(CARRY);
+        }
         // The memory operand is loaded first: it may fault, and nothing has been written yet.
         match (dst, src) {
             (Dst::Mem, Src::Reg(reg, high)) => {
@@ -957,6 +1072,24 @@ impl<'a> Gen<'a> {
                 self.c.op(op::I64_ADD);
                 self.mask_to(size);
                 (LazyFlagsOp::Add, FusedOp::Add)
+            }
+            ALU_ADC | ALU_SBB => {
+                let (arithmetic, lazy) = if alu_op == ALU_ADC {
+                    (op::I64_ADD, LazyFlagsOp::Adc)
+                } else {
+                    (op::I64_SUB, LazyFlagsOp::Sbb)
+                };
+                self.c.op(arithmetic).local_get(CARRY).op(arithmetic);
+                self.mask_to(size);
+                self.c.local_set(RES);
+                let stored = self.store_dst(dst, size, RES, index, rip);
+                self.store_lazy(lazy, size, RHS);
+                self.c
+                    .local_get(CPU)
+                    .local_get(CARRY)
+                    .mem(op::I64_STORE, LAZY_SRC2);
+                self.flags = None;
+                return stored;
             }
             ALU_SUB | ALU_CMP => {
                 self.c.op(op::I64_SUB);
@@ -1218,6 +1351,76 @@ impl<'a> Gen<'a> {
         self.flags = None;
     }
 
+    /// The 64-bit `imul r, r/m` and `imul r, r/m, imm` when their flags are dead
+    /// (`flags_dead_after`): the low half of the product is one `i64.mul`, and CF/OF, which need
+    /// the high half wasm has no instruction for, are never computed. The flags the record holds
+    /// are then stale, which is fine because the instruction that overwrites them comes before
+    /// anything that could look.
+    fn imul64_without_flags(&mut self, insn: &Insn, next: u64, index: u32, rip: u64) {
+        match Self::rm_src(insn, 8) {
+            Src::Reg(reg, _) => self.read_reg(reg, false, 8),
+            _ => {
+                self.ea(insn, next);
+                self.mem_load(8, false, index, rip, false);
+            }
+        }
+        if insn.op == 0x1af {
+            self.read_reg(insn.reg, false, 8);
+        } else {
+            self.c.i64_const(insn.imm as i32 as i64);
+        }
+        self.c.op(op::I64_MUL).local_set(VALUE);
+        self.write_reg(insn.reg, false, 8, VALUE);
+        self.flags = None;
+    }
+
+    /// `rol`/`ror` of a 32- or 64-bit operand by an immediate (`count`: masked, non-zero) or CL,
+    /// when nothing reads the flags they would change (`flags_dead_after`). The wasm rotates take
+    /// their count modulo the width, which is the x86 count mask at these sizes; a CL count of
+    /// zero still writes the destination, zero-extending a 32-bit one, as the interpreter does.
+    #[allow(clippy::too_many_arguments)]
+    fn rotate_without_flags(
+        &mut self,
+        insn: &Insn,
+        left: bool,
+        dst: Dst,
+        count: Option<u32>,
+        size: u8,
+        next: u64,
+        index: u32,
+        rip: u64,
+    ) -> bool {
+        self.load_dst(insn, dst, VALUE, size, next, index, rip);
+        self.c.local_get(VALUE);
+        if size == 8 {
+            match count {
+                Some(count) => {
+                    self.c.i64_const(count as i64);
+                }
+                None => self.read_reg(GUEST_RCX, false, 1),
+            }
+            self.c.op(if left { op::I64_ROTL } else { op::I64_ROTR });
+        } else {
+            self.c.op(op::I32_WRAP_I64);
+            match count {
+                Some(count) => {
+                    self.c.i32_const(count as i32);
+                }
+                None => {
+                    self.c
+                        .local_get(CPU)
+                        .mem(op::I32_LOAD8_U, register_offset(GUEST_RCX, false));
+                }
+            }
+            self.c
+                .op(if left { op::I32_ROTL } else { op::I32_ROTR })
+                .op(op::I64_EXTEND_I32_U);
+        }
+        self.c.local_set(SCRATCH_B);
+        self.flags = None;
+        self.store_dst(dst, size, SCRATCH_B, index, rip)
+    }
+
     fn jcc(&mut self, cc: u8, target: u64, next: u64, retired: u32) {
         self.condition(cc);
         self.c.begin_if(BLOCK_VOID);
@@ -1258,7 +1461,9 @@ impl<'a> Gen<'a> {
     /// Lower instruction `index` inline if it is a supported form. Returns false with nothing
     /// emitted otherwise (callers fall back to `helper_exec`), so every `return false` below must
     /// come before the first emit for that arm. Which forms are lowered mirrors `emit_x64.rs`
-    /// except for adc/sbb, narrow shifts, rotates, 64-bit imul and BMI.
+    /// except for narrow shifts and BMI, and rotates and 64-bit imul only when their flags are dead
+    /// (`flags_dead_after`); adc/sbb are lowered at 32 and 64
+    /// bits, as on the native backends.
     fn try_inline(&mut self, index: usize, rip: u64, next: u64) -> bool {
         let insn: Insn = self.insns[index];
         self.skip_flag_record = !self.flag_record_needed[index];
@@ -1273,11 +1478,11 @@ impl<'a> Gen<'a> {
         match insn.op {
             0x00..=0x3f if insn.op & 7 < 6 && plain => {
                 let alu_op = ((insn.op >> 3) & 7) as u8;
-                if matches!(alu_op, ALU_ADC | ALU_SBB) {
-                    return false;
-                }
                 let form = insn.op & 7;
                 let size = if form & 1 == 0 { 1 } else { osz };
+                if matches!(alu_op, ALU_ADC | ALU_SBB) && size < 4 {
+                    return false;
+                }
                 let (dst, src) = match form {
                     0 | 1 => (Self::rm_dst(&insn, size), Self::reg_src(&insn, size)),
                     2 | 3 => (Self::reg_dst(&insn, size), Self::rm_src(&insn, size)),
@@ -1290,10 +1495,10 @@ impl<'a> Gen<'a> {
             }
             0x80 | 0x81 | 0x83 if plain => {
                 let alu_op = insn.reg & 7;
-                if matches!(alu_op, ALU_ADC | ALU_SBB) {
+                let size = if insn.op == 0x80 { 1 } else { osz };
+                if matches!(alu_op, ALU_ADC | ALU_SBB) && size < 4 {
                     return false;
                 }
-                let size = if insn.op == 0x80 { 1 } else { osz };
                 store = self.alu(
                     &insn,
                     alu_op,
@@ -1342,6 +1547,32 @@ impl<'a> Gen<'a> {
                     insn.reg & 7 == 1,
                     Self::rm_dst(&insn, size),
                     size,
+                    next,
+                    k,
+                    rip,
+                );
+            }
+            // rol/ror at 32 and 64 bits whose CF and OF nothing reads; the flags they keep
+            // (SF, ZF, PF, AF) would need the interpreter to merge.
+            0xc1 | 0xd1 | 0xd3
+                if wide
+                    && matches!(insn.reg & 7, SHIFT_ROL | SHIFT_ROR)
+                    && flags_dead_after(self.insns, index) =>
+            {
+                let count = match insn.op {
+                    0xc1 => Some(insn.imm as u32 & (8 * osz as u32 - 1)),
+                    0xd1 => Some(1),
+                    _ => None,
+                };
+                if count == Some(0) {
+                    return false;
+                }
+                store = self.rotate_without_flags(
+                    &insn,
+                    insn.reg & 7 == SHIFT_ROL,
+                    Self::rm_dst(&insn, osz),
+                    count,
+                    osz,
                     next,
                     k,
                     rip,
@@ -1450,6 +1681,9 @@ impl<'a> Gen<'a> {
                 self.write_reg(insn.reg, false, 8, VALUE);
             }
             0x1af | 0x69 | 0x6b if wide && osz == 4 => self.imul32(&insn, next, k, rip),
+            0x1af | 0x69 | 0x6b if wide && osz == 8 && flags_dead_after(self.insns, index) => {
+                self.imul64_without_flags(&insn, next, k, rip);
+            }
             // group 5: /2 call near, /4 jmp near (r/m64), /6 push r/m64
             0xff if plain && !insn.p66 && matches!(insn.reg & 7, 2 | 4 | 6) => {
                 match Self::rm_src(&insn, 8) {
@@ -1664,20 +1898,87 @@ impl<'a> Gen<'a> {
     }
 }
 
-/// Generates the module for one block. `insns` must outlive the code, which points into it.
+/// Generates the module for one block. `insns` must outlive the code, which points into it, and
+/// so must the `LINKS_PER_BLOCK` cells at `link_cells` (0: the exits are not linked).
 pub(crate) fn compile_block(
     addrs: &Addrs,
     insns: &[Insn],
     rips: &[u64],
     end_rip: u64,
+    link_cells: u32,
 ) -> CompiledBlock {
-    let mut generator = Gen::new(addrs, insns);
+    let mut generator = Gen::new(addrs, insns, link_cells);
     generator.compile(rips, end_rip);
     CompiledBlock {
         module: block_module(&generator.c.bytes, I32_LOCALS, I64_LOCALS),
         inlined: generator.inlined,
         flag_records_skipped: generator.flag_records_skipped,
     }
+}
+
+/// Inside the chain stub's `if` for a jump cache entry whose physical address is not that of
+/// `stub_rip`: falls out of the `if` (and on to the slot and validity checks) only when the entry
+/// is the straddling block of this address and the page after `stub_rip`'s is still mapped
+/// executable to the physical page that block was decoded from, as `Jit::lookup_straddler` checks;
+/// otherwise branches to the stub's miss path (`br 1`). Without this, every run of a straddler
+/// (a hot loop that crosses a page) returned to the run loop. Reuses `tlb_entry` and `stub_phys`,
+/// which nothing after it reads.
+fn straddler_check(
+    c: &mut Code,
+    tables: &ChainTables,
+    cache_entry: u32,
+    tlb_entry: u32,
+    stub_rip: u32,
+    stub_phys: u32,
+) {
+    const MISS: u32 = 1;
+    let next_page = stub_phys;
+    c.local_get(cache_entry)
+        .mem(op::I64_LOAD, tables.entry_phys)
+        .local_get(stub_phys)
+        .i64_const(STRADDLER_TAG as i64)
+        .op(op::I64_OR)
+        .op(op::I64_NE)
+        .br_if(MISS);
+    c.local_get(stub_rip)
+        .i64_const(PAGE_MASK_NEG)
+        .op(op::I64_AND)
+        .i64_const(PAGE_SIZE as i64)
+        .op(op::I64_ADD)
+        .local_set(next_page);
+    c.local_get(next_page)
+        .i64_const(PAGE_SHIFT)
+        .op(op::I64_SHR_U)
+        .i64_const(TLB_ENTRIES_PER_MODE as i64 - 1)
+        .op(op::I64_AND)
+        .op(op::I32_WRAP_I64)
+        .i32_const(TLB_ENTRY_SHIFT)
+        .op(op::I32_SHL)
+        .local_get(CPU)
+        .mem(op::I32_LOAD, TLB_ACTIVE_BASE)
+        .op(op::I32_ADD)
+        .local_set(tlb_entry);
+    c.local_get(tlb_entry)
+        .mem(op::I64_LOAD, TLB_TAG_EXEC)
+        .local_get(next_page)
+        .op(op::I64_NE)
+        .br_if(MISS);
+    // the second page's physical page number against the one kept above the block index
+    c.local_get(next_page)
+        .local_get(tlb_entry)
+        .mem(op::I64_LOAD, TLB_ADDEND)
+        .op(op::I64_ADD)
+        .local_get(CPU)
+        .mem(op::I64_LOAD, RAM_BASE)
+        .op(op::I64_SUB)
+        .i64_const(PAGE_SHIFT)
+        .op(op::I64_SHR_U)
+        .local_get(cache_entry)
+        .mem(op::I64_LOAD, tables.entry_block)
+        .i64_const(SLOT_BLOCK_BITS as i64)
+        .op(op::I64_SHR_U)
+        .op(op::I64_NE)
+        .br_if(MISS);
 }
 
 /// Where the chain stub finds what it looks blocks up in: the jump cache and the validity table
@@ -1711,13 +2012,19 @@ pub(crate) struct ChainTables {
 ///
 /// The miss path gives back the successor's pre-charge, as `native.rs` documents for
 /// `Cpu::step_block`, and reports one retired instruction.
-pub(crate) fn compile_chain_stub(tables: &ChainTables) -> Vec<u8> {
-    // locals: 0 cpu; i32: 1 tlb entry, 2 jump cache entry, 3 block slot; i64: 4 rip, 5 phys
-    const TLB_ENTRY: u32 = 1;
-    const CACHE_ENTRY: u32 = 2;
-    const BLOCK_SLOT: u32 = 3;
-    const STUB_RIP: u32 = 4;
-    const STUB_PHYS: u32 = 5;
+///
+/// With `link` the stub is the `LINK_TYPE` variant a linkable exit calls (`Gen::linked_exit`):
+/// its second parameter is the exit's link cell, which a hit fills with the block it enters.
+pub(crate) fn compile_chain_stub(tables: &ChainTables, link: bool) -> Vec<u8> {
+    // parameters: 0 cpu, then the link cell for the linking variant; locals after them: i32 tlb
+    // entry, jump cache entry, block slot; i64 rip, phys
+    const LINK_CELL: u32 = 1;
+    let first_local = if link { 2 } else { 1 };
+    let tlb_entry = first_local;
+    let cache_entry = first_local + 1;
+    let block_slot = first_local + 2;
+    let stub_rip = first_local + 3;
+    let stub_phys = first_local + 4;
     const JUMP_HASH_FOLD_SHIFT: i64 = 16;
     let mut c = Code::default();
     c.begin_block();
@@ -1731,9 +2038,9 @@ pub(crate) fn compile_chain_stub(tables: &ChainTables) -> Vec<u8> {
     c.local_get(CPU)
         .mem(op::I32_LOAD8_U, BLOCK_EXIT_REQUESTED)
         .br_if(0);
-    c.local_get(CPU).mem(op::I64_LOAD, RIP).local_set(STUB_RIP);
+    c.local_get(CPU).mem(op::I64_LOAD, RIP).local_set(stub_rip);
     // the exec TLB entry of rip's page
-    c.local_get(STUB_RIP)
+    c.local_get(stub_rip)
         .i64_const(PAGE_SHIFT)
         .op(op::I64_SHR_U)
         .i64_const(TLB_ENTRIES_PER_MODE as i64 - 1)
@@ -1744,26 +2051,26 @@ pub(crate) fn compile_chain_stub(tables: &ChainTables) -> Vec<u8> {
         .local_get(CPU)
         .mem(op::I32_LOAD, TLB_ACTIVE_BASE)
         .op(op::I32_ADD)
-        .local_set(TLB_ENTRY);
-    c.local_get(TLB_ENTRY)
+        .local_set(tlb_entry);
+    c.local_get(tlb_entry)
         .mem(op::I64_LOAD, TLB_TAG_EXEC)
-        .local_get(STUB_RIP)
+        .local_get(stub_rip)
         .i64_const(PAGE_MASK_NEG)
         .op(op::I64_AND)
         .op(op::I64_NE)
         .br_if(0);
     // phys = rip + addend - ram_base
-    c.local_get(STUB_RIP)
-        .local_get(TLB_ENTRY)
+    c.local_get(stub_rip)
+        .local_get(tlb_entry)
         .mem(op::I64_LOAD, TLB_ADDEND)
         .op(op::I64_ADD)
         .local_get(CPU)
         .mem(op::I64_LOAD, RAM_BASE)
         .op(op::I64_SUB)
-        .local_set(STUB_PHYS);
+        .local_set(stub_phys);
     // the jump cache entry: index = (rip ^ (rip >> 16)) & mask, as `jump_cache_hash`
-    c.local_get(STUB_RIP)
-        .local_get(STUB_RIP)
+    c.local_get(stub_rip)
+        .local_get(stub_rip)
         .i64_const(JUMP_HASH_FOLD_SHIFT)
         .op(op::I64_SHR_U)
         .op(op::I64_XOR)
@@ -1774,32 +2081,53 @@ pub(crate) fn compile_chain_stub(tables: &ChainTables) -> Vec<u8> {
         .op(op::I32_SHL)
         .i32_const(tables.jump_cache as i32)
         .op(op::I32_ADD)
-        .local_set(CACHE_ENTRY);
-    c.local_get(CACHE_ENTRY)
+        .local_set(cache_entry);
+    c.local_get(cache_entry)
         .mem(op::I64_LOAD, 0)
-        .local_get(STUB_RIP)
+        .local_get(stub_rip)
         .op(op::I64_NE)
         .br_if(0);
-    c.local_get(CACHE_ENTRY)
+    c.local_get(cache_entry)
         .mem(op::I64_LOAD, tables.entry_phys)
-        .local_get(STUB_PHYS)
+        .local_get(stub_phys)
         .op(op::I64_NE)
-        .br_if(0);
-    c.local_get(CACHE_ENTRY)
+        .begin_if(BLOCK_VOID);
+    straddler_check(&mut c, tables, cache_entry, tlb_entry, stub_rip, stub_phys);
+    c.op(op::END);
+    c.local_get(cache_entry)
         .mem(op::I32_LOAD, tables.entry_slot)
-        .local_tee(BLOCK_SLOT)
+        .local_tee(block_slot)
         .op(op::I32_EQZ)
         .br_if(0);
-    // the block may have been invalidated since the entry was made
-    c.local_get(CACHE_ENTRY)
+    // the block may have been invalidated since the entry was made (a straddler's index has its
+    // second page above it)
+    c.local_get(cache_entry)
         .mem(op::I32_LOAD, tables.entry_block)
+        .i32_const(SLOT_BLOCK_MASK as i32)
+        .op(op::I32_AND)
         .i32_const(tables.valid as i32)
         .op(op::I32_ADD)
         .mem(op::I32_LOAD8_U, 0)
         .op(op::I32_EQZ)
         .br_if(0);
+    // A straddler is never linked: a linked exit skips the second page's check.
+    if link {
+        c.local_get(cache_entry)
+            .mem(op::I64_LOAD, tables.entry_phys)
+            .i64_const(0)
+            .op(op::I64_GE_S)
+            .begin_if(BLOCK_VOID);
+        c.local_get(LINK_CELL)
+            .local_get(cache_entry)
+            .mem(op::I32_LOAD, tables.entry_block)
+            .mem(op::I32_STORE, LINK_CELL_BLOCK);
+        c.local_get(LINK_CELL)
+            .local_get(block_slot)
+            .mem(op::I32_STORE, LINK_CELL_SLOT);
+        c.op(op::END);
+    }
     c.local_get(CPU)
-        .local_get(BLOCK_SLOT)
+        .local_get(block_slot)
         .return_call_indirect(BLOCK_TYPE);
     c.op(op::END);
     // miss: give back the pre-charge and return to the run loop (rip is already stored)
@@ -1812,5 +2140,5 @@ pub(crate) fn compile_chain_stub(tables: &ChainTables) -> Vec<u8> {
     c.i64_const(1 << EXIT_COUNT_SHIFT)
         .op(op::RETURN)
         .op(op::END);
-    block_module(&c.bytes, 3, 2)
+    module_of_type(if link { LINK_TYPE } else { BLOCK_TYPE }, &c.bytes, 3, 2)
 }
