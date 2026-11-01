@@ -1,5 +1,7 @@
 # QEMU reference map
 
+**Status:** reference.
+
 `../ext/qemu-uplink` (branch `xtcg/next`, QEMU 11.1.50 + uplink fork, ~16.5k commits past the merge-base with the latest upstream tag). Read-only. Study behavior and algorithms; write Rust from scratch (code is GPLv2 like the reference, but not copied; QEMU's own AGENTS.md restricts AI output to local experiments, so nothing here is intended for upstream).
 
 | subsystem | read |

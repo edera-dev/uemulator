@@ -1,5 +1,7 @@
 # CPU
 
+**Status:** implemented.
+
 ## State (`Env`, `#[repr(C)]`, pointed to by a pinned host register in the JIT)
 
 - 16 GPRs (u64), `rip`, `rflags` (without lazy bits), segment regs (selector, base, limit, attrs) incl. hidden parts, GDTR/IDTR/LDTR/TR

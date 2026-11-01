@@ -1,5 +1,7 @@
 # Xen dom0 on a modern AMD machine
 
+**Status:** partially implemented. Xen 4.21 boots with an Alpine dom0 and a PVH domU (step 6); a Fedora dom0 has not been booted yet.
+
 Goal: boot a stock Xen with a Fedora dom0 (PVH, x86_64) through UEFI and GRUB, on a machine that looks like a current AMD server part. Success line: Fedora dom0 at a login prompt under Xen; stretch: a PVH domU running inside it. Alpine's `xen` packages are the cheap stand-in for Fedora while developing (same hypervisor, much smaller userspace).
 
 Written by the first session on this work; update the status list as pieces land.

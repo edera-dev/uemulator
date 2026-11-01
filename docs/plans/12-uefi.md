@@ -1,5 +1,7 @@
 # UEFI application
 
+**Status:** implemented. The Intel VMX path is written but has never run; see Status below.
+
 `crates/uemulator-uefi` is a `no_std` UEFI application (`x86_64-unknown-uefi`, `aarch64-unknown-uefi`) that embeds the library, loads a bzImage and an initramfs from the boot filesystem and runs them on the emulated machine. The guest is always x86_64. On an aarch64 host build that is cross-architecture emulation; on an x86_64 build it is x86_64 on x86_64.
 
 ## Status

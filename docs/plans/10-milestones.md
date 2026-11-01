@@ -1,5 +1,7 @@
 # Milestones
 
+**Status:** the project's status log, updated as work lands.
+
 ## Status
 
 - M0-M3 done: kernel banner, VFS panic then `ExitReason::Reset`, and the Debian installer userspace (dialogs drawn) with both interpreter and JIT.

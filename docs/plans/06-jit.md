@@ -1,5 +1,7 @@
 # JIT
 
+**Status:** implemented (aarch64, x86_64 and WebAssembly backends).
+
 ## Scope
 
 Backends: **aarch64** (macOS Apple Silicon, Linux), **x86_64** (Linux, macOS, Windows) and **wasm32** (the browser build, `docs/plans/13-web.md`; a different shape: modules instantiated by the host, no executable buffer). Other hosts, and builds without the `jit` feature, run the interpreter. The feature gate is `jit` (default on): it enables the `libc` / `windows-sys` dependencies and every file under `jit/` and `sys.rs`.

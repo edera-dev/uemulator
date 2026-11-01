@@ -1,5 +1,7 @@
 # Memory
 
+**Status:** implemented.
+
 ## Physical
 
 - Guest RAM: one anonymous `mmap` region of `memory_mib` (lazy-committed, host page size aware: macOS arm64 uses 16 KiB pages, guest uses 4 KiB; never rely on host page protection for guest page granularity).

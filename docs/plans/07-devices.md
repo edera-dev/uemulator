@@ -1,5 +1,7 @@
 # Devices and time
 
+**Status:** implemented. The opening paragraph describes v1 (port I/O only); the LAPIC/IOAPIC and ACPI/HPET/ECAM sections below cover the memory-mapped devices added since.
+
 Port I/O only (no MMIO in v1). Unknown ports read all ones, writes ignored. Devices implement a small trait: `io_read(port, size) -> u32`, `io_write(port, size, val)`, optional `next_deadline() -> Option<u64>` and `tick(now)`.
 
 ## Clock (`clock.rs`)

@@ -1,5 +1,7 @@
 # Ryzen 5 7000-class feature parity
 
+**Status:** proposal.
+
 Goal: the emulated CPU **has every feature a Ryzen 5 7000-series part (Zen 4: Raphael 7600/7600X, Phoenix 7640U/7640HS, family 19h) advertises**, so a guest, a hypervisor or a test suite that looks for a feature finds it and it works. This is a feature list, not a fidelity project:
 
 - Not the exact core. Instruction latency, speculation, cache and TLB replacement, performance-counter values, undefined-flag quirks beyond what the manuals specify: out of scope.

@@ -1,5 +1,7 @@
 # UEFI firmware
 
+**Status:** implemented.
+
 `crates/uemulator-firmware` is a small `no_std` UEFI 2.9 firmware (not EDK2) for `x86_64-unknown-none`. The library starts it with `MachineConfig::uefi_firmware(image)`; the CLI embeds it (`crates/uemulator-cli/build.rs` builds it into its own target dir, so `rustup target add x86_64-unknown-none` is needed) and runs it with `advanced boot-uefi` or a `quick` machine with `firmware = "uefi"`.
 
 ## Image and start state

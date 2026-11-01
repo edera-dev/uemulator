@@ -1,5 +1,7 @@
 # Public API
 
+**Status:** implemented. Where this and `crates/uemulator/src/lib.rs` differ, the code is authoritative.
+
 Small surface; everything else is `pub(crate)`.
 
 ```rust

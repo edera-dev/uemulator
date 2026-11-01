@@ -1,5 +1,7 @@
 # One host thread per vCPU
 
+**Status:** implemented.
+
 With `MachineConfig::cpus(n)` the guest has n vCPUs. Time-sharing them on one host thread (`docs/plans/03-cpu.md`, "SMP") is the deterministic mode and the only one a freestanding host without threads can run. This plan is the other mode: every vCPU on its own host thread, so a parallel guest workload really runs in parallel. Four simultaneous 40 MiB `md5sum`s finish in the time one takes alone.
 
 `SmpMode` picks the mode (`MachineConfig::smp`, CLI `--smp auto|timeshare|threads`, saved in `machine.toml`):

@@ -1,5 +1,7 @@
 # Configurable RAM, disk, network, console resize
 
+**Status:** implemented.
+
 ## Findings that drive the design (Debian 6.12.107 kernel + d-i initrd)
 
 - Built in: `virtio-pci` (PCI bus driver), `virtio_console`, `virtiofs`. Modules: `virtio_net` (in the d-i initrd), `virtio_blk` (not in the d-i initrd, present in a normal installed system), `virtio_mmio` (module).

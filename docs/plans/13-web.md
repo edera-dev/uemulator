@@ -1,5 +1,7 @@
 # WebAssembly port
 
+**Status:** implemented; "Not done" below lists what is missing.
+
 `crates/uemulator-web` builds the library to `wasm32-unknown-unknown` (empty crate on any other target) and `crates/uemulator-web/www` is the page around it. `hack/web.sh [serve]` builds into `target/web` and serves it on `http://127.0.0.1:8080/`; `hack/web/serve.py` adds the two headers that make the page cross-origin isolated.
 
 ## What is ported

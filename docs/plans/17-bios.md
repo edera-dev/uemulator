@@ -1,5 +1,7 @@
 # BIOS boot of a disk
 
+**Status:** implemented.
+
 `MachineConfig::boot_disk(true)` boots the first disk the way a PC with a BIOS does, so the disk's own boot loader (syslinux, GRUB) loads the kernel. There is no firmware image: the BIOS is host code in `cpu/bios.rs`. CLI: `quick boot` with `--boot-from auto|disk` (`docs/plans/01-api.md`).
 
 ## Shape

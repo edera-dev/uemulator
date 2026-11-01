@@ -1,5 +1,7 @@
 # JIT performance: direct chaining, more inline integer ops, native SIMD
 
+**Status:** implemented as far as the Status paragraph and the Results section below say; the task lists are the plan as written.
+
 > **For agentic workers:** execute task by task; steps use checkbox syntax. The interpreter is the oracle for every JIT change (`testkit::assert_jit_matches_interpreter`).
 
 **Goal:** make the initramfs unpack (and everything else a daily-driven guest does) several times faster than today's ~21 s host time for the 252 MB Fedora netboot initramfs on an Apple Silicon host.

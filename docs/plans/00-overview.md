@@ -1,5 +1,7 @@
 # Overview
 
+**Status:** implemented. The goal and non-goals below are the original v1 scope, which the project has since grown past (firmware, SMP, many more devices); [10-milestones.md](10-milestones.md) has what exists now.
+
 ## Goal
 
 A small, embeddable x86_64 system emulator in Rust that boots an unmodified Linux kernel (Debian netboot `linux` bzImage, 6.12.x) with a serial console, with no BIOS and no firmware. Design follows QEMU TCG (translate guest blocks to micro-ops, cache them, run via interpreter or host JIT), minus everything not needed to boot Linux.
