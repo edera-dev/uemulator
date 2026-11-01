@@ -41,6 +41,18 @@
   main { flex: 1; min-height: 0; position: relative; background: #000; }
   #terminal { position: absolute; inset: 8px 16px; }
 
+  /* Terminal | Screen, shown while the machine has a screen or input devices. */
+  .views { display: flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  .views button { border: none; border-radius: 0; background: none; padding: 4px 12px; }
+  .views button[aria-pressed=true] { background: var(--accent); color: var(--on-accent); }
+  .fit-guest { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; cursor: pointer; }
+  /* The screen: the guest's pixels scaled to fit (main.js sets the size), centred. */
+  #screen-view { position: absolute; inset: 8px 16px; display: flex; align-items: center; justify-content: center; }
+  #screen { background: #000; outline: none; box-shadow: 0 0 0 1px #222; image-rendering: auto; }
+  #screen[data-pixelated] { image-rendering: pixelated; }
+  #screen:focus-visible { box-shadow: 0 0 0 2px var(--accent); }
+  #screen-note { position: absolute; top: 12px; left: 0; right: 0; text-align: center; color: #98a2b3; margin: 0; pointer-events: none; }
+
   /* The launch wizard sits over the terminal until the machine starts. */
   .overlay { position: absolute; inset: 0; background: rgba(0, 0, 0, .55); display: flex; align-items: flex-start; justify-content: center; padding: 24px 16px; }
   /* Only the step scrolls, so Back, Next and Launch stay in view. */
@@ -104,6 +116,11 @@
   <div class="brand">uemulator<small>x86_64 in WebAssembly</small></div>
   <div id="summary"></div>
   <div id="status">idle</div>
+  <label class="fit-guest" id="fit-guest-label" hidden title="Ask the guest for a screen mode the size of this pane (its driver decides whether to follow)"><input id="fit-guest" type="checkbox"> Resize guest to fit</label>
+  <div class="views" id="views" role="group" aria-label="View" hidden>
+    <button id="view-terminal" aria-pressed="true">Terminal</button>
+    <button id="view-screen" aria-pressed="false">Screen</button>
+  </div>
   <div class="bar-actions">
     <button id="configure">Settings</button>
     <button id="stop" hidden>Stop</button>
@@ -112,6 +129,10 @@
 </header>
 <main>
   <div id="terminal"></div>
+  <div id="screen-view" hidden>
+    <canvas id="screen" tabindex="0" width="1280" height="800" aria-label="Guest screen; click to type into the guest"></canvas>
+    <p id="screen-note" hidden></p>
+  </div>
   <div id="overlay" class="overlay">
     <section class="wizard demo-card" id="demo" role="dialog" aria-modal="true" aria-labelledby="demo-title" hidden>
       <header><h2 id="demo-title">Start a machine</h2></header>
@@ -194,6 +215,20 @@
             <label class="choice"><input type="radio" name="console" value="serial">
               <strong>Serial (ttyS0)</strong><span>The 16550 UART, for kernels without virtio-console. Early boot text and the firmware use it either way.</span></label>
           </div>
+        </fieldset>
+        <fieldset>
+          <legend>Display</legend>
+          <div class="choices" role="radiogroup" aria-label="Display">
+            <label class="choice"><input type="radio" name="display" value="none" checked>
+              <strong>Terminal only</strong><span>No screen: the terminal is the machine's console.</span></label>
+            <label class="choice"><input type="radio" name="display" value="screen">
+              <strong>Screen</strong><span>A virtio-gpu screen that is the guest's console (<code>console=tty0</code>): init's shell is on it. The terminal keeps the kernel log.</span></label>
+            <label class="choice"><input type="radio" name="display" value="both">
+              <strong>Screen and terminal</strong><span>A screen next to the terminal, which stays the console; the screen shows what the guest runs on its virtual terminals.</span></label>
+          </div>
+          <label class="toggle"><input id="input" type="checkbox" checked>
+            <strong>Keyboard and mouse</strong><span>A virtio keyboard and tablet fed from the Screen view (also the firmware's keyboard). Without a screen they still reach the guest's <code>/dev/input</code>.</span></label>
+          <p class="hint">Switch between the terminal and the screen with the buttons in the top bar. Needs a kernel with <code>virtio_gpu</code> and <code>virtio_input</code> (as modules is fine); through UEFI the firmware draws on the screen from the start.</p>
         </fieldset>
         <fieldset>
           <legend>Devices and options</legend>

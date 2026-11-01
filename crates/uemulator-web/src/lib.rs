@@ -5,16 +5,21 @@
 //! The library is single-threaded here (see `freestanding` in `uemulator/build.rs`): the vCPU
 //! runs inside `uw_run` and reaches the outside world only through `MachineConfig::poll`, which
 //! calls the `host_*` imports below. A worker cannot receive messages while a synchronous call is
-//! running, so keyboard input arrives through a `SharedArrayBuffer` ring that `host_input` drains.
+//! running, so keyboard input arrives through a `SharedArrayBuffer` ring that `host_input` drains,
+//! and the screen's keyboard and pointer events through a second ring (`host_input_events`).
+//! Screen updates go the other way through `host_frame`, one at a time: the page acknowledges
+//! each once drawn (`host_frame_ready`), so a busy page gets fewer, larger updates rather than a
+//! backlog of messages.
 #![cfg(target_arch = "wasm32")]
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use uemulator::{
-    BlockBackend, ClockMode, ConsoleKind, Disk, EmulatedMachine, ExitReason, JitMode,
-    MachineConfig, MemoryKeyValueStore, RawImage, RemoteImage, StopHandle, Udisk, UdiskOptions,
-    disk_io,
+    BYTES_PER_PIXEL, BlockBackend, ClockMode, ConsoleKind, Cursor, Disk, DisplayHandle,
+    DisplayMode, EmulatedMachine, ExitReason, FrameUpdate, InputHandle, JitMode, MachineConfig,
+    MemoryKeyValueStore, PointerButton, RawImage, Rect, RemoteImage, StopHandle, Udisk,
+    UdiskOptions, disk_io,
 };
 
 const NS_PER_MS: f64 = 1_000_000.0;
@@ -26,6 +31,13 @@ const POLL_INPUT_EVERY: u32 = 16;
 /// Largest burst of keyboard bytes handed to the guest per poll.
 const INPUT_CHUNK: usize = 256;
 const SECTOR_BYTES: u64 = 512;
+/// Screen updates go out at most this often: about what a browser paints anyway, and each one
+/// is a copy out of the module plus a message to the page.
+const FRAME_INTERVAL_MS: f64 = 16.0;
+/// Input events taken from the page's ring per poll. A record is three `i32`: kind and two
+/// arguments (`EVENT_*`, `www/protocol.js` has the same numbers).
+const EVENTS_PER_POLL: usize = 64;
+const EVENT_WORDS: usize = 3;
 
 pub const EXIT_SHUTDOWN: i32 = 0;
 pub const EXIT_RESET: i32 = 1;
@@ -60,6 +72,33 @@ pub const OPTION_REPLACE_CMDLINE: u32 = 1 << 6;
 /// The library's `debug` mode: on exit, a state dump with the JIT's counters and the
 /// instructions that went through the interpreter goes to `host_log`.
 pub const OPTION_DEBUG: u32 = 1 << 7;
+/// A screen (`DisplayMode::Framebuffer`), shown on the page's canvas.
+pub const OPTION_DISPLAY: u32 = 1 << 8;
+/// A virtio keyboard and tablet fed from the canvas. The page always says, with or without a
+/// screen (`MachineConfig::input`).
+pub const OPTION_INPUT: u32 = 1 << 9;
+/// With `OPTION_DISPLAY`: the screen is the guest's console (`console=tty0` last), not the
+/// terminal (`MachineConfig::console_on_screen`).
+pub const OPTION_SCREEN_CONSOLE: u32 = 1 << 10;
+
+// Input event kinds in the page's event ring, as `www/protocol.js` numbers them.
+/// A key by USB HID usage; then pressed (1) or released (0).
+const EVENT_KEY: i32 = 1;
+/// The pointer to (x, y) in screen pixels.
+const EVENT_POINTER_MOVE: i32 = 2;
+/// A pointer button (0 left, 1 right, 2 middle, 3 back, 4 forward); then pressed or released.
+const EVENT_POINTER_BUTTON: i32 = 3;
+/// The wheel by a number of clicks, positive away from the user.
+const EVENT_WHEEL: i32 = 4;
+/// Let go of every key and button (the canvas lost the focus).
+const EVENT_RELEASE_ALL: i32 = 5;
+/// Ask the guest for a screen mode of (width, height).
+const EVENT_REQUEST_SIZE: i32 = 6;
+
+// `host_cursor` kinds.
+const CURSOR_HOST: i32 = 0;
+const CURSOR_HIDDEN: i32 = 1;
+const CURSOR_IMAGE: i32 = 2;
 
 #[link(wasm_import_module = "host")]
 unsafe extern "C" {
@@ -84,6 +123,36 @@ unsafe extern "C" {
     /// with a synchronous range request, or a `File` read with `FileReaderSync`). Blocks until
     /// they arrive. Returns 0, or non-zero when the read failed.
     fn host_disk_read(source: i32, offset: f64, ptr: *mut u8, len: usize) -> i32;
+    /// Copies up to `capacity` input event records (`EVENT_WORDS` `i32` each) to `ptr` and
+    /// returns how many; never blocks.
+    fn host_input_events(ptr: *mut i32, capacity: usize) -> usize;
+    /// Non-zero when the page has drawn the last frame and can take the next.
+    fn host_frame_ready() -> i32;
+    /// A screen update: the screen is `screen_width` x `screen_height`, and the `width` x
+    /// `height` rectangle at (`x`, `y`) is at `ptr` as packed RGBA rows (what `ImageData`
+    /// takes). The page owes an acknowledgement before the next.
+    #[allow(clippy::too_many_arguments)]
+    fn host_frame(
+        screen_width: u32,
+        screen_height: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        ptr: *const u8,
+        len: usize,
+    );
+    /// The pointer image: `CURSOR_*` kind, and for `CURSOR_IMAGE` its size, hotspot and RGBA
+    /// pixels (straight alpha).
+    fn host_cursor(
+        kind: i32,
+        width: u32,
+        height: u32,
+        hot_x: u32,
+        hot_y: u32,
+        ptr: *const u8,
+        len: usize,
+    );
 }
 
 // `host_jit_compile` and `host_jit_release` are imported by the library (`jit/wasm.rs`), from the
@@ -99,6 +168,19 @@ thread_local! {
     static PENDING_DISKS: RefCell<Vec<Disk>> = const { RefCell::new(Vec::new()) };
     /// What `uw_set_firmware` chose for the next `uw_create`: a `FIRMWARE_*` kind and its image.
     static PENDING_FIRMWARE: RefCell<(i32, Vec<u8>)> = const { RefCell::new((FIRMWARE_NONE, Vec::new())) };
+    /// The machine's screen and input handles, for the poll hook (like `STOP`).
+    static SCREEN: RefCell<Option<ScreenLink>> = const { RefCell::new(None) };
+}
+
+/// What the poll hook keeps between calls to feed the page the screen and the guest the input.
+struct ScreenLink {
+    display: Option<DisplayHandle>,
+    input: Option<InputHandle>,
+    /// The screen generation the page has; `None` until the first (whole-screen) frame.
+    sent_generation: Option<u64>,
+    sent_cursor: u64,
+    last_frame_ms: f64,
+    pixels: Vec<u8>,
 }
 
 fn set_error(message: String) {
@@ -266,6 +348,12 @@ pub unsafe extern "C" fn uw_create(
     if option(OPTION_SERIAL_CONSOLE) {
         config = config.console(ConsoleKind::Serial);
     }
+    if option(OPTION_DISPLAY) {
+        config = config
+            .display(DisplayMode::Framebuffer)
+            .console_on_screen(option(OPTION_SCREEN_CONSOLE));
+    }
+    config = config.input(option(OPTION_INPUT));
     if initrd_len != 0 {
         config = config.initrd(initrd);
     }
@@ -304,6 +392,17 @@ pub unsafe extern "C" fn uw_create(
         return 1;
     }
     STOP.with(|stop| *stop.borrow_mut() = Some(machine.stop_handle()));
+    let (display, input) = (machine.display(), machine.input());
+    SCREEN.with(|screen| {
+        *screen.borrow_mut() = (display.is_some() || input.is_some()).then(|| ScreenLink {
+            display,
+            input,
+            sent_generation: None,
+            sent_cursor: 0,
+            last_frame_ms: f64::NEG_INFINITY,
+            pixels: Vec::new(),
+        });
+    });
     MACHINE.with(|slot| *slot.borrow_mut() = Some(machine));
     0
 }
@@ -331,6 +430,12 @@ fn poll(console: &uemulator::ConsoleHandle, idle: bool) {
     if unsafe { host_resize(size.as_mut_ptr()) } != 0 {
         console.resize(size[0], size[1]);
     }
+    SCREEN.with(|screen| {
+        if let Some(link) = screen.borrow_mut().as_mut() {
+            link.deliver_input();
+            link.send_screen();
+        }
+    });
     if unsafe { host_should_stop() } != 0 {
         STOP.with(|stop| {
             if let Some(stop) = &*stop.borrow() {
@@ -340,6 +445,156 @@ fn poll(console: &uemulator::ConsoleHandle, idle: bool) {
     }
     if idle {
         unsafe { host_idle() };
+    }
+}
+
+impl ScreenLink {
+    /// Hands the page's keyboard and pointer events to the guest.
+    fn deliver_input(&mut self) {
+        let mut records = [0i32; EVENTS_PER_POLL * EVENT_WORDS];
+        loop {
+            let count = unsafe { host_input_events(records.as_mut_ptr(), EVENTS_PER_POLL) };
+            for [kind, first, second] in records[..count * EVENT_WORDS].as_chunks::<EVENT_WORDS>().0
+            {
+                self.apply(*kind, *first, *second);
+            }
+            if count < EVENTS_PER_POLL {
+                break;
+            }
+        }
+    }
+
+    fn apply(&self, kind: i32, first: i32, second: i32) {
+        const BUTTONS: [PointerButton; 5] = [
+            PointerButton::Left,
+            PointerButton::Right,
+            PointerButton::Middle,
+            PointerButton::Side,
+            PointerButton::Extra,
+        ];
+        let non_negative = |value: i32| value.max(0) as u32;
+        if kind == EVENT_REQUEST_SIZE {
+            if let Some(display) = &self.display {
+                display.request_size(non_negative(first), non_negative(second));
+            }
+            return;
+        }
+        let Some(input) = &self.input else {
+            return;
+        };
+        // A full queue (a guest that is not reading) drops the event, as a real keyboard
+        // controller would.
+        match kind {
+            EVENT_KEY => {
+                if let Ok(usage) = u16::try_from(first) {
+                    input.key_usb(usage, second != 0);
+                }
+            }
+            EVENT_POINTER_MOVE => {
+                input.pointer_move(non_negative(first), non_negative(second));
+            }
+            EVENT_POINTER_BUTTON => {
+                if let Some(button) = usize::try_from(first).ok().and_then(|i| BUTTONS.get(i)) {
+                    input.pointer_button(*button, second != 0);
+                }
+            }
+            EVENT_WHEEL => {
+                input.scroll(first);
+            }
+            EVENT_RELEASE_ALL => input.release_all(),
+            _ => {}
+        }
+    }
+
+    /// Sends what changed on the screen since the page's last frame, once the page has drawn
+    /// that one and `FRAME_INTERVAL_MS` has passed; and the pointer image when it changed.
+    fn send_screen(&mut self) {
+        let Some(display) = &self.display else {
+            return;
+        };
+        let (cursor_generation, cursor) = display.cursor();
+        if cursor_generation != self.sent_cursor {
+            self.sent_cursor = cursor_generation;
+            send_cursor(&cursor);
+        }
+        let now = unsafe { host_now_ms() };
+        if now - self.last_frame_ms < FRAME_INTERVAL_MS || unsafe { host_frame_ready() } == 0 {
+            return;
+        }
+        let update = match self.sent_generation {
+            Some(generation) => match display.update_since(generation, &mut self.pixels) {
+                Some(update) => update,
+                None => return,
+            },
+            // The page starts with no picture at all, so the first frame is the whole screen
+            // even when the guest has not drawn anything yet.
+            None => {
+                let frame = display.frame();
+                self.pixels = frame.pixels;
+                FrameUpdate {
+                    generation: frame.generation,
+                    width: frame.width,
+                    height: frame.height,
+                    rect: Rect {
+                        x: 0,
+                        y: 0,
+                        width: frame.width,
+                        height: frame.height,
+                    },
+                }
+            }
+        };
+        self.sent_generation = Some(update.generation);
+        self.last_frame_ms = now;
+        bgrx_to_rgba(&mut self.pixels);
+        let rect = update.rect;
+        unsafe {
+            host_frame(
+                update.width,
+                update.height,
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+                self.pixels.as_ptr(),
+                self.pixels.len(),
+            )
+        };
+    }
+}
+
+/// The library's pixels (blue, green, red, unused) as `ImageData` wants them (red, green, blue,
+/// alpha), in place. Opaque, since the fourth byte of a screen pixel means nothing.
+fn bgrx_to_rgba(pixels: &mut [u8]) {
+    for pixel in pixels.as_chunks_mut::<BYTES_PER_PIXEL>().0 {
+        pixel.swap(0, 2);
+        pixel[3] = u8::MAX;
+    }
+}
+
+fn send_cursor(cursor: &Cursor) {
+    let none = core::ptr::null();
+    match cursor {
+        Cursor::Host => unsafe { host_cursor(CURSOR_HOST, 0, 0, 0, 0, none, 0) },
+        Cursor::Hidden => unsafe { host_cursor(CURSOR_HIDDEN, 0, 0, 0, 0, none, 0) },
+        Cursor::Image(image) => {
+            // Blue, green, red, alpha to red, green, blue, alpha; the alpha stays.
+            let mut pixels = image.pixels.clone();
+            for pixel in pixels.as_chunks_mut::<BYTES_PER_PIXEL>().0 {
+                pixel.swap(0, 2);
+            }
+            unsafe {
+                host_cursor(
+                    CURSOR_IMAGE,
+                    image.width,
+                    image.height,
+                    image.hot_x,
+                    image.hot_y,
+                    pixels.as_ptr(),
+                    pixels.len(),
+                )
+            };
+        }
     }
 }
 
@@ -353,6 +608,7 @@ pub extern "C" fn uw_run() -> i32 {
     };
     let reason = machine.wait();
     STOP.with(|slot| *slot.borrow_mut() = None);
+    SCREEN.with(|slot| *slot.borrow_mut() = None);
     match reason {
         ExitReason::Shutdown => EXIT_SHUTDOWN,
         ExitReason::Reset => EXIT_RESET,

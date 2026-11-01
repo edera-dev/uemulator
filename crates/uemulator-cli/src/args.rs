@@ -62,17 +62,26 @@ pub enum ConsoleArg {
     Virtio,
 }
 
-/// `--display KIND`: whether the machine has a screen, keyboard and mouse.
+/// `--display KIND`: whether the machine has a screen, and which console the guest's shell is on.
+/// Keyboard and mouse follow the screen unless `--input` says otherwise.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DisplayArg {
     /// Text consoles only: the terminal is the machine's console
     #[default]
     Serial,
-    /// A virtio-gpu screen with a virtio keyboard and tablet, shown in a browser by the built-in
-    /// viewer (`--viewer-address`); the kernel's console moves to the screen (tty0) and the
-    /// terminal keeps a copy of the kernel log
+    /// A virtio-gpu screen, shown in a browser by the built-in viewer (`--viewer-address`); the
+    /// kernel's console moves to the screen (tty0) and the terminal keeps a copy of the kernel log
     Framebuffer,
+    /// The screen as with framebuffer, but the terminal stays the machine's console; the screen
+    /// shows what the guest runs on its virtual terminals (a distro's login on tty1)
+    Both,
+}
+
+impl DisplayArg {
+    pub fn has_screen(self) -> bool {
+        self != DisplayArg::Serial
+    }
 }
 
 /// Where the web viewer listens unless `--viewer-address` says otherwise: loopback only, on the
@@ -164,10 +173,16 @@ pub struct HardwareArgs {
     /// be given once [default: virtio]
     #[arg(long, value_enum, value_name = "KIND")]
     pub console: Vec<ConsoleArg>,
-    /// The machine's display: serial (text consoles only) or framebuffer (a screen, keyboard and
-    /// mouse in the browser viewer) [default: serial]
+    /// The machine's display: serial (text consoles only), framebuffer (a screen in the browser
+    /// viewer that is the guest's console) or both (the screen, with the terminal as the console)
+    /// [default: serial]
     #[arg(long, value_enum, value_name = "KIND")]
     pub display: Option<DisplayArg>,
+    /// Add a virtio keyboard and tablet, fed by the browser viewer; `--input=false` leaves them
+    /// out. They come with a screen by default, and without one the viewer offers only them
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = BOOL_FLAG_DEFAULT,
+        value_name = "BOOL")]
+    pub input: Option<bool>,
     /// Run the interpreter only; `--disable-jit=false` turns it back on
     #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = BOOL_FLAG_DEFAULT,
         value_name = "BOOL")]
@@ -319,11 +334,23 @@ pub struct RuntimeArgs {
     /// Stop the machine after this many seconds
     #[arg(long, value_name = "SECS")]
     pub timeout: Option<u64>,
-    /// Where the viewer of a `--display framebuffer` machine listens, as ADDRESS:PORT (port 0
-    /// picks a free one). Anyone who can reach it controls the machine's keyboard and mouse
-    /// [default: 127.0.0.1:5800]
-    #[arg(long, value_name = "ADDRESS:PORT")]
+    /// Where the viewer of a machine with a screen or input listens, as HOST:PORT: an address or
+    /// a host name (the viewer then answers to that name), port 0 picks a free one. Anyone who
+    /// can reach it controls the machine's keyboard and mouse [default: 127.0.0.1:5800]
+    #[arg(long, value_name = "HOST:PORT", conflicts_with_all = ["viewer_host", "viewer_port"])]
     pub viewer_address: Option<String>,
+    /// The viewer's host alone (an address, or a name it then answers to); the port stays
+    /// --viewer-port or 5800
+    #[arg(long, value_name = "HOST")]
+    pub viewer_host: Option<String>,
+    /// The viewer's port alone (0 picks a free one); the host stays --viewer-host or 127.0.0.1
+    #[arg(long, value_name = "PORT")]
+    pub viewer_port: Option<u16>,
+    /// Another host name the viewer answers to, for a reverse proxy or a DNS name of a viewer
+    /// bound to every address (0.0.0.0). Repeat for more. Names not listed get 403, which is what
+    /// keeps other web sites from driving the machine through DNS rebinding
+    #[arg(long, value_name = "NAME")]
+    pub viewer_allow_host: Vec<String>,
 }
 
 /// Everything about a machine that outlives one run, and what `run` needs to build it. `None` and
@@ -348,6 +375,10 @@ pub struct Settings {
     pub iommu: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display: Option<DisplayArg>,
+    /// `None` follows the display, so a machine saved before input could be chosen keeps its
+    /// keyboard with its screen.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<bool>,
     // The arrays come last: TOML wants every plain value before the first table.
     pub consoles: Vec<ConsoleArg>,
     pub disks: Vec<DiskSpec>,
@@ -449,6 +480,9 @@ impl Settings {
         }
         if hardware.display.is_some() {
             self.display = hardware.display;
+        }
+        if hardware.input.is_some() {
+            self.input = hardware.input;
         }
         set_or_clear(&mut self.cmdline, &linux.cmdline);
         set_or_clear(&mut self.append, &linux.append);
@@ -754,7 +788,8 @@ mod tests {
             disable_jit: false,
             disable_rng: true,
             iommu: true,
-            display: Some(DisplayArg::Framebuffer),
+            display: Some(DisplayArg::Both),
+            input: Some(false),
             consoles: vec![ConsoleArg::Virtio, ConsoleArg::Serial],
             disks: vec![disk("/x/disk-0.img", false), disk("/y.iso", true)],
             networks: vec![
@@ -799,6 +834,34 @@ mod tests {
                 .unwrap()
                 .contains("display")
         );
+    }
+
+    #[test]
+    fn a_machine_saved_before_input_could_be_chosen_keeps_its_keyboard_with_its_screen() {
+        let old: Settings = toml::from_str("display = \"framebuffer\"\n").unwrap();
+        assert_eq!(old.display, Some(DisplayArg::Framebuffer));
+        assert_eq!(old.input, None, "follows the display");
+        let old: Settings = toml::from_str("display = \"serial\"\n").unwrap();
+        assert_eq!(old.display, Some(DisplayArg::Serial));
+    }
+
+    #[test]
+    fn input_is_saved_and_replaced_by_a_later_choice() {
+        let mut settings = Settings::default();
+        let input = HardwareArgs {
+            input: Some(true),
+            ..HardwareArgs::default()
+        };
+        settings.add(&input, &LinuxArgs::default(), Vec::new());
+        assert!(toml::to_string(&settings).unwrap().contains("input = true"));
+        settings.add(&HardwareArgs::default(), &LinuxArgs::default(), Vec::new());
+        assert_eq!(settings.input, Some(true), "kept");
+        let off = HardwareArgs {
+            input: Some(false),
+            ..HardwareArgs::default()
+        };
+        settings.add(&off, &LinuxArgs::default(), Vec::new());
+        assert_eq!(settings.input, Some(false));
     }
 
     #[test]

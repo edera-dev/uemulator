@@ -1,4 +1,7 @@
-import { CONTROL_BYTES, CTRL, EXIT_NAMES, FIRMWARE, OPTION, RING_BYTES, RING_OFFSET, UEFI_FIRMWARE_MAGIC } from "./protocol.js";
+import {
+  CONTROL_BYTES, CTRL, CURSOR, EVENT, EVENT_OFFSET, EVENT_RECORDS, EVENT_WORDS, EXIT_NAMES, FIRMWARE, OPTION,
+  RING_BYTES, RING_OFFSET, UEFI_FIRMWARE_MAGIC,
+} from "./protocol.js";
 
 const $ = (id) => document.getElementById(id);
 const term = window.term = new Terminal({ convertEol: false, cursorBlink: true, fontSize: 14, scrollback: 5000 });
@@ -8,10 +11,12 @@ term.open($("terminal"));
 fit.fit();
 
 // The library's DEFAULT_CMDLINE (crates/uemulator/src/platform.rs) as EmulatedMachine adjusts it:
-// `acpi=off` goes when ACPI is on and the console word follows the console kind. Only for showing
-// what the guest will get; the library builds the real one and the page appends to it.
-function defaultCmdline({ serial, acpi }) {
-  return [`console=${serial ? "ttyS0" : "hvc0"}`, "earlyprintk=serial,ttyS0", acpi ? "" : "acpi=off", "panic=-1"]
+// `acpi=off` goes when ACPI is on, the console word follows the console kind, and a screen that
+// is the console adds `console=tty0` last. Only for showing what the guest will get; the library
+// builds the real one and the page appends to it.
+function defaultCmdline({ serial, acpi, display }) {
+  return [`console=${serial ? "ttyS0" : "hvc0"}`, "earlyprintk=serial,ttyS0", acpi ? "" : "acpi=off", "panic=-1",
+    display === "screen" ? "console=tty0" : ""]
     .filter(Boolean).join(" ");
 }
 const DEFAULT_CMDLINE_EXTRA = "earlycon=uart8250,io,0x3f8";
@@ -26,14 +31,16 @@ const FIRMWARE_LABELS = { uefi: "UEFI", none: "Direct kernel", bios: "BIOS", cus
 
 const SOURCES = ["firmware", "kernel", "initrd", "disk"];
 // Everything that is remembered across visits (files cannot be) and locked while a machine runs.
-const FIELDS = ["firmware-url", "kernel-url", "initrd-url", "disk-url", "cmdline", "shell", "replace-cmdline", "memory", "cpus", "jit", "acpi", "iommu", "rng", "reboot"];
-const RADIOS = ["firmware", "console"];
+const FIELDS = ["firmware-url", "kernel-url", "initrd-url", "disk-url", "cmdline", "shell", "replace-cmdline", "memory", "cpus", "jit", "acpi", "iommu", "rng", "reboot", "input"];
+const RADIOS = ["firmware", "console", "display"];
+const DISPLAY_LABELS = { none: "terminal only", screen: "screen (the console)", both: "screen and terminal" };
 
 let worker = null;
 // Set from Launch until the worker exists (downloads happen in between).
 let starting = false;
 let control = null;
 let ring = null;
+let events = null;
 let startedAt = 0;
 let clock = null;
 let step = 0;
@@ -76,6 +83,8 @@ function readSettings() {
     extra,
     replaceCmdline: $("replace-cmdline").checked,
     serial: radio("console") === "serial",
+    display: radio("display"),
+    input: $("input").checked,
     memoryMib: Number($("memory").value),
     cpus: Number($("cpus").value),
     jit: $("jit").checked,
@@ -111,6 +120,8 @@ function summaryOf(s) {
     s.jit ? "JIT" : "interpreter",
     s.iommu && "IOMMU",
     s.serial ? "ttyS0" : "hvc0",
+    s.display !== "none" && (s.display === "screen" ? "screen console" : "screen"),
+    s.input && "keyboard+mouse",
   ].filter(Boolean).join(" · ");
 }
 
@@ -171,6 +182,7 @@ function render() {
     ["Memory", `${s.memoryMib} MiB`],
     ["vCPUs", String(s.cpus)],
     ["Console", s.serial ? "serial (ttyS0)" : "virtio-console (hvc0)"],
+    ["Display", DISPLAY_LABELS[s.display] + (s.input ? ", virtio keyboard and tablet" : "")],
     ["Execution", s.jit ? "WebAssembly JIT" : "interpreter only"],
     ["Devices", [s.acpi ? "ACPI" : "no ACPI", s.iommu && "AMD IOMMU", s.rng && "virtio-rng"].filter(Boolean).join(", ")],
     // The library keeps no image to restart a BIOS boot from: a reset always ends it.
@@ -206,6 +218,8 @@ function demoSettings(d) {
     extra: d.args ?? "",
     replaceCmdline: false,
     serial: d.console === "serial",
+    display: d.display ?? "none",
+    input: Boolean(d.input),
     memoryMib: d.memoryMib,
     cpus: 1,
     jit: true,
@@ -231,10 +245,7 @@ function showPanel(name) {
   $("demo").hidden = name !== "demo";
   $("wizard").hidden = name !== "wizard";
   if (name === "wizard") render();
-  if (!name) {
-    fit.fit();
-    term.focus();
-  }
+  if (!name) focusView();
 }
 
 // Closing the wizard goes back to the demo until something has run; after that, to the terminal,
@@ -330,7 +341,236 @@ function sendSize() {
 
 term.onData(sendKeys);
 term.onResize(sendSize);
-window.addEventListener("resize", () => fit.fit());
+window.addEventListener("resize", () => {
+  if (view === "terminal") fit.fit();
+  else layoutScreen();
+  requestGuestSize();
+});
+
+// The screen: frames from the worker go onto the canvas, the canvas's keys and pointer go back
+// through the event ring. "terminal" or "screen" is in front.
+let view = "terminal";
+const canvas = $("screen");
+const screenContext = canvas.getContext("2d", { alpha: false });
+// KeyboardEvent.code to USB HID keyboard usage (UI Events code values are named after the USB
+// usage they come from); the same table as the CLI's viewer (crates/uemulator-cli/src/frontend/web/viewer.html).
+const USAGES = (() => {
+  const map = {};
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("").forEach((c, i) => map["Key" + c] = 0x04 + i);
+  "123456789".split("").forEach((c, i) => map["Digit" + c] = 0x1e + i);
+  map.Digit0 = 0x27;
+  for (let i = 1; i <= 12; i++) map["F" + i] = 0x3a + i - 1;
+  for (let i = 13; i <= 24; i++) map["F" + i] = 0x68 + i - 13;
+  "123456789".split("").forEach((c, i) => map["Numpad" + c] = 0x59 + i);
+  Object.assign(map, {
+    Enter: 0x28, Escape: 0x29, Backspace: 0x2a, Tab: 0x2b, Space: 0x2c, Minus: 0x2d,
+    Equal: 0x2e, BracketLeft: 0x2f, BracketRight: 0x30, Backslash: 0x31, Semicolon: 0x33,
+    Quote: 0x34, Backquote: 0x35, Comma: 0x36, Period: 0x37, Slash: 0x38, CapsLock: 0x39,
+    PrintScreen: 0x46, ScrollLock: 0x47, Pause: 0x48, Insert: 0x49, Home: 0x4a, PageUp: 0x4b,
+    Delete: 0x4c, End: 0x4d, PageDown: 0x4e, ArrowRight: 0x4f, ArrowLeft: 0x50,
+    ArrowDown: 0x51, ArrowUp: 0x52, NumLock: 0x53, NumpadDivide: 0x54, NumpadMultiply: 0x55,
+    NumpadSubtract: 0x56, NumpadAdd: 0x57, NumpadEnter: 0x58, Numpad0: 0x62,
+    NumpadDecimal: 0x63, IntlBackslash: 0x64, ContextMenu: 0x65, Power: 0x66,
+    NumpadEqual: 0x67, AudioVolumeMute: 0x7f, AudioVolumeUp: 0x80, AudioVolumeDown: 0x81,
+    NumpadComma: 0x85, IntlRo: 0x87, KanaMode: 0x88, IntlYen: 0x89, Convert: 0x8a,
+    NonConvert: 0x8b, Lang1: 0x90, Lang2: 0x91, ControlLeft: 0xe0, ShiftLeft: 0xe1,
+    AltLeft: 0xe2, MetaLeft: 0xe3, ControlRight: 0xe4, ShiftRight: 0xe5, AltRight: 0xe6,
+    MetaRight: 0xe7,
+  });
+  return map;
+})();
+// For keyboards that leave `code` empty (on-screen keyboards, synthetic events): the US-layout
+// key that types the character and whether it needs shift, [usage, shifted].
+const CHARACTERS = (() => {
+  const map = {};
+  "abcdefghijklmnopqrstuvwxyz".split("").forEach((c, i) => {
+    map[c] = [0x04 + i, false];
+    map[c.toUpperCase()] = [0x04 + i, true];
+  });
+  "1234567890".split("").forEach((c, i) => map[c] = [0x1e + i, false]);
+  "!@#$%^&*()".split("").forEach((c, i) => map[c] = [0x1e + i, true]);
+  const pairs = ["-_", "=+", "[{", "]}", "\\|", null, ";:", "'\"", "`~", ",<", ".>", "/?"];
+  pairs.forEach((pair, i) => {
+    if (pair) {
+      map[pair[0]] = [0x2d + i, false];
+      map[pair[1]] = [0x2d + i, true];
+    }
+  });
+  map[" "] = [0x2c, false];
+  return map;
+})();
+const LEFT_SHIFT = 0xe1;
+// MouseEvent.button to the guest's button index (EVENT.POINTER_BUTTON).
+const BUTTONS = { 0: 0, 1: 2, 2: 1, 3: 3, 4: 4 };
+const GUEST_SIZE_DEBOUNCE_MS = 300;
+const DEFAULT_SCREEN = [1280, 800];
+
+// Drops the event when the ring is full rather than blocking the page.
+function pushEvent(kind, first = 0, second = 0) {
+  if (!control) return;
+  const head = Atomics.load(control, CTRL.EVENT_HEAD);
+  const next = (head + 1) % EVENT_RECORDS;
+  if (next === Atomics.load(control, CTRL.EVENT_TAIL)) return;
+  events.set([kind, first, second], head * EVENT_WORDS);
+  Atomics.store(control, CTRL.EVENT_HEAD, next);
+  // The worker's idle wait sleeps on HEAD.
+  Atomics.notify(control, CTRL.HEAD);
+}
+
+function showView(name) {
+  if (name === view) return focusView();
+  // Keys held down while switching would never see their release.
+  pushEvent(EVENT.RELEASE_ALL);
+  view = name;
+  $("terminal").hidden = name !== "terminal";
+  $("screen-view").hidden = name !== "screen";
+  $("view-terminal").setAttribute("aria-pressed", String(name === "terminal"));
+  $("view-screen").setAttribute("aria-pressed", String(name === "screen"));
+  focusView();
+}
+
+// Fitting a hidden terminal would measure zero columns and send that to the guest, so it is only
+// refitted while it is in front.
+function focusView() {
+  if (!$("overlay").hidden) return;
+  if (view === "terminal") {
+    fit.fit();
+    term.focus();
+  } else {
+    layoutScreen();
+    canvas.focus();
+  }
+}
+
+// Shrinks the canvas to fit, or enlarges it by whole pixels (crisp when pixelated).
+function layoutScreen() {
+  const box = $("screen-view");
+  const fitScale = Math.min(box.clientWidth / canvas.width, box.clientHeight / canvas.height);
+  if (!(fitScale > 0)) return;
+  const scale = fitScale >= 1 ? Math.floor(fitScale) : fitScale;
+  canvas.style.width = `${Math.floor(canvas.width * scale)}px`;
+  canvas.style.height = `${Math.floor(canvas.height * scale)}px`;
+  canvas.toggleAttribute("data-pixelated", scale >= 1);
+}
+
+function resetScreen(s) {
+  [canvas.width, canvas.height] = DEFAULT_SCREEN;
+  screenContext.fillStyle = "#000";
+  screenContext.fillRect(0, 0, canvas.width, canvas.height);
+  canvas.style.cursor = "";
+  const note = s.display === "none" ? "No screen: keys and the pointer go to the guest's virtio keyboard and tablet." : "";
+  $("screen-note").textContent = note;
+  $("screen-note").hidden = !note;
+  const hasScreen = s.display !== "none" || s.input;
+  $("views").hidden = !hasScreen;
+  $("fit-guest-label").hidden = s.display === "none";
+  view = "";
+  showView(hasScreen && s.display === "screen" ? "screen" : "terminal");
+}
+
+function drawFrame(frame) {
+  if (canvas.width !== frame.screenWidth || canvas.height !== frame.screenHeight) {
+    canvas.width = frame.screenWidth;
+    canvas.height = frame.screenHeight;
+    layoutScreen();
+  }
+  if (frame.width > 0 && frame.height > 0) {
+    const image = new ImageData(new Uint8ClampedArray(frame.pixels), frame.width, frame.height);
+    screenContext.putImageData(image, frame.x, frame.y);
+  }
+  if (control) Atomics.store(control, CTRL.FRAME_ACK, 1);
+}
+
+// The guest's pointer image becomes the canvas's CSS cursor: the tablet puts the guest's pointer
+// under the host's, so drawing it into the frames would show two.
+function setCursor(cursor) {
+  if (cursor.kind === CURSOR.HIDDEN) {
+    canvas.style.cursor = "none";
+  } else if (cursor.kind === CURSOR.IMAGE && cursor.width > 0 && cursor.height > 0) {
+    const image = document.createElement("canvas");
+    image.width = cursor.width;
+    image.height = cursor.height;
+    image.getContext("2d").putImageData(new ImageData(new Uint8ClampedArray(cursor.pixels), cursor.width, cursor.height), 0, 0);
+    canvas.style.cursor = `url(${image.toDataURL()}) ${cursor.hotX} ${cursor.hotY}, auto`;
+  } else {
+    canvas.style.cursor = "";
+  }
+}
+
+let guestSizeTimer = 0;
+function requestGuestSize() {
+  if (!$("fit-guest").checked || $("fit-guest-label").hidden) return;
+  clearTimeout(guestSizeTimer);
+  guestSizeTimer = setTimeout(() => {
+    const box = $("screen-view");
+    if (box.clientWidth > 0 && box.clientHeight > 0) pushEvent(EVENT.REQUEST_SIZE, box.clientWidth, box.clientHeight);
+  }, GUEST_SIZE_DEBOUNCE_MS);
+}
+
+function pointerPosition(event) {
+  const box = canvas.getBoundingClientRect();
+  const x = Math.floor((event.clientX - box.left) * canvas.width / box.width);
+  const y = Math.floor((event.clientY - box.top) * canvas.height / box.height);
+  return [Math.max(0, Math.min(canvas.width - 1, x)), Math.max(0, Math.min(canvas.height - 1, y))];
+}
+
+// One move per animation frame: only the latest position matters.
+let pendingMove = null;
+function flushMove() {
+  if (pendingMove) pushEvent(EVENT.POINTER_MOVE, ...pendingMove);
+  pendingMove = null;
+}
+canvas.addEventListener("mousemove", (event) => {
+  if (!pendingMove) requestAnimationFrame(flushMove);
+  pendingMove = pointerPosition(event);
+});
+canvas.addEventListener("mousedown", (event) => {
+  canvas.focus();
+  pendingMove = null;
+  pushEvent(EVENT.POINTER_MOVE, ...pointerPosition(event));
+  if (event.button in BUTTONS) pushEvent(EVENT.POINTER_BUTTON, BUTTONS[event.button], 1);
+  event.preventDefault();
+});
+canvas.addEventListener("mouseup", (event) => {
+  if (event.button in BUTTONS) pushEvent(EVENT.POINTER_BUTTON, BUTTONS[event.button], 0);
+  event.preventDefault();
+});
+canvas.addEventListener("contextmenu", (event) => event.preventDefault());
+canvas.addEventListener("wheel", (event) => {
+  // One click per event in the scroll's direction: trackpads send many small ones.
+  if (event.deltaY !== 0) pushEvent(EVENT.WHEEL, event.deltaY < 0 ? 1 : -1);
+  event.preventDefault();
+}, { passive: false });
+
+function screenKey(event, pressed) {
+  // The guest repeats held keys itself; the browser's repeats would double them.
+  const repeat = pressed && event.repeat;
+  const usage = USAGES[event.code];
+  if (usage !== undefined) {
+    if (!repeat) pushEvent(EVENT.KEY, usage, pressed ? 1 : 0);
+    event.preventDefault();
+    return;
+  }
+  const typed = CHARACTERS[event.key];
+  if (typed === undefined) return;
+  event.preventDefault();
+  // Typed whole on the press: the release carries nothing to match it with.
+  if (!pressed || repeat) return;
+  const [character, shifted] = typed;
+  const shift = shifted && !event.shiftKey;
+  if (shift) pushEvent(EVENT.KEY, LEFT_SHIFT, 1);
+  pushEvent(EVENT.KEY, character, 1);
+  pushEvent(EVENT.KEY, character, 0);
+  if (shift) pushEvent(EVENT.KEY, LEFT_SHIFT, 0);
+}
+canvas.addEventListener("keydown", (event) => screenKey(event, true));
+canvas.addEventListener("keyup", (event) => screenKey(event, false));
+// Releases are lost while the focus is elsewhere; let go of everything instead.
+canvas.addEventListener("blur", () => pushEvent(EVENT.RELEASE_ALL));
+window.addEventListener("blur", () => pushEvent(EVENT.RELEASE_ALL));
+$("view-terminal").onclick = () => showView("terminal");
+$("view-screen").onclick = () => showView("screen");
+$("fit-guest").onchange = requestGuestSize;
 
 function finish(text, kind) {
   starting = false;
@@ -339,6 +579,7 @@ function finish(text, kind) {
   worker = null;
   control = null;
   ring = null;
+  events = null;
   // The library's wording names the CLI flag; point at the page's own control instead.
   setStatus(text.replace("boot it with firmware none", "choose Direct kernel under Firmware"), kind);
   setRunning(false);
@@ -362,6 +603,7 @@ async function launch(s = readSettings()) {
   starting = true;
   setRunning(true);
   term.reset();
+  resetScreen(s);
   try {
     const firmware = await loadFirmware(s);
     const realMode = firmware.kind === FIRMWARE.REAL_MODE;
@@ -371,14 +613,20 @@ async function launch(s = readSettings()) {
     const shared = new SharedArrayBuffer(CONTROL_BYTES);
     control = new Int32Array(shared, 0, RING_OFFSET / 4);
     ring = new Uint8Array(shared, RING_OFFSET, RING_BYTES);
+    events = new Int32Array(shared, EVENT_OFFSET, EVENT_RECORDS * EVENT_WORDS);
     control[CTRL.COLS] = term.cols;
     control[CTRL.ROWS] = term.rows;
+    control[CTRL.FRAME_ACK] = 1;
 
     worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
     starting = false;
     worker.onmessage = ({ data }) => {
       if (data.type === "output") {
         term.write(new Uint8Array(data.bytes));
+      } else if (data.type === "frame") {
+        drawFrame(data);
+      } else if (data.type === "cursor") {
+        setCursor(data);
       } else if (data.type === "log") {
         console.log("[uemulator]", data.text);
       } else if (data.type === "started") {
@@ -386,7 +634,8 @@ async function launch(s = readSettings()) {
         clock = setInterval(() => {
           setStatus(`running, ${((performance.now() - startedAt) / 1000).toFixed(0)} s`, "running");
         }, 500);
-        term.focus();
+        focusView();
+        requestGuestSize();
       } else if (data.type === "exit") {
         const name = EXIT_NAMES[data.code] ?? `error ${data.code}`;
         const detail = data.message ? `: ${data.message}` : "";
@@ -400,7 +649,8 @@ async function launch(s = readSettings()) {
     const disks = !s.disk ? [] : s.disk.file ? [{ file: s.disk.file }] : [{ url: new URL(s.disk.url, location.href).href }];
     const options = (s.jit ? OPTION.JIT : 0) | (s.acpi ? OPTION.ACPI : 0) | (s.iommu ? OPTION.IOMMU : 0) |
       (s.rng ? OPTION.RNG : 0) | (s.serial ? OPTION.SERIAL_CONSOLE : 0) | (s.reboot ? OPTION.REBOOT : 0) |
-      (s.replaceCmdline ? OPTION.REPLACE_CMDLINE : 0);
+      (s.replaceCmdline ? OPTION.REPLACE_CMDLINE : 0) | (s.display !== "none" ? OPTION.DISPLAY : 0) |
+      (s.display === "screen" ? OPTION.SCREEN_CONSOLE : 0) | (s.input ? OPTION.INPUT : 0);
     const message = {
       firmware,
       kernel,

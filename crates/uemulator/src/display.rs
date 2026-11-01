@@ -1,8 +1,9 @@
 //! The host side of the graphical console: `DisplayHandle` shows what the guest's screen holds,
 //! `InputHandle` feeds it a keyboard and an absolute pointer. Both are frontends' only contact
-//! with the machine (the CLI's web viewer, a native window later), so nothing here knows how the
-//! pixels are shown or where the keys come from. Layout and protocol choices are in
-//! `docs/plans/24-display-input.md`.
+//! with the machine (the CLI's web viewer, the web page, a native window later), so nothing here
+//! knows how the pixels are shown or where the keys come from. A machine may have either without
+//! the other (`MachineConfig::display`, `MachineConfig::input`). Layout and protocol choices are
+//! in `docs/plans/24-display-input.md`.
 //!
 //! Locking: the devices publish into these handles while they hold the device lock; a frontend
 //! takes only the handle's own lock, never the device lock, so a slow frontend cannot stall the
@@ -139,6 +140,37 @@ pub struct FrameUpdate {
 /// Called with the new generation after each change, see `DisplayHandle::on_update`.
 type UpdateFn = Arc<dyn Fn(u64) + Send + Sync>;
 
+/// Largest pointer image kept, per side. Linux's virtio_gpu uses 64x64; the bound only stops a
+/// guest from making every frontend ship a screen-sized cursor.
+pub(crate) const MAX_CURSOR_SIDE: u32 = 256;
+
+/// A pointer image the guest drew (`Cursor::Image`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CursorImage {
+    pub width: u32,
+    pub height: u32,
+    /// The pixel of the image that is the pointer's position.
+    pub hot_x: u32,
+    pub hot_y: u32,
+    /// `height` rows of `width` pixels with no padding, each blue, green, red, alpha (straight
+    /// alpha, not premultiplied: DRM's ARGB8888 as Linux hands it over).
+    pub pixels: Vec<u8>,
+}
+
+/// What the pointer should look like over the screen (`DisplayHandle::cursor`). The guest's
+/// pointer is never composited into the frames: the tablet puts it exactly under the host's, so
+/// a frontend shows the image as its own pointer and pointer moves cost no screen updates.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Cursor {
+    /// The guest has no pointer of its own (a text console, the firmware, no GPU driver): show
+    /// the host's.
+    #[default]
+    Host,
+    /// The guest hid its pointer (a desktop over a full-screen game, a text field being typed in).
+    Hidden,
+    Image(CursorImage),
+}
+
 struct Screen {
     width: u32,
     height: u32,
@@ -150,6 +182,9 @@ struct Screen {
     resized_at: u64,
     /// A size the host asked the guest to switch to, until the GPU device takes it.
     requested_size: Option<(u32, u32)>,
+    cursor: Cursor,
+    /// Goes up with every change of `cursor`, independent of `generation`.
+    cursor_generation: u64,
 }
 
 impl Screen {
@@ -162,6 +197,8 @@ impl Screen {
             damage: VecDeque::new(),
             resized_at: 0,
             requested_size: None,
+            cursor: Cursor::Host,
+            cursor_generation: 0,
         }
     }
 
@@ -279,8 +316,10 @@ impl DisplayHandle {
     }
 
     /// Waits until the generation is past `generation` or `timeout` passes, and returns the
-    /// generation then. Waits once, so it may return early. A freestanding host has no threads
-    /// to wait for and gets the current value at once; it uses `on_update`.
+    /// generation then. Waits once, so it may return early; a cursor change also ends the wait
+    /// (with the generation unchanged), so a frontend that shows the cursor checks
+    /// `cursor` after it. A freestanding host has no threads to wait for and gets the current
+    /// value at once; it polls or uses `on_update`.
     pub fn wait_for_update(&self, generation: u64, timeout: Duration) -> u64 {
         let mut screen = self.shared.screen.lock().unwrap();
         if screen.generation <= generation {
@@ -289,10 +328,10 @@ impl DisplayHandle {
         screen.generation
     }
 
-    /// Calls `notify` with the new generation after every change. It runs on the thread that
-    /// runs the devices, while the device lock is held: it must return quickly and must not call
-    /// into the machine or this handle (signal a frontend thread instead). Callbacks add up; they
-    /// live as long as the handle's last clone.
+    /// Calls `notify` with the generation after every change of the screen or the cursor. It
+    /// runs on the thread that runs the devices, while the device lock is held: it must return
+    /// quickly and must not call into the machine or this handle (signal a frontend thread
+    /// instead). Callbacks add up; they live as long as the handle's last clone.
     pub fn on_update(&self, notify: impl Fn(u64) + Send + Sync + 'static) {
         self.shared.callbacks.lock().unwrap().push(Arc::new(notify));
     }
@@ -306,6 +345,30 @@ impl DisplayHandle {
         let width = width.clamp(MIN_WIDTH, MAX_WIDTH);
         let height = height.clamp(MIN_HEIGHT, MAX_HEIGHT);
         self.shared.screen.lock().unwrap().requested_size = Some((width, height));
+    }
+
+    /// The pointer image and its change counter (0 until the guest first sets one).
+    pub fn cursor(&self) -> (u64, Cursor) {
+        let screen = self.shared.screen.lock().unwrap();
+        (screen.cursor_generation, screen.cursor.clone())
+    }
+
+    /// Replaces the pointer image; nothing happens when it is the same.
+    pub(crate) fn set_cursor(&self, cursor: Cursor) {
+        let generation = {
+            let mut screen = self.shared.screen.lock().unwrap();
+            if screen.cursor == cursor {
+                return;
+            }
+            screen.cursor = cursor;
+            screen.cursor_generation += 1;
+            self.shared.changed.notify_all();
+            screen.generation
+        };
+        let callbacks = self.shared.callbacks.lock().unwrap().clone();
+        for notify in callbacks {
+            notify(generation);
+        }
     }
 
     pub(crate) fn take_requested_size(&self) -> Option<(u32, u32)> {
@@ -439,16 +502,29 @@ struct InputState {
     wake_devices: Option<Notify>,
 }
 
-#[derive(Default)]
 struct InputShared {
     state: Mutex<InputState>,
-    /// The screen pointer positions are relative to; none for an input handle on its own.
+    /// The screen pointer positions are relative to; none on a machine without a display.
     display: Option<DisplayHandle>,
+    /// The area pointer positions are relative to without a display (`display_size`).
+    pointer_area: (u32, u32),
+}
+
+impl Default for InputShared {
+    fn default() -> Self {
+        InputShared {
+            state: Mutex::new(InputState::default()),
+            display: None,
+            pointer_area: (DEFAULT_WIDTH, DEFAULT_HEIGHT),
+        }
+    }
 }
 
 /// The guest's keyboard and tablet, shared by clones. Obtained from `EmulatedMachine::input()`;
-/// survives guest reboots. Every method returns false when the event was not queued (the queue
-/// is full because the guest is not reading, or the code is out of range).
+/// survives guest reboots. A machine may have them without a display: the keyboard works the
+/// same, and pointer positions are then relative to `pointer_area`. Every method returns false
+/// when the event was not queued (the queue is full because the guest is not reading, or the
+/// code is out of range).
 #[derive(Clone, Default)]
 pub struct InputHandle {
     shared: Arc<InputShared>,
@@ -463,13 +539,35 @@ fn syn() -> InputEvent {
 }
 
 impl InputHandle {
-    pub(crate) fn for_display(display: Option<DisplayHandle>) -> InputHandle {
+    /// Pointer positions follow `display`'s current size.
+    pub(crate) fn for_display(display: DisplayHandle) -> InputHandle {
+        let pointer_area = display.size();
         InputHandle {
             shared: Arc::new(InputShared {
-                state: Mutex::new(InputState::default()),
-                display,
+                display: Some(display),
+                pointer_area,
+                ..InputShared::default()
             }),
         }
+    }
+
+    /// No screen: pointer positions are relative to a fixed `width` x `height` area.
+    pub(crate) fn without_display(width: u32, height: u32) -> InputHandle {
+        InputHandle {
+            shared: Arc::new(InputShared {
+                pointer_area: (width, height),
+                ..InputShared::default()
+            }),
+        }
+    }
+
+    /// The size `pointer_move` positions are relative to: the screen's current size, or on a
+    /// machine without a display the configured `display_size`.
+    pub fn pointer_area(&self) -> (u32, u32) {
+        self.shared
+            .display
+            .as_ref()
+            .map_or(self.shared.pointer_area, DisplayHandle::size)
     }
 
     /// Presses (`pressed`) or releases a key, by Linux key code (`KEY_A` is 30; codes 1 to 255).
@@ -531,15 +629,11 @@ impl InputHandle {
         }
     }
 
-    /// Moves the pointer to (`x`, `y`) in pixels of the screen's current size
-    /// (`DisplayHandle::size`), clamped to the screen. The tablet reports absolute positions, so
-    /// the guest's pointer lands exactly where the host's is.
+    /// Moves the pointer to (`x`, `y`) in pixels of `pointer_area` (the screen's current size),
+    /// clamped to it. The tablet reports absolute positions, so the guest's pointer lands
+    /// exactly where the host's is.
     pub fn pointer_move(&self, x: u32, y: u32) -> bool {
-        let (width, height) = self
-            .shared
-            .display
-            .as_ref()
-            .map_or((DEFAULT_WIDTH, DEFAULT_HEIGHT), DisplayHandle::size);
+        let (width, height) = self.pointer_area();
         let scale = |position: u32, extent: u32| -> u32 {
             let last = extent.max(2) - 1;
             (position.min(last) as u64 * POINTER_AXIS_MAX as u64 / last as u64) as u32

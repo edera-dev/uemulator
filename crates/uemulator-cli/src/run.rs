@@ -165,8 +165,14 @@ fn build_config(
     for console in console_list(settings) {
         cfg = cfg.console(console_kind(console));
     }
-    if settings.display == Some(DisplayArg::Framebuffer) {
-        cfg = cfg.display(DisplayMode::Framebuffer);
+    let display = settings.display.unwrap_or_default();
+    if display.has_screen() {
+        cfg = cfg
+            .display(DisplayMode::Framebuffer)
+            .console_on_screen(display == DisplayArg::Framebuffer);
+    }
+    if let Some(input) = settings.input {
+        cfg = cfg.input(input);
     }
     if let Some(t) = runtime.time {
         cfg = cfg.unix_time(t);
@@ -263,12 +269,37 @@ pub fn run_uefi(
     run_config(cfg, settings, runtime, tty)
 }
 
-/// The viewer for a machine with a display: where `--viewer-address` says, or the default
-/// address, or any free loopback port when something else holds the default one.
+/// Where the viewer was asked to listen: `--viewer-address`, or `--viewer-host` and
+/// `--viewer-port` over the default address's parts. `None` when none was given.
+fn viewer_address(runtime: &RuntimeArgs) -> Option<String> {
+    if let Some(address) = &runtime.viewer_address {
+        return Some(address.clone());
+    }
+    if runtime.viewer_host.is_none() && runtime.viewer_port.is_none() {
+        return None;
+    }
+    let (default_host, default_port) = DEFAULT_VIEWER_ADDRESS.rsplit_once(':').unwrap();
+    let host = runtime.viewer_host.as_deref().unwrap_or(default_host);
+    // An IPv6 literal needs its brackets to be followed by a port.
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let port = runtime
+        .viewer_port
+        .map_or(default_port.to_string(), |port| port.to_string());
+    Some(format!("{host}:{port}"))
+}
+
+/// The viewer for a machine with a screen or input: where the viewer options say, or the
+/// default address, or any free loopback port when something else holds the default one.
 fn bind_viewer(runtime: &RuntimeArgs) -> Result<WebViewer, String> {
-    match &runtime.viewer_address {
-        Some(address) => WebViewer::bind(address),
-        None => WebViewer::bind(DEFAULT_VIEWER_ADDRESS).or_else(|_| WebViewer::bind("127.0.0.1:0")),
+    let names = &runtime.viewer_allow_host;
+    match viewer_address(runtime) {
+        Some(address) => WebViewer::bind(&address, names),
+        None => WebViewer::bind(DEFAULT_VIEWER_ADDRESS, names)
+            .or_else(|_| WebViewer::bind("127.0.0.1:0", names)),
     }
 }
 
@@ -279,10 +310,14 @@ fn run_config(
     tty: bool,
 ) -> Result<ExitReason, String> {
     let mut machine = EmulatedMachine::new(cfg).map_err(|e| e.to_string())?;
-    if let (Some(display), Some(input)) = (machine.display(), machine.input()) {
+    let screen = Screen {
+        display: machine.display(),
+        input: machine.input(),
+    };
+    if screen.display.is_some() || screen.input.is_some() {
         let viewer: Box<dyn Frontend> = Box::new(bind_viewer(runtime)?);
         // Before raw mode, so a plain newline ends the line.
-        eprintln!("{}", viewer.start(Screen { display, input })?);
+        eprintln!("{}", viewer.start(screen)?);
     }
     let console = machine.console();
     if machine.consoles().len() > 1 {
@@ -676,6 +711,88 @@ mod tests {
                 "vga"
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn display_both_and_input_parse_and_old_values_still_do() {
+        let (settings, _) = boot_args(&["--display", "both", "--input=false"]);
+        assert_eq!(settings.display, Some(DisplayArg::Both));
+        assert_eq!(settings.input, Some(false));
+        let (settings, _) = boot_args(&["--input"]);
+        assert_eq!((settings.display, settings.input), (None, Some(true)));
+    }
+
+    #[test]
+    fn a_screen_beside_the_terminal_and_input_alone_build_the_machines_they_say() {
+        // Through the firmware, which needs no kernel; whether tty0 ends up on the command line
+        // is the library's business (`console_on_screen`), tested there.
+        let machine = |flags: &[&str]| {
+            EmulatedMachine::new(
+                build(flags, None)
+                    .unwrap()
+                    .uefi_firmware(crate::firmware::IMAGE),
+            )
+            .unwrap()
+        };
+        let both = machine(&["--display", "both"]);
+        assert!(both.display().is_some() && both.input().is_some());
+        let input_only = machine(&["--input"]);
+        assert!(input_only.display().is_none() && input_only.input().is_some());
+        let screen_only = machine(&["--display", "framebuffer", "--input=false"]);
+        assert!(screen_only.display().is_some() && screen_only.input().is_none());
+    }
+
+    #[test]
+    fn the_viewer_host_and_port_compose_over_the_default() {
+        let runtime = |host: Option<&str>, port: Option<u16>| RuntimeArgs {
+            viewer_host: host.map(str::to_string),
+            viewer_port: port,
+            ..RuntimeArgs::default()
+        };
+        assert_eq!(viewer_address(&runtime(None, None)), None);
+        assert_eq!(
+            viewer_address(&runtime(Some("0.0.0.0"), None)).as_deref(),
+            Some("0.0.0.0:5800")
+        );
+        assert_eq!(
+            viewer_address(&runtime(None, Some(6000))).as_deref(),
+            Some("127.0.0.1:6000")
+        );
+        assert_eq!(
+            viewer_address(&runtime(Some("::"), Some(6000))).as_deref(),
+            Some("[::]:6000")
+        );
+        assert_eq!(
+            viewer_address(&runtime(Some("vm.example"), Some(80))).as_deref(),
+            Some("vm.example:80")
+        );
+        let (_, parsed) = boot_args(&[
+            "--viewer-host",
+            "0.0.0.0",
+            "--viewer-port",
+            "6001",
+            "--viewer-allow-host",
+            "vm.example",
+            "--viewer-allow-host",
+            "proxy.example",
+        ]);
+        assert_eq!(viewer_address(&parsed).as_deref(), Some("0.0.0.0:6001"));
+        assert_eq!(parsed.viewer_allow_host, ["vm.example", "proxy.example"]);
+        assert!(
+            crate::parse_cli([
+                "uemulator",
+                "advanced",
+                "boot",
+                "--kernel",
+                "k",
+                "--viewer-address",
+                "127.0.0.1:1",
+                "--viewer-port",
+                "2"
+            ])
+            .is_err(),
+            "the address and its parts conflict"
         );
     }
 

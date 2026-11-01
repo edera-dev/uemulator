@@ -1,4 +1,5 @@
-//! A minimal PNG writer (ISO/IEC 15948): 8-bit RGB, one IDAT, each row filtered with `Sub`.
+//! A minimal PNG writer (ISO/IEC 15948): 8-bit RGB (screens) or RGBA (pointer images), one
+//! IDAT, each row filtered with `Sub`.
 //! Browsers decode PNG natively and off the main thread (`createImageBitmap`), and a console's
 //! flat colours deflate to a few percent, so a screen update is small even off loopback.
 
@@ -11,6 +12,7 @@ use uemulator::BYTES_PER_PIXEL;
 const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
 const BIT_DEPTH: u8 = 8;
 const COLOR_TYPE_RGB: u8 = 2;
+const COLOR_TYPE_RGBA: u8 = 6;
 const COMPRESSION_DEFLATE: u8 = 0;
 const FILTER_METHOD_ADAPTIVE: u8 = 0;
 const INTERLACE_NONE: u8 = 0;
@@ -18,24 +20,36 @@ const INTERLACE_NONE: u8 = 0;
 /// colour become runs of zeros, which deflate well, for the cost of one subtraction per byte.
 const FILTER_SUB: u8 = 1;
 const RGB_BYTES: usize = 3;
+const RGBA_BYTES: usize = 4;
 
 /// Encodes `width` x `height` pixels in the library's frame format (blue, green, red, unused;
 /// rows packed) as a PNG.
 pub fn encode_bgrx(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
+    encode(width, height, pixels, false)
+}
+
+/// Encodes `width` x `height` pixels of blue, green, red, alpha (a `CursorImage`) as a PNG with
+/// alpha.
+pub fn encode_bgra(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
+    encode(width, height, pixels, true)
+}
+
+fn encode(width: u32, height: u32, pixels: &[u8], alpha: bool) -> Vec<u8> {
+    let channels = if alpha { RGBA_BYTES } else { RGB_BYTES };
     let row_pixels = width as usize;
-    let mut filtered = Vec::with_capacity((1 + row_pixels * RGB_BYTES) * height as usize);
+    let mut filtered = Vec::with_capacity((1 + row_pixels * channels) * height as usize);
     for row in pixels
         .chunks_exact(row_pixels * BYTES_PER_PIXEL)
         .take(height as usize)
     {
         filtered.push(FILTER_SUB);
-        let mut left = [0u8; RGB_BYTES];
+        let mut left = [0u8; RGBA_BYTES];
         for pixel in row.as_chunks::<BYTES_PER_PIXEL>().0 {
-            let rgb = [pixel[2], pixel[1], pixel[0]];
-            for channel in 0..RGB_BYTES {
-                filtered.push(rgb[channel].wrapping_sub(left[channel]));
+            let rgba = [pixel[2], pixel[1], pixel[0], pixel[3]];
+            for channel in 0..channels {
+                filtered.push(rgba[channel].wrapping_sub(left[channel]));
             }
-            left = rgb;
+            left = rgba;
         }
     }
     // Fast compression: the encoder sits between the guest drawing and the user seeing it.
@@ -51,7 +65,11 @@ pub fn encode_bgrx(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
     header.extend_from_slice(&height.to_be_bytes());
     header.extend_from_slice(&[
         BIT_DEPTH,
-        COLOR_TYPE_RGB,
+        if alpha {
+            COLOR_TYPE_RGBA
+        } else {
+            COLOR_TYPE_RGB
+        },
         COMPRESSION_DEFLATE,
         FILTER_METHOD_ADAPTIVE,
         INTERLACE_NONE,
@@ -133,6 +151,23 @@ mod tests {
                 left = rgb;
             }
         }
+    }
+
+    #[test]
+    fn a_pointer_image_keeps_its_alpha() {
+        let pixels = [0x10, 0x20, 0x30, 0x80, 0x10, 0x20, 0x30, 0x00];
+        let png = encode_bgra(2, 1, &pixels);
+        let chunks = chunks(&png);
+        assert_eq!(chunks[0].1[8..], [8, 6, 0, 0, 0]);
+        let mut filtered = Vec::new();
+        ZlibDecoder::new(&chunks[1].1[..])
+            .read_to_end(&mut filtered)
+            .unwrap();
+        // Sub filter: the second pixel is stored as its difference from the first.
+        assert_eq!(
+            filtered,
+            [FILTER_SUB, 0x30, 0x20, 0x10, 0x80, 0, 0, 0, 0x80]
+        );
     }
 
     #[test]

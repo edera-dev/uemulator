@@ -603,27 +603,135 @@ fn a_response_buffer_too_small_gets_what_fits() {
     assert_eq!(used_entry(&rig.ram, CONTROL_USED, 0), (0, 8));
 }
 
+impl Rig {
+    /// Sends one cursor command (`struct virtio_gpu_update_cursor`) on the cursor queue.
+    fn cursor(&mut self, command: u32, id: u32, hot_x: u32, hot_y: u32) {
+        let mut request = header(command);
+        // pos: scanout 0 at (5, 6); then resource_id, hot_x, hot_y, padding.
+        request.extend(words(&[0, 5, 6, 0, id, hot_x, hot_y, 0]));
+        assert_eq!(request.len(), CURSOR_REQUEST_BYTES);
+        let used_before = used_idx(&self.ram, CURSOR_USED);
+        self.ram[REQUEST as usize..REQUEST as usize + request.len()].copy_from_slice(&request);
+        put_desc(
+            &mut self.ram,
+            CURSOR_DESC,
+            0,
+            REQUEST,
+            request.len() as u32,
+            0,
+            0,
+        );
+        post(&mut self.ram, CURSOR_AVAIL, QUEUE_SIZE, 0);
+        assert!(self.kick(CURSOR_QUEUE));
+        let index = used_idx(&self.ram, CURSOR_USED);
+        assert_eq!(index, used_before.wrapping_add(1));
+        let entry = used_entry(
+            &self.ram,
+            CURSOR_USED,
+            (index.wrapping_sub(1) % QUEUE_SIZE) as usize,
+        );
+        assert_eq!(entry, (0, 0), "completed with nothing written");
+    }
+}
+
+const CMD_MOVE_CURSOR: u32 = 0x0301;
+
 #[test]
-fn cursor_commands_are_completed_and_ignored() {
+fn moving_the_cursor_is_completed_and_ignored() {
     let mut rig = Rig::new();
-    const CMD_MOVE_CURSOR: u32 = 0x0301;
-    const CURSOR_REQUEST_BYTES: usize = 56;
-    let mut request = header(CMD_MOVE_CURSOR);
-    request.resize(CURSOR_REQUEST_BYTES, 0);
-    rig.ram[REQUEST as usize..REQUEST as usize + request.len()].copy_from_slice(&request);
-    put_desc(
-        &mut rig.ram,
-        CURSOR_DESC,
-        0,
-        REQUEST,
-        request.len() as u32,
-        0,
-        0,
+    rig.cursor(CMD_MOVE_CURSOR, RESOURCE, 1, 1);
+    assert_eq!(rig.display.cursor(), (0, Cursor::Host));
+}
+
+#[test]
+fn update_cursor_hands_the_frontend_the_resource_image_with_alpha_and_hotspot() {
+    let mut rig = Rig::new();
+    // Linux's cursor plane: ARGB8888, which virtio calls B8G8R8A8.
+    rig.paint(0, 0, [0x10, 0x20, 0x30, 0x80]);
+    rig.paint(WIDTH - 1, HEIGHT - 1, [0xa0, 0xb0, 0xc0, 0xff]);
+    rig.show(FORMAT_B8G8R8A8);
+    rig.cursor(CMD_UPDATE_CURSOR, RESOURCE, 3, 2);
+    let (generation, cursor) = rig.display.cursor();
+    assert_eq!(generation, 1);
+    let Cursor::Image(image) = cursor else {
+        panic!("expected an image, got {cursor:?}");
+    };
+    assert_eq!((image.width, image.height), (WIDTH, HEIGHT));
+    assert_eq!((image.hot_x, image.hot_y), (3, 2));
+    assert_eq!(image.pixels.len(), (WIDTH * HEIGHT * 4) as usize);
+    assert_eq!(image.pixels[..4], [0x10, 0x20, 0x30, 0x80]);
+    assert_eq!(
+        image.pixels[image.pixels.len() - 4..],
+        [0xa0, 0xb0, 0xc0, 0xff]
     );
-    post(&mut rig.ram, CURSOR_AVAIL, QUEUE_SIZE, 0);
-    assert!(rig.kick(CURSOR_QUEUE));
-    assert_eq!(used_idx(&rig.ram, CURSOR_USED), 1);
-    assert_eq!(used_entry(&rig.ram, CURSOR_USED, 0), (0, 0));
+    // The same image again is no change.
+    rig.cursor(CMD_UPDATE_CURSOR, RESOURCE, 3, 2);
+    assert_eq!(rig.display.cursor().0, 1);
+}
+
+#[test]
+fn a_cursor_without_alpha_is_opaque_and_red_blue_formats_are_swapped() {
+    let mut rig = Rig::new();
+    rig.paint(0, 0, [0x30, 0x20, 0x10, 0x00]);
+    rig.show(FORMAT_R8G8B8X8);
+    rig.cursor(CMD_UPDATE_CURSOR, RESOURCE, 0, 0);
+    let Cursor::Image(image) = rig.display.cursor().1 else {
+        panic!("expected an image");
+    };
+    assert_eq!(image.pixels[..4], [0x10, 0x20, 0x30, 0xff]);
+}
+
+#[test]
+fn resource_zero_hides_the_cursor_and_a_reset_gives_it_back_to_the_host() {
+    let mut rig = Rig::new();
+    rig.cursor(CMD_UPDATE_CURSOR, 0, 0, 0);
+    assert_eq!(rig.display.cursor(), (1, Cursor::Hidden));
+    rig.gpu.reset();
+    assert_eq!(rig.display.cursor(), (2, Cursor::Host));
+}
+
+#[test]
+fn the_device_of_the_next_boot_takes_the_screen_and_pointer_back_without_a_reset() {
+    let mut rig = Rig::new();
+    rig.show(FORMAT_B8G8R8X8);
+    rig.cursor(CMD_UPDATE_CURSOR, 0, 0, 0);
+    assert!(rig.display.virtio_owns_screen());
+    assert_eq!(rig.display.cursor().1, Cursor::Hidden);
+    // A restart that skipped the driver's shutdown: no reset, just new devices.
+    let _next_boot = VirtioGpu::new(rig.display.clone());
+    assert!(
+        !rig.display.virtio_owns_screen(),
+        "the boot framebuffer is scanned again"
+    );
+    assert_eq!(rig.display.cursor().1, Cursor::Host);
+}
+
+#[test]
+fn a_cursor_from_a_missing_or_oversized_resource_or_out_of_range_hotspot_is_contained() {
+    let mut rig = Rig::new();
+    rig.cursor(CMD_UPDATE_CURSOR, 99, 0, 0);
+    assert_eq!(rig.display.cursor(), (0, Cursor::Host), "no such resource");
+    const BIG: u32 = 99;
+    assert_eq!(
+        rig.create(BIG, FORMAT_B8G8R8A8, MAX_CURSOR_SIDE + 1, 1),
+        RESP_OK_NODATA
+    );
+    rig.cursor(CMD_UPDATE_CURSOR, BIG, 0, 0);
+    assert_eq!(
+        rig.display.cursor(),
+        (0, Cursor::Host),
+        "too big to be a pointer"
+    );
+    rig.show(FORMAT_B8G8R8A8);
+    rig.cursor(CMD_UPDATE_CURSOR, RESOURCE, u32::MAX, u32::MAX);
+    let Cursor::Image(image) = rig.display.cursor().1 else {
+        panic!("expected an image");
+    };
+    assert_eq!(
+        (image.hot_x, image.hot_y),
+        (WIDTH - 1, HEIGHT - 1),
+        "clamped"
+    );
 }
 
 #[test]

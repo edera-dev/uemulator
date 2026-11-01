@@ -13,7 +13,10 @@ use alloc::collections::BTreeMap;
 
 use super::guestmem::GuestMem;
 use super::virtio::{Chain, DEVICE_TYPE_GPU, Queue, VirtioDev};
-use crate::display::{BYTES_PER_PIXEL, DisplayHandle, MAX_HEIGHT, MAX_WIDTH, Rect};
+use crate::display::{
+    BYTES_PER_PIXEL, Cursor, CursorImage, DisplayHandle, MAX_CURSOR_SIDE, MAX_HEIGHT, MAX_WIDTH,
+    Rect,
+};
 #[cfg(freestanding)]
 use crate::prelude::*;
 
@@ -30,6 +33,15 @@ const CMD_RESOURCE_FLUSH: u32 = 0x0104;
 const CMD_TRANSFER_TO_HOST_2D: u32 = 0x0105;
 const CMD_RESOURCE_ATTACH_BACKING: u32 = 0x0106;
 const CMD_RESOURCE_DETACH_BACKING: u32 = 0x0107;
+/// Cursor queue commands. Both carry `struct virtio_gpu_update_cursor`; `MOVE_CURSOR` only
+/// moves the pointer, which the tablet already put under the host's, so it is ignored.
+const CMD_UPDATE_CURSOR: u32 = 0x0300;
+/// `struct virtio_gpu_update_cursor` after its header: pos (scanout_id, x, y, padding), then
+/// resource_id, hot_x, hot_y, padding.
+const CURSOR_RESOURCE_ID: usize = 16;
+const CURSOR_HOT_X: usize = 20;
+const CURSOR_HOT_Y: usize = 24;
+const CURSOR_REQUEST_BYTES: usize = HEADER_BYTES + 32;
 const RESP_OK_NODATA: u32 = 0x1100;
 const RESP_OK_DISPLAY_INFO: u32 = 0x1101;
 const RESP_ERR_UNSPEC: u32 = 0x1200;
@@ -94,6 +106,16 @@ const FORMAT_R8G8B8A8: u32 = 67;
 const FORMAT_X8B8G8R8: u32 = 68;
 const FORMAT_A8B8G8R8: u32 = 121;
 const FORMAT_R8G8B8X8: u32 = 134;
+
+/// Where alpha sits in a pixel of a resource format; none for the formats whose fourth byte is
+/// unused (opaque).
+fn alpha_offset(format: u32) -> Option<usize> {
+    match format {
+        FORMAT_B8G8R8A8 | FORMAT_R8G8B8A8 => Some(3),
+        FORMAT_A8R8G8B8 | FORMAT_A8B8G8R8 => Some(0),
+        _ => None,
+    }
+}
 
 /// Where blue, green and red sit in a pixel of a resource format, as byte indices. The screen
 /// is always blue, green, red, unused.
@@ -245,7 +267,13 @@ fn request_limit(nr_entries: u32) -> usize {
 }
 
 impl VirtioGpu {
+    /// Built for every boot around the embedder's handle, which outlives the boot. A guest that
+    /// restarts without resetting the device (Linux's emergency restart under `panic=-1` skips
+    /// device shutdown) would otherwise leave its pointer image on the firmware's screen and
+    /// keep the boot framebuffer from being scanned, freezing the firmware's console.
     pub fn new(display: DisplayHandle) -> Self {
+        display.set_virtio_owns_screen(false);
+        display.set_cursor(Cursor::Host);
         let preferred = display.size();
         VirtioGpu {
             display,
@@ -447,6 +475,48 @@ impl VirtioGpu {
             });
     }
 
+    /// `UPDATE_CURSOR` hands the frontend the image of the resource it names (resource 0 hides
+    /// the pointer). The image is copied now, as QEMU does: the guest may reuse the resource
+    /// for the next shape right away. A resource too big to be a pointer, or in a format with
+    /// no colour channels known, leaves the pointer as it was.
+    fn cursor_command(&mut self, request: &[u8]) {
+        if request.len() < CURSOR_REQUEST_BYTES || u32_at(request, 0) != CMD_UPDATE_CURSOR {
+            return;
+        }
+        let body = &request[HEADER_BYTES..];
+        let id = u32_at(body, CURSOR_RESOURCE_ID);
+        if id == 0 {
+            self.display.set_cursor(Cursor::Hidden);
+            return;
+        }
+        let Some(resource) = self.resources.get(&id) else {
+            return;
+        };
+        let Some([blue, green, red]) = channel_offsets(resource.format) else {
+            return;
+        };
+        if resource.width > MAX_CURSOR_SIDE || resource.height > MAX_CURSOR_SIDE {
+            return;
+        }
+        let alpha = alpha_offset(resource.format);
+        let mut pixels = Vec::with_capacity(resource.pixels.len());
+        for pixel in resource.pixels.as_chunks::<BYTES_PER_PIXEL>().0 {
+            pixels.extend_from_slice(&[
+                pixel[blue],
+                pixel[green],
+                pixel[red],
+                alpha.map_or(u8::MAX, |alpha| pixel[alpha]),
+            ]);
+        }
+        self.display.set_cursor(Cursor::Image(CursorImage {
+            width: resource.width,
+            height: resource.height,
+            hot_x: u32_at(body, CURSOR_HOT_X).min(resource.width.saturating_sub(1)),
+            hot_y: u32_at(body, CURSOR_HOT_Y).min(resource.height.saturating_sub(1)),
+            pixels,
+        }));
+    }
+
     /// A black screen of the current size.
     fn blank(&self) {
         let (width, height) = self.display.size();
@@ -572,9 +642,11 @@ impl VirtioDev for VirtioGpu {
                 let response = self.execute(&chain, mem);
                 chain.write_at(mem, 0, &response)
             } else {
-                // Cursor updates carry no response; the guest's cursor is drawn by the host's
-                // own pointer (the tablet maps it 1:1), so the image is not kept.
+                // Cursor commands carry no response.
                 debug_assert_eq!(queue, CURSOR_QUEUE);
+                let mut request = [0u8; CURSOR_REQUEST_BYTES];
+                let length = chain.read_from(mem, 0, &mut request);
+                self.cursor_command(&request[..length]);
                 0
             };
             queues[queue].push_used(mem, chain.head, written as u32);
@@ -608,6 +680,7 @@ impl VirtioDev for VirtioGpu {
         self.events_read = 0;
         self.event_pending = false;
         self.display.set_virtio_owns_screen(false);
+        self.display.set_cursor(Cursor::Host);
     }
 }
 

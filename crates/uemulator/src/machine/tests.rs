@@ -290,8 +290,8 @@ mod twin_devices {
     ) -> DevConfig {
         let display = crate::display::DisplayHandle::with_size(640, 480);
         DevConfig {
+            input: Some(crate::display::InputHandle::for_display(display.clone())),
             display: Some(crate::dev::DisplayDevices {
-                input: crate::display::InputHandle::for_display(Some(display.clone())),
                 display,
                 boot_framebuffer,
             }),
@@ -615,6 +615,41 @@ mod twin_devices {
                     id_bytes(DEVICE_TYPE_INPUT)
                 ]),
                 "{jit:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn display_and_input_are_chosen_apart_and_keep_their_slot_order() {
+        let gpu = id_bytes(DEVICE_TYPE_GPU);
+        let input = id_bytes(DEVICE_TYPE_INPUT);
+        type Choose = fn(MachineConfig) -> MachineConfig;
+        let cases: [(&str, Choose, [[u8; 4]; 3]); 4] = [
+            ("neither", |config| config, [NOTHING, NOTHING, NOTHING]),
+            (
+                "screen without input",
+                |config| config.display(DisplayMode::Framebuffer).input(false),
+                [gpu, NOTHING, NOTHING],
+            ),
+            (
+                "input without a screen",
+                |config| config.input(true),
+                [input, input, NOTHING],
+            ),
+            (
+                "both, the input following the screen",
+                |config| config.display(DisplayMode::Framebuffer),
+                [gpu, input, input],
+            ),
+        ];
+        for (name, choose, slots) in cases {
+            assert_eq!(
+                probe(
+                    |config| choose(config.console(ConsoleKind::Serial).rng(false)),
+                    JitMode::Off
+                ),
+                expected_slots(slots),
+                "{name}"
             );
         }
     }
@@ -949,9 +984,57 @@ mod multiple_devices {
             }
             EmulatedMachine::new(config)
         };
-        assert!(config(MAX_VIRTIO_FUNCTIONS - DISPLAY_FUNCTIONS).is_ok());
-        let message = expect_config_error(config(MAX_VIRTIO_FUNCTIONS - DISPLAY_FUNCTIONS + 1));
+        // The input devices come with the screen by default.
+        let functions = DISPLAY_FUNCTIONS + INPUT_FUNCTIONS;
+        assert!(config(MAX_VIRTIO_FUNCTIONS - functions).is_ok());
+        let message = expect_config_error(config(MAX_VIRTIO_FUNCTIONS - functions + 1));
         assert!(message.contains("display"), "{message}");
+    }
+
+    #[test]
+    fn input_counts_against_the_pci_bus_on_its_own() {
+        let config = |nets: usize| {
+            let mut config = MachineConfig::new()
+                .kernel(fake_bzimage(&[0xf4]))
+                .console(ConsoleKind::Serial)
+                .rng(false)
+                .input(true);
+            for _ in 0..nets {
+                config = config.net(MAC);
+            }
+            EmulatedMachine::new(config)
+        };
+        assert!(config(MAX_VIRTIO_FUNCTIONS - INPUT_FUNCTIONS).is_ok());
+        let message = expect_config_error(config(MAX_VIRTIO_FUNCTIONS - INPUT_FUNCTIONS + 1));
+        assert!(message.contains("input"), "{message}");
+    }
+
+    #[test]
+    fn input_without_a_display_has_a_handle_whose_pointer_area_is_the_display_size() {
+        let machine = EmulatedMachine::new(
+            MachineConfig::new()
+                .kernel(fake_bzimage(&[0xf4]))
+                .input(true)
+                .display_size(640, 480),
+        )
+        .unwrap();
+        assert!(machine.display().is_none());
+        let input = machine.input().unwrap();
+        assert_eq!(input.pointer_area(), (640, 480));
+        const KEY_A: u16 = 30;
+        assert!(input.key(KEY_A, true));
+    }
+
+    #[test]
+    fn a_display_without_input_has_no_input_handle() {
+        let machine = EmulatedMachine::new(
+            MachineConfig::new()
+                .kernel(fake_bzimage(&[0xf4]))
+                .display(DisplayMode::Framebuffer)
+                .input(false),
+        )
+        .unwrap();
+        assert!(machine.display().is_some() && machine.input().is_none());
     }
 
     #[test]
@@ -979,8 +1062,16 @@ mod multiple_devices {
                     .display_size(width, height),
             ));
             assert!(message.contains("display_size"), "{message}");
+            // It is the input's pointer area without a display.
+            let message = expect_config_error(EmulatedMachine::new(
+                MachineConfig::new()
+                    .kernel(fake_bzimage(&[0xf4]))
+                    .input(true)
+                    .display_size(width, height),
+            ));
+            assert!(message.contains("display_size"), "{message}");
         }
-        // Without a display the size is not looked at.
+        // Without a display or input the size is not looked at.
         assert!(
             EmulatedMachine::new(
                 MachineConfig::new()
@@ -1440,6 +1531,22 @@ mod guest_view {
                 .display(DisplayMode::Framebuffer)),
             "root=/dev/vda",
             "an explicit command line is the embedder's"
+        );
+    }
+
+    #[test]
+    fn a_display_that_is_not_the_console_leaves_the_command_line_alone() {
+        assert_eq!(
+            printed_cmdline(|config| config
+                .acpi(false)
+                .display(DisplayMode::Framebuffer)
+                .console_on_screen(false)),
+            DEFAULT_CMDLINE
+        );
+        assert_eq!(
+            printed_cmdline(|config| config.acpi(false).input(true)),
+            DEFAULT_CMDLINE,
+            "input alone has no screen to put a console on"
         );
     }
 

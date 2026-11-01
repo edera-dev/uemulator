@@ -583,8 +583,16 @@ pub fn describe(machine: &Machine) -> String {
     };
     out.push_str(&format!("  boots     {boot}\n"));
     out.push_str(&format!("  firmware  {}\n", machine.firmware.name()));
-    if settings.display == Some(DisplayArg::Framebuffer) {
-        out.push_str("  display   framebuffer\n");
+    let display = settings.display.unwrap_or_default();
+    match display {
+        DisplayArg::Serial => {}
+        DisplayArg::Framebuffer => out.push_str("  display   framebuffer (the console)\n"),
+        DisplayArg::Both => out.push_str("  display   framebuffer (the terminal is the console)\n"),
+    }
+    let input = settings.input.unwrap_or(display.has_screen());
+    if input != display.has_screen() {
+        let state = if input { "keyboard and tablet" } else { "none" };
+        out.push_str(&format!("  input     {state}\n"));
     }
     for (index, disk) in settings.disks.iter().enumerate() {
         let mode = if disk.read_only { "ro" } else { "rw" };
@@ -1529,9 +1537,29 @@ mod tests {
         assert!(saved.contains("display = \"framebuffer\""), "{saved}");
         let loaded = load(home.path(), "m").unwrap();
         assert_eq!(loaded.settings.display, Some(DisplayArg::Framebuffer));
-        assert!(describe(&machine).contains("display   framebuffer"));
+        assert!(describe(&machine).contains("display   framebuffer (the console)"));
+        assert!(
+            !describe(&machine).contains("input"),
+            "input follows the screen"
+        );
         let plain = create_machine(&home.path().join("other"), &[]);
         assert!(!describe(&plain).contains("display   "));
+    }
+
+    #[test]
+    fn a_screen_beside_the_terminal_and_input_alone_are_saved_and_shown() {
+        let home = TempDir::new("machines-display-both");
+        let both = create_machine(home.path(), &["--display", "both", "--input=false"]);
+        let text = describe(&both);
+        assert!(
+            text.contains("display   framebuffer (the terminal is the console)"),
+            "{text}"
+        );
+        assert!(text.contains("input     none"), "{text}");
+        let input_only = create_machine(&home.path().join("other"), &["--input"]);
+        let text = describe(&input_only);
+        assert!(!text.contains("display   "), "{text}");
+        assert!(text.contains("input     keyboard and tablet"), "{text}");
     }
 
     #[test]

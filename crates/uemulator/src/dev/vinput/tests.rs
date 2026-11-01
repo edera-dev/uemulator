@@ -28,7 +28,7 @@ struct Rig {
 impl Rig {
     fn new(kind: InputDevice) -> Rig {
         let display = DisplayHandle::with_size(SCREEN_WIDTH, SCREEN_HEIGHT);
-        let input = InputHandle::for_display(Some(display));
+        let input = InputHandle::for_display(display);
         let mut ram = vec![0u8; RAM_BYTES];
         let queues = vec![
             setup_queue(&mut ram, EVENT_DESC, EVENT_AVAIL, EVENT_USED, QUEUE_SIZE),
