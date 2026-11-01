@@ -1,4 +1,4 @@
-//! The page the library leaves at the firmware's `rdi` (layout in `plans/19-uefi-firmware.md`,
+//! The page the library leaves at the firmware's `rdi` (layout in `docs/plans/19-uefi-firmware.md`,
 //! written by `crates/uemulator/src/boot/uefi.rs`). Parsed once into plain values.
 
 use alloc::vec::Vec;

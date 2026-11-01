@@ -233,7 +233,7 @@ pub unsafe extern "C" fn uw_create(
         .kernel(kernel)
         .memory_mib(memory_mib as usize)
         // Without a `thread_spawner` the vCPUs take turns on this thread, which the JIT needs
-        // anyway (its function table belongs to this instance; `plans/13-web.md`).
+        // anyway (its function table belongs to this instance; `docs/plans/13-web.md`).
         .cpus(cpus as usize)
         // Blocks are compiled to WebAssembly modules the page instantiates; without the page's
         // `host_jit_*` imports working, `Auto` falls back to the interpreter.

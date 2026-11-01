@@ -1,6 +1,6 @@
 //! AVX-512 (EVEX-encoded) instructions: register file, operand fetch, write masking and the
 //! instructions that are an SSE/AVX instruction on four 128-bit lanes. See
-//! `plans/14-avx-and-virtualization.md` for what is and is not implemented.
+//! `docs/plans/14-avx-and-virtualization.md` for what is and is not implemented.
 //!
 //! Register file: `xmm`/`ymm_hi` keep ZMM0-15 bits 255:0 as before, `zmm_hi` holds bits 511:256 and
 //! `zmm_extra` all of ZMM16-31, so the JIT's view of `xmm` and every VEX path are untouched. A

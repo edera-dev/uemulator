@@ -107,7 +107,7 @@
 ### Task 5: Docs and real-guest verification
 
 **Files:**
-- Modify: `CLAUDE.md` (Commands: `--firmware` default, kernels through UEFI, `none`), `plans/19-uefi-firmware.md` (handoff table rows at `0x308..0x330`, boot-manager paragraph, verification list), `plans/10-milestones.md` (UEFI firmware section), `plans/02-boot.md` or `plans/01-api.md` if they describe the config combinations
+- Modify: `CLAUDE.md` (Commands: `--firmware` default, kernels through UEFI, `none`), `docs/plans/19-uefi-firmware.md` (handoff table rows at `0x308..0x330`, boot-manager paragraph, verification list), `docs/plans/10-milestones.md` (UEFI firmware section), `docs/plans/02-boot.md` or `docs/plans/01-api.md` if they describe the config combinations
 
 - [ ] **Step 1: Verify by hand** (not tests, need artifacts): `cargo run --release -- quick create t1 --install alpine` then `quick boot t1` reaches the installer on `hvc0` through UEFI (serial shows `uemulator UEFI firmware`, kernel prints `efi: EFI v2.9 by uemulator`); `/sys/firmware/efi` exists; complete an Alpine install, `quick boot t1` boots the disk. Repeat with `--install debian` far enough to confirm the installer finds its initramfs and an ESP. `advanced boot --kernel K --initramfs I --firmware none` still boots as before. Report anything that fails instead of papering over it; installer memory defaults (`Distro::default_memory_mib`) may need a bump for the extra initramfs copy.
 - [ ] **Step 2: Update docs** to what was verified, including that an old keyless `machine.toml` of a BIOS-installed machine now needs `firmware = "bios"` (the user chose this).

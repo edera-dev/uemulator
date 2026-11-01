@@ -36,6 +36,6 @@ export const OPTION = {
   REPLACE_CMDLINE: 1 << 6,
   DEBUG: 1 << 7,
 };
-// The first bytes of a crates/uemulator-firmware image (plans/19-uefi-firmware.md); anything else
+// The first bytes of a crates/uemulator-firmware image (docs/plans/19-uefi-firmware.md); anything else
 // picked as a firmware image is taken for a real-mode one.
 export const UEFI_FIRMWARE_MAGIC = "UEMUFW64";

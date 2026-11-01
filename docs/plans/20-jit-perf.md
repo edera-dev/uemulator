@@ -106,7 +106,7 @@ Design: a block's exit to a static same-page target has a patchable 4-byte (aarc
 ### Task 4: measure and document
 
 - [ ] **Step 1: `hack/perf/unpack.sh` three times; sample again; record in the results table.**
-- [ ] **Step 2: Update `plans/06-jit.md` (chaining paragraph) and `plans/10-milestones.md`; commit** `Plans: direct chaining`.
+- [ ] **Step 2: Update `docs/plans/06-jit.md` (chaining paragraph) and `docs/plans/10-milestones.md`; commit** `Plans: direct chaining`.
 
 ---
 
@@ -185,7 +185,7 @@ Only if S1+S2 leave SIMD above ~10% of the busy samples. Inline `ldp q`/`stp q` 
 
 ### Task S4: decide on hiding features
 
-Only if the unpack is still well over 2x slower than the target after S1-S3: write the options and numbers into this file and ask before changing CPUID (it conflicts with the Zen 4 model contract in `plans/03-cpu.md`).
+Only if the unpack is still well over 2x slower than the target after S1-S3: write the options and numbers into this file and ask before changing CPUID (it conflicts with the Zen 4 model contract in `docs/plans/03-cpu.md`).
 
 ---
 

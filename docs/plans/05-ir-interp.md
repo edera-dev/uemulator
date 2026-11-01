@@ -47,7 +47,7 @@ loop {
 }
 ```
 
-With several vCPUs the loop body is `Cpu::run_slice`, which also returns when the vCPU should give way (quantum end at the event tick, `pause`, halted with nothing to wake it) and `cpu/smp.rs` picks the next vCPU; the TB/decode caches are shared between them (`plans/03-cpu.md`, "SMP").
+With several vCPUs the loop body is `Cpu::run_slice`, which also returns when the vCPU should give way (quantum end at the event tick, `pause`, halted with nothing to wake it) and `cpu/smp.rs` picks the next vCPU; the TB/decode caches are shared between them (`docs/plans/03-cpu.md`, "SMP").
 
 Chained TBs bypass the loop; therefore every `GotoTb` slot decrements/checks `exit_request` (one load+branch) — loops that never leave a chain must still be interruptible by timers (virtual clock deadline compares at the same point; use an icount budget counter in Env decremented per TB: reaching zero exits to the loop).
 

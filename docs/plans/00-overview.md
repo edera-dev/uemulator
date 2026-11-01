@@ -62,7 +62,7 @@ src/dev/{mod,serial,pic,pit,cmos,misc}.rs
 8. Decoder is parameterized by mode (16/32/64-bit code size) even though only 64-bit is tested in v1; decompressor stubs and far returns may touch compat mode.
 9. 0F 18–1F hint space is NOP, including ENDBR64 (F3 0F 1E FA).
 10. The library never touches stdio, never calls `process::exit`, holds no global mutable state, and never panics on guest behavior (guest faults are guest exceptions; unimplemented opcodes raise #UD and are logged through an optional hook).
-11. The guest has one vCPU by default, or up to 64. They take turns on one host thread (`plans/03-cpu.md`, "SMP"; deterministic on the virtual clock, and the only mode on a freestanding host with no threads) or, by default where the host allows it, run on one host thread each on the host clock (`plans/22-smp-threads.md`). With threads, x86 memory ordering and atomics are the emulator's job (x-tso in the fork is no longer moot): acquire/release guest accesses, locked instructions as compare-exchanges, a lock around the devices.
+11. The guest has one vCPU by default, or up to 64. They take turns on one host thread (`docs/plans/03-cpu.md`, "SMP"; deterministic on the virtual clock, and the only mode on a freestanding host with no threads) or, by default where the host allows it, run on one host thread each on the host clock (`docs/plans/22-smp-threads.md`). With threads, x86 memory ordering and atomics are the emulator's job (x-tso in the fork is no longer moot): acquire/release guest accesses, locked instructions as compare-exchanges, a lock around the devices.
 
 ## Risks
 

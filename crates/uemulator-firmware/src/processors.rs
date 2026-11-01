@@ -7,7 +7,7 @@
 //! the MTRRs and the other MSRs (SDM vol. 3 table 10-1), which is the whole point.
 //!
 //! The stub spins with `pause` rather than `cli; hlt`: on this machine HLT with IF clear ends the
-//! run (`plans/07-devices.md`), and with time-sharing the spinning AP must give its slice back.
+//! run (`docs/plans/07-devices.md`), and with time-sharing the spinning AP must give its slice back.
 
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicU32, Ordering};

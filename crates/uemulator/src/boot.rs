@@ -89,7 +89,7 @@ const SETUP_HEADER_END_LIMIT: usize = 0x290;
 const HEADER_MAGIC: &[u8; 4] = b"HdrS";
 /// `setup_sects` of 0 means 4 (boot.rst).
 const DEFAULT_SETUP_SECTS: u8 = 4;
-/// Boot protocol 2.15, what the target kernel speaks (`plans/02-boot.md`); older ones are
+/// Boot protocol 2.15, what the target kernel speaks (`docs/plans/02-boot.md`); older ones are
 /// rejected rather than checked field by field.
 const MIN_PROTOCOL_VERSION: u16 = 0x020f;
 const LOADFLAGS_LOADED_HIGH: u8 = 1 << 0;

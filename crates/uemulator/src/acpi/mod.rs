@@ -4,8 +4,8 @@
 //! 0xE0000..0xFFFFF).
 //!
 //! The set is RSDP (rev 2), RSDT, XSDT, FACS, FADT (rev 6, full hardware, no SMI_CMD so ACPI
-//! starts enabled), DSDT, MADT, MCFG, HPET and, with the IOMMU, IVRS. `plans/18-xen-dom0.md` and
-//! `plans/07-devices.md` describe the devices the tables point at.
+//! starts enabled), DSDT, MADT, MCFG, HPET and, with the IOMMU, IVRS. `docs/plans/18-xen-dom0.md` and
+//! `docs/plans/07-devices.md` describe the devices the tables point at.
 #[cfg(freestanding)]
 use crate::prelude::*;
 

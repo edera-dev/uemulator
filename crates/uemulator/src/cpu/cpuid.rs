@@ -1,5 +1,5 @@
 //! CPUID: an AMD Zen 4 (family 19h, EPYC 9004 "Genoa") with only the features that have tests
-//! behind them. Read `plans/03-cpu.md` ("CPUID/MSR contract") before adding a bit: a set bit is a
+//! behind them. Read `docs/plans/03-cpu.md` ("CPUID/MSR contract") before adding a bit: a set bit is a
 //! promise that the instruction, MSR or table it describes works.
 //!
 //! The identity matters to the software that matters. Linux picks erratum workarounds, mitigation

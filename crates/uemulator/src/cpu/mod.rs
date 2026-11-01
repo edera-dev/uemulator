@@ -3,7 +3,7 @@ use crate::prelude::*;
 mod atomic;
 mod avx;
 mod avx_special;
-// The BIOS disk boot is for hosted machines only (`plans/17-bios.md`).
+// The BIOS disk boot is for hosted machines only (`docs/plans/17-bios.md`).
 #[cfg(not(freestanding))]
 mod bios;
 #[cfg(not(freestanding))]
@@ -634,7 +634,7 @@ pub(crate) const MONITOR_WATCH_BYTES: usize = 64;
 
 impl Cpu {
     /// Starts in 64-bit long mode with paging already on, as the Linux 64-bit boot protocol
-    /// leaves it (`plans/02-boot.md`): there is no firmware to set any of this up.
+    /// leaves it (`docs/plans/02-boot.md`): there is no firmware to set any of this up.
     pub fn new(
         ram: Vec<u8>,
         boot: BootState,

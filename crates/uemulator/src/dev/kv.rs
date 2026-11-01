@@ -1,6 +1,6 @@
 //! The guest's window onto the embedder's `KeyValueStore`: four 32-bit registers a firmware
 //! drives with a handful of `in`/`out` instructions. Protocol and port numbers are in
-//! `plans/19-uefi-firmware.md`; `crates/uemulator-firmware/src/kv.rs` is the guest side.
+//! `docs/plans/19-uefi-firmware.md`; `crates/uemulator-firmware/src/kv.rs` is the guest side.
 
 use crate::kv::{KeyValueStore, MAX_KEY_BYTES, MAX_VALUE_BYTES};
 #[cfg(freestanding)]

@@ -26,7 +26,7 @@ $ cargo run --release -- quick boot test --cpus 4
 
 ## What it boots
 
-Everything below was run on the emulator, not just decoded. "Verified" means the result is recorded in `plans/10-milestones.md` or the plan file named in the last column.
+Everything below was run on the emulator, not just decoded. "Verified" means the result is recorded in `docs/plans/10-milestones.md` or the plan file named in the last column.
 
 | Guest | What works | Details |
 |---|---|---|
@@ -106,9 +106,9 @@ The identity is an AMD EPYC 9004 "Genoa" (family 19h, model 11h, signature `0x00
 
 Speculation: the guest sees an in-order CPU that is immune to the speculative-execution bugs, so Linux skips retpolines, return thunks, KPTI and `VERW`. That is true of the model, since it never speculates.
 
-Deliberate departures, kept short: TSC-deadline is advertised even though AMD has none (calibration is much faster), the speculation-control interface uses its Intel spelling, and the address widths are 40 physical and 48 virtual bits. There is no PMU, no AVX512_FP16, no LA57, no PKU, no CET and no VMX. `plans/21-ryzen-7000-parity.md` is the plan for the next ones.
+Deliberate departures, kept short: TSC-deadline is advertised even though AMD has none (calibration is much faster), the speculation-control interface uses its Intel spelling, and the address widths are 40 physical and 48 virtual bits. There is no PMU, no AVX512_FP16, no LA57, no PKU, no CET and no VMX. `docs/plans/21-ryzen-7000-parity.md` is the plan for the next ones.
 
-One note on trust. An earlier milestone entry claimed AVX-512 coverage that unit tests could not back: `vpsubsw` (EVEX) and `vdbpsadbw` raised `#UD` while AVX512BW was advertised, and only a real guest running one of every intrinsic found it. `plans/03-cpu.md` ("Real-guest check") records how AVX was then verified in a guest against QEMU TCG, under signals and context switches, and JIT against interpreter.
+One note on trust. An earlier milestone entry claimed AVX-512 coverage that unit tests could not back: `vpsubsw` (EVEX) and `vdbpsadbw` raised `#UD` while AVX512BW was advertised, and only a real guest running one of every intrinsic found it. `docs/plans/03-cpu.md` ("Real-guest check") records how AVX was then verified in a guest against QEMU TCG, under signals and context switches, and JIT against interpreter.
 
 ## SMP
 
@@ -354,7 +354,7 @@ What is not done, or not checked, as of this writing:
 
 ## Design docs
 
-`plans/README.md` indexes them, and `plans/10-milestones.md` has the status log, corrections included.
+`docs/plans/README.md` indexes them, and `docs/plans/10-milestones.md` has the status log, corrections included.
 
 | File | Topic |
 |---|---|
@@ -369,7 +369,7 @@ What is not done, or not checked, as of this writing:
 | `13-web.md` | Browser port and the WebAssembly JIT |
 | `21-ryzen-7000-parity.md`, `22-smp-threads.md` | Planned CPU work, threaded SMP |
 
-`../ext/qemu-uplink` is read-only reference for behavior (`plans/09-qemu-map.md`). The Rust is written from scratch, not transliterated.
+`../ext/qemu-uplink` is read-only reference for behavior (`docs/plans/09-qemu-map.md`). The Rust is written from scratch, not transliterated.
 
 ## License
 

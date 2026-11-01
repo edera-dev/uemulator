@@ -5,7 +5,7 @@
 //! encoder (`wasm_encode`), with the host (`www/jit_host.js`) instantiating the modules. `blocks`
 //! (how a block is read from RAM and keyed) and `helpers` serve all of them. Hosts or builds
 //! without a backend use `stub`, so `Cpu` can hold an `Option<Jit>` unconditionally and the
-//! interpreter runs alone. See `plans/06-jit.md`.
+//! interpreter runs alone. See `docs/plans/06-jit.md`.
 
 #[cfg(all(feature = "jit", target_arch = "aarch64"))]
 pub(crate) mod a64;

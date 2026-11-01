@@ -1,6 +1,6 @@
 //! What the host JIT backends share: how a block's guest instructions are read out of RAM and how
 //! blocks are keyed and found. `native` (aarch64, x86-64) and `wasm` each keep their own code
-//! cache around these. See `plans/06-jit.md`.
+//! cache around these. See `docs/plans/06-jit.md`.
 
 #[cfg(freestanding)]
 use crate::prelude::*;

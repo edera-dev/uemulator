@@ -1,5 +1,5 @@
 //! The embedder's persistent key-value store (UEFI variables live in it) and its implementations.
-//! The guest reaches it through `dev/kv.rs`; the file format is in `plans/19-uefi-firmware.md`.
+//! The guest reaches it through `dev/kv.rs`; the file format is in `docs/plans/19-uefi-firmware.md`.
 
 #[cfg(freestanding)]
 use crate::prelude::*;
