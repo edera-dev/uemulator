@@ -1,6 +1,8 @@
 use super::guestmem::GuestMem;
 use super::virtio::{Chain, DEVICE_TYPE_BLOCK, Queue, VirtioDev};
 use crate::disk::Disk;
+#[cfg(freestanding)]
+use crate::prelude::*;
 
 /// virtio-blk addresses the disk in 512-byte units regardless of `BLK_SIZE`.
 const SECTOR_SIZE: u64 = 512;
@@ -164,6 +166,7 @@ impl VirtioDev for VirtioBlk {
         Some(self.disk)
     }
 
+    #[cfg(not(freestanding))]
     fn block_backend(&mut self) -> Option<&mut dyn crate::disk::BlockBackend> {
         Some(&mut *self.disk.backend)
     }

@@ -3,7 +3,7 @@
 //!
 //! The cfg gates: `freestanding` (set by `build.rs` for UEFI and wasm32) selects the `no_std`
 //! build, which has no threads and no
-//! `std::fs` (so no `disk`) and needs `prelude` and `math` to replace what `std` provides. The
+//! `std::fs` (so no host files behind `disk`) and needs `prelude` and `math` to replace what `std` provides. The
 //! `jit` feature enables `sys` (executable memory); without it the crate has no dependencies and
 //! only interprets.
 
@@ -16,7 +16,6 @@ mod boot;
 mod console;
 mod cpu;
 mod dev;
-#[cfg(not(freestanding))]
 mod disk;
 mod jit;
 mod kv;
@@ -37,7 +36,13 @@ mod testkit;
 pub use boot::{BootMode, BootState};
 pub use console::ConsoleHandle;
 #[cfg(not(freestanding))]
-pub use disk::{BlockBackend, Disk};
+pub use disk::ImageFile;
+pub use disk::io as disk_io;
+pub use disk::{
+    BlockBackend, DEFAULT_CLUSTER_SIZE, Disk, FetchFn, ImageStorage, MAX_LOCATOR_BYTES,
+    REMOTE_CHUNK_BYTES, RawImage, RemoteImage, Udisk, UdiskBacking, UdiskInfo, UdiskOptions,
+    UdiskUsage,
+};
 #[cfg(not(freestanding))]
 pub use kv::FileKeyValueStore;
 pub use kv::{KeyValueError, KeyValueStore, MemoryKeyValueStore};
@@ -55,6 +60,8 @@ mod api_tests {
     use super::*;
 
     type LoadLinux = fn(&mut [u8], &[u8], Option<&[u8]>, &str) -> Result<BootState, Error>;
+    /// An overlay's base, as `Udisk::open` and `Udisk::create` take it.
+    type Base = Option<Box<dyn BlockBackend>>;
 
     fn is_send<T: Send>() {}
     fn is_send_sync<T: Send + Sync>() {}
@@ -68,6 +75,9 @@ mod api_tests {
     fn entry_points_have_the_documented_signatures() {
         let _: fn(MachineConfig) -> Result<EmulatedMachine, Error> = EmulatedMachine::new;
         let _: fn(&mut EmulatedMachine) -> Result<(), Error> = EmulatedMachine::start;
+        let _: fn(Vec<u8>, Base) -> disk_io::Result<Udisk> = Udisk::open;
+        let _: fn(Vec<u8>, &UdiskOptions, Base) -> disk_io::Result<Udisk> = Udisk::create;
+        let _: fn(&mut dyn ImageStorage) -> disk_io::Result<Option<UdiskInfo>> = Udisk::probe;
         let _: fn(&mut EmulatedMachine) -> ExitReason = EmulatedMachine::wait;
         let _: fn(&EmulatedMachine) = EmulatedMachine::stop;
         let _: fn(&EmulatedMachine) -> StopHandle = EmulatedMachine::stop_handle;
@@ -106,6 +116,10 @@ mod api_tests {
         is_clone::<StopHandle>();
         is_send::<Platform>();
         is_send::<Disk>();
+        is_send::<Udisk>();
+        is_send::<RawImage>();
+        is_send::<RemoteImage>();
+        is_send::<ImageFile>();
     }
 
     #[test]

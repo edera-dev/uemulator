@@ -1,5 +1,6 @@
 mod args;
 mod firmware;
+mod images;
 mod machines;
 mod netgw;
 mod quick;
@@ -71,6 +72,52 @@ enum Cmd {
     Advanced {
         #[command(subcommand)]
         cmd: AdvancedCmd,
+    },
+    /// Create, convert and inspect disk images (raw, or udisk: docs/spec/uemulator-disk-format.md)
+    Disk {
+        #[command(subcommand)]
+        cmd: DiskCmd,
+    },
+}
+
+/// udisk images are sparse and can be copy-on-write overlays over a base image, which may be
+/// local or an http(s) URL; `--disk` takes either format and finds an overlay's base itself.
+#[derive(Subcommand)]
+enum DiskCmd {
+    /// Create an empty udisk image, or an overlay that keeps its writes apart from a base image
+    Create {
+        /// The new image; must not exist
+        file: PathBuf,
+        /// Size in MiB [default: the base's size]
+        #[arg(long, value_name = "MIB", value_parser = clap::value_parser!(u64).range(1..))]
+        size: Option<u64>,
+        /// Make an overlay over this image (raw or udisk; a path, relative to FILE's directory,
+        /// or an http(s) URL served with range requests). The base is opened read-only and must
+        /// not change afterwards
+        #[arg(long, value_name = "BASE")]
+        backing: Option<String>,
+        /// Cluster size in KiB, a power of two from 64 to 16384 [default: 64]
+        #[arg(long, value_name = "KIB")]
+        cluster_size: Option<u64>,
+    },
+    /// Copy a disk image into a new one, raw or udisk. An overlay comes out flattened with its
+    /// bases; a udisk comes out with its clusters in disk order, ready to serve over HTTP
+    Convert {
+        /// The image to read: a path or an http(s) URL
+        source: String,
+        /// The image to write; must not exist
+        destination: PathBuf,
+        /// Format to write [default: raw for a .img or .raw DESTINATION, else udisk]
+        #[arg(long, value_enum)]
+        format: Option<images::ImageFormat>,
+        /// Cluster size of a udisk DESTINATION in KiB [default: 64]
+        #[arg(long, value_name = "KIB")]
+        cluster_size: Option<u64>,
+    },
+    /// Show an image's format, size and, for udisk, its base and how much of it is stored
+    Info {
+        /// A path or an http(s) URL
+        image: String,
     },
 }
 
@@ -244,7 +291,7 @@ impl Cmd {
                     | AdvancedCmd::BootFirmware { hardware, .. }
                     | AdvancedCmd::BootUefi { hardware, .. },
             } => Some(hardware),
-            Cmd::Quick { .. } => None,
+            Cmd::Quick { .. } | Cmd::Disk { .. } => None,
         }
     }
 }
@@ -491,6 +538,65 @@ fn execute(cli: Cli) -> Result<Option<ExitReason>, String> {
     match cli.cmd {
         Cmd::Quick { cmd } => quick_command(cmd),
         Cmd::Advanced { cmd } => advanced_command(cmd).map(Some),
+        Cmd::Disk { cmd } => disk_command(cmd).map(|()| None),
+    }
+}
+
+const KIB: u64 = 1024;
+const MIB: u64 = 1024 * KIB;
+
+fn disk_command(cmd: DiskCmd) -> Result<(), String> {
+    match cmd {
+        DiskCmd::Create {
+            file,
+            size,
+            backing,
+            cluster_size,
+        } => {
+            let size = size
+                .map(|mib| mib.checked_mul(MIB).ok_or("--size is too large"))
+                .transpose()?;
+            let info = images::create_udisk(
+                &file,
+                size,
+                backing.as_deref(),
+                cluster_size.map(|kib| kib.saturating_mul(KIB)),
+            )?;
+            eprintln!(
+                "created {} ({} MiB{})",
+                file.display(),
+                info.virtual_size.div_ceil(MIB),
+                match &backing {
+                    Some(base) => format!(", over {base}"),
+                    None => String::new(),
+                }
+            );
+            Ok(())
+        }
+        DiskCmd::Convert {
+            source,
+            destination,
+            format,
+            cluster_size,
+        } => {
+            let format = format.unwrap_or_else(|| images::ImageFormat::for_path(&destination));
+            let size = images::convert(
+                &images::Location::parse(&source),
+                &destination,
+                format,
+                cluster_size.map(|kib| kib.saturating_mul(KIB)),
+            )?;
+            eprintln!(
+                "wrote {} ({} MiB, {format})",
+                destination.display(),
+                size.div_ceil(MIB)
+            );
+            Ok(())
+        }
+        DiskCmd::Info { image } => {
+            print!("{}", images::describe(&images::Location::parse(&image))?);
+            Ok(())
+        }
     }
 }
 

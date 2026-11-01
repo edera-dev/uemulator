@@ -25,7 +25,7 @@ function setStatus(text, kind = "") {
 function setRunning(running) {
   $("start").disabled = running;
   $("stop").disabled = !running;
-  for (const id of ["kernel-file", "kernel-url", "initrd-file", "initrd-url", "memory", "cmdline", "shell", "jit"]) {
+  for (const id of ["kernel-file", "kernel-url", "initrd-file", "initrd-url", "disk-file", "disk-url", "memory", "cmdline", "shell", "jit"]) {
     $(id).disabled = running;
   }
 }
@@ -118,11 +118,17 @@ async function start() {
     worker.onerror = (event) => finish(`worker failed: ${event.message}`, "error");
 
     const extra = [$("cmdline").value.trim(), $("shell").checked ? "rdinit=/bin/sh" : ""].join(" ").trim();
+    // The worker reads the disk on demand (a File slice or an HTTP range request per miss), so
+    // neither is downloaded here. A relative URL is resolved against the page, not the worker.
+    const diskFile = $("disk-file").files[0];
+    const diskUrl = $("disk-url").value.trim();
+    const disks = diskFile ? [{ file: diskFile }] : diskUrl ? [{ url: new URL(diskUrl, location.href).href }] : [];
     const message = {
       kernel,
       initrd,
       cmdline: `console=hvc0 earlyprintk=serial,ttyS0 nokaslr mitigations=off acpi=off panic=-1 ${extra}`.trim(),
       memoryMib: Number($("memory").value),
+      disks,
       jit: $("jit").checked,
       cols: term.cols,
       rows: term.rows,
@@ -140,8 +146,9 @@ $("stop").onclick = () => {
   if (control) Atomics.store(control, CTRL.STOP, 1);
 };
 
-// `hack/web.sh` links the cached Alpine netboot files under assets/; prefill them when present.
-for (const [id, url] of [["kernel-url", "assets/vmlinuz-virt"], ["initrd-url", "assets/initramfs-virt"]]) {
+// `hack/web.sh` links the cached Alpine netboot files (and WEB_DISK) under assets/; prefill them
+// when present.
+for (const [id, url] of [["kernel-url", "assets/vmlinuz-virt"], ["initrd-url", "assets/initramfs-virt"], ["disk-url", "assets/disk"]]) {
   fetch(url, { method: "HEAD" })
     .then((response) => { if (response.ok) $(id).value = url; })
     .catch(() => {});

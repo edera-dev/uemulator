@@ -99,7 +99,6 @@ impl DevHandle {
 
     /// The devices themselves, once every other handle is gone (after the vCPU threads have been
     /// joined). `None` if one is still alive.
-    #[cfg(not(freestanding))]
     pub fn into_devices(self) -> Option<Devices> {
         Arc::try_unwrap(self.shared)
             .ok()

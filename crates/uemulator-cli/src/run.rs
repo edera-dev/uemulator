@@ -150,9 +150,10 @@ fn build_config(
     }
     for disk in &settings.disks {
         let path = disk.path.display();
-        cfg = cfg.disk(
-            Disk::open(&disk.path, disk.read_only).map_err(|e| format!("open disk {path}: {e}"))?,
-        );
+        let location = crate::images::Location::File(disk.path.clone());
+        let backend = crate::images::open_disk(&location, disk.read_only)
+            .map_err(|e| format!("open disk {path}: {e}"))?;
+        cfg = cfg.disk(Disk::from_backend(backend));
     }
     for index in 0..settings.networks.len() {
         cfg = cfg.net(guest_mac(index));

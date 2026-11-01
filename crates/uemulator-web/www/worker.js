@@ -11,6 +11,8 @@ const IDLE_WAIT_MS = 1;
 
 let wasm;
 let control;
+// Disk sources by the number `uw_add_disk` was given: { url } or { file }.
+const diskSources = [];
 let ring;
 let outputChunks = [];
 let outputBytes = 0;
@@ -94,7 +96,49 @@ const host = {
   host_log(ptr, len) {
     postMessage({ type: "log", text: decoder.decode(memoryBytes(ptr, len)) });
   },
+  // Blocks the emulator until the bytes are here: the guest's disk request is served on this
+  // thread inside `uw_run`. A worker may make synchronous requests (a page may not).
+  host_disk_read(source, offset, ptr, len) {
+    try {
+      const bytes = readDiskSource(diskSources[source], offset, len);
+      if (bytes.byteLength !== len) return 1;
+      // After the read: the view must be made on the memory as it is now.
+      memoryBytes(ptr, len).set(bytes);
+      return 0;
+    } catch (error) {
+      postMessage({ type: "log", text: `disk read at ${offset} failed: ${error}` });
+      return 1;
+    }
+  },
 };
+
+// One synchronous range request. A 200 instead of 206 means the server ignored the range and
+// sent the whole image, which would make every read a full download; that is refused.
+function rangeRequest(url, first, last) {
+  const xhr = new XMLHttpRequest();
+  xhr.open("GET", url, false);
+  xhr.responseType = "arraybuffer";
+  xhr.setRequestHeader("Range", `bytes=${first}-${last}`);
+  xhr.send();
+  if (xhr.status !== 206) {
+    throw new Error(`${url}: range request answered with ${xhr.status}; the server must support range requests`);
+  }
+  return xhr;
+}
+
+function readDiskSource(source, offset, len) {
+  if (source.file) {
+    return new Uint8Array(new FileReaderSync().readAsArrayBuffer(source.file.slice(offset, offset + len)));
+  }
+  return new Uint8Array(rangeRequest(source.url, offset, offset + len - 1).response);
+}
+
+function diskLength(source) {
+  if (source.file) return source.file.size;
+  const total = rangeRequest(source.url, 0, 0).getResponseHeader("Content-Range")?.split("/")[1];
+  if (!total || total === "*") throw new Error(`${source.url}: no length in Content-Range`);
+  return Number(total);
+}
 
 function lastError() {
   const text = decoder.decode(memoryBytes(wasm.uw_error_ptr(), wasm.uw_error_len()));
@@ -123,6 +167,13 @@ async function boot(message) {
   const kernelPtr = upload(kernel);
   const initrdPtr = upload(initrd);
   const cmdlinePtr = upload(cmdline);
+  for (const source of message.disks ?? []) {
+    const index = diskSources.push(source) - 1;
+    if (wasm.uw_add_disk(index, diskLength(source))) {
+      postMessage({ type: "exit", code: -2, message: `disk: ${lastError()}` });
+      return;
+    }
+  }
   const failed = wasm.uw_create(
     kernelPtr, kernel.length, initrdPtr, initrd.length, cmdlinePtr, cmdline.length,
     message.memoryMib, Math.floor(Date.now() / 1000), message.cols, message.rows, message.jit ? 1 : 0,

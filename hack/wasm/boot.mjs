@@ -2,12 +2,16 @@
 // module and the same host imports as www/worker.js, with the console on stdout. For measuring
 // and for checking the WebAssembly JIT against a real guest without a browser.
 //
-//   node hack/wasm/boot.mjs --kernel K [--initrd I] [--cmdline S] [--memory MiB] [--no-jit]
-//                           [--until TEXT] [--seconds N]
+//   node hack/wasm/boot.mjs --kernel K [--initrd I] [--disk D] [--cmdline S] [--memory MiB]
+//                           [--no-jit] [--until TEXT] [--seconds N]
+//
+// --disk is a raw or udisk image (a file, or an http(s) URL served with range requests) attached
+// as vda the way the page attaches one: read on demand, writes kept in memory.
 //
 // Stops when TEXT shows up on the console or after N seconds, and prints the wall time and what the
 // JIT host did to stderr.
-import { readFileSync } from "node:fs";
+import { closeSync, fstatSync, openSync, readFileSync, readSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { parseArgs } from "node:util";
 import { createJitHost } from "../../crates/uemulator-web/www/jit_host.js";
 
@@ -15,6 +19,7 @@ const { values } = parseArgs({
   options: {
     kernel: { type: "string" },
     initrd: { type: "string" },
+    disk: { type: "string" },
     cmdline: { type: "string", default: "earlycon=uart8250,io,0x3f8 console=hvc0" },
     memory: { type: "string", default: "256" },
     wasm: { type: "string", default: new URL("../../target/web/uemulator_web.wasm", import.meta.url).pathname },
@@ -65,7 +70,48 @@ const host = {
   },
   host_now_ms: () => performance.now(),
   host_log: (ptr, len) => console.error("log:", decoder.decode(bytes(ptr, len))),
+  host_disk_read(source, offset, ptr, len) {
+    try {
+      const data = diskSource.read(offset, len);
+      if (data.length !== len) return 1;
+      bytes(ptr, len).set(data);
+      diskReads++;
+      diskBytes += len;
+      return 0;
+    } catch (error) {
+      console.error("disk:", error.message);
+      return 1;
+    }
+  },
 };
+
+// Node has no synchronous fetch; a URL is read with curl, which is slow per request but blocks,
+// like the page's synchronous XMLHttpRequest. The library caches and reads ahead either way.
+function openDiskSource(name) {
+  if (/^https?:\/\//.test(name)) {
+    const head = execFileSync("curl", ["-sf", "-r", "0-0", "-D", "-", "-o", "/dev/null", name], { encoding: "utf8" });
+    const total = /content-range: bytes 0-0\/(\d+)/i.exec(head)?.[1];
+    if (!total) throw new Error(`${name}: no range support`);
+    return {
+      length: Number(total),
+      read: (offset, len) =>
+        execFileSync("curl", ["-sf", "-r", `${offset}-${offset + len - 1}`, name], { maxBuffer: len + 1 }),
+    };
+  }
+  const fd = openSync(name, "r");
+  return {
+    length: fstatSync(fd).size,
+    read(offset, len) {
+      const out = Buffer.alloc(len);
+      const count = readSync(fd, out, 0, len, offset);
+      return out.subarray(0, count);
+    },
+    close: () => closeSync(fd),
+  };
+}
+let diskSource = null;
+let diskReads = 0;
+let diskBytes = 0;
 
 const { instance } = await WebAssembly.instantiate(readFileSync(values.wasm), { host });
 wasm = instance.exports;
@@ -79,6 +125,13 @@ function upload(data) {
 const kernel = readFileSync(values.kernel);
 const initrd = values.initrd ? readFileSync(values.initrd) : new Uint8Array(0);
 const cmdline = new TextEncoder().encode(values.cmdline);
+if (values.disk) {
+  diskSource = openDiskSource(values.disk);
+  if (wasm.uw_add_disk(0, diskSource.length)) {
+    console.error("disk:", decoder.decode(bytes(wasm.uw_error_ptr(), wasm.uw_error_len())));
+    process.exit(2);
+  }
+}
 const failed = wasm.uw_create(
   upload(kernel), kernel.length, upload(initrd), initrd.length, upload(cmdline), cmdline.length,
   Number(values.memory), Math.floor(Date.now() / 1000), 80, 25, values["no-jit"] ? 0 : 1,
@@ -92,6 +145,7 @@ const code = wasm.uw_run();
 const seconds = ((performance.now() - runStart) / 1000).toFixed(2);
 console.error(
   `\nexit=${code} found=${found} run=${seconds}s jit=${values["no-jit"] ? "off" : "on"} ` +
-    `modules=${compiled} compile=${compileMs.toFixed(0)}ms`,
+    `modules=${compiled} compile=${compileMs.toFixed(0)}ms` +
+    (diskSource ? ` disk-reads=${diskReads} disk-bytes=${diskBytes}` : ""),
 );
 if (code === 4) console.error(decoder.decode(bytes(wasm.uw_error_ptr(), wasm.uw_error_len())));

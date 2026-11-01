@@ -117,7 +117,8 @@ pub struct HardwareArgs {
     /// thread, deterministically (timeshare) [default: auto]
     #[arg(long, value_enum, value_name = "MODE")]
     pub smp: Option<SmpArg>,
-    /// Attach a raw disk image as a virtio-blk device; append ",ro" for read-only. Repeat for more
+    /// Attach a disk image (raw or udisk) as a virtio-blk device; append ",ro" for read-only. A
+    /// udisk overlay's base is found from the overlay and opened read-only. Repeat for more
     /// disks: the guest sees them in order (vda, vdb, ...)
     #[arg(long, value_name = "PATH[,ro]")]
     disk: Vec<String>,

@@ -325,7 +325,6 @@ impl PciHost {
     }
 
     /// Tears the bus down and returns the disks behind its virtio-blk functions, in slot order.
-    #[cfg(not(freestanding))]
     pub fn into_disks(self) -> Vec<crate::disk::Disk> {
         self.funcs
             .into_iter()

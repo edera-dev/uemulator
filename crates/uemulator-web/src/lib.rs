@@ -11,7 +11,10 @@
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use uemulator::{ClockMode, EmulatedMachine, ExitReason, JitMode, MachineConfig, StopHandle};
+use uemulator::{
+    BlockBackend, ClockMode, Disk, EmulatedMachine, ExitReason, JitMode, MachineConfig, RawImage,
+    RemoteImage, StopHandle, Udisk, UdiskOptions, disk_io,
+};
 
 const NS_PER_MS: f64 = 1_000_000.0;
 
@@ -21,6 +24,7 @@ const NS_PER_MS: f64 = 1_000_000.0;
 const POLL_INPUT_EVERY: u32 = 16;
 /// Largest burst of keyboard bytes handed to the guest per poll.
 const INPUT_CHUNK: usize = 256;
+const SECTOR_BYTES: u64 = 512;
 
 pub const EXIT_SHUTDOWN: i32 = 0;
 pub const EXIT_RESET: i32 = 1;
@@ -49,6 +53,10 @@ unsafe extern "C" {
     fn host_random(ptr: *mut u8, len: usize);
     /// Emulator diagnostics (the library's `log` hook).
     fn host_log(ptr: *const u8, len: usize);
+    /// Fills `ptr..ptr+len` with bytes `offset..offset+len` of disk source `source` (a URL read
+    /// with a synchronous range request, or a `File` read with `FileReaderSync`). Blocks until
+    /// they arrive. Returns 0, or non-zero when the read failed.
+    fn host_disk_read(source: i32, offset: f64, ptr: *mut u8, len: usize) -> i32;
 }
 
 // `host_jit_compile` and `host_jit_release` are imported by the library (`jit/wasm.rs`), from the
@@ -60,6 +68,8 @@ thread_local! {
     /// poll hook runs inside it, so the hook cannot reach the machine itself.
     static STOP: RefCell<Option<StopHandle>> = const { RefCell::new(None) };
     static LAST_ERROR: RefCell<String> = const { RefCell::new(String::new()) };
+    /// Disks `uw_add_disk` made, for the next `uw_create` to attach.
+    static PENDING_DISKS: RefCell<Vec<Disk>> = const { RefCell::new(Vec::new()) };
 }
 
 fn set_error(message: String) {
@@ -93,9 +103,56 @@ unsafe fn take_buffer(ptr: *mut u8, len: usize) -> Vec<u8> {
     buffer
 }
 
+/// A disk for the next `uw_create`: the page's disk source `source` (`length` bytes; see
+/// `host_disk_read`), raw or udisk, read-only and read on demand, under an in-memory udisk
+/// overlay that takes the guest's writes. The writes are gone when the page stops the machine.
+/// Returns 0, or 1 with the message in `uw_error_*`.
+#[unsafe(no_mangle)]
+pub extern "C" fn uw_add_disk(source: i32, length: f64) -> i32 {
+    match streamed_disk(source, length as u64) {
+        Ok(disk) => {
+            PENDING_DISKS.with(|disks| disks.borrow_mut().push(disk));
+            0
+        }
+        Err(message) => {
+            set_error(message);
+            1
+        }
+    }
+}
+
+fn streamed_disk(source: i32, length: u64) -> Result<Disk, String> {
+    if length == 0 {
+        return Err("the disk image is empty".into());
+    }
+    let mut remote = RemoteImage::new(length, move |offset, buf: &mut [u8]| {
+        match unsafe { host_disk_read(source, offset as f64, buf.as_mut_ptr(), buf.len()) } {
+            0 => Ok(()),
+            _ => Err(disk_io::Error::other("reading the disk image failed")),
+        }
+    });
+    let base: Box<dyn BlockBackend> = match Udisk::probe(&mut remote).map_err(|e| e.to_string())? {
+        Some(info) if info.backing.is_some() => {
+            return Err(
+                "the disk image is an overlay; the page cannot follow it to its base. \
+                        Flatten it first with `uemulator disk convert`"
+                    .into(),
+            );
+        }
+        Some(_) => Box::new(Udisk::open(remote, None).map_err(|e| e.to_string())?),
+        None => Box::new(RawImage::new(remote)),
+    };
+    let mut id = [0u8; 16];
+    unsafe { host_random(id.as_mut_ptr(), id.len()) };
+    let size = base.len().div_ceil(SECTOR_BYTES) * SECTOR_BYTES;
+    let overlay = Udisk::create(Vec::<u8>::new(), &UdiskOptions::new(size, id), Some(base))
+        .map_err(|e| e.to_string())?;
+    Ok(Disk::from_backend(overlay))
+}
+
 /// Builds the machine and loads the kernel. Returns 0, or 1 with the message in `uw_error_*`.
 /// `initrd_len == 0` means no initramfs, `cmdline_len == 0` the library's default command line,
-/// `jit == 0` the interpreter only.
+/// `jit == 0` the interpreter only. Attaches the disks `uw_add_disk` made, in order.
 /// Takes ownership of all three buffers either way.
 ///
 /// # Safety
@@ -139,6 +196,9 @@ pub unsafe extern "C" fn uw_create(
         .poll(poll);
     if initrd_len != 0 {
         config = config.initrd(initrd);
+    }
+    for disk in PENDING_DISKS.with(|disks| disks.take()) {
+        config = config.disk(disk);
     }
     if cmdline_len != 0 {
         config = config.cmdline(String::from_utf8_lossy(&cmdline).into_owned());

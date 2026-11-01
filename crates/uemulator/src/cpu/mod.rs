@@ -3,7 +3,7 @@ use crate::prelude::*;
 mod atomic;
 mod avx;
 mod avx_special;
-// Booting a disk needs the host disks, which freestanding builds do not have.
+// The BIOS disk boot is for hosted machines only (`plans/17-bios.md`).
 #[cfg(not(freestanding))]
 mod bios;
 mod bmi;

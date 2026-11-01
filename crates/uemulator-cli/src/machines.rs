@@ -5,11 +5,12 @@
 //!   its first boot and removed with the directory
 //! - `artifacts/`: the distro's netboot kernel and initramfs, which `reinstall` throws away and
 //!   `update-artifacts` replaces
-//! - `disk-<n>.img`: the sparse images `--create-disk` made. Disks attached with `--disk` stay
-//!   where they are; neither kind is ever deleted by the CLI.
+//! - `disk-<n>.udisk`: the images `--create-disk` made (`disk-<n>.img`, raw, in machines made
+//!   before the udisk format). Disks attached with `--disk` stay where they are; neither kind is
+//!   ever deleted by the CLI.
 
-use std::fs::{self, File};
-use std::io::{self, Cursor, Read};
+use std::fs;
+use std::io::{self, Cursor};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,7 @@ use crate::args::{
     BootSource, ConsoleArg, DiskSpec, DiskStep, Firmware, HardwareArgs, LinuxArgs, NetLink,
     NetModel, Nic, RemoveArgs, Settings, attach_only,
 };
+use crate::images;
 use crate::quick::{Artifacts, Distro, artifacts_present, ensure_in, write_atomically};
 use crate::run::DEFAULT_MEMORY_MIB;
 
@@ -135,25 +137,29 @@ pub fn load(home: &Path, name: &str) -> Result<Machine, String> {
     })
 }
 
-/// Creates `path` (and its parent directories) as a sparse file of `mib` MiB.
-fn create_sparse_disk(path: &Path, mib: u64) -> Result<(), String> {
+/// Creates `path` (and its parent directories) as an empty udisk image of `mib` MiB, which takes
+/// next to no space until the guest writes to it.
+fn create_disk_image(path: &Path, mib: u64) -> Result<(), String> {
     let len = mib
         .checked_mul(1 << MIB_SHIFT)
         .ok_or_else(|| format!("a disk of {mib} MiB is too large"))?;
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-    }
-    File::create(path)
-        .and_then(|file| file.set_len(len))
-        .map_err(|e| format!("create {}: {e}", path.display()))
+    images::create_udisk(path, Some(len), None, None).map(|_| ())
 }
 
-/// The first `disk-<n>.img` that does not exist: a detached image keeps its name, so a new disk
-/// never lands on top of it.
+/// The images `--create-disk` makes are `disk-<n>.udisk`; machines made before the udisk format
+/// have `disk-<n>.img`.
+const CREATED_DISK_EXTENSIONS: [&str; 2] = [images::UDISK_EXTENSION, "img"];
+
+/// The first `disk-<n>.udisk` whose number no image in `dir` has: a detached image keeps its
+/// name, so a new disk never lands on top of it or reads as its sibling.
 fn next_disk_path(dir: &Path) -> PathBuf {
     (0..)
-        .map(|n| dir.join(format!("disk-{n}.img")))
-        .find(|path| !path.exists())
+        .find(|n| {
+            CREATED_DISK_EXTENSIONS
+                .iter()
+                .all(|extension| !dir.join(format!("disk-{n}.{extension}")).exists())
+        })
+        .map(|n| dir.join(format!("disk-{n}.{}", images::UDISK_EXTENSION)))
         .expect("an unused disk name")
 }
 
@@ -180,7 +186,7 @@ fn persist_disks(dir: &Path, steps: &[DiskStep]) -> Result<Vec<DiskSpec>, String
             }),
             (DiskStep::Create { mib }, _) => {
                 let path = next_disk_path(dir);
-                create_sparse_disk(&path, *mib)?;
+                create_disk_image(&path, *mib)?;
                 eprintln!("created {mib} MiB disk {}", path.display());
                 Ok(DiskSpec {
                     path,
@@ -310,11 +316,9 @@ pub fn with_distro_defaults(mut settings: Settings, distro: Distro) -> Settings 
 /// boot sectors and the first filesystem structures all live in the first 32 KiB.
 const BLANK_CHECK_BYTES: u64 = 32 * 1024;
 
+/// Read through the image's format: a udisk image's header is never zero, its guest bytes are.
 fn disk_is_blank(path: &Path) -> Result<bool, String> {
-    let mut start = Vec::new();
-    File::open(path)
-        .and_then(|file| file.take(BLANK_CHECK_BYTES).read_to_end(&mut start))
-        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let start = images::read_start(path, BLANK_CHECK_BYTES)?;
     Ok(start.iter().all(|byte| *byte == 0))
 }
 
@@ -532,7 +536,10 @@ pub fn removal(home: &Path, name: &str) -> Result<Removal, String> {
         .map(|entry| entry.path())
         .filter(|path| {
             let file = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
-            file.starts_with("disk-") && file.ends_with(".img")
+            file.starts_with("disk-")
+                && CREATED_DISK_EXTENSIONS
+                    .iter()
+                    .any(|extension| file.ends_with(&format!(".{extension}")))
         })
         .collect();
     created_disks.sort();
@@ -764,15 +771,12 @@ mod tests {
         let dir = home.path().join("machines/m");
         assert_eq!(machine.dir, dir);
         assert!(dir.join(MACHINE_FILE).is_file());
-        assert_eq!(
-            fs::metadata(dir.join("disk-0.img")).unwrap().len(),
-            DEFAULT_DISK_MIB * MIB
-        );
+        assert_eq!(disk_size(&dir.join("disk-0.udisk")), DEFAULT_DISK_MIB * MIB);
         let settings = load(home.path(), "m").unwrap().settings;
         assert_eq!(
             settings.disks,
             vec![DiskSpec {
-                path: dir.join("disk-0.img"),
+                path: dir.join("disk-0.udisk"),
                 read_only: false
             }]
         );
@@ -813,10 +817,7 @@ mod tests {
         assert_eq!(settings, machine.settings);
         assert_eq!(settings.memory, Some(512));
         assert_eq!(settings.disks.len(), 1);
-        assert_eq!(
-            fs::metadata(&settings.disks[0].path).unwrap().len(),
-            16 * MIB
-        );
+        assert_eq!(disk_size(&settings.disks[0].path), 16 * MIB);
         assert_eq!(
             settings.networks,
             vec![Nic {
@@ -884,7 +885,7 @@ mod tests {
             }),
         ];
         assert!(persist_disks(dir.path(), &steps).is_err());
-        assert!(!dir.path().join("disk-0.img").exists());
+        assert!(!dir.path().join("disk-0.udisk").exists());
     }
 
     #[test]
@@ -913,12 +914,12 @@ mod tests {
         let dir = home.path().join("machines/m");
         assert_eq!(disks.len(), 4);
         assert_eq!(disks[0].path, fs::canonicalize(&existing).unwrap());
-        assert_eq!(disks[1].path, dir.join("disk-0.img"));
+        assert_eq!(disks[1].path, dir.join("disk-0.udisk"));
         assert_eq!(disks[2].path, fs::canonicalize(&other).unwrap());
         assert!(disks[2].read_only);
-        assert_eq!(disks[3].path, dir.join("disk-1.img"));
-        assert_eq!(fs::metadata(&disks[1].path).unwrap().len(), 2 * MIB);
-        assert_eq!(fs::metadata(&disks[3].path).unwrap().len(), 3 * MIB);
+        assert_eq!(disks[3].path, dir.join("disk-1.udisk"));
+        assert_eq!(disk_size(&disks[1].path), 2 * MIB);
+        assert_eq!(disk_size(&disks[3].path), 3 * MIB);
     }
 
     #[test]
@@ -929,15 +930,15 @@ mod tests {
         let edited = edit(home.path(), "m", &hardware, &linux, &remove, None, None).unwrap();
         let dir = home.path().join("machines/m");
         assert_eq!(edited.detached.len(), 1);
-        assert_eq!(edited.detached[0].path, dir.join("disk-0.img"));
+        assert_eq!(edited.detached[0].path, dir.join("disk-0.udisk"));
         assert!(
-            dir.join("disk-0.img").exists(),
+            dir.join("disk-0.udisk").exists(),
             "detaching must not delete the image"
         );
         assert_eq!(edited.machine.settings.disks.len(), 1);
         assert_eq!(
             edited.machine.settings.disks[0].path,
-            dir.join("disk-1.img")
+            dir.join("disk-1.udisk")
         );
     }
 
@@ -970,7 +971,7 @@ mod tests {
                 .iter()
                 .map(|d| d.path.clone())
                 .collect::<Vec<_>>(),
-            vec![dir.join("disk-0.img"), dir.join("disk-2.img")]
+            vec![dir.join("disk-0.udisk"), dir.join("disk-2.udisk")]
         );
         assert_eq!(
             reloaded.networks,
@@ -996,7 +997,7 @@ mod tests {
             fs::read_to_string(home.path().join("machines/m/machine.toml")).unwrap(),
             before
         );
-        assert!(!home.path().join("machines/m/disk-1.img").exists());
+        assert!(!home.path().join("machines/m/disk-1.udisk").exists());
     }
 
     #[test]
@@ -1108,14 +1109,19 @@ mod tests {
 
     /// Puts something in the machine's first disk, the way an installer does: a partition table
     /// entry in the first sector.
+    /// Writes a partition table entry, through the image's format, as an installer would.
     fn finish_install(machine: &Machine) {
-        use std::io::{Seek, SeekFrom, Write};
-        let mut disk = fs::OpenOptions::new()
-            .write(true)
-            .open(&machine.settings.disks[0].path)
-            .unwrap();
-        disk.seek(SeekFrom::Start(446)).unwrap();
-        disk.write_all(&[0x80, 0x01, 0x01, 0x00, 0x83]).unwrap();
+        let path = machine.settings.disks[0].path.clone();
+        let mut disk = images::open_disk(&images::Location::File(path), false).unwrap();
+        disk.write_at(446, &[0x80, 0x01, 0x01, 0x00, 0x83]).unwrap();
+        disk.flush().unwrap();
+    }
+
+    /// The size the guest sees, whatever the image's format.
+    fn disk_size(path: &Path) -> u64 {
+        images::open_disk(&images::Location::File(path.to_path_buf()), true)
+            .unwrap()
+            .len()
     }
 
     fn launch(machine: &Machine, boot_from: Option<BootSource>) -> Result<Launch, String> {
@@ -1167,7 +1173,23 @@ mod tests {
         fs::write(&path, [0, 0, 7]).unwrap();
         assert!(!disk_is_blank(&path).unwrap());
         let error = disk_is_blank(&dir.path().join("missing.img")).unwrap_err();
-        assert!(error.starts_with("read "), "{error}");
+        assert!(error.starts_with("open "), "{error}");
+    }
+
+    #[test]
+    fn a_new_udisk_image_is_blank_until_written() {
+        let dir = TempDir::new("machines-blank-udisk");
+        let path = dir.path().join("d.udisk");
+        create_disk_image(&path, 1).unwrap();
+        assert!(
+            disk_is_blank(&path).unwrap(),
+            "the header is not the guest's data"
+        );
+        let mut disk = images::open_disk(&images::Location::File(path.clone()), false).unwrap();
+        disk.write_at(BLANK_CHECK_BYTES - 1, &[1]).unwrap();
+        disk.flush().unwrap();
+        drop(disk);
+        assert!(!disk_is_blank(&path).unwrap());
     }
 
     #[test]
@@ -1386,7 +1408,11 @@ mod tests {
         let fetcher = FakeFetcher::new();
         fetch_artifacts(&machine, |u, d| fetcher.fetch(u, d)).unwrap();
         let disk = machine.settings.disks[0].path.clone();
-        fs::write(&disk, b"guest data").unwrap();
+        let mut image = images::open_disk(&images::Location::File(disk.clone()), false).unwrap();
+        image.write_at(0, b"guest data").unwrap();
+        image.flush().unwrap();
+        drop(image);
+        let disk_file = fs::read(&disk).unwrap();
 
         let reinstalled = reinstall(home.path(), "m", Some(Distro::Debian), |u, d| {
             fetcher.fetch(u, d)
@@ -1395,7 +1421,7 @@ mod tests {
         assert_eq!(reinstalled.install, Distro::Debian);
         assert_eq!(load(home.path(), "m").unwrap().install, Distro::Debian);
         assert_eq!(load(home.path(), "m").unwrap().settings.memory, Some(700));
-        assert_eq!(fs::read(&disk).unwrap(), b"guest data");
+        assert_eq!(fs::read(&disk).unwrap(), disk_file);
         let artifacts = home.path().join("machines/m/artifacts");
         assert!(artifacts.join("linux").is_file());
         assert!(artifacts.join("initrd.gz").is_file());
@@ -1469,21 +1495,15 @@ mod tests {
     }
 
     #[test]
-    fn sparse_disk_has_the_requested_length_without_allocating_it() {
+    fn a_new_disk_has_the_requested_size_without_taking_the_space() {
         let dir = TempDir::new("machines-sparse");
-        let path = dir.path().join("nested").join("deeper").join("disk.img");
-        create_sparse_disk(&path, 2048).unwrap();
-        let meta = fs::metadata(&path).unwrap();
-        assert_eq!(meta.len(), 2048 * MIB);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            const BLOCK_BYTES: u64 = 512;
-            assert!(
-                meta.blocks() * BLOCK_BYTES < MIB * 2048,
-                "file is not sparse"
-            );
-        }
+        let path = dir.path().join("nested").join("deeper").join("disk.udisk");
+        create_disk_image(&path, 2048).unwrap();
+        assert_eq!(disk_size(&path), 2048 * MIB);
+        assert!(
+            fs::metadata(&path).unwrap().len() < MIB,
+            "header and map only"
+        );
     }
 
     #[test]
@@ -1491,11 +1511,11 @@ mod tests {
         let dir = TempDir::new("machines-sparse-fail");
         let blocker = dir.path().join("file");
         fs::write(&blocker, b"x").unwrap();
-        let error = create_sparse_disk(&blocker.join("disk.img"), 1).unwrap_err();
+        let error = create_disk_image(&blocker.join("disk.udisk"), 1).unwrap_err();
         assert!(error.starts_with("create "), "{error}");
-        let error = create_sparse_disk(&dir.path().join("big.img"), u64::MAX).unwrap_err();
+        let error = create_disk_image(&dir.path().join("big.udisk"), u64::MAX).unwrap_err();
         assert!(error.contains("too large"), "{error}");
-        assert!(!dir.path().join("big.img").exists());
+        assert!(!dir.path().join("big.udisk").exists());
     }
 
     #[test]
@@ -1611,7 +1631,7 @@ mod tests {
         );
         let plan = removal(home.path(), "m").unwrap();
         assert_eq!(plan.dir, home.path().join("machines/m"));
-        assert_eq!(plan.created_disks, vec![plan.dir.join("disk-0.img")]);
+        assert_eq!(plan.created_disks, vec![plan.dir.join("disk-0.udisk")]);
         delete(&plan).unwrap();
         assert!(!plan.dir.exists());
         assert_eq!(fs::read(&attached).unwrap(), b"keep me");

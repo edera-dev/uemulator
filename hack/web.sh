@@ -7,7 +7,10 @@
 #
 # Kernel and initramfs: pick files on the page, or run `uemulator quick create alpine --install alpine`
 # once; that machine's netboot files are linked under assets/ and prefilled (UEMULATOR_MACHINE names
-# another Alpine machine).
+# another Alpine machine). WEB_DISK=IMAGE links a disk image as assets/disk and prefills it; make
+# one that nothing writes to any more, for example from an installed machine:
+#
+#   uemulator disk convert ~/.uemulator/machines/alpine/disk-0.udisk alpine.udisk
 set -e
 
 cd "$(dirname "${0}")/.." || exit 1
@@ -25,6 +28,11 @@ if [ -f "$cache/vmlinuz-virt" ] && [ -f "$cache/initramfs-virt" ]; then
     mkdir -p "$out/assets"
     ln -s "$cache/vmlinuz-virt" "$out/assets/vmlinuz-virt"
     ln -s "$cache/initramfs-virt" "$out/assets/initramfs-virt"
+fi
+
+if [ -n "$WEB_DISK" ]; then
+    mkdir -p "$out/assets"
+    ln -s "$(cd "$(dirname "$WEB_DISK")" && pwd)/$(basename "$WEB_DISK")" "$out/assets/disk"
 fi
 
 if [ "$1" = serve ]; then

@@ -166,7 +166,6 @@ pub(crate) struct Chain {
 
 impl Chain {
     /// Concatenates the device-readable segments, truncated to `limit` bytes.
-    #[cfg(not(freestanding))]
     pub fn read_all(&self, mem: &GuestMem, limit: usize) -> Vec<u8> {
         let mut out = Vec::new();
         for seg in self.segs.iter().filter(|seg| !seg.device_writable) {
@@ -401,7 +400,6 @@ pub(crate) trait VirtioDev: Send {
     fn features_negotiated(&mut self, _features: u64) {}
     /// Gives the backing disk back when the device is torn down for a machine reboot, so the
     /// next incarnation of the device can serve the same image. Only virtio-blk has one.
-    #[cfg(not(freestanding))]
     fn into_disk(self: Box<Self>) -> Option<crate::disk::Disk> {
         None
     }

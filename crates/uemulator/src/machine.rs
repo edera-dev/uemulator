@@ -14,7 +14,6 @@ use crate::cpu::{Cpu, DEFAULT_RANDOM_SEED};
 use crate::dev::host_entropy;
 use crate::dev::kv::SharedKeyValueStore;
 use crate::dev::{DevConfig, EntropyFn, MAX_VIRTIO_FUNCTIONS, RngSource};
-#[cfg(not(freestanding))]
 use crate::disk::Disk;
 use crate::kv::{KeyValueStore, MemoryKeyValueStore};
 use crate::netdev::NetHandle;
@@ -159,7 +158,6 @@ pub struct MachineConfig {
     cmdline_extra: Vec<String>,
     memory_mib: usize,
     cpus: usize,
-    #[cfg(not(freestanding))]
     disks: Vec<Disk>,
     net_macs: Vec<[u8; 6]>,
     consoles: Vec<ConsoleKind>,
@@ -194,7 +192,6 @@ impl Default for MachineConfig {
             cmdline_extra: Vec::new(),
             memory_mib: DEFAULT_MEMORY_MIB,
             cpus: MIN_CPUS,
-            #[cfg(not(freestanding))]
             disks: Vec::new(),
             net_macs: Vec::new(),
             consoles: Vec::new(),
@@ -290,7 +287,6 @@ impl MachineConfig {
 
     /// Adds a virtio-blk disk. Call it again for more: the guest sees them in call order
     /// (`vda`, `vdb`, ...).
-    #[cfg(not(freestanding))]
     pub fn disk(mut self, disk: Disk) -> Self {
         self.disks.push(disk);
         self
@@ -608,22 +604,19 @@ fn host_unix_time() -> u64 {
 /// Both CPUs issue the same requests in the same order (the twin runs each block after the main
 /// CPU), so a FIFO is enough; the twin's own writes vanish and a later read of what the guest wrote
 /// is answered from what the main CPU read.
-#[cfg(not(freestanding))]
-type DiskReplay = Arc<Mutex<std::collections::VecDeque<(u64, Vec<u8>)>>>;
+type DiskReplay = Arc<Mutex<alloc::collections::VecDeque<(u64, Vec<u8>)>>>;
 
 /// The main CPU's disk under verify: every read is also queued for the twin.
-#[cfg(not(freestanding))]
 struct RecordingDisk {
     inner: Box<dyn crate::disk::BlockBackend>,
     replay: DiskReplay,
 }
 
-#[cfg(not(freestanding))]
 impl crate::disk::BlockBackend for RecordingDisk {
     fn len(&self) -> u64 {
         self.inner.len()
     }
-    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> crate::disk::io::Result<()> {
         self.inner.read_at(offset, buf)?;
         self.replay
             .lock()
@@ -631,10 +624,10 @@ impl crate::disk::BlockBackend for RecordingDisk {
             .push_back((offset, buf.to_vec()));
         Ok(())
     }
-    fn write_at(&mut self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+    fn write_at(&mut self, offset: u64, data: &[u8]) -> crate::disk::io::Result<()> {
         self.inner.write_at(offset, data)
     }
-    fn flush(&mut self) -> std::io::Result<()> {
+    fn flush(&mut self) -> crate::disk::io::Result<()> {
         self.inner.flush()
     }
     fn read_only(&self) -> bool {
@@ -645,19 +638,17 @@ impl crate::disk::BlockBackend for RecordingDisk {
 /// Stands in for a disk on the verify twin: same capacity and read-only flag as the real one so
 /// the guest sees the same device. Reads replay what the main CPU's disk returned; a request the
 /// main CPU did not make (or made at another offset) reads zeros and shows up as a divergence.
-#[cfg(not(freestanding))]
 struct ShadowDisk {
     len: u64,
     read_only: bool,
     replay: DiskReplay,
 }
 
-#[cfg(not(freestanding))]
 impl crate::disk::BlockBackend for ShadowDisk {
     fn len(&self) -> u64 {
         self.len
     }
-    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> crate::disk::io::Result<()> {
         match self.replay.lock().unwrap().pop_front() {
             Some((recorded_offset, data))
                 if recorded_offset == offset && data.len() == buf.len() =>
@@ -668,10 +659,10 @@ impl crate::disk::BlockBackend for ShadowDisk {
         }
         Ok(())
     }
-    fn write_at(&mut self, _offset: u64, _data: &[u8]) -> std::io::Result<()> {
+    fn write_at(&mut self, _offset: u64, _data: &[u8]) -> crate::disk::io::Result<()> {
         Ok(())
     }
-    fn flush(&mut self) -> std::io::Result<()> {
+    fn flush(&mut self) -> crate::disk::io::Result<()> {
         Ok(())
     }
     fn read_only(&self) -> bool {
@@ -689,7 +680,6 @@ impl crate::disk::BlockBackend for ShadowDisk {
 fn mirrored_devices(main: &mut DevConfig, main_uart: &ConsoleHandle) -> (DevConfig, ConsoleHandle) {
     let twin_uart = ConsoleHandle::default();
     let devices = DevConfig {
-        #[cfg(not(freestanding))]
         disks: main
             .disks
             .iter_mut()
@@ -764,7 +754,6 @@ fn interpreter_twin(
 /// What a finished run hands to the next one.
 struct Finished {
     ram_bytes: usize,
-    #[cfg(not(freestanding))]
     disks: Vec<Disk>,
 }
 
@@ -807,7 +796,6 @@ impl Vcpu {
             }
             self.ram = ram;
             self.devcfg = DevConfig {
-                #[cfg(not(freestanding))]
                 disks: finished.disks,
                 nets: image.nets.clone(),
                 virtio_consoles: image.virtio_consoles.clone(),
@@ -963,7 +951,6 @@ impl Vcpu {
         }
         let finished = Finished {
             ram_bytes,
-            #[cfg(not(freestanding))]
             disks: cpu
                 .dev
                 .into_devices()
@@ -1048,10 +1035,7 @@ impl EmulatedMachine {
                 "there is one UART: ConsoleKind::Serial can be configured only once".into(),
             ));
         }
-        #[cfg(not(freestanding))]
         let disk_count = cfg.disks.len();
-        #[cfg(freestanding)]
-        let disk_count = 0;
         let virtio_console_count = kinds
             .iter()
             .filter(|kind| **kind == ConsoleKind::Virtio)
@@ -1180,7 +1164,6 @@ impl EmulatedMachine {
             .map(|(_, handle)| handle.clone())
             .collect();
         let devcfg = DevConfig {
-            #[cfg(not(freestanding))]
             disks: cfg.disks,
             nets,
             virtio_consoles,

@@ -4,7 +4,8 @@
 
 ## What is ported
 
-- Hot code runs on a WebAssembly JIT (below; the page has a checkbox, and `uw_create` takes the flag). No virtio disk (`Disk` needs `std::fs`) and no network (no sockets). Console only: virtio-console (`hvc0`), the 16550 carries early boot text.
+- Hot code runs on a WebAssembly JIT (below; the page has a checkbox, and `uw_create` takes the flag). No network (no sockets). Console: virtio-console (`hvc0`), the 16550 carries early boot text.
+- One optional disk (`vda`): a raw or udisk image picked as a file or given as a URL, read on demand and never downloaded whole. `uw_add_disk(source, length)` (before `uw_create`) wraps the page's source in a `RemoteImage` (256 KiB chunks, 64 MiB LRU, 2 MiB read-ahead on sequential misses) whose fetch is the import `host_disk_read(source, offset, ptr, len)`: the worker serves it with a synchronous `XMLHttpRequest` with a `Range` header (allowed in a worker, refused unless the answer is 206) or `FileReaderSync` on a `File` slice. The guest's writes go to an in-memory udisk overlay over it and are lost when the machine stops. An overlay image cannot be streamed (its base would need a second source); flatten it with `uemulator disk convert`. `WEB_DISK=IMAGE hack/web.sh` links an image as `assets/disk` and the page prefills it; `node hack/wasm/boot.mjs --disk FILE|URL` does the same under Node.
 - Boots the Alpine netboot kernel and initramfs to userspace in about 1 s of guest time and roughly 15 s wall clock in Chrome; with the distro's init it ends at `Mounting boot media: failed` like the UEFI app, so the page defaults to `rdinit=/bin/sh`, which gives a working busybox shell (keyboard included).
 
 ## Library changes
@@ -43,5 +44,5 @@ The library's suite runs on `wasm32-wasip1` under Node, so the JIT is exercised 
 
 ## Not done
 
-- Disk (a `BlockBackend` over OPFS or an in-memory image) and network (a WebSocket or fetch gateway for `NetHandle`).
+- Keeping the disk's writes across page loads (a udisk overlay in OPFS instead of memory), and network (a WebSocket or fetch gateway for `NetHandle`).
 - Direct block links, 64-bit `imul` and the other helper-only forms inline, and a JIT per worker for SMP.

@@ -12,7 +12,6 @@ pub(crate) mod pci;
 mod pic;
 mod pit;
 mod serial;
-#[cfg(not(freestanding))]
 mod vblk;
 mod vcons;
 mod virtio;
@@ -20,7 +19,6 @@ mod vnet;
 mod vrng;
 
 use crate::console::ConsoleHandle;
-#[cfg(not(freestanding))]
 use crate::disk::Disk;
 use crate::netdev::NetHandle;
 use crate::sync::Arc;
@@ -35,7 +33,6 @@ use pci::PciHost;
 use pic::Pics;
 use pit::Pit;
 use serial::Uart;
-#[cfg(not(freestanding))]
 use vblk::VirtioBlk;
 use vcons::VirtioConsole;
 use virtio::Transport;
@@ -152,7 +149,6 @@ enum Source {
 /// (and legacy IRQ lines) in this order: virtio consoles, disks, nets, then the entropy source, each in list order.
 #[derive(Default)]
 pub(crate) struct DevConfig {
-    #[cfg(not(freestanding))]
     pub disks: Vec<Disk>,
     /// MAC address and the host side of the frame channel, one entry per NIC.
     pub nets: Vec<([u8; 6], NetHandle)>,
@@ -272,7 +268,6 @@ impl Devices {
             }
             virtio_devices.push(Transport::new(Box::new(VirtioConsole::new(handle))));
         }
-        #[cfg(not(freestanding))]
         for disk in cfg.disks {
             virtio_devices.push(Transport::new(Box::new(VirtioBlk::new(disk))));
         }
@@ -323,7 +318,6 @@ impl Devices {
     /// Consumes the devices and returns the disks in attach order, for the machine to attach to
     /// the devices it builds for the next boot. Everything else (PCI config, virtqueues, UART,
     /// PIC, PIT) is dropped on purpose: a reboot must not leak state from the previous run.
-    #[cfg(not(freestanding))]
     pub fn into_disks(self) -> Vec<Disk> {
         self.pci.into_disks()
     }

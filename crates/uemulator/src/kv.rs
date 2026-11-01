@@ -79,6 +79,19 @@ impl KeyValueStore for MemoryKeyValueStore {
 #[cfg(not(freestanding))]
 pub use file::FileKeyValueStore;
 
+/// The zlib/IEEE 802.3 CRC-32 (reflected), which the store's records and the udisk header use.
+pub(crate) fn crc32(data: &[u8]) -> u32 {
+    const CRC32_POLYNOMIAL: u32 = 0xedb8_8320;
+    let mut crc = !0u32;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (CRC32_POLYNOMIAL & (crc & 1).wrapping_neg());
+        }
+    }
+    !crc
+}
+
 #[cfg(not(freestanding))]
 mod file {
     use super::*;
@@ -96,18 +109,6 @@ mod file {
     /// Rewrite the log once it holds this many bytes beyond what the live entries need, so a
     /// guest that rewrites one variable forever does not grow the file without bound.
     const WASTE_COMPACTION_BYTES: u64 = 1 << 20;
-    const CRC32_POLYNOMIAL: u32 = 0xedb8_8320;
-
-    pub(super) fn crc32(data: &[u8]) -> u32 {
-        let mut crc = !0u32;
-        for &byte in data {
-            crc ^= byte as u32;
-            for _ in 0..8 {
-                crc = (crc >> 1) ^ (CRC32_POLYNOMIAL & (crc & 1).wrapping_neg());
-            }
-        }
-        !crc
-    }
 
     fn encode_record(op: u8, key: &[u8], value: &[u8]) -> Vec<u8> {
         let payload_len = PAYLOAD_HEADER_BYTES + key.len() + value.len();

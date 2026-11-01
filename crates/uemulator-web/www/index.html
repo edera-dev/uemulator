@@ -33,7 +33,7 @@
 <body>
 <header>
   <h1>uemulator</h1>
-  <p>x86_64 Linux in WebAssembly (no disk or network). Boots a bzImage and optional initramfs; the console is hvc0. Hot code is compiled to WebAssembly by a JIT.</p>
+  <p>x86_64 Linux in WebAssembly (no network). Boots a bzImage and optional initramfs, with an optional disk (vda) streamed on demand; the console is hvc0. Hot code is compiled to WebAssembly by a JIT.</p>
 </header>
 <form onsubmit="return false">
   <label>Kernel (bzImage)
@@ -43,6 +43,10 @@
   <label>Initramfs (optional)
     <span class="row"><input id="initrd-file" type="file"></span>
     <span class="row"><input id="initrd-url" type="text" placeholder="or URL"></span>
+  </label>
+  <label>Disk (optional; raw or udisk, read on demand, writes kept in memory)
+    <span class="row"><input id="disk-file" type="file"></span>
+    <span class="row"><input id="disk-url" type="text" placeholder="or URL (served with range requests)"></span>
   </label>
   <label>Extra kernel arguments
     <input id="cmdline" type="text">
