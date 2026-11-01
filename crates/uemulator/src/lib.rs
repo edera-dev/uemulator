@@ -28,6 +28,7 @@ mod platform;
 #[cfg(freestanding)]
 mod prelude;
 mod ram;
+mod segment;
 mod sync;
 #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
 mod sys;
@@ -57,6 +58,7 @@ pub use machine::{
 };
 pub use netdev::{NetHandle, NetOffloads};
 pub use platform::{DEFAULT_CMDLINE, DEFAULT_SERIAL_CMDLINE, Platform, load_linux};
+pub use segment::{SegmentAgent, SegmentDestination, SegmentStatus};
 
 #[cfg(test)]
 mod api_tests {
@@ -67,6 +69,8 @@ mod api_tests {
     type LoadLinux = fn(&mut [u8], &[u8], Option<&[u8]>, &str) -> Result<BootState, Error>;
     /// An overlay's base, as `Udisk::open` and `Udisk::create` take it.
     type Base = Option<Box<dyn BlockBackend>>;
+    /// A frame for the segment and where it goes, as `SegmentAgent::take_for_segment` hands it.
+    type Addressed = (SegmentDestination, Vec<u8>);
 
     fn is_send<T: Send>() {}
     fn is_send_sync<T: Send + Sync>() {}
@@ -98,6 +102,25 @@ mod api_tests {
             takes_guest_segments: true,
             sends_large_segments: true,
         };
+        let _: fn([u8; 6], u32, u64) -> Result<SegmentAgent, Error> = SegmentAgent::new;
+        let _: fn(&mut SegmentAgent, bool, u64) = SegmentAgent::set_serving;
+        let _: fn(&mut SegmentAgent, &[u8], u64) = SegmentAgent::from_guest;
+        let _: fn(&mut SegmentAgent, u32, &[u8], u64) = SegmentAgent::from_segment;
+        let _: fn(&mut SegmentAgent, u64) = SegmentAgent::tick;
+        let _: fn(&mut SegmentAgent) -> Vec<Vec<u8>> = SegmentAgent::take_for_guest;
+        let _: fn(&mut SegmentAgent) -> Vec<Addressed> = SegmentAgent::take_for_segment;
+        let _ = [
+            SegmentDestination::Everyone,
+            SegmentDestination::Tab(1),
+            SegmentDestination::Server,
+        ];
+        let status: SegmentStatus = SegmentStatus {
+            address: Some([10, 0, 2, 15]),
+            peers: 1,
+            serving: false,
+        };
+        let _: fn(&SegmentAgent) -> SegmentStatus = SegmentAgent::status;
+        let _ = status;
         let _: fn(&StopHandle) = StopHandle::stop;
         let _: fn() -> MachineConfig = MachineConfig::new;
         let _: fn(MachineConfig, bool) -> MachineConfig = MachineConfig::reboot;
@@ -195,6 +218,9 @@ mod api_tests {
     fn handles_cross_threads_and_clone() {
         is_send::<MachineConfig>();
         is_send::<EmulatedMachine>();
+        is_send_sync::<SegmentAgent>();
+        is_copy::<SegmentStatus>();
+        is_copy::<SegmentDestination>();
         is_send_sync::<ConsoleHandle>();
         is_send_sync::<NetHandle>();
         is_send_sync::<StopHandle>();
