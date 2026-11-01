@@ -206,6 +206,13 @@ async function boot(message) {
     postMessage({ type: "exit", code: -2, message: `firmware: ${lastError()}` });
     return;
   }
+  if (message.hypervisor) {
+    const hypervisor = new Uint8Array(message.hypervisor);
+    const hypervisorCmdline = new TextEncoder().encode(message.hypervisorCmdline ?? "");
+    wasm.uw_set_hypervisor(
+      upload(hypervisor), hypervisor.length, upload(hypervisorCmdline), hypervisorCmdline.length,
+    );
+  }
   const kernelPtr = upload(kernel);
   const initrdPtr = upload(initrd);
   const cmdlinePtr = upload(cmdline);

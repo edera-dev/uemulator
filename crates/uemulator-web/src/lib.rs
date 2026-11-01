@@ -168,6 +168,8 @@ thread_local! {
     static PENDING_DISKS: RefCell<Vec<Disk>> = const { RefCell::new(Vec::new()) };
     /// What `uw_set_firmware` chose for the next `uw_create`: a `FIRMWARE_*` kind and its image.
     static PENDING_FIRMWARE: RefCell<(i32, Vec<u8>)> = const { RefCell::new((FIRMWARE_NONE, Vec::new())) };
+    /// What `uw_set_hypervisor` gave the next `uw_create`: the image and its command line.
+    static PENDING_HYPERVISOR: RefCell<Option<(Vec<u8>, String)>> = const { RefCell::new(None) };
     /// The machine's screen and input handles, for the poll hook (like `STOP`).
     static SCREEN: RefCell<Option<ScreenLink>> = const { RefCell::new(None) };
 }
@@ -288,6 +290,26 @@ pub unsafe extern "C" fn uw_set_firmware(kind: i32, image: *mut u8, len: usize) 
     0
 }
 
+/// A hypervisor for the next `uw_create`, which boots it through the UEFI firmware with the
+/// kernel as its dom0: Xen as `xen.gz`, `xen` or `xen.efi` (`MachineConfig::hypervisor`), and
+/// its command line (`cmdline_len == 0`: the library's default, Xen's console on the 16550).
+/// Takes ownership of both buffers. Without a call there is no hypervisor.
+///
+/// # Safety
+/// Both pointers must come from `uw_alloc` with the matching length.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uw_set_hypervisor(
+    image: *mut u8,
+    len: usize,
+    cmdline: *mut u8,
+    cmdline_len: usize,
+) {
+    let image = unsafe { take_buffer(image, len) };
+    let cmdline = unsafe { take_buffer(cmdline, cmdline_len) };
+    let cmdline = String::from_utf8_lossy(&cmdline).into_owned();
+    PENDING_HYPERVISOR.with(|hypervisor| *hypervisor.borrow_mut() = Some((image, cmdline)));
+}
+
 /// Builds the machine and loads the kernel. Returns 0, or 1 with the message in `uw_error_*`.
 /// `kernel_len == 0` means no kernel (the firmware boots a disk), `initrd_len == 0` no initramfs.
 /// The command line is appended to the library's default (which follows `OPTION_ACPI` and
@@ -371,6 +393,12 @@ pub unsafe extern "C" fn uw_create(
         config = config.cmdline(cmdline);
     } else if !cmdline.is_empty() {
         config = config.cmdline_append(cmdline);
+    }
+    if let Some((image, cmdline)) = PENDING_HYPERVISOR.with(|hypervisor| hypervisor.take()) {
+        config = config.hypervisor(image);
+        if !cmdline.is_empty() {
+            config = config.hypervisor_cmdline(cmdline);
+        }
     }
     let (firmware, image) = PENDING_FIRMWARE.with(|firmware| firmware.take());
     config = match firmware {

@@ -236,8 +236,9 @@ enum AdvancedCmd {
         #[arg(long)]
         initramfs: Option<PathBuf>,
         /// A hypervisor to boot with the kernel as its dom0: Xen as xen.gz (or the uncompressed
-        /// xen), or xen.efi. Needs the UEFI firmware; the console defaults to serial (Xen owns
-        /// the 16550 and gives dom0 hvc0), and --cmdline/--append are dom0's
+        /// xen), or Edera's xen.efi (an upstream xen.efi cannot take its kernel from the firmware;
+        /// give such a Xen as xen.gz). Needs the UEFI firmware; the console defaults to serial
+        /// (Xen owns the 16550 and gives dom0 hvc0), and --cmdline/--append are dom0's
         #[arg(long)]
         hypervisor: Option<PathBuf>,
         /// The hypervisor's own command line [default: console=com1 com1=115200,8n1]

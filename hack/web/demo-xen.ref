@@ -1,0 +1,6 @@
+# The Xen the web page's "Edera Xen" demo boots (hack/web/demo.py): Edera's Xen 4.22 image, its
+# linux/amd64 manifest pinned by digest. The digest covers the layers, so the build gets exactly
+# these bytes or stops. To move to a new build, put the platform manifest's digest here:
+#
+#   crane digest ghcr.io/edera-dev/xen:4.22 --platform linux/amd64
+ghcr.io/edera-dev/xen@sha256:5410d37a741e08eaf0dc64cc60b97c33411c2ad4b0a2ab3e28289706824d3f57

@@ -329,7 +329,8 @@ impl MachineConfig {
     /// no EFI stub. The firmware loads `xen.gz` the way GRUB's `multiboot2` does on UEFI (boot
     /// services kept, Xen's EFI entry point), and starts `xen.efi` with its configuration, the
     /// kernel and the initramfs behind Xen's `LoadFile2` media loaders, as Edera's boot loader
-    /// does (`docs/plans/18-xen-dom0.md`).
+    /// does (`docs/plans/18-xen-dom0.md`). Only Edera's `xen.efi` reads those; an upstream one
+    /// looks for `xen.cfg` on a disk, so give such a Xen as `xen.gz`.
     ///
     /// Xen owns the 16550 and gives dom0 its console as `hvc0`, so with a hypervisor the default
     /// console is `ConsoleKind::Serial` and the default command line puts dom0's console on

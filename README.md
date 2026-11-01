@@ -6,7 +6,7 @@ uemulator is an x86_64 PC emulator written in Rust, built to be embedded. It boo
 
 ## Features
 
-- **Real guests.** Boots stock Alpine, Debian installer and Fedora kernels, Xen 4.21 with a dom0 and domU, and Linux KVM running nested inside the guest.
+- **Real guests.** Boots stock Alpine, Debian installer and Fedora kernels, Xen 4.21 with a dom0 and domU, and Linux KVM running nested inside the guest. Xen can also be handed to the machine directly (`--hypervisor xen.gz` or `xen.efi`), and the firmware boots it with the kernel as dom0, no disk or GRUB needed.
 - **Modern CPU model.** AMD Zen 5 (EPYC Turin) with AVX2 and AVX-512, AES-NI and SHA, and AMD SVM with nested paging. Linux needs no software mitigations and runs with KASLR. Real mode, protected mode and compatibility mode are all supported.
 - **Your choice of firmware.** The built-in UEFI firmware (the default), a built-in BIOS for legacy disk boot, or direct kernel entry with no firmware.
 - **SMP.** Up to 64 vCPUs. Each one runs on its own host thread, or all of them share one thread and run deterministically.
@@ -49,6 +49,7 @@ uemulator quick delete test --yes
 
 uemulator advanced boot --kernel bzImage --initramfs initrd.img   # your own kernel, through UEFI
 uemulator advanced boot --kernel bzImage --firmware none          # ... or entered directly (no EFI stub needed)
+uemulator advanced boot --kernel bzImage --initramfs initrd.img --hypervisor xen.gz   # Xen (xen.gz or xen.efi) with the kernel as dom0
 uemulator disk create disk.udisk --size 8192                      # create an empty disk image
 uemulator disk info disk.udisk
 ```
@@ -62,7 +63,7 @@ rustup target add wasm32-unknown-unknown x86_64-unknown-none
 ./hack/web.sh serve                           # http://127.0.0.1:8080/
 ```
 
-Setting `WEB_DEMO=1` also builds a ready-to-boot Alpine machine and puts the page in one-button demo mode. Because the page needs cross-origin isolation, serve it with `hack/web/serve.py` (which `web.sh serve` uses) or with a server that sends the COOP/COEP headers.
+Setting `WEB_DEMO=1` also builds ready-to-boot machines and puts the page in demo mode: Alpine Linux, and Edera's Xen 4.22 with the same Alpine as its dom0 (the Xen image is pinned by digest in `hack/web/demo-xen.ref`). The page also takes a hypervisor of your own next to the kernel. Because the page needs cross-origin isolation, serve it with `hack/web/serve.py` (which `web.sh serve` uses) or with a server that sends the COOP/COEP headers.
 
 ## Embedding
 

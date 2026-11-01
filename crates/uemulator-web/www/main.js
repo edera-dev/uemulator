@@ -13,11 +13,14 @@ term.open($("terminal"));
 // `acpi=off` goes when ACPI is on, the console word follows the console kind, and a screen that
 // is the console adds `console=tty0` last. Only for showing what the guest will get; the library
 // builds the real one and the page appends to it.
-function defaultCmdline({ serial, acpi, display }) {
-  return [`console=${serial ? "ttyS0" : "hvc0"}`, "earlyprintk=serial,ttyS0", acpi ? "" : "acpi=off", "panic=-1",
-    display === "screen" ? "console=tty0" : ""]
+function defaultCmdline({ serial, acpi, display, hypervisor }) {
+  // Under Xen dom0's console is Xen's hvc0 and the 16550 is Xen's (DEFAULT_DOM0_CMDLINE).
+  const console = hypervisor ? ["console=hvc0", "earlyprintk=xen"] : [`console=${serial ? "ttyS0" : "hvc0"}`, "earlyprintk=serial,ttyS0"];
+  return [...console, acpi ? "" : "acpi=off", "panic=-1", display === "screen" ? "console=tty0" : ""]
     .filter(Boolean).join(" ");
 }
+// What the library gives Xen when the page leaves its arguments empty (DEFAULT_HYPERVISOR_CMDLINE).
+const DEFAULT_HYPERVISOR_CMDLINE = "console=com1 com1=115200,8n1";
 const DEFAULT_CMDLINE_EXTRA = "earlycon=uart8250,io,0x3f8";
 const BUILT_IN_FIRMWARE_URL = "uemulator-firmware.bin";
 // v2: drives became a list and sources are kept as URLs, not form fields. A v1 entry is ignored.
@@ -63,8 +66,8 @@ let events = null;
 let startedAt = 0;
 let clock = null;
 let hasRun = false;
-// demo.json when the site has one.
-let demo = null;
+// demo.json's machines when the site has one; the first is what ?autoboot boots.
+let demos = [];
 // What the running (or last) machine was started with.
 let current = null;
 
@@ -74,6 +77,7 @@ const state = {
   drives: [],
   kernel: null,
   initrd: null,
+  hypervisor: null,
   firmwareImage: null,
 };
 let nextDriveId = 1;
@@ -131,6 +135,10 @@ async function looksLikeIso(file) {
   try { return (await readText(file, ISO9660_MAGIC_OFFSET, ISO9660_MAGIC.length)) === ISO9660_MAGIC; } catch { return false; }
 }
 
+// Xen ships as xen.gz (or xen-4.22.gz and the like) and xen.efi; nothing in a gzip file says what
+// is inside, so the name decides.
+const looksLikeHypervisor = (file) => /^xen[^/]*\.(gz|efi)$/i.test(file.name);
+
 async function looksLikeKernel(file) {
   try { return (await readText(file, BZIMAGE_MAGIC_OFFSET, BZIMAGE_MAGIC.length)) === BZIMAGE_MAGIC; } catch { return false; }
 }
@@ -159,10 +167,17 @@ function addDrive(source, kind) {
   return true;
 }
 
-// Files from a picker or a drop: ISOs become CDs, a bzImage the kernel, the rest disks.
+// Files from a picker or a drop: ISOs become CDs, a bzImage the kernel, Xen the hypervisor, the
+// rest disks.
 async function addFiles(files, { kind = null, detectKernel = false } = {}) {
   const added = [];
   for (const file of files) {
+    if (detectKernel && looksLikeHypervisor(file)) {
+      state.hypervisor = { file, label: file.name, size: file.size };
+      setRadio("firmware", "uefi");
+      added.push(`${file.name} as the hypervisor`);
+      continue;
+    }
     if (detectKernel && await looksLikeKernel(file)) {
       state.kernel = { file, label: file.name, size: file.size };
       added.push(`${file.name} as the kernel`);
@@ -197,6 +212,9 @@ function readSettings() {
     firmwareImage: firmware === "custom" ? state.firmwareImage : null,
     kernel: usesKernel ? state.kernel : null,
     initrd: usesKernel ? state.initrd : null,
+    // Kept whatever the firmware, so that a note can say why it would not boot.
+    hypervisor: usesKernel ? state.hypervisor : null,
+    hypervisorCmdline: $("hypervisor-cmdline").value.trim(),
     drives: state.drives.map((drive) => ({ ...drive })),
     extra,
     replaceCmdline: $("replace-cmdline").checked,
@@ -228,6 +246,8 @@ function notesFor(s) {
   if (s.firmware === "bios" && !s.drives.length) error("BIOS boot needs a drive.");
   if (s.firmware === "custom" && !s.firmwareImage) error("Choose a firmware image.");
   if (s.replaceCmdline && s.kernel && !s.extra) error("Replacing the default command line with nothing leaves the guest without a console.");
+  if (s.hypervisor && s.firmware !== "uefi") error("A hypervisor is booted by the UEFI firmware: choose UEFI.");
+  if (s.hypervisor && !s.kernel) error("A hypervisor needs a kernel to boot as its dom0.");
   if (hasBigCd && s.memoryMib < ISO_MEMORY_MIB) {
     warn("Live and installer ISOs usually need 2 GiB: their initramfs is unpacked into RAM, and with less the kernel ends in “Unable to mount root fs”.");
   }
@@ -238,12 +258,16 @@ function notesFor(s) {
   if (s.firmware === "uefi" && s.kernel && s.drives.length) {
     warn("UEFI boots the kernel when one is set; the drives are only attached. Remove the kernel to boot from a drive.");
   }
+  if (s.hypervisor && s.display === "screen") {
+    warn("Xen's own console is the terminal; with the screen as dom0's console, Xen's messages only show in the Terminal view.");
+  }
   if (s.drives.some((drive) => drive.unreachable)) warn("A drive's URL did not answer; it will fail when the machine starts.");
   return notes;
 }
 
 function summaryOf(s) {
   const media = s.title ?? [
+    s.hypervisor?.label,
     s.kernel?.label,
     ...s.drives.map((drive) => drive.label),
   ].filter(Boolean).join(" + ");
@@ -353,14 +377,24 @@ function render() {
   const s = readSettings();
   renderDrives();
   $("kernel-panel").hidden = !s.usesKernel;
-  renderSource($("kernel-source"), "kernel", "Kernel", firmware === "uefi" ? "bzImage with an EFI stub" : "bzImage");
+  renderSource($("kernel-source"), "kernel", "Kernel", firmware === "uefi" && !s.hypervisor ? "bzImage with an EFI stub" : "bzImage");
   renderSource($("initrd-source"), "initrd", "Initramfs", "optional");
+  // Xen keeps the 16550 for itself and gives dom0 its console through it, so the console is
+  // serial whatever the choice; the library makes it so, and the radios say it.
+  $("hypervisor-source").hidden = firmware !== "uefi" && !s.hypervisor;
+  if (!$("hypervisor-source").hidden) renderSource($("hypervisor-source"), "hypervisor", "Hypervisor", "optional: xen.gz, or Edera's xen.efi");
+  $("hypervisor-cmdline-group").hidden = !s.hypervisor;
+  $("hypervisor-cmdline").placeholder = DEFAULT_HYPERVISOR_CMDLINE;
+  for (const input of document.querySelectorAll("input[name=console]")) input.disabled = Boolean(s.hypervisor);
+  if (s.hypervisor) setRadio("console", "serial");
   $("firmware-source").hidden = firmware !== "custom";
   if (firmware === "custom") renderSource($("firmware-source"), "firmwareImage", "Firmware image");
   $("kernel-optional").textContent = firmware === "none" ? "required" : "optional";
-  $("kernel-hint").textContent = firmware === "uefi"
-    ? "With a kernel the firmware boots it, like QEMU's ‑kernel under OVMF, and the drives are only attached."
-    : "";
+  $("kernel-hint").textContent = s.hypervisor
+    ? "The firmware boots the hypervisor with this kernel, initramfs and command line as its dom0: xen.gz the way GRUB's multiboot2 does, Edera's xen.efi through its media loaders (an upstream xen.efi cannot take them; use its xen.gz)."
+    : firmware === "uefi"
+      ? "With a kernel the firmware boots it, like QEMU's ‑kernel under OVMF, and the drives are only attached."
+      : "";
   $("kernel-hint").hidden = !$("kernel-hint").textContent;
   // A drive's boot loader brings its own command line; the arguments only matter with a kernel.
   $("cmdline-group").hidden = !s.kernel && firmware !== "none";
@@ -386,7 +420,8 @@ function saveSettings() {
   for (const id of CHECKBOXES) saved[id] = $(id).checked;
   for (const id of SELECTS) saved[id] = $(id).value;
   saved.cmdline = $("cmdline").value;
-  for (const key of ["kernel", "initrd", "firmwareImage"]) saved[key] = state[key]?.url ?? null;
+  saved.hypervisorCmdline = $("hypervisor-cmdline").value;
+  for (const key of ["kernel", "initrd", "hypervisor", "firmwareImage"]) saved[key] = state[key]?.url ?? null;
   saved.drives = state.drives.filter((drive) => drive.url).map(({ url, kind }) => ({ url, kind }));
   try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(saved)); } catch { /* private mode */ }
 }
@@ -403,7 +438,8 @@ function restoreSettings() {
   $("cmdline").value = "cmdline" in saved ? saved.cmdline : DEFAULT_CMDLINE_EXTRA;
   if (params.has("args")) $("cmdline").value = params.get("args");
   if (params.has("iommu")) $("iommu").checked = $("acpi").checked = true;
-  for (const key of ["kernel", "initrd", "firmwareImage"]) {
+  $("hypervisor-cmdline").value = params.get("hypervisor-args") ?? saved.hypervisorCmdline ?? "";
+  for (const key of ["kernel", "initrd", "hypervisor", "firmwareImage"]) {
     const url = params.get(key === "firmwareImage" ? "firmware-image" : key) ?? saved[key];
     if (url) state[key] = { url, label: labelOfUrl(url) };
   }
@@ -417,12 +453,19 @@ function restoreSettings() {
 
 // A kernel left over from an earlier choice wins over every drive under UEFI (the firmware boots
 // the kernel it is given, QEMU -kernel style), so the drive presets drop it, and the kernel preset
-// drops the demo's, along with the command line that went with it.
+// drops the demo's, along with the command line that went with it. A hypervisor goes with them:
+// it would turn the next kernel into a dom0.
 function clearKernel() {
   state.kernel = null;
   state.initrd = null;
+  clearHypervisor();
   $("cmdline").value = "";
   $("shell").checked = false;
+}
+
+function clearHypervisor() {
+  state.hypervisor = null;
+  $("hypervisor-cmdline").value = "";
 }
 
 // By URL rather than a flag, so a demo kernel remembered across a reload still counts.
@@ -430,6 +473,8 @@ const isDemoSource = (source) => Boolean(source?.url?.startsWith(new URL(".", DE
 
 function applyPreset(name) {
   if (name === "iso" || name === "disk" || (name === "kernel" && isDemoSource(state.kernel))) clearKernel();
+  // Direct boot cannot take a hypervisor, whoever's kernel this is.
+  if (name === "kernel") clearHypervisor();
   if (name === "iso") {
     setRadio("firmware", "uefi");
     setRadio("display", "screen");
@@ -447,8 +492,9 @@ function applyPreset(name) {
     setRadio("display", "none");
     $("shell").checked = true;
     if (!state.kernel) queueMicrotask(() => $("kernel-source").querySelector("button")?.focus());
-  } else if (name === "demo" && demo) {
-    applyDemo(demo);
+  } else if (name.startsWith("demo:")) {
+    const machine = demos.find((d) => d.id === name.slice("demo:".length));
+    if (machine) applyDemo(machine);
   }
   render();
 }
@@ -458,6 +504,8 @@ function applyDemo(d) {
   const at = (name) => ({ url: new URL(name, DEMO_URL).href, label: name });
   state.kernel = at(d.kernel);
   state.initrd = at(d.initrd);
+  state.hypervisor = d.hypervisor ? at(d.hypervisor) : null;
+  $("hypervisor-cmdline").value = d.hypervisorArgs ?? "";
   state.drives = [];
   setRadio("firmware", d.firmware);
   setRadio("console", d.console === "serial" ? "serial" : "virtio");
@@ -856,6 +904,7 @@ async function launch() {
     const realMode = firmware.kind === FIRMWARE.REAL_MODE;
     const kernel = realMode ? null : await load(s.kernel, "kernel");
     const initrd = realMode ? null : await load(s.initrd, "initramfs");
+    const hypervisor = realMode ? null : await load(s.hypervisor, "hypervisor");
 
     const shared = new SharedArrayBuffer(CONTROL_BYTES);
     control = new Int32Array(shared, 0, RING_OFFSET / 4);
@@ -905,6 +954,8 @@ async function launch() {
       firmware,
       kernel,
       initrd,
+      hypervisor,
+      hypervisorCmdline: s.hypervisorCmdline,
       cmdline: s.extra,
       memoryMib: s.memoryMib,
       cpus: realMode ? 1 : s.cpus,
@@ -915,7 +966,7 @@ async function launch() {
       control: shared,
     };
     setStatus("Starting…", "busy");
-    worker.postMessage(message, [kernel, initrd, firmware.image].filter(Boolean));
+    worker.postMessage(message, [kernel, initrd, hypervisor, firmware.image].filter(Boolean));
   } catch (error) {
     finish(String(error.message ?? error), "error");
   }
@@ -950,11 +1001,6 @@ $("start-sidebar").onclick = launch;
 $("banner-restart").onclick = launch;
 $("banner-close").onclick = () => { $("banner").hidden = true; };
 $("toggle-sidebar").onclick = () => setSidebar($("sidebar").hasAttribute("data-collapsed"));
-$("demo-boot").onclick = () => {
-  applyDemo(demo);
-  render();
-  launch();
-};
 $("stop").onclick = () => {
   if (control) Atomics.store(control, CTRL.STOP, 1);
   else if (starting) toast("Still downloading; the machine stops as soon as it starts.");
@@ -1013,27 +1059,47 @@ const probes = [
     .catch(() => {}));
 Promise.all(probes).then(render);
 
+// A welcome button and a preset per machine; the first button is the primary one.
 const demoReady = fetch(DEMO_URL)
   .then((response) => (response.ok ? response.json() : null))
   .catch(() => null)
   .then((found) => {
-    demo = found;
-    if (!demo) return;
-    $("demo-boot").hidden = false;
-    $("demo-boot").innerHTML = `<svg class="i"><use href="#i-play"/></svg>`;
-    $("demo-boot").append(`Boot ${demo.label}`);
-    $("demo-boot").title = `${demo.name}, ${Math.round(demo.bytes / 1e6)} MB download`;
-    const preset = document.querySelector("[data-preset=demo]");
-    preset.hidden = false;
-    preset.textContent = demo.label;
+    demos = found?.machines ?? [];
+    $("demo-actions").replaceChildren(...demos.map((machine, index) => {
+      const button = Object.assign(document.createElement("button"), {
+        type: "button",
+        className: index === 0 ? "primary big" : "big",
+        title: `${machine.name}, ${Math.round(machine.bytes / 1e6)} MB download`,
+        innerHTML: `<svg class="i"><use href="#i-play"/></svg>`,
+      });
+      button.append(`Boot ${machine.label}`);
+      button.onclick = () => {
+        applyDemo(machine);
+        render();
+        launch();
+      };
+      return button;
+    }));
+    $("demo-actions").hidden = !demos.length;
+    for (const machine of demos) {
+      const preset = Object.assign(document.createElement("button"), {
+        type: "button",
+        textContent: machine.label,
+        title: machine.name,
+      });
+      preset.onclick = () => applyPreset(`demo:${machine.id}`);
+      $("presets").append(preset);
+    }
   });
 
 if (!crossOriginIsolated) {
   setStatus(NOT_ISOLATED, "error");
 } else if (new URLSearchParams(location.search).has("autoboot")) {
-  // In demo mode ?autoboot boots the demo; otherwise the settings as restored.
+  // In demo mode ?autoboot boots the first demo (?demo=ID another); otherwise the settings as restored.
   Promise.all([...probes, demoReady]).then(() => {
-    if (demo) applyDemo(demo);
+    const wanted = new URLSearchParams(location.search).get("demo");
+    const machine = demos.find((d) => d.id === wanted) ?? demos[0];
+    if (machine) applyDemo(machine);
     render();
     launch();
   });
