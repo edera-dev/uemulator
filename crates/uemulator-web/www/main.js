@@ -517,7 +517,7 @@ function applyDemo(d) {
   $("replace-cmdline").checked = false;
   $("cmdline").value = d.args ?? "";
   for (const id of ["jit", "acpi", "rng", "reboot"]) $(id).checked = true;
-  $("iommu").checked = false;
+  $("iommu").checked = Boolean(d.iommu);
 }
 
 function setRunning(isRunning) {
