@@ -16,7 +16,7 @@ Spec: AMD I/O Virtualization Technology (IOMMU) Specification, rev 3.x (publicat
 | `iommu/tables.rs` | device table entries, the 1 to 6 level page walk |
 | `iommu/irq.rs` | `remap_interrupt`, `ioapic_request`, IRTE decoding |
 | `iommu/ivrs.rs` | `Iommu::ivrs_table` |
-| `iommu/tests.rs` | the fake driver and 76 tests |
+| `iommu/tests.rs` | the fake driver and its tests |
 
 ## PCI function and registers
 
@@ -32,9 +32,11 @@ Spec: AMD I/O Virtualization Technology (IOMMU) Specification, rev 3.x (publicat
 
 ## Translation
 
-- `Iommu::translate(mem, requester, iova, access) -> Translation { phys, bytes_left }`: IOMMU off or no device table programmed = identity. Order: IOTLB hit, DTE fetch, V=0 passes through (QEMU; Linux blocks with V=1, TV=1, mode 0, no IR/IW), reserved DTE bits are an illegal entry, the exclusion range (all devices with ExclusionAllow, else those with DTE.EX), TV=0 passes through, mode 0 passes through if the DTE's IR/IW allow the access, else the walk.
+- `Iommu::translate(mem, requester, iova, access) -> Translation { phys, bytes_left }`: IOMMU off or no device table programmed = identity. Order: IOTLB hit, DTE (cached, below), V=0 passes through (QEMU; Linux blocks with V=1, TV=1, mode 0, no IR/IW), reserved DTE bits are an illegal entry, the exclusion range (all devices with ExclusionAllow, else those with DTE.EX), TV=0 passes through, mode 0 passes through if the DTE's IR/IW allow the access, else the walk.
 - Walk: modes 1..6, permissions are the AND of the DTE's IR/IW and every entry's, NextLevel may skip levels, 0 is a leaf of the level's size (4 KiB, 2 MiB, 1 GiB...), 7 is a leaf whose size is 2^(p+1) for the lowest clear address bit p >= 12. Such an entry must be repeated in every slot the page covers; the walk does not search for the first. An address above what the mode covers is not present.
-- IOTLB: 4 KiB granular, keyed by (requester, page), carries domain and permissions, dropped by the invalidation commands, by changing the device table base or the IOMMU enable, and wholesale at 1024 entries. A translation stays in use until the guest invalidates it, as on hardware.
+- IOTLB: 4 KiB granular, 4096 slots direct-mapped by (requester, page) (16 MiB of pages; the requester is shifted into the index so two devices using the same low addresses do not evict each other), carries domain and permissions, dropped by the invalidation commands and by changing the device table base or the IOMMU enable. A translation stays in use until the guest invalidates it, as on hardware. It used to be a map dropped wholesale at 1024 entries, so a device streaming through more than 4 MiB of buffers walked the tables for every page.
+- Device table entries are cached per requester (256 slots by the low byte of the id, which covers bus 0) for DMA, as hardware does: INVALIDATE_DEVTAB_ENTRY drops the device's entry and its translations, INVALIDATE_IOMMU_ALL, a new device table base and an enable change drop them all. Linux and Xen invalidate after every change; the fake driver's `set_dte` does the same. Interrupt remapping still reads the entry each time. Both caches are allocated by the first translation, because `GuestMem::with_dma` swaps a default `Iommu` in around every device poll.
+- Cost per DMA access (64-byte reads in one `with_dma`, Apple M3, `iommu/tests.rs`-style harness not kept): IOMMU off 4.8 ns; before, IOTLB hit 15.8 ns, a 2048-page working set 84 ns, passthrough (mode 0) 17.4 ns, V=0 16 ns; after, 6.2, 6.0, 6.8 and 6.3 ns. Not visible in a Xen boot (no DMA-heavy device in the demo's dom0: PV with and without `--iommu` boot in the same time); it matters for virtio-blk and virtio-net streaming behind the IOMMU.
 - Interrupt window 0xFEE00000..0xFEEFFFFF: DMA there is refused without an event (interrupt messages go through `remap_interrupt`, not memory).
 
 ## DMA hook

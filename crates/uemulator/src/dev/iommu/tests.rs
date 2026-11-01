@@ -132,7 +132,16 @@ impl Fixture {
         page
     }
 
+    /// Writes a device table entry and, with the command buffer running, invalidates it, as a
+    /// driver must: the IOMMU caches entries.
     fn set_dte(&mut self, device: u16, quads: [u64; 4]) {
+        self.write_dte_without_invalidating(device, quads);
+        if self.iommu.control() & CONTROL_COMMAND_BUFFER_ENABLE != 0 {
+            self.invalidate_device(device);
+        }
+    }
+
+    fn write_dte_without_invalidating(&mut self, device: u16, quads: [u64; 4]) {
         for (i, quad) in quads.iter().enumerate() {
             self.write64(DEVICE_TABLE_AT + device as u64 * 32 + 8 * i as u64, *quad);
         }
@@ -877,6 +886,67 @@ fn invalidating_a_device_or_everything_drops_its_translations() {
     assert_eq!(f.dma_read(DEVICE, 0x5000, 1), Some(vec![1]));
 }
 
+/// Hardware caches device table entries too (spec 2.2.2.1); Linux and Xen invalidate one after
+/// every change. Passthrough and untranslated devices then need no table read per access.
+#[test]
+fn device_table_entries_stay_cached_until_the_driver_invalidates_them() {
+    let mut f = Fixture::enabled();
+    f.ram[0x3000] = 0x11;
+    f.set_dte(DEVICE, [dte_q0(0, 0, true, true), DOMAIN as u64, 0, 0]);
+    assert_eq!(f.dma_read(DEVICE, 0x3000, 1), Some(vec![0x11]));
+    let blocked = [dte_q0(0, 0, false, false), DOMAIN as u64, 0, 0];
+    f.write_dte_without_invalidating(DEVICE, blocked);
+    assert_eq!(
+        f.dma_read(DEVICE, 0x3000, 1),
+        Some(vec![0x11]),
+        "stale until invalidated"
+    );
+    f.invalidate_device(DEVICE + 8);
+    assert!(
+        f.dma_read(DEVICE, 0x3000, 1).is_some(),
+        "another device's flush"
+    );
+    f.invalidate_device(DEVICE);
+    assert!(f.dma_read(DEVICE, 0x3000, 1).is_none());
+    let passthrough = [dte_q0(0, 0, true, true), DOMAIN as u64, 0, 0];
+    f.write_dte_without_invalidating(DEVICE, passthrough);
+    f.invalidate_all();
+    assert!(f.dma_read(DEVICE, 0x3000, 1).is_some(), "invalidate all");
+    f.write_dte_without_invalidating(DEVICE, blocked);
+    f.mmio_write(REG_DEVICE_TABLE, 8, DEVICE_TABLE_AT);
+    assert!(
+        f.dma_read(DEVICE, 0x3000, 1).is_none(),
+        "a new device table"
+    );
+    f.write_dte_without_invalidating(DEVICE, passthrough);
+    f.mmio_write(REG_CONTROL, 8, CONTROL_ALL & !CONTROL_IOMMU_ENABLE);
+    f.mmio_write(REG_CONTROL, 8, CONTROL_ALL);
+    assert!(
+        f.dma_read(DEVICE, 0x3000, 1).is_some(),
+        "the IOMMU switched off and on"
+    );
+}
+
+/// The IOTLB keeps a working set of thousands of pages (it used to drop everything at 1024, so
+/// a device streaming through more buffers than that walked the tables for every page).
+#[test]
+fn the_iotlb_holds_a_two_thousand_page_working_set() {
+    const PAGES: u64 = 2048;
+    let mut f = Fixture::enabled();
+    let root = f.device_with_tables(DEVICE, 3);
+    for page in 0..PAGES {
+        f.map_4k(root, 3, page << 12, DATA_AT + (page % 512) * 0x1000, true);
+    }
+    for page in 0..PAGES {
+        assert!(f.dma_read(DEVICE, page << 12, 1).is_some());
+    }
+    // Unmapped behind the IOMMU's back: every page must still come from the IOTLB.
+    f.write64(root, 0);
+    for page in 0..PAGES {
+        assert!(f.dma_read(DEVICE, page << 12, 1).is_some(), "page {page}");
+    }
+}
+
 #[test]
 fn invalidating_another_domain_keeps_the_cache() {
     let mut f = Fixture::enabled();
@@ -1297,7 +1367,9 @@ fn irte_with_remap_disabled_aborts_and_logs_unless_suppressed() {
         remap(&mut f, msi(DEVICE, 1, 0)),
         Err(InterruptFault::TargetAbort)
     );
-    f.mmio_write(REG_COMMAND_TAIL, 8, 0);
+    // Any register write services the IOMMU; this one leaves the command ring as it is.
+    let tail = f.command_tail;
+    f.mmio_write(REG_COMMAND_TAIL, 8, tail);
     let mut mem = GuestMem::new(&mut f.ram, &[]);
     f.iommu.service(&mut mem);
     let event = expect_one(f.events());

@@ -86,9 +86,13 @@ impl Iommu {
                     }
                 }
             }
-            OPCODE_INVALIDATE_DEVICE_TABLE_ENTRY | OPCODE_INVALIDATE_IOTLB_PAGES => {
-                // Nothing caches device table entries, so only the translations made through
-                // the entry have to go.
+            OPCODE_INVALIDATE_DEVICE_TABLE_ENTRY => {
+                // The entry and the translations made through it.
+                let device = (low & COMMAND_DEVICE_ID_MASK) as u16;
+                self.forget_device_entry(device);
+                self.iotlb_remove_device(device);
+            }
+            OPCODE_INVALIDATE_IOTLB_PAGES => {
                 self.iotlb_remove_device((low & COMMAND_DEVICE_ID_MASK) as u16);
             }
             OPCODE_INVALIDATE_IOMMU_PAGES => {
@@ -101,7 +105,7 @@ impl Iommu {
             OPCODE_INVALIDATE_INTERRUPT_TABLE
             | OPCODE_PREFETCH_IOMMU_PAGES
             | OPCODE_COMPLETE_PPR_REQUEST => {}
-            OPCODE_INVALIDATE_IOMMU_ALL => self.iotlb_clear(),
+            OPCODE_INVALIDATE_IOMMU_ALL => self.forget_device_table(),
             _ => {
                 self.log_illegal_command(address);
                 return false;

@@ -209,8 +209,16 @@ pub(crate) const EXTENDED_FEATURES: u64 = EFR_PREFETCH
     | EFR_GUEST_APIC
     | EFR_HOST_ADDRESS_TRANSLATION_SIZE_6_LEVEL;
 
-/// A cached translation is dropped wholesale when the table reaches this many pages.
-const IOTLB_MAX_ENTRIES: usize = 1024;
+/// IOTLB slots, direct-mapped by requester and page (`iotlb_slot`): 16 MiB of 4 KiB pages. It
+/// used to be a map dropped wholesale at 1024 pages, which a device streaming through more
+/// buffers than that turned into a table walk per page.
+const IOTLB_ENTRIES: usize = 4096;
+/// Spreads requesters over the IOTLB so two devices using the same addresses (every virtio
+/// queue starts low) do not evict each other.
+const IOTLB_REQUESTER_SHIFT: u32 = 6;
+/// Device table entries cached, direct-mapped by the low bits of the requester id: bus 0, where
+/// every function of this machine sits, fits.
+const DEVICE_ENTRY_CACHE_ENTRIES: usize = 256;
 
 pub(crate) trait PhysRead {
     fn read_phys(&self, addr: u64, buf: &mut [u8]) -> bool;
@@ -272,10 +280,28 @@ pub(crate) struct MsiMessage {
 
 #[derive(Clone, Copy)]
 struct IotlbEntry {
+    requester: u16,
+    /// Device address >> `PAGE_SHIFT`; `NO_IOTLB_PAGE` for an empty slot.
+    page: u64,
     phys_page: u64,
     read: bool,
     write: bool,
     domain: u16,
+}
+
+/// Never a page number: device addresses have at most 64 - 12 bits of page.
+const NO_IOTLB_PAGE: u64 = u64::MAX;
+const EMPTY_IOTLB_ENTRY: IotlbEntry = IotlbEntry {
+    requester: 0,
+    page: NO_IOTLB_PAGE,
+    phys_page: 0,
+    read: false,
+    write: false,
+    domain: 0,
+};
+
+fn iotlb_slot(requester: u16, page: u64) -> usize {
+    (page ^ (requester as u64) << IOTLB_REQUESTER_SHIFT) as usize & (IOTLB_ENTRIES - 1)
 }
 
 pub(crate) struct Iommu {
@@ -302,7 +328,16 @@ pub(crate) struct Iommu {
     command_stalled: bool,
     pending_events: Vec<[u32; 4]>,
     msi_pending: bool,
-    iotlb: BTreeMap<(u16, u64), IotlbEntry>,
+    /// `IOTLB_ENTRIES` slots, allocated by the first translation. Empty until then because
+    /// `GuestMem::with_dma` swaps a default `Iommu` in for every device poll, which must not
+    /// allocate.
+    iotlb: Vec<IotlbEntry>,
+    /// Device table entries as read, by requester (`DEVICE_ENTRY_CACHE_ENTRIES`). Hardware
+    /// caches them too and software invalidates one after changing it (INVALIDATE_DEVTAB_ENTRY),
+    /// which Linux and Xen do; until then DMA uses the old entry. Interrupt remapping still reads
+    /// the table every time.
+    /// Allocated by the first fetch, as `iotlb`.
+    device_entries: Vec<Option<(u16, DeviceTableEntry)>>,
 }
 
 impl Default for Iommu {
@@ -333,7 +368,8 @@ impl Iommu {
             command_stalled: false,
             pending_events: Vec::new(),
             msi_pending: false,
-            iotlb: BTreeMap::new(),
+            iotlb: Vec::new(),
+            device_entries: Vec::new(),
         };
         iommu.init_config();
         iommu
@@ -508,15 +544,39 @@ impl Iommu {
     }
 
     fn iotlb_remove_device(&mut self, requester: u16) {
-        self.iotlb.retain(|&(device, _), _| device != requester);
+        for entry in self.iotlb.iter_mut() {
+            if entry.requester == requester {
+                *entry = EMPTY_IOTLB_ENTRY;
+            }
+        }
     }
 
     fn iotlb_remove_domain(&mut self, domain: u16) {
-        self.iotlb.retain(|_, entry| entry.domain != domain);
+        for entry in self.iotlb.iter_mut() {
+            if entry.page != NO_IOTLB_PAGE && entry.domain == domain {
+                *entry = EMPTY_IOTLB_ENTRY;
+            }
+        }
     }
 
     fn iotlb_clear(&mut self) {
-        self.iotlb.clear();
+        self.iotlb.fill(EMPTY_IOTLB_ENTRY);
+    }
+
+    fn forget_device_entry(&mut self, requester: u16) {
+        if let Some(slot) = self
+            .device_entries
+            .get_mut(requester as usize % DEVICE_ENTRY_CACHE_ENTRIES)
+            && slot.is_some_and(|(cached, _)| cached == requester)
+        {
+            *slot = None;
+        }
+    }
+
+    /// Everything cached about the device table: the entries and what was translated with them.
+    fn forget_device_table(&mut self) {
+        self.iotlb_clear();
+        self.device_entries.fill(None);
     }
 
     /// The message to deliver for a pending event or completion-wait interrupt, once: `None` if
@@ -611,7 +671,7 @@ impl Iommu {
         match register {
             REG_DEVICE_TABLE => {
                 self.device_table = merge(self.device_table, DEVICE_TABLE_WRITABLE);
-                self.iotlb.clear();
+                self.forget_device_table();
             }
             REG_COMMAND_BASE => {
                 self.command_base = merge(self.command_base, RING_BASE_WRITABLE);
@@ -655,7 +715,7 @@ impl Iommu {
         let old = core::mem::replace(&mut self.control, new);
         let changed = old ^ new;
         if changed & CONTROL_IOMMU_ENABLE != 0 {
-            self.iotlb.clear();
+            self.forget_device_table();
         }
         if changed & CONTROL_EVENT_LOG_ENABLE != 0 {
             if new & CONTROL_EVENT_LOG_ENABLE != 0 {
@@ -731,7 +791,11 @@ impl Iommu {
         } else {
             0
         };
-        if let Some(entry) = self.iotlb.get(&(requester, iova >> PAGE_SHIFT)).copied() {
+        let page = iova >> PAGE_SHIFT;
+        if let Some(&entry) = self.iotlb.get(iotlb_slot(requester, page))
+            && entry.page == page
+            && entry.requester == requester
+        {
             let allowed = match access {
                 Access::Read => entry.read,
                 Access::Write => entry.write,
@@ -747,7 +811,7 @@ impl Iommu {
             );
             return Err(DmaFault::Permission);
         }
-        let entry = match self.fetch_device_entry(mem, requester) {
+        let entry = match self.device_entry(mem, requester) {
             Ok(entry) => entry,
             Err(error) => {
                 if report {
@@ -791,18 +855,17 @@ impl Iommu {
                     Access::Read => leaf.read,
                     Access::Write => leaf.write,
                 };
-                if self.iotlb.len() >= IOTLB_MAX_ENTRIES {
-                    self.iotlb.clear();
+                if self.iotlb.is_empty() {
+                    self.iotlb = vec![EMPTY_IOTLB_ENTRY; IOTLB_ENTRIES];
                 }
-                self.iotlb.insert(
-                    (requester, iova >> PAGE_SHIFT),
-                    IotlbEntry {
-                        phys_page: leaf.phys_page,
-                        read: leaf.read,
-                        write: leaf.write,
-                        domain,
-                    },
-                );
+                self.iotlb[iotlb_slot(requester, page)] = IotlbEntry {
+                    requester,
+                    page,
+                    phys_page: leaf.phys_page,
+                    read: leaf.read,
+                    write: leaf.write,
+                    domain,
+                };
                 if allowed || !report {
                     return Ok(page_translation(leaf.phys_page));
                 }
@@ -832,6 +895,27 @@ impl Iommu {
 
     fn exclusion_allows_all(&self) -> bool {
         self.exclusion_base & EXCLUSION_ALLOW_ALL != 0
+    }
+
+    /// The device table entry of `requester`, from `device_entries` or the table (and then
+    /// cached; failures are not).
+    fn device_entry(
+        &mut self,
+        mem: &dyn PhysRead,
+        requester: u16,
+    ) -> Result<DeviceTableEntry, tables::DeviceEntryError> {
+        let slot = requester as usize % DEVICE_ENTRY_CACHE_ENTRIES;
+        if let Some(&Some((cached, entry))) = self.device_entries.get(slot)
+            && cached == requester
+        {
+            return Ok(entry);
+        }
+        let entry = self.fetch_device_entry(mem, requester)?;
+        if self.device_entries.is_empty() {
+            self.device_entries = vec![None; DEVICE_ENTRY_CACHE_ENTRIES];
+        }
+        self.device_entries[slot] = Some((requester, entry));
+        Ok(entry)
     }
 
     /// Reads the device table entry of `requester`; `Err` if it lies outside the table or RAM.
