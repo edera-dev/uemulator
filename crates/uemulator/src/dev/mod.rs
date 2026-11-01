@@ -128,8 +128,15 @@ const CMOS_STATUS_B: usize = 0x0b;
 const CMOS_STATUS_C: usize = 0x0c;
 const CMOS_STATUS_D: usize = 0x0d;
 const CMOS_CENTURY: usize = 0x32;
-/// Status A: update-in-progress clear, 32.768 kHz time base, 1024 Hz periodic rate.
+/// Status A: 32.768 kHz time base, 1024 Hz periodic rate; update-in-progress comes on top.
 const CMOS_STATUS_A_VALUE: u8 = 0x26;
+/// Status A bit 7: an update cycle is about to start, so the time registers are about to change.
+const CMOS_STATUS_A_UPDATE_IN_PROGRESS: u8 = 0x80;
+/// How long before each second's update UIP is set: 8 periods of the 32.768 kHz time base, as
+/// the MC146818 and QEMU have it. It must rise at all: Xen reads the time by waiting for UIP to
+/// rise and then fall, for up to a second each way, and an RTC that never raised it cost every
+/// Xen boot that second. It must also fall again quickly (Xen gives up after 3 ms).
+const CMOS_UPDATE_IN_PROGRESS_NS: u64 = 8 * NS_PER_SECOND / 32_768;
 /// Status B: 24-hour mode, BCD, no interrupts enabled.
 const CMOS_STATUS_B_VALUE: u8 = 0x02;
 /// Status D: battery good (VRT), so the kernel trusts the time.
@@ -981,6 +988,10 @@ impl Devices {
             CMOS_MONTH => bcd(month),
             CMOS_YEAR => bcd(year as u64 % 100),
             CMOS_CENTURY => bcd(year as u64 / 100),
+            // The time registers change at whole seconds of `now`, so the update is due then.
+            CMOS_STATUS_A if now % NS_PER_SECOND >= NS_PER_SECOND - CMOS_UPDATE_IN_PROGRESS_NS => {
+                CMOS_STATUS_A_VALUE | CMOS_STATUS_A_UPDATE_IN_PROGRESS
+            }
             CMOS_STATUS_A => CMOS_STATUS_A_VALUE,
             CMOS_STATUS_B => CMOS_STATUS_B_VALUE,
             CMOS_STATUS_C => 0,
@@ -1275,18 +1286,42 @@ mod tests {
         assert_eq!(cmos_read(&mut dev, CMOS_STATUS_D as u8, 0), 0x80);
     }
 
+    /// Xen's `__get_cmos_time` waits for UIP to rise before it reads the time, for up to a
+    /// second; an RTC that never raised it cost every Xen boot that whole second.
     #[test]
-    fn cmos_status_a_never_reports_update_in_progress() {
+    fn cmos_status_a_reports_update_in_progress_in_the_last_244_microseconds_of_a_second() {
+        const UIP: u8 = 0x80;
+        const HOLD_NS: u64 = 244_140;
         let mut dev = bus();
         for now in [
             0,
             1,
-            ONE_SECOND_NS - 1,
+            ONE_SECOND_NS - HOLD_NS - 1,
             ONE_SECOND_NS,
             123 * ONE_SECOND_NS + 7,
         ] {
-            assert_eq!(cmos_read(&mut dev, CMOS_STATUS_A as u8, now) & 0x80, 0);
+            assert_eq!(
+                cmos_read(&mut dev, CMOS_STATUS_A as u8, now) & UIP,
+                0,
+                "{now}"
+            );
         }
+        for now in [
+            ONE_SECOND_NS - HOLD_NS,
+            ONE_SECOND_NS - 1,
+            124 * ONE_SECOND_NS - 1000,
+        ] {
+            assert_eq!(
+                cmos_read(&mut dev, CMOS_STATUS_A as u8, now) & UIP,
+                UIP,
+                "{now}"
+            );
+        }
+        assert_eq!(
+            cmos_read(&mut dev, CMOS_STATUS_A as u8, 0) & !UIP,
+            CMOS_STATUS_A_VALUE,
+            "the other bits are fixed"
+        );
     }
 
     #[test]
