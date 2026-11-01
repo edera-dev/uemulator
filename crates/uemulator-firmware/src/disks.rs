@@ -1,5 +1,6 @@
-//! Disks as UEFI sees them: a handle per virtio disk and per partition, each with a device path,
-//! `BlockIO` and `DiskIO`, and a `SimpleFileSystem` where the contents are FAT.
+//! Disks as UEFI sees them: a handle per virtio disk, per partition and per El Torito EFI boot
+//! image, each with a device path, `BlockIO` and `DiskIO`, and a `SimpleFileSystem` where the
+//! contents are FAT.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -7,6 +8,7 @@ use core::ffi::c_void;
 use core::ptr;
 
 use crate::devicepath::{self, DevicePath};
+use crate::eltorito;
 use crate::fat::{self, FatError};
 use crate::files;
 use crate::gpt::{self, Blocks, Partition, Scheme};
@@ -371,11 +373,30 @@ pub fn init() {
             unsafe { (*raw).sector_count },
             partitions.as_ref().map_or(0, |found| found.len())
         );
+        // An ISO image without a hybrid partition table: its EFI boot image is found the way a
+        // CD's is. Only then, as EDK2 tries GPT before El Torito: a hybrid's GPT and catalog
+        // usually name the same FAT image, and two volumes would give it two boot entries.
+        let boot_image = match partitions {
+            None => eltorito::efi_boot_image(&mut BlockStorage { device: whole }),
+            Some(_) => None,
+        };
+        crate::serial::trace!("  El Torito EFI image: {:?}", boot_image);
         // A disk that has partitions does not also offer a file system spanning them.
-        publish(whole, &disk_path, partitions.is_none());
+        publish(
+            whole,
+            &disk_path,
+            partitions.is_none() && boot_image.is_none(),
+        );
         for partition in partitions.unwrap_or_default() {
             let device = new_device(raw, partition.first_block, partition.block_count, true);
             publish(device, &partition_path(&disk_path, &partition), true);
+        }
+        if let Some(image) = boot_image {
+            let device = new_device(raw, image.first_block, image.block_count, true);
+            let path = disk_path
+                .clone()
+                .cd_rom(image.entry, image.cd_sector, image.block_count);
+            publish(device, &path, true);
         }
     }
 }

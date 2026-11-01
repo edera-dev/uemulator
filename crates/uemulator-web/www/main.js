@@ -8,7 +8,6 @@ const term = window.term = new Terminal({ convertEol: false, cursorBlink: true, 
 const fit = new FitAddon.FitAddon();
 term.loadAddon(fit);
 term.open($("terminal"));
-fit.fit();
 
 // The library's DEFAULT_CMDLINE (crates/uemulator/src/platform.rs) as EmulatedMachine adjusts it:
 // `acpi=off` goes when ACPI is on, the console word follows the console kind, and a screen that
@@ -21,65 +20,184 @@ function defaultCmdline({ serial, acpi, display }) {
 }
 const DEFAULT_CMDLINE_EXTRA = "earlycon=uart8250,io,0x3f8";
 const BUILT_IN_FIRMWARE_URL = "uemulator-firmware.bin";
-const SETTINGS_KEY = "uemulator.settings.v1";
+// v2: drives became a list and sources are kept as URLs, not form fields. A v1 entry is ignored.
+const SETTINGS_KEY = "uemulator.settings.v2";
 // Present only when the site was built with WEB_DEMO=1 (hack/web/demo.py), as the Pages build is;
 // its file names are relative to it.
 const DEMO_URL = new URL("demo/demo.json", location.href);
 // isolate.js normally fixes this with a reload before anyone sees it.
 const NOT_ISOLATED = "page is not cross-origin isolated: serve it with hack/web.sh, or allow service workers";
-const FIRMWARE_LABELS = { uefi: "UEFI", none: "Direct kernel", bios: "BIOS", custom: "Firmware image" };
-
-const SOURCES = ["firmware", "kernel", "initrd", "disk"];
-// Everything that is remembered across visits (files cannot be) and locked while a machine runs.
-const FIELDS = ["firmware-url", "kernel-url", "initrd-url", "disk-url", "cmdline", "shell", "replace-cmdline", "memory", "cpus", "jit", "acpi", "iommu", "rng", "reboot", "input"];
+const FIRMWARE_HINTS = {
+  uefi: "Boots the kernel above if there is one, else the first drive with an EFI boot loader (a hybrid ISO's ESP, a CD's El Torito image, an installed disk).",
+  bios: "Runs the first drive's boot sector in real mode: installed disks and isohybrid ISOs.",
+  none: "Enters the kernel above directly in 64-bit mode. Drives are only attached.",
+  custom: "A UEMUFW64 image (crates/uemulator-firmware) boots as UEFI; anything else is placed below 1 MiB and started at F000:FFF0. OVMF is not supported.",
+};
+const FIRMWARE_LABELS = { uefi: "UEFI", none: "direct kernel", bios: "BIOS", custom: "custom firmware" };
 const RADIOS = ["firmware", "console", "display"];
-const DISPLAY_LABELS = { none: "terminal only", screen: "screen (the console)", both: "screen and terminal" };
+const CHECKBOXES = ["shell", "replace-cmdline", "jit", "acpi", "iommu", "rng", "reboot", "input"];
+const SELECTS = ["memory", "cpus"];
+// Where the guest RAM is one allocation of the 32-bit module: Rust refuses one larger than
+// isize::MAX, so 2 GiB less a MiB is the most there is.
+const MAX_MEMORY_MIB = 2047;
+// What live and installer ISOs need: Fedora's installer initramfs alone takes more than 1 GiB
+// to unpack, and with less the kernel ends in "VFS: Unable to mount root fs".
+const ISO_MEMORY_MIB = MAX_MEMORY_MIB;
+// Below this an ISO is a rescue or network-boot image (netboot.xyz is 2 MB) that needs no such
+// memory; the warning is for distribution ISOs. An ISO of unknown size gets it too.
+const BIG_ISO_BYTES = 256e6;
+// More would not fit the PCI slots next to the other devices, and nobody needs it.
+const MAX_DRIVES = 8;
+const ISO9660_MAGIC_OFFSET = 0x8001;
+const ISO9660_MAGIC = "CD001";
+// The Linux boot protocol header's magic, at 0x202 of every bzImage.
+const BZIMAGE_MAGIC_OFFSET = 0x202;
+const BZIMAGE_MAGIC = "HdrS";
 
 let worker = null;
-// Set from Launch until the worker exists (downloads happen in between).
+// Set from Start until the worker exists (downloads happen in between).
 let starting = false;
 let control = null;
 let ring = null;
 let events = null;
 let startedAt = 0;
 let clock = null;
-let step = 0;
-// "Boot again" only makes sense once something has booted.
 let hasRun = false;
-// demo.json when the site has one, and what Boot again repeats.
+// demo.json when the site has one.
 let demo = null;
-let lastSettings = null;
-const steps = [...document.querySelectorAll(".wizard .step")];
+// What the running (or last) machine was started with.
+let current = null;
+
+// Picked files cannot be remembered or put in a form field, so sources live here: each is
+// { file } or { url }, with a `label` and, once known, a `size`.
+const state = {
+  drives: [],
+  kernel: null,
+  initrd: null,
+  firmwareImage: null,
+};
+let nextDriveId = 1;
 
 function setStatus(text, kind = "") {
   const status = $("status");
-  status.textContent = text;
+  status.firstElementChild.textContent = text;
   status.dataset.kind = kind;
+  status.title = text;
+}
+
+let toastTimer = 0;
+function toast(text) {
+  $("toast").textContent = text;
+  $("toast").hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { $("toast").hidden = true; }, 3500);
 }
 
 const radio = (name) => document.querySelector(`input[name=${name}]:checked`).value;
+const setRadio = (name, value) => {
+  const input = value != null && document.querySelector(`input[name=${name}][value="${CSS.escape(String(value))}"]`);
+  if (input) input.checked = true;
+};
+// A select only takes values it has an option for; anything else would read back as "".
+function setSelect(id, value) {
+  const select = $(id);
+  if ([...select.options].some((option) => option.value === String(value))) select.value = String(value);
+}
 
-function sourceOf(name) {
-  const file = $(`${name}-file`).files[0];
-  if (file) return { file, label: file.name };
-  const url = $(`${name}-url`).value.trim();
-  if (url) return { url, label: decodeURIComponent(url.split(/[?#]/)[0].split("/").filter(Boolean).pop() ?? url) };
-  return null;
+function labelOfUrl(url) {
+  return decodeURIComponent(url.split(/[?#]/)[0].split("/").filter(Boolean).pop() ?? url);
+}
+
+function formatBytes(bytes) {
+  if (!(bytes >= 0)) return "";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1000 && unit < units.length - 1) {
+    value /= 1000;
+    unit++;
+  }
+  return `${value >= 10 || unit === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unit]}`;
+}
+
+async function readText(file, offset, length) {
+  const bytes = new Uint8Array(await file.slice(offset, offset + length).arrayBuffer());
+  return String.fromCharCode(...bytes);
+}
+
+// ISO 9660 says so at 32 KiB + 1; anything else is attached as a disk unless its name says ISO.
+async function looksLikeIso(file) {
+  if (/\.iso$/i.test(file.name)) return true;
+  try { return (await readText(file, ISO9660_MAGIC_OFFSET, ISO9660_MAGIC.length)) === ISO9660_MAGIC; } catch { return false; }
+}
+
+async function looksLikeKernel(file) {
+  try { return (await readText(file, BZIMAGE_MAGIC_OFFSET, BZIMAGE_MAGIC.length)) === BZIMAGE_MAGIC; } catch { return false; }
+}
+
+// The size of a URL source, for the drive list; a server without HEAD just leaves it blank.
+function probeSize(source) {
+  fetch(source.url, { method: "HEAD" })
+    .then((response) => {
+      const length = Number(response.headers.get("Content-Length"));
+      source.size = response.ok && length > 0 ? length : undefined;
+      source.unreachable = !response.ok;
+      render();
+    })
+    .catch(() => {});
+}
+
+function addDrive(source, kind) {
+  if (state.drives.length >= MAX_DRIVES) {
+    toast(`At most ${MAX_DRIVES} drives.`);
+    return false;
+  }
+  const drive = { id: nextDriveId++, kind, ...source };
+  if (drive.file) drive.size = drive.file.size;
+  else probeSize(drive);
+  state.drives.push(drive);
+  return true;
+}
+
+// Files from a picker or a drop: ISOs become CDs, a bzImage the kernel, the rest disks.
+async function addFiles(files, { kind = null, detectKernel = false } = {}) {
+  const added = [];
+  for (const file of files) {
+    if (detectKernel && await looksLikeKernel(file)) {
+      state.kernel = { file, label: file.name, size: file.size };
+      added.push(`${file.name} as the kernel`);
+      continue;
+    }
+    const as = kind ?? (await looksLikeIso(file) ? "cdrom" : "disk");
+    if (addDrive({ file, label: file.name }, as)) added.push(`${file.name} as a ${as === "cdrom" ? "CD" : "disk"}`);
+  }
+  if (added.length) toast(`Attached ${added.join(", ")}.`);
+  render();
+}
+
+function addDriveUrl(url) {
+  url = url.trim();
+  if (!url) return;
+  const kind = /\.iso([?#]|$)/i.test(url) ? "cdrom" : "disk";
+  if (addDrive({ url, label: labelOfUrl(url) }, kind)) {
+    $("drive-url").value = "";
+    $("url-row").hidden = true;
+  }
+  render();
 }
 
 function readSettings() {
   const firmware = radio("firmware");
-  // BIOS and a real-mode image replace the kernel; what the BIOS path cannot use is not offered.
   const usesKernel = firmware !== "bios";
   const acpi = $("acpi").checked;
   const extra = [$("cmdline").value.trim(), $("shell").checked ? "rdinit=/bin/sh" : ""].filter(Boolean).join(" ");
   const settings = {
     firmware,
     usesKernel,
-    firmwareImage: firmware === "custom" ? sourceOf("firmware") : null,
-    kernel: usesKernel ? sourceOf("kernel") : null,
-    initrd: usesKernel ? sourceOf("initrd") : null,
-    disk: sourceOf("disk"),
+    firmwareImage: firmware === "custom" ? state.firmwareImage : null,
+    kernel: usesKernel ? state.kernel : null,
+    initrd: usesKernel ? state.initrd : null,
+    drives: state.drives.map((drive) => ({ ...drive })),
     extra,
     replaceCmdline: $("replace-cmdline").checked,
     serial: radio("console") === "serial",
@@ -97,38 +215,130 @@ function readSettings() {
   return settings;
 }
 
-// The combinations EmulatedMachine::new refuses, caught before anything is downloaded. Each names
-// the step that fixes it. The library still has the last word (an EFI stub, a firmware header).
-function problemsWith(s) {
-  const problems = [];
-  if (s.firmware === "none" && !s.kernel) problems.push({ step: 1, text: "Direct kernel boot needs a kernel." });
-  if (s.firmware === "uefi" && !s.kernel && !s.disk) problems.push({ step: 1, text: "UEFI needs a kernel (with an EFI stub) or a disk with an EFI boot loader." });
-  if (s.firmware === "bios" && !s.disk) problems.push({ step: 1, text: "BIOS boot needs a disk." });
-  if (s.firmware === "custom" && !s.firmwareImage) problems.push({ step: 0, text: "Choose a firmware image." });
-  if (s.replaceCmdline && s.kernel && !s.extra) problems.push({ step: 1, text: "Replacing the default command line with nothing leaves the guest without a console." });
-  return problems;
+// What blocks Start (the combinations EmulatedMachine::new refuses, caught before anything is
+// downloaded) and what is only worth knowing. The library still has the last word (an EFI stub,
+// a firmware header).
+function notesFor(s) {
+  const notes = [];
+  const error = (text) => notes.push({ kind: "error", text });
+  const warn = (text) => notes.push({ kind: "warn", text });
+  const hasBigCd = s.drives.some((drive) => drive.kind === "cdrom" && !(drive.size < BIG_ISO_BYTES));
+  if (s.firmware === "none" && !s.kernel) error("Direct boot needs a kernel.");
+  if (s.firmware === "uefi" && !s.kernel && !s.drives.length) error("Add a drive with a boot loader (an ISO, an installed disk) or a kernel with an EFI stub.");
+  if (s.firmware === "bios" && !s.drives.length) error("BIOS boot needs a drive.");
+  if (s.firmware === "custom" && !s.firmwareImage) error("Choose a firmware image.");
+  if (s.replaceCmdline && s.kernel && !s.extra) error("Replacing the default command line with nothing leaves the guest without a console.");
+  if (hasBigCd && s.memoryMib < ISO_MEMORY_MIB) {
+    warn("Live and installer ISOs usually need 2 GiB: their initramfs is unpacked into RAM, and with less the kernel ends in “Unable to mount root fs”.");
+  }
+  // GRUB on the drive picks the command line, and an ISO's has no console= for hvc0 or ttyS0.
+  if (!s.kernel && s.firmware !== "none" && s.drives.length && s.display === "none") {
+    warn("The drive's boot loader chooses the kernel's console, usually the screen: without a display you may see nothing after its menu.");
+  }
+  if (s.drives.some((drive) => drive.unreachable)) warn("A drive's URL did not answer; it will fail when the machine starts.");
+  return notes;
 }
 
 function summaryOf(s) {
-  const media = s.title ?? [s.kernel?.label, s.initrd?.label, s.disk && `disk ${s.disk.label}`].filter(Boolean).join(" + ");
-  return [
-    s.title,
-    FIRMWARE_LABELS[s.firmware] + (s.firmwareImage ? ` (${s.firmwareImage.label})` : ""),
-    s.title ? null : media || "no media",
-    `${s.memoryMib} MiB`,
-    `${s.cpus} vCPU${s.cpus > 1 ? "s" : ""}`,
-    s.jit ? "JIT" : "interpreter",
-    s.iommu && "IOMMU",
-    s.serial ? "ttyS0" : "hvc0",
-    s.display !== "none" && (s.display === "screen" ? "screen console" : "screen"),
-    s.input && "keyboard+mouse",
-  ].filter(Boolean).join(" · ");
+  const media = s.title ?? [
+    s.kernel?.label,
+    ...s.drives.map((drive) => drive.label),
+  ].filter(Boolean).join(" + ");
+  return [media || "no media", FIRMWARE_LABELS[s.firmware], s.memoryMib >= 1024 ? `${+(s.memoryMib / 1024).toFixed(1)} GiB` : `${s.memoryMib} MiB`,
+    `${s.cpus} vCPU${s.cpus > 1 ? "s" : ""}`].join(" · ");
+}
+
+const running = () => starting || worker !== null;
+
+function renderDrives() {
+  const list = $("drives");
+  const template = $("drive-template").content;
+  $("drive-count").textContent = state.drives.length ? String(state.drives.length) : "";
+  if (!state.drives.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty-drives";
+    empty.textContent = "No drives. Add an installer or live ISO, or a disk image.";
+    list.replaceChildren(empty);
+    return;
+  }
+  list.replaceChildren(...state.drives.map((drive, index) => {
+    const row = template.cloneNode(true).firstElementChild;
+    row.dataset.kind = drive.kind;
+    row.querySelector(".glyph use").setAttribute("href", drive.kind === "cdrom" ? "#i-disc" : "#i-disk");
+    row.querySelector(".name").textContent = drive.label;
+    row.querySelector(".name").title = drive.url ?? drive.label;
+    // virtio-blk names them in PCI slot order, which is this order.
+    row.querySelector(".device").textContent = `vd${String.fromCharCode(97 + index)}`;
+    row.querySelector(".size").textContent = [formatBytes(drive.size), drive.url ? "URL" : "file"].filter(Boolean).join(" · ");
+    const select = row.querySelector("select");
+    select.value = drive.kind;
+    select.onchange = () => {
+      drive.kind = select.value;
+      render();
+    };
+    for (const button of row.querySelectorAll("button[data-action]")) {
+      const action = button.dataset.action;
+      button.disabled = (action === "up" && index === 0) || (action === "down" && index === state.drives.length - 1);
+      button.onclick = () => {
+        if (action === "remove") state.drives.splice(index, 1);
+        else {
+          const other = index + (action === "up" ? -1 : 1);
+          [state.drives[index], state.drives[other]] = [state.drives[other], state.drives[index]];
+        }
+        render();
+      };
+    }
+    return row;
+  }));
+}
+
+// A kernel, initrd or firmware image: the file or URL chosen, or the two ways to choose one.
+function renderSource(container, key, title, optionalText) {
+  const source = state[key];
+  const label = document.createElement("label");
+  label.textContent = title;
+  if (optionalText) label.append(Object.assign(document.createElement("small"), { textContent: optionalText }));
+  if (source) {
+    const chosen = document.createElement("div");
+    chosen.className = "chosen";
+    chosen.innerHTML = `<svg class="i"><use href="#${source.url ? "i-link" : "i-file"}"/></svg><span></span>`;
+    chosen.querySelector("span").textContent = source.label + (source.size ? ` (${formatBytes(source.size)})` : "");
+    chosen.title = source.url ?? source.label;
+    const clear = Object.assign(document.createElement("button"), { type: "button", className: "ghost", title: "Remove" });
+    clear.setAttribute("aria-label", `Remove the ${title.toLowerCase()}`);
+    clear.innerHTML = `<svg class="i"><use href="#i-x"/></svg>`;
+    clear.onclick = () => {
+      state[key] = null;
+      render();
+    };
+    chosen.append(clear);
+    container.replaceChildren(label, chosen);
+    return;
+  }
+  const pick = document.createElement("div");
+  pick.className = "pick";
+  const file = Object.assign(document.createElement("input"), { type: "file", hidden: true });
+  file.onchange = () => {
+    const picked = file.files[0];
+    if (picked) state[key] = { file: picked, label: picked.name, size: picked.size };
+    render();
+  };
+  const choose = Object.assign(document.createElement("button"), { type: "button", textContent: "File…" });
+  choose.onclick = () => file.click();
+  const url = Object.assign(document.createElement("input"), { type: "url", placeholder: "or a URL", spellcheck: false });
+  url.setAttribute("aria-label", `${title} URL`);
+  url.onchange = () => {
+    const value = url.value.trim();
+    if (!value) return;
+    state[key] = { url: value, label: labelOfUrl(value) };
+    render();
+  };
+  pick.append(choose, url, file);
+  container.replaceChildren(label, pick);
 }
 
 function render() {
   const firmware = radio("firmware");
-  $("custom-firmware").hidden = firmware !== "custom";
-
   // More than one vCPU needs the MADT (ACPI) and cannot run under the BIOS shim; the IOMMU is found
   // through the IVRS table. Disabled controls are reset so they cannot linger in a hidden state.
   const smpAllowed = $("acpi").checked && firmware !== "bios";
@@ -138,128 +348,43 @@ function render() {
   if ($("iommu").disabled) $("iommu").checked = false;
 
   const s = readSettings();
-  $("kernel-group").hidden = $("initrd-group").hidden = !s.usesKernel;
-  // A disk's boot loader brings its own command line; the field only matters with a kernel.
-  $("cmdline-group").hidden = !s.usesKernel || (!s.kernel && firmware !== "none");
-  $("disk-optional").hidden = firmware === "bios";
-  $("kernel-hint").textContent = {
-    // U+2011: keeps "-kernel" from breaking after the hyphen.
-    uefi: "An EFI-stub bzImage (most distribution kernels). The firmware boots it before any disk, like OVMF with QEMU's \u2011kernel.",
-    none: "Any x86_64 bzImage.",
-    custom: "Used when the image is UEFI firmware; a real-mode image ignores it.",
-  }[firmware] ?? "";
-  $("media-lead").textContent = {
-    uefi: "A kernel, a disk, or both. With a kernel the firmware boots it and the disk is just attached; without one it boots the disk's EFI system partition.",
-    none: "A kernel and, optionally, an initramfs and a disk.",
-    bios: "The disk's first sector is loaded at 0000:7C00 and its boot loader takes it from there.",
-    custom: "Whatever the image boots from.",
-  }[firmware];
+  renderDrives();
+  $("kernel-panel").hidden = !s.usesKernel;
+  renderSource($("kernel-source"), "kernel", "Kernel", firmware === "uefi" ? "bzImage with an EFI stub" : "bzImage");
+  renderSource($("initrd-source"), "initrd", "Initramfs", "optional");
+  $("firmware-source").hidden = firmware !== "custom";
+  if (firmware === "custom") renderSource($("firmware-source"), "firmwareImage", "Firmware image");
+  $("kernel-optional").textContent = firmware === "none" ? "required" : "optional";
+  $("kernel-hint").textContent = firmware === "uefi"
+    ? "With a kernel the firmware boots it, like QEMU's ‑kernel under OVMF, and the drives are only attached."
+    : "";
+  $("kernel-hint").hidden = !$("kernel-hint").textContent;
+  // A drive's boot loader brings its own command line; the arguments only matter with a kernel.
+  $("cmdline-group").hidden = !s.kernel && firmware !== "none";
   $("cmdline-preview").textContent = s.cmdline || "(empty)";
+  $("firmware-hint").textContent = FIRMWARE_HINTS[firmware];
 
-  const problems = problemsWith(s);
-  const nav = $("steps");
-  nav.replaceChildren(...steps.map((section, index) => {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.innerHTML = `<span class="num">${index + 1}</span>`;
-    button.append(section.dataset.title);
-    if (index === step) button.setAttribute("aria-current", "step");
-    if (problems.some((problem) => problem.step === index) && index < steps.length - 1) button.dataset.problem = "";
-    button.onclick = () => go(index);
-    return button;
+  const notes = notesFor(s);
+  $("notes").replaceChildren(...notes.map(({ kind, text }) => {
+    const item = Object.assign(document.createElement("li"), { textContent: text });
+    item.dataset.kind = kind;
+    return item;
   }));
-  steps.forEach((section, index) => { section.hidden = index !== step; });
-  for (const name of SOURCES) $(`${name}-url`).closest(".source").querySelector(".clear").disabled = starting || worker !== null || (!$(`${name}-file`).files.length && !$(`${name}-url`).value);
-  $("back").disabled = step === 0;
-  $("next").hidden = step === steps.length - 1;
-  $("launch").disabled = problems.length > 0 || starting || worker !== null;
-
-  const rows = [
-    ["Firmware", FIRMWARE_LABELS[s.firmware] + (s.firmwareImage ? `: ${s.firmwareImage.label}` : "")],
-    ["Kernel", s.usesKernel ? s.kernel?.label ?? "none" : "not used"],
-    ["Initramfs", s.usesKernel ? s.initrd?.label ?? "none" : "not used"],
-    ["Disk", s.disk ? `${s.disk.label} (vda, writes kept in memory)` : "none"],
-    ["Memory", `${s.memoryMib} MiB`],
-    ["vCPUs", String(s.cpus)],
-    ["Console", s.serial ? "serial (ttyS0)" : "virtio-console (hvc0)"],
-    ["Display", DISPLAY_LABELS[s.display] + (s.input ? ", virtio keyboard and tablet" : "")],
-    ["Execution", s.jit ? "WebAssembly JIT" : "interpreter only"],
-    ["Devices", [s.acpi ? "ACPI" : "no ACPI", s.iommu && "AMD IOMMU", s.rng && "virtio-rng"].filter(Boolean).join(", ")],
-    // The library keeps no image to restart a BIOS boot from: a reset always ends it.
-    ["On guest reset", s.reboot && s.firmware !== "bios" ? "restart" : "stop"],
-  ];
-  if (s.kernel) rows.push(["Command line", s.cmdline]);
-  $("review").replaceChildren(...rows.flatMap(([term, value]) => {
-    const dt = document.createElement("dt");
-    dt.textContent = term;
-    const dd = document.createElement("dd");
-    dd.textContent = value;
-    if (term === "Command line") dd.className = "mono";
-    return [dt, dd];
-  }));
-  $("problems").hidden = problems.length === 0;
-  $("problems").replaceChildren(...problems.map(({ text }) => Object.assign(document.createElement("li"), { textContent: text })));
-  // The bar describes what Launch would boot while the wizard is open, else what last ran.
-  if (!$("wizard").hidden) $("summary").textContent = summaryOf(s);
+  const blocked = notes.some((note) => note.kind === "error");
+  for (const id of ["start", "start-sidebar"]) $(id).disabled = blocked || running();
+  $("start").title = blocked ? notes.find((note) => note.kind === "error").text : "Start the machine";
   saveSettings();
-}
-
-// The same shape as readSettings, for demo.json's machine; the wizard's fields are left alone.
-function demoSettings(d) {
-  const at = (name) => ({ url: new URL(name, DEMO_URL).href, label: name });
-  const s = {
-    title: d.name,
-    firmware: d.firmware,
-    usesKernel: true,
-    firmwareImage: null,
-    kernel: at(d.kernel),
-    initrd: at(d.initrd),
-    disk: null,
-    extra: d.args ?? "",
-    replaceCmdline: false,
-    serial: d.console === "serial",
-    display: d.display ?? "none",
-    input: Boolean(d.input),
-    memoryMib: d.memoryMib,
-    cpus: 1,
-    jit: true,
-    acpi: true,
-    iommu: false,
-    rng: true,
-    reboot: true,
-  };
-  s.cmdline = [defaultCmdline(s), s.extra].filter(Boolean).join(" ");
-  return s;
-}
-
-function go(index) {
-  step = Math.max(0, Math.min(steps.length - 1, index));
-  render();
-  steps[step].scrollTop = 0;
-  steps[step].querySelector("input:not([type=radio]):not([disabled]), select:not([disabled]), input[type=radio]:checked")?.focus({ preventScroll: true });
-}
-
-// What sits over the terminal: "demo", "wizard" or nothing.
-function showPanel(name) {
-  $("overlay").hidden = !name;
-  $("demo").hidden = name !== "demo";
-  $("wizard").hidden = name !== "wizard";
-  if (name === "wizard") render();
-  if (!name) focusView();
-}
-
-// Closing the wizard goes back to the demo until something has run; after that, to the terminal,
-// with the bar describing what ran again (Boot again repeats it, not the wizard's edits).
-function closeWizard() {
-  showPanel(demo && !hasRun ? "demo" : null);
-  const shown = lastSettings ?? (demo && demoSettings(demo));
-  if (shown) $("summary").textContent = summaryOf(shown);
 }
 
 // Per-visitor convenience only: files cannot be remembered, and storage may be unavailable.
 function saveSettings() {
-  const saved = Object.fromEntries(FIELDS.map((id) => [id, $(id).type === "checkbox" ? $(id).checked : $(id).value]));
+  const saved = {};
   for (const name of RADIOS) saved[name] = radio(name);
+  for (const id of CHECKBOXES) saved[id] = $(id).checked;
+  for (const id of SELECTS) saved[id] = $(id).value;
+  saved.cmdline = $("cmdline").value;
+  for (const key of ["kernel", "initrd", "firmwareImage"]) saved[key] = state[key]?.url ?? null;
+  saved.drives = state.drives.filter((drive) => drive.url).map(({ url, kind }) => ({ url, kind }));
   try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(saved)); } catch { /* private mode */ }
 }
 
@@ -267,36 +392,88 @@ function saveSettings() {
 function restoreSettings() {
   let saved = {};
   try { saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? "{}") ?? {}; } catch { /* nothing saved */ }
-  for (const id of FIELDS) {
-    if (!(id in saved)) continue;
-    if ($(id).type === "checkbox") $(id).checked = Boolean(saved[id]);
-    else $(id).value = saved[id];
-  }
   const params = new URLSearchParams(location.search);
-  for (const name of RADIOS) {
-    const value = params.get(name) ?? saved[name];
-    const input = value && document.querySelector(`input[name=${name}][value="${CSS.escape(value)}"]`);
-    if (input) input.checked = true;
-  }
-  if (!("cmdline" in saved)) $("cmdline").value = DEFAULT_CMDLINE_EXTRA;
+  for (const name of RADIOS) setRadio(name, params.get(name) ?? saved[name]);
+  for (const id of CHECKBOXES) if (id in saved) $(id).checked = Boolean(saved[id]);
+  for (const id of SELECTS) if (id in saved) setSelect(id, saved[id]);
+  if (params.has("memory")) setSelect("memory", Math.min(Number(params.get("memory")), MAX_MEMORY_MIB));
+  $("cmdline").value = "cmdline" in saved ? saved.cmdline : DEFAULT_CMDLINE_EXTRA;
   if (params.has("args")) $("cmdline").value = params.get("args");
   if (params.has("iommu")) $("iommu").checked = $("acpi").checked = true;
+  for (const key of ["kernel", "initrd", "firmwareImage"]) {
+    const url = params.get(key === "firmwareImage" ? "firmware-image" : key) ?? saved[key];
+    if (url) state[key] = { url, label: labelOfUrl(url) };
+  }
+  // ?cdrom= and ?disk= (both repeat) replace the remembered drives.
+  const fromUrl = [...params.getAll("cdrom").map((url) => ({ url, kind: "cdrom" })), ...params.getAll("disk").map((url) => ({ url, kind: "disk" }))];
+  for (const { url, kind } of fromUrl.length ? fromUrl : saved.drives ?? []) {
+    if (url) addDrive({ url, label: labelOfUrl(url) }, kind === "cdrom" ? "cdrom" : "disk");
+  }
   return saved;
 }
 
-function setRunning(running) {
-  for (const id of [...FIELDS, ...SOURCES.map((name) => `${name}-file`)]) $(id).disabled = running;
-  for (const input of document.querySelectorAll("input[type=radio]")) input.disabled = running;
-  $("stop").hidden = !running;
-  $("configure").disabled = running;
-  $("relaunch").hidden = running || !hasRun;
-  if (!running) render();
+function applyPreset(name) {
+  if (name === "iso") {
+    setRadio("firmware", "uefi");
+    setRadio("display", "screen");
+    $("input").checked = true;
+    setSelect("memory", ISO_MEMORY_MIB);
+    if (!state.drives.some((drive) => drive.kind === "cdrom")) $("cdrom-file").click();
+  } else if (name === "disk") {
+    setRadio("firmware", "uefi");
+    setRadio("display", "both");
+    $("input").checked = true;
+    if (Number($("memory").value) < 1024) setSelect("memory", 1024);
+    if (!state.drives.some((drive) => drive.kind === "disk")) $("disk-file").click();
+  } else if (name === "kernel") {
+    setRadio("firmware", "none");
+    setRadio("display", "none");
+    $("shell").checked = true;
+    if (!state.kernel) queueMicrotask(() => $("kernel-source").querySelector("button")?.focus());
+  } else if (name === "demo" && demo) {
+    applyDemo(demo);
+  }
+  render();
+}
+
+// Loads demo.json's machine into the settings, so what runs is what the sidebar shows.
+function applyDemo(d) {
+  const at = (name) => ({ url: new URL(name, DEMO_URL).href, label: name });
+  state.kernel = at(d.kernel);
+  state.initrd = at(d.initrd);
+  state.drives = [];
+  setRadio("firmware", d.firmware);
+  setRadio("console", d.console === "serial" ? "serial" : "virtio");
+  setRadio("display", d.display ?? "none");
+  $("input").checked = Boolean(d.input);
+  setSelect("memory", d.memoryMib);
+  setSelect("cpus", 1);
+  $("shell").checked = false;
+  $("replace-cmdline").checked = false;
+  $("cmdline").value = d.args ?? "";
+  for (const id of ["jit", "acpi", "rng", "reboot"]) $(id).checked = true;
+  $("iommu").checked = false;
+}
+
+function setRunning(isRunning) {
+  $("config").disabled = isRunning;
+  $("locked-note").hidden = !isRunning;
+  $("stop").hidden = !isRunning;
+  $("start").hidden = isRunning;
+  if (!isRunning) render();
+  else for (const id of ["start", "start-sidebar"]) $(id).disabled = true;
+}
+
+function setSidebar(open) {
+  $("sidebar").toggleAttribute("data-collapsed", !open);
+  $("toggle-sidebar").setAttribute("aria-expanded", String(open));
+  relayout();
 }
 
 async function load(source, label) {
   if (!source) return null;
   if (source.file) return source.file.arrayBuffer();
-  setStatus(`downloading ${label}…`);
+  setStatus(`Downloading ${label}…`, "busy");
   const response = await fetch(source.url);
   if (!response.ok) throw new Error(`${label}: ${source.url} returned ${response.status}`);
   return response.arrayBuffer();
@@ -341,11 +518,7 @@ function sendSize() {
 
 term.onData(sendKeys);
 term.onResize(sendSize);
-window.addEventListener("resize", () => {
-  if (view === "terminal") fit.fit();
-  else layoutScreen();
-  requestGuestSize();
-});
+window.addEventListener("resize", relayout);
 
 // The screen: frames from the worker go onto the canvas, the canvas's keys and pointer go back
 // through the event ring. "terminal" or "screen" is in front.
@@ -399,7 +572,7 @@ const CHARACTERS = (() => {
   map[" "] = [0x2c, false];
   return map;
 })();
-const LEFT_SHIFT = 0xe1;
+const LEFT_SHIFT = USAGES.ShiftLeft;
 // MouseEvent.button to the guest's button index (EVENT.POINTER_BUTTON).
 const BUTTONS = { 0: 0, 1: 2, 2: 1, 3: 3, 4: 4 };
 const GUEST_SIZE_DEBOUNCE_MS = 300;
@@ -431,15 +604,17 @@ function showView(name) {
 
 // Fitting a hidden terminal would measure zero columns and send that to the guest, so it is only
 // refitted while it is in front.
+function relayout() {
+  if (view === "terminal" && !$("terminal").hidden) fit.fit();
+  else if (view === "screen") layoutScreen();
+  requestGuestSize();
+}
+
 function focusView() {
-  if (!$("overlay").hidden) return;
-  if (view === "terminal") {
-    fit.fit();
-    term.focus();
-  } else {
-    layoutScreen();
-    canvas.focus();
-  }
+  relayout();
+  if (!hasRun) return;
+  if (view === "terminal") term.focus();
+  else canvas.focus();
 }
 
 // Shrinks the canvas to fit, or enlarges it by whole pixels (crisp when pixelated).
@@ -462,8 +637,9 @@ function resetScreen(s) {
   $("screen-note").textContent = note;
   $("screen-note").hidden = !note;
   const hasScreen = s.display !== "none" || s.input;
-  $("views").hidden = !hasScreen;
-  $("fit-guest-label").hidden = s.display === "none";
+  $("screen-tools").hidden = !hasScreen;
+  $("fit-guest").hidden = $("screenshot").hidden = s.display === "none";
+  $("ctrl-alt-del").hidden = !s.input;
   view = "";
   showView(hasScreen && s.display === "screen" ? "screen" : "terminal");
 }
@@ -499,7 +675,7 @@ function setCursor(cursor) {
 
 let guestSizeTimer = 0;
 function requestGuestSize() {
-  if (!$("fit-guest").checked || $("fit-guest-label").hidden) return;
+  if ($("fit-guest").getAttribute("aria-pressed") !== "true" || $("fit-guest").hidden) return;
   clearTimeout(guestSizeTimer);
   guestSizeTimer = setTimeout(() => {
     const box = $("screen-view");
@@ -536,6 +712,13 @@ canvas.addEventListener("mouseup", (event) => {
   event.preventDefault();
 });
 canvas.addEventListener("contextmenu", (event) => event.preventDefault());
+// The canvas is letterboxed; a click on the bars around it still means "type into the guest".
+$("screen-view").addEventListener("mousedown", (event) => {
+  if (event.target !== canvas) {
+    canvas.focus();
+    event.preventDefault();
+  }
+});
 canvas.addEventListener("wheel", (event) => {
   // One click per event in the scroll's direction: trackpads send many small ones.
   if (event.deltaY !== 0) pushEvent(EVENT.WHEEL, event.deltaY < 0 ? 1 : -1);
@@ -570,7 +753,50 @@ canvas.addEventListener("blur", () => pushEvent(EVENT.RELEASE_ALL));
 window.addEventListener("blur", () => pushEvent(EVENT.RELEASE_ALL));
 $("view-terminal").onclick = () => showView("terminal");
 $("view-screen").onclick = () => showView("screen");
-$("fit-guest").onchange = requestGuestSize;
+$("fit-guest").onclick = () => {
+  const on = $("fit-guest").getAttribute("aria-pressed") !== "true";
+  $("fit-guest").setAttribute("aria-pressed", String(on));
+  requestGuestSize();
+};
+// The browser keeps Ctrl+Alt+Delete for itself, so it goes to the guest's virtio keyboard from here.
+$("ctrl-alt-del").onclick = () => {
+  const keys = [USAGES.ControlLeft, USAGES.AltLeft, USAGES.Delete];
+  for (const key of keys) pushEvent(EVENT.KEY, key, 1);
+  for (const key of keys.reverse()) pushEvent(EVENT.KEY, key, 0);
+  focusView();
+};
+$("screenshot").onclick = () => {
+  canvas.toBlob((blob) => {
+    if (!blob) return;
+    const link = Object.assign(document.createElement("a"), {
+      href: URL.createObjectURL(blob),
+      download: `uemulator-${new Date().toISOString().replace(/[:.]/g, "-")}.png`,
+    });
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+  }, "image/png");
+};
+$("fullscreen").onclick = () => {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else $("stage").requestFullscreen?.().catch(() => {});
+};
+document.addEventListener("fullscreenchange", () => {
+  relayout();
+  focusView();
+});
+
+function formatUptime(seconds) {
+  const s = Math.floor(seconds);
+  return s >= 3600
+    ? `${Math.floor(s / 3600)}:${String(Math.floor(s / 60) % 60).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`
+    : `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+function showBanner(text, kind) {
+  $("banner-text").textContent = text;
+  $("banner").dataset.kind = kind;
+  $("banner").hidden = false;
+}
 
 function finish(text, kind) {
   starting = false;
@@ -581,27 +807,31 @@ function finish(text, kind) {
   ring = null;
   events = null;
   // The library's wording names the CLI flag; point at the page's own control instead.
-  setStatus(text.replace("boot it with firmware none", "choose Direct kernel under Firmware"), kind);
+  const shown = text.replace("boot it with firmware none", "choose Direct under Firmware");
+  setStatus(kind === "error" ? shown : `Stopped: ${shown}`, kind);
+  showBanner(shown.charAt(0).toUpperCase() + shown.slice(1), kind);
   setRunning(false);
 }
 
-async function launch(s = readSettings()) {
+async function launch() {
   if (!crossOriginIsolated) {
     setStatus(NOT_ISOLATED, "error");
     return;
   }
-  const problems = problemsWith(s);
-  if (problems.length) {
-    showPanel("wizard");
-    go(problems[0].step);
+  const s = readSettings();
+  if (notesFor(s).some((note) => note.kind === "error")) {
+    setSidebar(true);
     return;
   }
-  showPanel(null);
   hasRun = true;
-  lastSettings = s;
-  $("summary").textContent = summaryOf(s);
+  current = s;
+  $("welcome").hidden = true;
+  $("banner").hidden = true;
+  // The settings are locked while it runs; the screen gets the room. The bar's Settings reopens them.
+  setSidebar(false);
   starting = true;
   setRunning(true);
+  setStatus("Starting…", "busy");
   term.reset();
   resetScreen(s);
   try {
@@ -631,11 +861,10 @@ async function launch(s = readSettings()) {
         console.log("[uemulator]", data.text);
       } else if (data.type === "started") {
         startedAt = performance.now();
-        clock = setInterval(() => {
-          setStatus(`running, ${((performance.now() - startedAt) / 1000).toFixed(0)} s`, "running");
-        }, 500);
+        const tick = () => setStatus(`Running ${formatUptime((performance.now() - startedAt) / 1000)} · ${summaryOf(current)}`, "running");
+        tick();
+        clock = setInterval(tick, 1000);
         focusView();
-        requestGuestSize();
       } else if (data.type === "exit") {
         const name = EXIT_NAMES[data.code] ?? `error ${data.code}`;
         const detail = data.message ? `: ${data.message}` : "";
@@ -644,9 +873,13 @@ async function launch(s = readSettings()) {
     };
     worker.onerror = (event) => finish(`worker failed: ${event.message}`, "error");
 
-    // The worker reads the disk on demand (a File slice or an HTTP range request per miss), so
-    // it is not downloaded here. A relative URL is resolved against the page, not the worker.
-    const disks = !s.disk ? [] : s.disk.file ? [{ file: s.disk.file }] : [{ url: new URL(s.disk.url, location.href).href }];
+    // The worker reads the drives on demand (a File slice or an HTTP range request per miss), so
+    // they are not downloaded here. A relative URL is resolved against the page, not the worker.
+    const disks = s.drives.map((drive) => ({
+      ...(drive.file ? { file: drive.file } : { url: new URL(drive.url, location.href).href }),
+      readOnly: drive.kind === "cdrom",
+      label: drive.label,
+    }));
     const options = (s.jit ? OPTION.JIT : 0) | (s.acpi ? OPTION.ACPI : 0) | (s.iommu ? OPTION.IOMMU : 0) |
       (s.rng ? OPTION.RNG : 0) | (s.serial ? OPTION.SERIAL_CONSOLE : 0) | (s.reboot ? OPTION.REBOOT : 0) |
       (s.replaceCmdline ? OPTION.REPLACE_CMDLINE : 0) | (s.display !== "none" ? OPTION.DISPLAY : 0) |
@@ -664,69 +897,127 @@ async function launch(s = readSettings()) {
       rows: term.rows,
       control: shared,
     };
-    setStatus("starting…");
+    setStatus("Starting…", "busy");
     worker.postMessage(message, [kernel, initrd, firmware.image].filter(Boolean));
   } catch (error) {
     finish(String(error.message ?? error), "error");
   }
 }
 
-for (const input of document.querySelectorAll(".wizard input, .wizard select")) {
-  input.addEventListener(input.type === "text" ? "input" : "change", render);
+for (const input of document.querySelectorAll("#config input:not([type=file]), #config select")) {
+  input.addEventListener(input.type === "text" || input.type === "url" ? "input" : "change", render);
 }
-for (const button of document.querySelectorAll("button[data-clear]")) {
-  button.onclick = () => {
-    $(`${button.dataset.clear}-file`).value = "";
-    $(`${button.dataset.clear}-url`).value = "";
-    render();
-  };
-}
-$("back").onclick = () => go(step - 1);
-$("next").onclick = () => go(step + 1);
-$("launch").onclick = () => launch();
-$("relaunch").onclick = () => launch(lastSettings ?? readSettings());
-$("configure").onclick = () => showPanel("wizard");
-$("wizard-close").onclick = closeWizard;
-$("wizard").addEventListener("keydown", (event) => {
-  if (event.key === "Escape") closeWizard();
+for (const button of document.querySelectorAll("#presets button")) button.onclick = () => applyPreset(button.dataset.preset);
+$("add-cdrom").onclick = () => $("cdrom-file").click();
+$("add-disk").onclick = () => $("disk-file").click();
+$("welcome-iso").onclick = () => applyPreset("iso");
+$("welcome-disk").onclick = () => applyPreset("disk");
+$("cdrom-file").onchange = () => {
+  addFiles([...$("cdrom-file").files], { kind: "cdrom" });
+  $("cdrom-file").value = "";
+};
+$("disk-file").onchange = () => {
+  addFiles([...$("disk-file").files], { kind: "disk" });
+  $("disk-file").value = "";
+};
+$("add-url").onclick = () => {
+  $("url-row").hidden = !$("url-row").hidden;
+  if (!$("url-row").hidden) $("drive-url").focus();
+};
+$("drive-url-add").onclick = () => addDriveUrl($("drive-url").value);
+$("drive-url").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") addDriveUrl($("drive-url").value);
 });
-$("demo-boot").onclick = () => launch(demoSettings(demo));
-$("demo-custom").onclick = () => showPanel("wizard");
+$("start").onclick = launch;
+$("start-sidebar").onclick = launch;
+$("banner-restart").onclick = launch;
+$("banner-close").onclick = () => { $("banner").hidden = true; };
+$("toggle-sidebar").onclick = () => setSidebar($("sidebar").hasAttribute("data-collapsed"));
+$("demo-boot").onclick = () => {
+  applyDemo(demo);
+  render();
+  launch();
+};
 $("stop").onclick = () => {
   if (control) Atomics.store(control, CTRL.STOP, 1);
+  else if (starting) toast("Still downloading; the machine stops as soon as it starts.");
 };
+
+// Dropping files anywhere attaches them; the overlay only shows while a drag carries files.
+let dragDepth = 0;
+const carriesFiles = (event) => [...(event.dataTransfer?.types ?? [])].includes("Files");
+window.addEventListener("dragenter", (event) => {
+  if (!carriesFiles(event) || running()) return;
+  dragDepth++;
+  $("dropzone").hidden = false;
+});
+window.addEventListener("dragleave", () => {
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (!dragDepth) $("dropzone").hidden = true;
+});
+window.addEventListener("dragover", (event) => {
+  if (carriesFiles(event)) event.preventDefault();
+});
+window.addEventListener("drop", (event) => {
+  if (!carriesFiles(event)) return;
+  event.preventDefault();
+  dragDepth = 0;
+  $("dropzone").hidden = true;
+  if (running()) {
+    toast("Stop the machine to attach drives.");
+    return;
+  }
+  addFiles([...event.dataTransfer.files], { detectKernel: true });
+});
 
 const saved = restoreSettings();
 setRunning(false);
-go(0);
+// On a phone the sidebar would cover the welcome pane, which already offers the common starts.
+setSidebar(!matchMedia("(max-width: 900px)").matches);
 
 // `hack/web.sh` links the cached Alpine netboot files (and WEB_DISK) under assets/; offer them
-// when present and the visitor has not chosen (or cleared) that field before. Refilling a cleared
+// when present and the visitor has not chosen (or cleared) them before. Refilling a cleared
 // kernel would quietly turn a UEFI disk boot back into a kernel boot.
-const probes = [["kernel-url", "assets/vmlinuz-virt"], ["initrd-url", "assets/initramfs-virt"], ["disk-url", "assets/disk"]]
-  .filter(([id]) => !(id in saved))
-  .map(([id, url]) => fetch(url, { method: "HEAD" })
-    .then((response) => { if (response.ok && !$(id).value) $(id).value = url; })
+const probes = [
+  ["kernel", "assets/vmlinuz-virt"],
+  ["initrd", "assets/initramfs-virt"],
+  ["drive", "assets/disk"],
+]
+  .filter(([key]) => !(key === "drive" ? "drives" in saved : key in saved))
+  .map(([key, url]) => fetch(url, { method: "HEAD" })
+    .then((response) => {
+      if (!response.ok) return;
+      if (key === "drive") {
+        if (!state.drives.length) addDrive({ url, label: "disk (assets)" }, "disk");
+      } else if (!state[key]) {
+        state[key] = { url, label: labelOfUrl(url) };
+      }
+    })
     .catch(() => {}));
 Promise.all(probes).then(render);
 
-// Both panels start hidden so the page does not flash the wizard before the demo replaces it.
 const demoReady = fetch(DEMO_URL)
   .then((response) => (response.ok ? response.json() : null))
   .catch(() => null)
   .then((found) => {
     demo = found;
-    if (demo) {
-      $("demo-boot").textContent = `Boot ${demo.label}`;
-      $("demo-boot").title = `${demo.name}, ${Math.round(demo.bytes / 1e6)} MB download`;
-      $("summary").textContent = summaryOf(demoSettings(demo));
-    }
-    if (!hasRun) showPanel(demo ? "demo" : "wizard");
+    if (!demo) return;
+    $("demo-boot").hidden = false;
+    $("demo-boot").innerHTML = `<svg class="i"><use href="#i-play"/></svg>`;
+    $("demo-boot").append(`Boot ${demo.label}`);
+    $("demo-boot").title = `${demo.name}, ${Math.round(demo.bytes / 1e6)} MB download`;
+    const preset = document.querySelector("[data-preset=demo]");
+    preset.hidden = false;
+    preset.textContent = demo.label;
   });
 
 if (!crossOriginIsolated) {
   setStatus(NOT_ISOLATED, "error");
 } else if (new URLSearchParams(location.search).has("autoboot")) {
-  // In demo mode ?autoboot boots the demo; otherwise the wizard's settings.
-  Promise.all([...probes, demoReady]).then(() => launch(demo ? demoSettings(demo) : readSettings()));
+  // In demo mode ?autoboot boots the demo; otherwise the settings as restored.
+  Promise.all([...probes, demoReady]).then(() => {
+    if (demo) applyDemo(demo);
+    render();
+    launch();
+  });
 }

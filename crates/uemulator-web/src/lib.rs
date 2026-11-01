@@ -215,12 +215,14 @@ unsafe fn take_buffer(ptr: *mut u8, len: usize) -> Vec<u8> {
 }
 
 /// A disk for the next `uw_create`: the page's disk source `source` (`length` bytes; see
-/// `host_disk_read`), raw or udisk, read-only and read on demand, under an in-memory udisk
-/// overlay that takes the guest's writes. The writes are gone when the page stops the machine.
-/// Returns 0, or 1 with the message in `uw_error_*`.
+/// `host_disk_read`), raw or udisk, read on demand. Disks attach in call order (`vda`, `vdb`, ...).
+/// With `read_only` 0 an in-memory udisk overlay takes the guest's writes, which are gone when
+/// the page stops the machine; otherwise the guest sees a read-only disk (the virtio-blk RO
+/// feature), which is what a CD image should be: an installer that finds its medium writable may
+/// offer it as an install target. Returns 0, or 1 with the message in `uw_error_*`.
 #[unsafe(no_mangle)]
-pub extern "C" fn uw_add_disk(source: i32, length: f64) -> i32 {
-    match streamed_disk(source, length as u64) {
+pub extern "C" fn uw_add_disk(source: i32, length: f64, read_only: i32) -> i32 {
+    match streamed_disk(source, length as u64, read_only != 0) {
         Ok(disk) => {
             PENDING_DISKS.with(|disks| disks.borrow_mut().push(disk));
             0
@@ -232,7 +234,7 @@ pub extern "C" fn uw_add_disk(source: i32, length: f64) -> i32 {
     }
 }
 
-fn streamed_disk(source: i32, length: u64) -> Result<Disk, String> {
+fn streamed_disk(source: i32, length: u64, read_only: bool) -> Result<Disk, String> {
     if length == 0 {
         return Err("the disk image is empty".into());
     }
@@ -253,6 +255,10 @@ fn streamed_disk(source: i32, length: u64) -> Result<Disk, String> {
         Some(_) => Box::new(Udisk::open(remote, None).map_err(|e| e.to_string())?),
         None => Box::new(RawImage::new(remote)),
     };
+    // `RemoteImage` is read-only, and so is anything over it.
+    if read_only {
+        return Ok(Disk::from_backend(base));
+    }
     let mut id = [0u8; 16];
     unsafe { host_random(id.as_mut_ptr(), id.len()) };
     let size = base.len().div_ceil(SECTOR_BYTES) * SECTOR_BYTES;

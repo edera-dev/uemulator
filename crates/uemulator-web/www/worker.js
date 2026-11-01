@@ -12,7 +12,7 @@ const IDLE_WAIT_MS = 1;
 
 let wasm;
 let control;
-// Disk sources by the number `uw_add_disk` was given: { url } or { file }.
+// Disk sources by the number `uw_add_disk` was given: { url } or { file }, and `readOnly`.
 const diskSources = [];
 let ring;
 let events;
@@ -22,8 +22,13 @@ let lastFlush = 0;
 let lastResizeGeneration = 0;
 const decoder = new TextDecoder();
 
+// Pointers from the module arrive as signed i32: `>>> 0` makes the ones past 2 GiB of module
+// memory (a machine with more than about 1.5 GiB of RAM) positive again. Every view on the
+// module's memory goes through this.
+const address = (ptr) => ptr >>> 0;
+
 function memoryBytes(ptr, len) {
-  return new Uint8Array(wasm.memory.buffer, ptr, len);
+  return new Uint8Array(wasm.memory.buffer, address(ptr), len);
 }
 
 function flushOutput() {
@@ -68,7 +73,7 @@ const host = {
     if (generation === lastResizeGeneration) return 0;
     lastResizeGeneration = generation;
     // `ptr` is two u16; it is 2-aligned because it points at a Rust `[u16; 2]`.
-    const size = new Uint16Array(wasm.memory.buffer, ptr, 2);
+    const size = new Uint16Array(wasm.memory.buffer, address(ptr), 2);
     size[0] = Atomics.load(control, CTRL.COLS);
     size[1] = Atomics.load(control, CTRL.ROWS);
     return 1;
@@ -88,7 +93,7 @@ const host = {
     const head = Atomics.load(control, CTRL.EVENT_HEAD);
     let tail = Atomics.load(control, CTRL.EVENT_TAIL);
     // `ptr` points at a Rust `[i32; N]`, so it is 4-aligned.
-    const out = new Int32Array(wasm.memory.buffer, ptr, capacity * EVENT_WORDS);
+    const out = new Int32Array(wasm.memory.buffer, address(ptr), capacity * EVENT_WORDS);
     let count = 0;
     while (tail !== head && count < capacity) {
       for (let word = 0; word < EVENT_WORDS; word++) out[count * EVENT_WORDS + word] = events[tail * EVENT_WORDS + word];
@@ -206,8 +211,8 @@ async function boot(message) {
   const cmdlinePtr = upload(cmdline);
   for (const source of message.disks ?? []) {
     const index = diskSources.push(source) - 1;
-    if (wasm.uw_add_disk(index, diskLength(source))) {
-      postMessage({ type: "exit", code: -2, message: `disk: ${lastError()}` });
+    if (wasm.uw_add_disk(index, diskLength(source), source.readOnly ? 1 : 0)) {
+      postMessage({ type: "exit", code: -2, message: `${source.label ?? "disk"}: ${lastError()}` });
       return;
     }
   }

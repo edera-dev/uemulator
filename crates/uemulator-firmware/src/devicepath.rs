@@ -16,6 +16,7 @@ pub const SUBTYPE_END_ENTIRE: u8 = 0xff;
 pub const SUBTYPE_PCI: u8 = 1;
 pub const SUBTYPE_ACPI: u8 = 1;
 pub const SUBTYPE_HARD_DRIVE: u8 = 1;
+pub const SUBTYPE_CD_ROM: u8 = 2;
 pub const SUBTYPE_VENDOR_MEDIA: u8 = 3;
 pub const SUBTYPE_FILE_PATH: u8 = 4;
 const SUBTYPE_VENDOR_HARDWARE: u8 = 4;
@@ -111,6 +112,22 @@ impl DevicePath {
         payload.push(format);
         payload.push(signature_type);
         self.push_node(TYPE_MEDIA, SUBTYPE_HARD_DRIVE, &payload)
+    }
+
+    /// An El Torito boot image (UEFI 2.9 10.3.5.2): its catalog entry, the CD sector it starts
+    /// at and its size in the disk's blocks.
+    pub fn cd_rom(self, boot_entry: u32, cd_sector: u64, block_count: u64) -> Self {
+        let mut payload = Vec::with_capacity(20);
+        payload.extend_from_slice(&boot_entry.to_le_bytes());
+        payload.extend_from_slice(&cd_sector.to_le_bytes());
+        payload.extend_from_slice(&block_count.to_le_bytes());
+        self.push_node(TYPE_MEDIA, SUBTYPE_CD_ROM, &payload)
+    }
+
+    /// Whether the path goes through an El Torito boot image.
+    pub fn is_cd_rom(&self) -> bool {
+        self.nodes()
+            .any(|node| (node.kind, node.subtype) == (TYPE_MEDIA, SUBTYPE_CD_ROM))
     }
 
     /// A vendor-defined media node: `guid` and no vendor data.
@@ -304,6 +321,12 @@ pub fn to_text(path: &[u8]) -> String {
                         "HD({number},MBR,{signature:#010x},{start:#x},{size:#x})"
                     );
                 }
+            }
+            (TYPE_MEDIA, SUBTYPE_CD_ROM) if p.len() >= 20 => {
+                let entry = u32::from_le_bytes(p[0..4].try_into().unwrap());
+                let start = u64::from_le_bytes(p[4..12].try_into().unwrap());
+                let size = u64::from_le_bytes(p[12..20].try_into().unwrap());
+                let _ = write!(text, "CDROM({entry:#x},{start:#x},{size:#x})");
             }
             (TYPE_MEDIA, SUBTYPE_FILE_PATH) => text.push_str(&file_node_text(p)),
             (TYPE_MEDIA, SUBTYPE_VENDOR_MEDIA)
