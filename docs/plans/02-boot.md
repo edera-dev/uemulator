@@ -1,5 +1,7 @@
 # Boot
 
+**Status:** implemented: the direct 64-bit boot (`--firmware none`). Booting through firmware is in [19-uefi-firmware.md](19-uefi-firmware.md) and [17-bios.md](17-bios.md).
+
 ## The target kernel (inspected, cached at ~/.cache/uemulator/linux)
 
 - `Linux 6.12.107+deb13-amd64`, bzImage, 12,142,528 bytes

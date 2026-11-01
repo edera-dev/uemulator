@@ -839,7 +839,7 @@ impl Cpu {
     /// one page: the source is read in full first, and a fault on the destination's first store
     /// leaves memory untouched. The SDM promises the 64-byte write is a single unit to other
     /// agents; with one host thread per vCPU the eight 8-byte stores below are not, which no
-    /// guest has been seen to depend on (`plans/21-ryzen-7000-parity.md`).
+    /// guest has been seen to depend on (`docs/plans/21-ryzen-7000-parity.md`).
     fn movdir64b(&mut self, i: &Insn, next: u64) -> ExecResult<()> {
         const BYTES: u64 = 64;
         const CHUNK: u8 = 8;

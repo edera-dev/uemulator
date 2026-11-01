@@ -1,5 +1,7 @@
 # QEMU reference map
 
+**Status:** reference.
+
 `../ext/qemu-uplink` (branch `xtcg/next`, QEMU 11.1.50 + uplink fork, ~16.5k commits past the merge-base with the latest upstream tag). Read-only. Study behavior and algorithms; write Rust from scratch (code is GPLv2 like the reference, but not copied; QEMU's own AGENTS.md restricts AI output to local experiments, so nothing here is intended for upstream).
 
 | subsystem | read |
@@ -23,7 +25,7 @@
 ## Fork triage (`git log $(git merge-base HEAD <latest upstream tag>)..HEAD`)
 
 - **Correctness fixes to adopt by design** (check each against our implementation): "fix immediate stack adjustment for RET and RETF", "Fix FXCH to unconditionally clear C1", "Mark MOVNTI as not valid with prefixes 66/F2/F3", "tcg/optimize: Fix expansion/simplification of deposit", "Fix fold_multiply2", "tcg/aarch64: Correct register MIN/MAX instructions", "fix EFLAGS reads in TCG plugin callbacks".
-- **SMP with threads** (`plans/22-smp-threads.md`): MTTCG's ideas, written fresh. `start_exclusive`/`end_exclusive` and `cpu_exec_step_atomic` (`Cpu::with_exclusive`, the retry of locked instructions), `tlb_protect_code` (revoking write tags for a page that gains code, here inside the exclusive section), the big lock around devices, and `TCG_GUEST_DEFAULT_MO` (x86 is TSO, so the aarch64 backend needs acquire loads and release stores; QEMU refuses MTTCG for that pairing by default, here it is on).
+- **SMP with threads** (`docs/plans/22-smp-threads.md`): MTTCG's ideas, written fresh. `start_exclusive`/`end_exclusive` and `cpu_exec_step_atomic` (`Cpu::with_exclusive`, the retry of locked instructions), `tlb_protect_code` (revoking write tags for a page that gains code, here inside the exclusive section), the big lock around devices, and `TCG_GUEST_DEFAULT_MO` (x86 is TSO, so the aarch64 backend needs acquire loads and release stores; QEMU refuses MTTCG for that pairing by default, here it is on).
 - **Perf features, JIT phase notes only**: x-tblookup, x-tblayout, x-iofast, x-edgesys, x-slowthunk, x-ssefp, lazy INC/DEC CC_OP, x-vexzero/regcache/superblock.
 - **Not applicable**: x-hyperv, x-user, x-versal/zynqmp/zcu/aio/blockdev, `[DEV]` stats commits.
 - **CPU identity**: AMD Zen 5 (family 0x1a model 0x02 stepping 1, EPYC-Turin; see 03 "CPUID/MSR contract"; QEMU's `EPYC-Turin` says model 0 stepping 0), no hypervisor bit. Read its leaves, then subtract (03).

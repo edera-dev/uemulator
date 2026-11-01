@@ -1,5 +1,7 @@
 # Testing
 
+**Status:** partially implemented. Unit, instruction and differential tests exist as described; the cached-kernel boot tests (`tests/boot.rs`) do not, and tests build tiny guests with `testkit::FakeKernel` instead ([CLAUDE.md](../../CLAUDE.md), "Tests").
+
 ## Unit tests (`cargo test --release`)
 
 - `boot.rs`: parse the real bzImage header from the cache when present (skip if absent) and assert the numbers in 02.

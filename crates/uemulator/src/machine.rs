@@ -135,7 +135,7 @@ pub enum DisplayMode {
     /// the keyboard reaches the firmware's text input. The default command line gains
     /// `console=tty0`, so the kernel log and `/dev/console` are on the screen while the text
     /// console keeps a copy of the log and early boot text stays on the 16550. Layout in
-    /// `plans/24-display-input.md`.
+    /// `docs/plans/24-display-input.md`.
     Framebuffer,
 }
 
@@ -259,7 +259,7 @@ impl MachineConfig {
     /// Boots a UEFI firmware image (`crates/uemulator-firmware`) instead of a Linux kernel. The
     /// CPU starts at the image's entry in 64-bit mode with the low 4 GiB identity-mapped,
     /// interrupts off and `rdi` pointing at a handoff page that describes the machine
-    /// (`plans/19-uefi-firmware.md`); the firmware finds the disks and boots from them. A guest
+    /// (`docs/plans/19-uefi-firmware.md`); the firmware finds the disks and boots from them. A guest
     /// reset runs the firmware again. Needs a disk or a kernel to be useful and cannot be
     /// combined with `firmware` or `boot_disk`.
     ///
@@ -327,7 +327,7 @@ impl MachineConfig {
     /// function through it once the guest enables it; I/O APIC, HPET and MSI-X interrupts go
     /// through its interrupt remapping, and the virtio functions offer `ACCESS_PLATFORM` so the
     /// guest maps their buffers. Off by default. The guest finds it through the ACPI IVRS table,
-    /// which needs `acpi` (on by default); see `plans/16-iommu.md`.
+    /// which needs `acpi` (on by default); see `docs/plans/16-iommu.md`.
     pub fn iommu(mut self, on: bool) -> Self {
         self.iommu = on;
         self

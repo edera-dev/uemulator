@@ -1,5 +1,7 @@
 # Real mode, protected mode, compatibility mode and virtual-8086
 
+**Status:** implemented; "Not implemented" below lists the gaps.
+
 The emulator started as a long-mode-only CPU (the Linux 64-bit boot protocol enters in long mode and nothing leaves it). It now runs 16- and 32-bit code too, so a BIOS, a DOS-style real-mode program, a 32-bit protected-mode kernel, or a compatibility-mode (IA-32e with CS.L clear) user process all execute. Paging formats are in 04 ("Non-long-mode paging") and 03 ("Control-register rules outside long mode").
 
 ## The mode is a property of CS

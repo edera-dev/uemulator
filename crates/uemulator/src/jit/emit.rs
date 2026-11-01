@@ -3,7 +3,7 @@
 //! operand size including read-modify-write memory forms, mov, lea, movzx/movsx, inc/dec/neg/not,
 //! shl/shr/sar, imul, setcc/cmovcc, push/pop, near jmp/jcc/call/ret and indirect call/jmp) are
 //! emitted inline; every other instruction becomes a call to `helper_exec`, which runs the
-//! interpreter on it, so coverage can grow one opcode at a time. See `plans/06-jit.md`.
+//! interpreter on it, so coverage can grow one opcode at a time. See `docs/plans/06-jit.md`.
 //!
 //! Register roles. The prologue in `arch_a64.rs` sets up the callee-saved ones and enters the
 //! block with `br`, so a block is straight-line code, not a function:

@@ -1,5 +1,5 @@
 //! AVX/AVX2 vector instructions. Not advertised until the whole set is done (see
-//! `plans/14-avx-and-virtualization.md`); until then XCR0 cannot enable the AVX component, so
+//! `docs/plans/14-avx-and-virtualization.md`); until then XCR0 cannot enable the AVX component, so
 //! these paths only run in tests that set `Cpu::xcr0` directly.
 //!
 //! Most VEX instructions are an SSE instruction with a non-destructive first source (VEX.vvvv),

@@ -1,5 +1,5 @@
 //! Loading `crates/uemulator-firmware` and the page it is handed. The byte layouts here are
-//! the contract with the firmware (`plans/19-uefi-firmware.md`); the firmware crate has the same
+//! the contract with the firmware (`docs/plans/19-uefi-firmware.md`); the firmware crate has the same
 //! offsets under tests of its own.
 
 use super::{

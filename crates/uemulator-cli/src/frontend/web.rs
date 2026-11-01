@@ -3,7 +3,7 @@
 //! page sends keyboard and mouse events as short text commands. One update is in flight per
 //! viewer at a time (the page acknowledges each after drawing it), so a slow browser or link
 //! gets fewer, larger updates instead of a growing backlog. Protocol in
-//! `plans/24-display-input.md`.
+//! `docs/plans/24-display-input.md`.
 
 mod png;
 mod websocket;

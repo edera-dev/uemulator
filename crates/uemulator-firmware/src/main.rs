@@ -1,5 +1,5 @@
 //! A minimal UEFI 2.9 firmware for uemulator. The library loads this flat image at 1 MiB in
-//! 64-bit mode and hands it a page describing the machine (`plans/19-uefi-firmware.md`); it
+//! 64-bit mode and hands it a page describing the machine (`docs/plans/19-uefi-firmware.md`); it
 //! finds the virtio disks, publishes the UEFI tables and boots the first thing it can.
 //!
 //! On a hosted target only the hardware-independent modules build, for their unit tests.

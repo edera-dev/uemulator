@@ -114,7 +114,7 @@ pub(crate) struct Block {
 /// whose three-word entries cannot be read while another thread writes them.
 ///
 /// The buffer is a single read-write-execute mapping (`MAP_JIT` on macOS, never flipped with
-/// mprotect; `plans/06-jit.md` describes an RW then RX path for Linux that the code does not
+/// mprotect; `docs/plans/06-jit.md` describes an RW then RX path for Linux that the code does not
 /// follow). All writes must go through `ExecMem`, which toggles per-thread write protection on
 /// Apple Silicon and flushes the instruction cache.
 pub(crate) struct Jit {

@@ -1,5 +1,7 @@
 # AMD IOMMU (AMD-Vi)
 
+**Status:** implemented.
+
 `MachineConfig::iommu(true)` adds an AMD IOMMU as PCI function 00:00.2 and puts every PCI function's DMA behind it. Code is in `crates/uemulator/src/dev/iommu/`. It exists for Windows 11 and Linux, which use it for DMA protection and (Windows with VBS, Linux with x2APIC and large guests) interrupt remapping. They find it through the IVRS table that `acpi/` publishes (`MachineConfig::acpi`, on by default; CLI `--iommu`), and a real Debian 6.12 kernel drives it: see "Verified in a guest" below.
 
 Spec: AMD I/O Virtualization Technology (IOMMU) Specification, rev 3.x (publication 48882). QEMU reference: `hw/i386/amd_iommu.{c,h}` (register layout, command set, event encoding, interrupt remapping decision tree), read for behaviour and not transliterated. Consumer used as the checklist of what must work: Linux `drivers/iommu/amd/amd_iommu_types.h` (bit positions, the IOMMU page table encoding `PAGE_SIZE_PTE`, the event flags).

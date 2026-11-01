@@ -1,5 +1,7 @@
 # Public API
 
+**Status:** implemented. Where this and `crates/uemulator/src/lib.rs` differ, the code is authoritative.
+
 Small surface; everything else is `pub(crate)`.
 
 ```rust
@@ -34,7 +36,7 @@ impl EmulatedMachine {
 
 pub enum ExitReason { Shutdown, Reset, TripleFault, Stopped, Internal(String) }
 
-// Graphical console (plans/24-display-input.md)
+// Graphical console (docs/plans/24-display-input.md)
 MachineConfig::display(DisplayMode::Framebuffer)    // Serial (default) | Framebuffer: virtio-gpu, keyboard, tablet
 MachineConfig::display_size(width, height)          // default 1280x800
 EmulatedMachine::display() -> Option<DisplayHandle> // size, generation, frame, update_since, wait_for_update, on_update, request_size
@@ -69,7 +71,7 @@ pub struct NetOffloads {
 
 ## Rules
 
-- With `cpus(n)` above 1 and the realtime clock the machine runs one thread per vCPU (`plans/22-smp-threads.md`): `std::thread` hosted, `thread_spawner` (and `host_clock`) on a freestanding host, else the vCPUs take turns on the thread that runs the machine. The thread that called `start`/`wait` ticks the devices. Everything an embedder hands in (log, poll, disk backends, console callbacks) is called from any of these threads, never concurrently with itself for one device.
+- With `cpus(n)` above 1 and the realtime clock the machine runs one thread per vCPU (`docs/plans/22-smp-threads.md`): `std::thread` hosted, `thread_spawner` (and `host_clock`) on a freestanding host, else the vCPUs take turns on the thread that runs the machine. The thread that called `start`/`wait` ticks the devices. Everything an embedder hands in (log, poll, disk backends, console callbacks) is called from any of these threads, never concurrently with itself for one device.
 
 - `new` does all fallible setup (parse bzImage, allocate RAM, probe JIT) so `start` failing is rare.
 - Guest shutdown is a value (`ExitReason`), never a process exit. `hlt` with IF=0 (nothing can wake it; with `acpi=off` this is how Linux poweroff/halt ends, `cli; hlt` in `stop_this_cpu`) is `Shutdown`; a triple fault is `TripleFault`, so automated runs terminate. A reset request (0x64←0xFE, 0x92 bit 0, 0xCF9 RST_CPU) wins over a `hlt` right after it.

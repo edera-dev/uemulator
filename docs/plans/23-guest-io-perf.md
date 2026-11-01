@@ -1,5 +1,7 @@
 # Guest-visible performance: syscalls, memory, disk, network
 
+**Status:** implemented: two rounds of measurements and fixes; "What bounds the rest, and what is left" lists the open items.
+
 Round 1 (2026-10-31). Measured from inside an Alpine guest (`quick create perf-test --install alpine`, installed to disk, logs in as root by itself) with the tools in `hack/perf/guest/`:
 
 - `ubench.c`: static guest binary. `sys` (raw `getppid`, 1-byte `read`+`write` on /dev/zero and /dev/null, vDSO `clock_gettime`), `mem` (musl `memcpy`/`memset` and hand-written `rep movsb`/`rep stosb` at 4K, 64K, 64M), `disk` (O_DIRECT 1M sequential write+fsync and read of a 512 MB file, then 4K random reads and writes), `net` (256 MB from and to the host, 1-byte TCP request/response), `randread` (200K 4K random reads, for profiling).

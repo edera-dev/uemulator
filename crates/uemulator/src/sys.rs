@@ -103,7 +103,7 @@ mod imp {
     }
 
     /// Apple Silicon only allows RWX anonymous memory mapped `MAP_JIT`; hardened-runtime
-    /// binaries also need the allow-jit entitlement (`plans/06-jit.md`).
+    /// binaries also need the allow-jit entitlement (`docs/plans/06-jit.md`).
     #[cfg(target_os = "macos")]
     const PLATFORM_MMAP_FLAGS: i32 = libc::MAP_JIT;
     #[cfg(not(target_os = "macos"))]

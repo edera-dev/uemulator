@@ -1,5 +1,7 @@
 # Xen dom0 on a modern AMD machine
 
+**Status:** partially implemented. Xen 4.21 boots with an Alpine dom0 and a PVH domU (step 6); a Fedora dom0 has not been booted yet.
+
 Goal: boot a stock Xen with a Fedora dom0 (PVH, x86_64) through UEFI and GRUB, on a machine that looks like a current AMD server part. Success line: Fedora dom0 at a login prompt under Xen; stretch: a PVH domU running inside it. Alpine's `xen` packages are the cheap stand-in for Fedora while developing (same hypervisor, much smaller userspace).
 
 Written by the first session on this work; update the status list as pieces land.
@@ -21,7 +23,7 @@ Written by the first session on this work; update the status list as pieces land
 1. ACPI and platform devices. Verified by booting Linux with `acpi_rsdp` (boot_params has the field), no firmware needed: `dmesg` shows ACPI, HPET, `AMD-Vi`.
 2. IOMMU wiring. A guest Linux finds `AMD-Vi`, enables DMA remapping, virtio devices keep working behind it, x2APIC interrupt remapping is on.
 3. CPU model and AVX. Family 19h model, cache/topology leaves, MSRs; AVX checked in a real guest, not only in unit tests.
-4. SMP, cooperative round robin on the one host thread. Done. (Later also one host thread per vCPU, `plans/22-smp-threads.md`; the round robin stays as the deterministic mode.)
+4. SMP, cooperative round robin on the one host thread. Done. (Later also one host thread per vCPU, `docs/plans/22-smp-threads.md`; the round robin stays as the deterministic mode.)
 5. Firmware, key-value store, `quick` support, GRUB.
 6. Xen: boot `xen.efi` or GRUB multiboot2 + Linux dom0, then a PVH domU. Done, see "Step 6" below.
 
@@ -48,7 +50,7 @@ Known gaps: no SMP; virtio-blk behind the IOMMU is only unit-tested (no cached g
 
 - Step 3 (CPU model and AVX), done except what needs steps 1 and 2 to show: `cpu/cpuid.rs` is a Zen 4 (family 19h model 11h stepping 1, signature 00A10F11, "AMD EPYC-Genoa Processor") with SVM + NPT + NRIPS + VMCB clean + flush-by-ASID (decode assists, the pause filter, AVIC and the TSC ratio MSR are not implemented and not advertised), x2APIC, XSAVE with correct sizes in both formats (XSAVEC/XSAVES/XGETBV1), invariant TSC, cache/TLB/topology leaves (0xB, 0x8000001D, 0x8000001E, 0x80000008 ECX) consistent with `Cpu::topology` (cpu count, threads per core, x2APIC id; defaults to one processor, to be driven by the SMP work), the AMD workaround MSRs as stored registers (HWCR, LS_CFG, DE_CFG, BP_CFG, the legacy perf counters, PATCH_LEVEL). A guest Linux 6.18 prints the Zen 4 identity, `xsaves`/compacted format and no PMU or microcode complaints. AVX was investigated in a real guest (see 03, "Real-guest check"): VEX instruction semantics match QEMU TCG bit for bit; the failures were missing instructions (`vpsubsw` EVEX, `vdbpsadbw`, SHA, BF16, ADX) and `clwb` executing as xsaveopt, all fixed. Not done: Xen itself has not been booted (it needs steps 1, 2, 5), so "no warnings from Xen" is not verified; leaf 0x1F, PKU, LA57, SSE4A, MWAITX, RDPRU, INVLPGB, perfctr_core and IBS are absent on purpose.
 
-- SMP (step 4): `MachineConfig::cpus(1..=64)`, `--cpus`, `cpus` in `machine.toml`; design and semantics in `plans/03-cpu.md` ("SMP") and `plans/07-devices.md` ("LAPIC and IOAPIC"). Linux sees N vCPUs from the MADT, starts them with INIT/SIPI (x2APIC and xAPIC), runs IPIs, TLB shootdowns and CPU hotplug; Alpine 6.18 on the JIT (4 and 64 vCPUs) and the interpreter, Debian 6.12 with `--iommu` (cluster x2APIC with interrupt remapping). Default stays 1: the vCPUs share one host thread, so more of them cost host time without adding speed. Xen should set the count explicitly. CPUID's topology leaves are minimal (`Cpu::smp_cpuid`) and will need the Zen 4 model's real layout (leaf 0x8000001E) merged in.
+- SMP (step 4): `MachineConfig::cpus(1..=64)`, `--cpus`, `cpus` in `machine.toml`; design and semantics in `docs/plans/03-cpu.md` ("SMP") and `docs/plans/07-devices.md` ("LAPIC and IOAPIC"). Linux sees N vCPUs from the MADT, starts them with INIT/SIPI (x2APIC and xAPIC), runs IPIs, TLB shootdowns and CPU hotplug; Alpine 6.18 on the JIT (4 and 64 vCPUs) and the interpreter, Debian 6.12 with `--iommu` (cluster x2APIC with interrupt remapping). Default stays 1: the vCPUs share one host thread, so more of them cost host time without adding speed. Xen should set the count explicitly. CPUID's topology leaves are minimal (`Cpu::smp_cpuid`) and will need the Zen 4 model's real layout (leaf 0x8000001E) merged in.
 
 Known gaps: virtio-blk behind the IOMMU is only unit-tested (no cached guest with both `AMD_IOMMU` and `virtio_blk` built in); interrupts that need the IOMMU's interrupt table and are raised on the CPU's polling path wait for the next device tick (at most 4096 instructions); no power button, GPE blocks, S3/S4 or hotplug; the 20th virtio function (PCI slot 0x14) shares its device-table entry with the I/O APIC's requester id; the BIOS boot path (`boot_disk`) does not publish ACPI tables.
 

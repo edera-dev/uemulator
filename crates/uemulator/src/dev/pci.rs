@@ -105,7 +105,7 @@ const SUBCLASS_COMMUNICATION_OTHER: u8 = 0x80;
 /// `virtio-gpu-pci`: Linux's driver removes the firmware's framebuffer (`efifb`, `simpledrm`)
 /// only for a VGA-class device, which is also the one the VGA arbiter makes the boot display.
 /// Without that the console stays on the dead firmware framebuffer while the screen shows the
-/// driver's (`plans/24-display-input.md`).
+/// driver's (`docs/plans/24-display-input.md`).
 const CLASS_DISPLAY: u8 = 0x03;
 const SUBCLASS_VGA: u8 = 0x00;
 const CLASS_INPUT: u8 = 0x09;

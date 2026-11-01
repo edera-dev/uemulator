@@ -1,5 +1,7 @@
 # JIT performance: direct chaining, more inline integer ops, native SIMD
 
+**Status:** implemented as far as the Status paragraph and the Results section below say; the task lists are the plan as written.
+
 > **For agentic workers:** execute task by task; steps use checkbox syntax. The interpreter is the oracle for every JIT change (`testkit::assert_jit_matches_interpreter`).
 
 **Goal:** make the initramfs unpack (and everything else a daily-driven guest does) several times faster than today's ~21 s host time for the 252 MB Fedora netboot initramfs on an Apple Silicon host.
@@ -106,7 +108,7 @@ Design: a block's exit to a static same-page target has a patchable 4-byte (aarc
 ### Task 4: measure and document
 
 - [ ] **Step 1: `hack/perf/unpack.sh` three times; sample again; record in the results table.**
-- [ ] **Step 2: Update `plans/06-jit.md` (chaining paragraph) and `plans/10-milestones.md`; commit** `Plans: direct chaining`.
+- [ ] **Step 2: Update `docs/plans/06-jit.md` (chaining paragraph) and `docs/plans/10-milestones.md`; commit** `Plans: direct chaining`.
 
 ---
 
@@ -185,7 +187,7 @@ Only if S1+S2 leave SIMD above ~10% of the busy samples. Inline `ldp q`/`stp q` 
 
 ### Task S4: decide on hiding features
 
-Only if the unpack is still well over 2x slower than the target after S1-S3: write the options and numbers into this file and ask before changing CPUID (it conflicts with the Zen 4 model contract in `plans/03-cpu.md`).
+Only if the unpack is still well over 2x slower than the target after S1-S3: write the options and numbers into this file and ask before changing CPUID (it conflicts with the Zen 4 model contract in `docs/plans/03-cpu.md`).
 
 ---
 

@@ -1,4 +1,4 @@
-//! One host thread per vCPU. The design is in `plans/22-smp-threads.md`; this is the machinery.
+//! One host thread per vCPU. The design is in `docs/plans/22-smp-threads.md`; this is the machinery.
 //!
 //! Every vCPU is a `Cpu` owned by its own thread, with a private soft TLB, decode cache and JIT.
 //! What they share is RAM and the code-page flags (`ram.rs`), the devices behind the device lock

@@ -1,5 +1,7 @@
 # Graphical console: display and input
 
+**Status:** implemented; the handover from a firmware framebuffer driver (`simpledrm`/`efifb`) to virtio_gpu is not yet verified.
+
 A machine can have a screen, a keyboard and a mouse next to its text consoles: `MachineConfig::display(DisplayMode::Framebuffer)`, CLI `--display framebuffer`. Everything is standard virtio plus UEFI GOP, so a stock Linux drives it with in-tree drivers and the firmware shows its console and menu on it. `DisplayMode::Serial` (the default) is the machine of earlier versions, byte for byte.
 
 ## Devices
@@ -22,7 +24,7 @@ Before the virtio-gpu driver loads there is a linear framebuffer the UEFI firmwa
 - Format: 4 bytes per pixel, blue, green, red, unused; pixels per line = width.
 - Scanning: nothing reports writes to RAM, so `BootFramebuffer::tick` (from `Devices::tick`) compares the region with the screen at most every 1/30 s of guest time and copies the rows that differ (`read_raw`: a CPU address, never IOMMU-translated). Not while the virtio driver owns the screen (`DisplayShared::virtio_owns_screen`, set on the first `SET_SCANOUT`, cleared on device reset); then the next scan is a full one.
 - Only machines booted through the UEFI firmware have it. The direct boot (`--firmware none`) leaves `screen_info` empty: the screen stays black until virtio-gpu loads (handing Linux the RAM framebuffer there would work the same way, but nothing needs it). The BIOS path has none either.
-- Handoff version 2 (`plans/19-uefi-firmware.md`) carries base, size, width, height and pixels per line at 0x338.
+- Handoff version 2 (`docs/plans/19-uefi-firmware.md`) carries base, size, width, height and pixels per line at 0x338.
 
 ## Firmware (`crates/uemulator-firmware`)
 

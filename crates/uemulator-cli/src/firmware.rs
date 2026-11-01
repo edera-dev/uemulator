@@ -19,7 +19,7 @@ const NODE_HEADER_BYTES: usize = 4;
 /// clears the bit.
 const OS_INDICATIONS_BOOT_TO_FW_UI: u64 = 1 << 0;
 
-/// The firmware's key for a variable (`var/<guid>/<name>`, `plans/19-uefi-firmware.md`).
+/// The firmware's key for a variable (`var/<guid>/<name>`, `docs/plans/19-uefi-firmware.md`).
 fn variable_key(name: &str) -> Vec<u8> {
     format!("var/{GLOBAL_VARIABLE_GUID}/{name}").into_bytes()
 }

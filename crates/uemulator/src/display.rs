@@ -2,7 +2,7 @@
 //! `InputHandle` feeds it a keyboard and an absolute pointer. Both are frontends' only contact
 //! with the machine (the CLI's web viewer, a native window later), so nothing here knows how the
 //! pixels are shown or where the keys come from. Layout and protocol choices are in
-//! `plans/24-display-input.md`.
+//! `docs/plans/24-display-input.md`.
 //!
 //! Locking: the devices publish into these handles while they hold the device lock; a frontend
 //! takes only the handle's own lock, never the device lock, so a slow frontend cannot stall the

@@ -1,5 +1,5 @@
 //! CPUID: an AMD Zen 5 (family 1Ah, EPYC 9005 "Turin") with only the features that have tests
-//! behind them. Read `plans/03-cpu.md` ("CPUID/MSR contract") before adding a bit: a set bit is a
+//! behind them. Read `docs/plans/03-cpu.md` ("CPUID/MSR contract") before adding a bit: a set bit is a
 //! promise that the instruction, MSR or table it describes works.
 //!
 //! The identity matters to the software that matters. Linux picks erratum workarounds, mitigation
@@ -9,7 +9,7 @@
 //! topology agree with each other and with the configured CPU count), and the ones it does not
 //! (Intel-only leaf 4, the hypervisor range, IBS, SEV) read as zero. There is one CPU model: the
 //! EPYC 9004 "Genoa" (family 19h model 11h) it replaced is described in
-//! `plans/21-ryzen-7000-parity.md`.
+//! `docs/plans/21-ryzen-7000-parity.md`.
 //!
 //! Deliberate departures from the hardware, each so a guest does not run code the emulator would
 //! only slow down:

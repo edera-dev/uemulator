@@ -1,6 +1,6 @@
-# AVX and nested virtualization (not implemented)
+# AVX and nested virtualization
 
-Status: AVX, AVX2, FMA, F16C, AVX-512 and SVM are implemented (03). VMX below is a design only and is not advertised.
+**Status:** partially implemented. AVX, AVX2, FMA, F16C, AVX-512 and SVM are implemented (03). VMX below is a design only and is not advertised.
 
 ## AVX, AVX2, FMA, F16C
 

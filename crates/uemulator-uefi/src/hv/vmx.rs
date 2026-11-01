@@ -1,6 +1,6 @@
 //! Intel VMX backend with EPT and unrestricted guest. Field encodings, capability MSRs and bit
 //! positions are from the Intel SDM Vol. 3 (VMCS fields, Appendix A and B). Never run on real
-//! hardware yet (plans/12-uefi.md). Pointers are used as physical addresses throughout: UEFI runs
+//! hardware yet (docs/plans/12-uefi.md). Pointers are used as physical addresses throughout: UEFI runs
 //! with an identity map.
 
 use alloc::format;

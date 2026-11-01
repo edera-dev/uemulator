@@ -1,6 +1,6 @@
 //! The Graphics Output Protocol (UEFI 2.9 section 12.9) on the machine's boot framebuffer: one
 //! mode, the framebuffer's size, `PixelBlueGreenRedReserved8BitPerColor`, the address the
-//! library reserved in RAM (`plans/24-display-input.md`). GRUB draws on it directly; the Linux
+//! library reserved in RAM (`docs/plans/24-display-input.md`). GRUB draws on it directly; the Linux
 //! EFI stub hands it to the kernel as `screen_info` (efifb, simpledrm) until virtio-gpu takes the
 //! screen over. The text console draws on the same pixels (`console.rs`).
 

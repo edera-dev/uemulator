@@ -1,5 +1,7 @@
 # WebAssembly port
 
+**Status:** implemented; "Not done" below lists what is missing.
+
 `crates/uemulator-web` builds the library to `wasm32-unknown-unknown` (empty crate on any other target) and `crates/uemulator-web/www` is the page around it. `hack/web.sh [serve]` builds into `target/web` and serves it on `http://127.0.0.1:8080/`; `hack/web/serve.py` adds the two headers that make the page cross-origin isolated.
 
 ## What is ported
@@ -30,7 +32,7 @@ A launch wizard over the terminal: firmware, boot media, machine options, review
 
 ## The JIT
 
-`jit/wasm.rs` (code cache and `Cpu::step_block`), `jit/emit_wasm.rs` (block generator) and `jit/wasm_encode.rs` (binary encoder) are the third backend; `plans/06-jit.md` has the shared design. What is different here:
+`jit/wasm.rs` (code cache and `Cpu::step_block`), `jit/emit_wasm.rs` (block generator) and `jit/wasm_encode.rs` (binary encoder) are the third backend; `docs/plans/06-jit.md` has the shared design. What is different here:
 
 - A block is a WebAssembly module of its own with one export, `block: (cpu: i32) -> i64`, which imports the emulator's `memory` and function `table`. It reads and writes the `Cpu` and guest RAM directly (both live in the module's linear memory) and calls the helpers with `call_indirect`: a Rust function pointer on wasm32 is its table index, so `Addrs` is just those numbers. The helper types are fixed in `wasm_encode` (`FUNCTION_TYPES`); a wrong one traps and takes the emulator down.
 - The library cannot instantiate a module itself. It hands the bytes to the host import `host_jit_compile(ptr, len) -> slot` (`www/jit_host.js`: `new WebAssembly.Module` + `Instance` with `{env: {memory, table}}`, then `table.set`), calls the block through that slot like a function pointer, and returns the slot with `host_jit_release`. The final link needs `--export-table --growable-table` (`uemulator-web/build.rs`, `.cargo/config.toml`).
