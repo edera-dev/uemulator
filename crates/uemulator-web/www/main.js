@@ -17,6 +17,8 @@ function defaultCmdline({ serial, acpi }) {
 const DEFAULT_CMDLINE_EXTRA = "earlycon=uart8250,io,0x3f8";
 const BUILT_IN_FIRMWARE_URL = "uemulator-firmware.bin";
 const SETTINGS_KEY = "uemulator.settings.v1";
+// isolate.js normally fixes this with a reload before anyone sees it.
+const NOT_ISOLATED = "page is not cross-origin isolated: serve it with hack/web.sh, or allow service workers";
 const FIRMWARE_LABELS = { uefi: "UEFI", none: "Direct kernel", bios: "BIOS", custom: "Firmware image" };
 
 const SOURCES = ["firmware", "kernel", "initrd", "disk"];
@@ -299,7 +301,7 @@ function finish(text, kind) {
 
 async function launch() {
   if (!crossOriginIsolated) {
-    setStatus("page is not cross-origin isolated; serve it with hack/web.sh", "error");
+    setStatus(NOT_ISOLATED, "error");
     return;
   }
   const s = readSettings();
@@ -411,7 +413,7 @@ const probes = [["kernel-url", "assets/vmlinuz-virt"], ["initrd-url", "assets/in
 Promise.all(probes).then(render);
 
 if (!crossOriginIsolated) {
-  setStatus("page is not cross-origin isolated; serve it with hack/web.sh", "error");
+  setStatus(NOT_ISOLATED, "error");
 } else if (new URLSearchParams(location.search).has("autoboot")) {
   Promise.all(probes).then(launch);
 }
