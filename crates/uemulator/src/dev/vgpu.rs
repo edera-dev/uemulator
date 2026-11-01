@@ -107,14 +107,14 @@ const FORMAT_X8B8G8R8: u32 = 68;
 const FORMAT_A8B8G8R8: u32 = 121;
 const FORMAT_R8G8B8X8: u32 = 134;
 
-/// Where alpha sits in a pixel of a resource format; none for the formats whose fourth byte is
-/// unused (opaque).
-fn alpha_offset(format: u32) -> Option<usize> {
-    match format {
-        FORMAT_B8G8R8A8 | FORMAT_R8G8B8A8 => Some(3),
-        FORMAT_A8R8G8B8 | FORMAT_A8B8G8R8 => Some(0),
-        _ => None,
-    }
+/// Where a pointer image's alpha sits in a pixel of a resource format: the byte its colours leave,
+/// in the X formats too. Linux creates every dumb buffer, the cursor's included, as XRGB8888
+/// (`B8G8R8X8`) and fills it with ARGB pixels, and QEMU copies cursor words as ARGB whatever the
+/// format says. Taking the X byte as opaque turns the transparent pixels around the arrow into a
+/// black square. Screens are different: there the fourth byte means nothing (`present`).
+fn cursor_alpha_offset(format: u32) -> Option<usize> {
+    let colours = channel_offsets(format)?;
+    (0..BYTES_PER_PIXEL).find(|offset| !colours.contains(offset))
 }
 
 /// Where blue, green and red sit in a pixel of a resource format, as byte indices. The screen
@@ -478,7 +478,8 @@ impl VirtioGpu {
     /// `UPDATE_CURSOR` hands the frontend the image of the resource it names (resource 0 hides
     /// the pointer). The image is copied now, as QEMU does: the guest may reuse the resource
     /// for the next shape right away. A resource too big to be a pointer, or in a format with
-    /// no colour channels known, leaves the pointer as it was.
+    /// no colour channels known, leaves the pointer as it was. Alpha is the byte the colours
+    /// leave, in the X formats too (`cursor_alpha_offset`).
     fn cursor_command(&mut self, request: &[u8]) {
         if request.len() < CURSOR_REQUEST_BYTES || u32_at(request, 0) != CMD_UPDATE_CURSOR {
             return;
@@ -498,15 +499,12 @@ impl VirtioGpu {
         if resource.width > MAX_CURSOR_SIDE || resource.height > MAX_CURSOR_SIDE {
             return;
         }
-        let alpha = alpha_offset(resource.format);
+        let Some(alpha) = cursor_alpha_offset(resource.format) else {
+            return;
+        };
         let mut pixels = Vec::with_capacity(resource.pixels.len());
         for pixel in resource.pixels.as_chunks::<BYTES_PER_PIXEL>().0 {
-            pixels.extend_from_slice(&[
-                pixel[blue],
-                pixel[green],
-                pixel[red],
-                alpha.map_or(u8::MAX, |alpha| pixel[alpha]),
-            ]);
+            pixels.extend_from_slice(&[pixel[blue], pixel[green], pixel[red], pixel[alpha]]);
         }
         self.display.set_cursor(Cursor::Image(CursorImage {
             width: resource.width,
