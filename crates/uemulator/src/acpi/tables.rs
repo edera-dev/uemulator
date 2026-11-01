@@ -142,11 +142,19 @@ const RESET_VALUE: u8 = 0x06;
 
 /// FADT revision 6.0 (276 bytes). No SMI_CMD and no ACPI_ENABLE value: ACPI starts enabled, which
 /// is how Linux decides not to try the SMI handshake (`acpi_enable` only runs with SMI_CMD).
+///
+/// ACPI 6 5.2.9 allows only one of FIRMWARE_CTRL and X_FIRMWARE_CTRL to be non-zero; with both
+/// set ACPICA installs the FACS twice and Linux logs it twice. Like QEMU, the 32-bit field wins
+/// when the address fits.
 pub(super) fn fadt(dsdt: u64, facs: u64) -> Vec<u8> {
     let mut body = Vec::with_capacity(FADT_BODY_LENGTH);
     let dword = |body: &mut Vec<u8>, value: u32| body.extend_from_slice(&value.to_le_bytes());
     let word = |body: &mut Vec<u8>, value: u16| body.extend_from_slice(&value.to_le_bytes());
-    dword(&mut body, facs as u32);
+    let (firmware_ctrl, x_firmware_ctrl) = match u32::try_from(facs) {
+        Ok(low) => (low, 0),
+        Err(_) => (0, facs),
+    };
+    dword(&mut body, firmware_ctrl);
     dword(&mut body, dsdt as u32);
     body.push(0); // reserved (was INT_MODEL)
     body.push(0); // preferred PM profile: unspecified
@@ -194,7 +202,7 @@ pub(super) fn fadt(dsdt: u64, facs: u64) -> Vec<u8> {
     body.push(RESET_VALUE);
     word(&mut body, 0); // ARM_BOOT_ARCH
     body.push(FADT_MINOR_VERSION);
-    body.extend_from_slice(&facs.to_le_bytes()); // X_FIRMWARE_CTRL
+    body.extend_from_slice(&x_firmware_ctrl.to_le_bytes());
     body.extend_from_slice(&dsdt.to_le_bytes()); // X_DSDT
     let pm_register =
         |base: u16, length: u8| generic_address(GAS_SYSTEM_IO, length * BITS_PER_BYTE, base as u64);

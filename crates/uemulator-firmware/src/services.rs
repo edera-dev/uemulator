@@ -130,5 +130,5 @@ fn install_acpi_and_smbios(handoff: &Handoff) {
         tables::install_configuration(guids::ACPI_20_TABLE, rsdp);
         tables::install_configuration(guids::ACPI_10_TABLE, rsdp);
     }
-    smbios::install();
+    smbios::install(handoff);
 }

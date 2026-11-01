@@ -18,6 +18,7 @@ mod handoff;
 mod keys;
 mod load_option;
 mod memory_map;
+mod mtrr;
 mod pe;
 mod smbios;
 mod sync;
@@ -47,6 +48,8 @@ mod kv;
 mod memory;
 #[cfg(target_os = "none")]
 mod pci;
+#[cfg(target_os = "none")]
+mod processors;
 #[cfg(target_os = "none")]
 mod protocols;
 #[cfg(target_os = "none")]
@@ -117,6 +120,8 @@ extern "C" fn firmware_main(handoff: *const u8) -> ! {
     serial::trace!("handoff read");
     cpu::init();
     serial::trace!("idt installed");
+    mtrr::init(&handoff);
+    serial::trace!("mtrrs programmed");
     memory::init(&handoff);
     serial::trace!("memory ready");
     time::init(&handoff);

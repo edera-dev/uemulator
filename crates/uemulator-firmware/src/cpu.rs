@@ -34,6 +34,74 @@ pub fn rdtsc() -> u64 {
     (high as u64) << 32 | low as u64
 }
 
+pub fn cpuid(leaf: u32, subleaf: u32) -> [u32; 4] {
+    let result = core::arch::x86_64::__cpuid_count(leaf, subleaf);
+    [result.eax, result.ebx, result.ecx, result.edx]
+}
+
+pub fn rdmsr(msr: u32) -> u64 {
+    let (low, high): (u32, u32);
+    unsafe {
+        asm!("rdmsr", in("ecx") msr, out("eax") low, out("edx") high, options(nomem, nostack))
+    }
+    (high as u64) << 32 | low as u64
+}
+
+pub fn wrmsr(msr: u32, value: u64) {
+    unsafe {
+        asm!(
+            "wrmsr",
+            in("ecx") msr,
+            in("eax") value as u32,
+            in("edx") (value >> 32) as u32,
+            options(nomem, nostack),
+        )
+    }
+}
+
+const CPUID_SIGNATURE: u32 = 1;
+const CPUID_BRAND_FIRST: u32 = 0x8000_0002;
+const CPUID_BRAND_LEAVES: u32 = 3;
+/// ECX bits 7:0: logical processors in the package minus one (AMD APM vol. 3, CPUID Fn8000_0008).
+const CPUID_ADDRESS_SIZES: u32 = 0x8000_0008;
+const LOGICAL_PROCESSORS_MINUS_ONE_MASK: u32 = 0xff;
+/// EBX bits 15:8: threads per core minus one (CPUID Fn8000_001E).
+const CPUID_EXTENDED_APIC_ID: u32 = 0x8000_001e;
+const THREADS_PER_CORE_SHIFT: u32 = 8;
+const THREADS_PER_CORE_MASK: u32 = 0xff;
+const HZ_PER_MHZ: u64 = 1_000_000;
+
+/// Logical processors in the package, from CPUID: the library starts every vCPU it has, and
+/// they all sit in the one package it reports.
+pub fn logical_processors() -> u32 {
+    (cpuid(CPUID_ADDRESS_SIZES, 0)[2] & LOGICAL_PROCESSORS_MINUS_ONE_MASK) + 1
+}
+
+/// The processor structure's contents, from CPUID and the TSC rate (which is the clock the
+/// guest sees: the library's TSC counts at `tsc_hz`).
+pub fn smbios_processor(tsc_hz: u64) -> crate::smbios::Processor {
+    let [signature, _, _, feature_edx] = cpuid(CPUID_SIGNATURE, 0);
+    let mut brand = [0u8; 48];
+    for leaf in 0..CPUID_BRAND_LEAVES {
+        for (index, word) in cpuid(CPUID_BRAND_FIRST + leaf, 0).into_iter().enumerate() {
+            let at = leaf as usize * 16 + index * 4;
+            brand[at..at + 4].copy_from_slice(&word.to_le_bytes());
+        }
+    }
+    let threads = logical_processors();
+    let threads_per_core = ((cpuid(CPUID_EXTENDED_APIC_ID, 0)[1] >> THREADS_PER_CORE_SHIFT)
+        & THREADS_PER_CORE_MASK)
+        + 1;
+    crate::smbios::Processor {
+        signature,
+        feature_edx,
+        brand,
+        cores: (threads / threads_per_core).max(1) as u16,
+        threads: threads as u16,
+        mhz: (tsc_hz / HZ_PER_MHZ).min(u16::MAX as u64) as u16,
+    }
+}
+
 pub fn halt_forever() -> ! {
     loop {
         unsafe { asm!("cli; hlt", options(nomem, nostack)) }

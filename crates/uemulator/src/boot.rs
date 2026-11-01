@@ -11,7 +11,8 @@ pub(crate) const KERNEL_LOAD: u64 = 0x100_0000;
 
 // The low-memory layout. Everything here sits inside the first e820 usable range (below
 // `LOW_RAM_END`) and the ranges must not overlap: GDT 0x6000..0x6020, boot_params
-// 0x7000..0x8000, page tables 0x9000..0x10000, command line from 0x20000.
+// 0x7000..0x8000, page tables 0x9000..0x10000, command line from 0x20000. The UEFI firmware runs
+// its application-processor start-up stub from 0x8000..0x9000 (`processors.rs` there).
 const GDT_ADDR: u64 = 0x6000;
 const BOOT_PARAMS: u64 = 0x7000;
 const PML4: u64 = 0x9000;

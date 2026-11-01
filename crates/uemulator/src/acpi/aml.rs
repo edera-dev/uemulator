@@ -15,8 +15,25 @@ const OP_QWORD_PREFIX: u8 = 0x0e;
 const OP_SCOPE: u8 = 0x10;
 const OP_BUFFER: u8 = 0x11;
 const OP_PACKAGE: u8 = 0x12;
+const OP_METHOD: u8 = 0x14;
 const OP_EXTENDED_PREFIX: u8 = 0x5b;
+const OP_LOCAL0: u8 = 0x60;
+const OP_ARG0: u8 = 0x68;
+const OP_STORE: u8 = 0x70;
+const OP_AND: u8 = 0x7b;
+const OP_OR: u8 = 0x7d;
 const OP_DEVICE: u8 = 0x82;
+const OP_CREATE_DWORD_FIELD: u8 = 0x8a;
+const OP_LNOT: u8 = 0x92;
+const OP_LEQUAL: u8 = 0x93;
+const OP_IF: u8 = 0xa0;
+const OP_ELSE: u8 = 0xa1;
+const OP_RETURN: u8 = 0xa4;
+/// Arg0..Arg6 and Local0..Local7 are consecutive opcodes.
+const ARG_COUNT: u8 = 7;
+const LOCAL_COUNT: u8 = 8;
+/// MethodFlags: bits 2:0 the argument count, bit 3 serialized (left clear).
+const METHOD_ARG_COUNT_MASK: u8 = 0b111;
 const ROOT_PREFIX: u8 = b'\\';
 const PARENT_PREFIX: u8 = b'^';
 const DUAL_NAME_PREFIX: u8 = 0x2e;
@@ -142,6 +159,107 @@ pub(crate) fn buffer(bytes: &[u8]) -> Vec<u8> {
     let mut content = integer(bytes.len() as u64);
     content.extend_from_slice(bytes);
     with_length(&[OP_BUFFER], None, &content)
+}
+
+/// `Method (name, args, NotSerialized) {body}`.
+pub(crate) fn method(name: &str, args: u8, body: &[u8]) -> Vec<u8> {
+    assert!(
+        args <= METHOD_ARG_COUNT_MASK,
+        "a method takes at most 7 arguments"
+    );
+    let mut content = name_string(name);
+    content.push(args);
+    content.extend_from_slice(body);
+    with_length(&[OP_METHOD], None, &content)
+}
+
+pub(crate) fn arg(index: u8) -> Vec<u8> {
+    assert!(index < ARG_COUNT);
+    vec![OP_ARG0 + index]
+}
+
+pub(crate) fn local(index: u8) -> Vec<u8> {
+    assert!(index < LOCAL_COUNT);
+    vec![OP_LOCAL0 + index]
+}
+
+/// A reference to a named object.
+pub(crate) fn name_ref(path: &str) -> Vec<u8> {
+    name_string(path)
+}
+
+fn concat(parts: &[&[u8]]) -> Vec<u8> {
+    parts.iter().flat_map(|part| part.iter().copied()).collect()
+}
+
+/// `If (predicate) {body}`.
+pub(crate) fn if_then(predicate: &[u8], body: &[u8]) -> Vec<u8> {
+    with_length(&[OP_IF], None, &concat(&[predicate, body]))
+}
+
+/// `Else {body}`, directly after an `If`.
+pub(crate) fn else_then(body: &[u8]) -> Vec<u8> {
+    with_length(&[OP_ELSE], None, body)
+}
+
+pub(crate) fn logical_equal(left: &[u8], right: &[u8]) -> Vec<u8> {
+    concat(&[&[OP_LEQUAL], left, right])
+}
+
+pub(crate) fn logical_not(operand: &[u8]) -> Vec<u8> {
+    concat(&[&[OP_LNOT], operand])
+}
+
+pub(crate) fn store(source: &[u8], destination: &[u8]) -> Vec<u8> {
+    concat(&[&[OP_STORE], source, destination])
+}
+
+/// `And (left, right, target)`.
+pub(crate) fn and(left: &[u8], right: &[u8], target: &[u8]) -> Vec<u8> {
+    concat(&[&[OP_AND], left, right, target])
+}
+
+/// `Or (left, right, target)`.
+pub(crate) fn or(left: &[u8], right: &[u8], target: &[u8]) -> Vec<u8> {
+    concat(&[&[OP_OR], left, right, target])
+}
+
+/// `CreateDWordField (source, byte_index, name)`.
+pub(crate) fn create_dword_field(source: &[u8], byte_index: u64, name: &str) -> Vec<u8> {
+    concat(&[
+        &[OP_CREATE_DWORD_FIELD],
+        source,
+        &integer(byte_index),
+        &name_string(name),
+    ])
+}
+
+pub(crate) fn return_value(value: &[u8]) -> Vec<u8> {
+    concat(&[&[OP_RETURN], value])
+}
+
+/// `ToUUID ("aabbccdd-eeff-gghh-iijj-kkllmmnnoopp")`: a 16-byte buffer with the first three
+/// fields little endian and the last two in string order (ACPI 6.5 19.6.142).
+pub(crate) fn uuid(text: &str) -> Vec<u8> {
+    let fields: Vec<&str> = text.split('-').collect();
+    assert!(
+        fields.iter().map(|field| field.len()).eq([8, 4, 4, 4, 12]),
+        "malformed UUID {text}"
+    );
+    let hex = |digits: &str| -> Vec<u8> {
+        (0..digits.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&digits[at..at + 2], 16).expect("UUID is hex"))
+            .collect()
+    };
+    let mut bytes = Vec::new();
+    for field in &fields[..3] {
+        bytes.extend(hex(field).into_iter().rev());
+    }
+    for field in &fields[3..] {
+        bytes.extend(hex(field));
+    }
+    buffer(&bytes)
 }
 
 /// `EisaId ("PNP0A08")`: manufacturer letters packed into 15 bits and byte-swapped, then the
@@ -305,6 +423,52 @@ mod tests {
         assert_eq!(&encoded[..2], [0x5b, 0x82]);
         assert_eq!(encoded[2] as usize, encoded.len() - 2);
         assert_eq!(&encoded[3..7], b"PCI0");
+    }
+
+    #[test]
+    fn uuid_matches_the_bytes_iasl_emits_for_the_pci_host_bridge_uuid() {
+        let encoded = uuid("33DB4D5B-1FF7-401C-9657-7441C03DD766");
+        assert_eq!(&encoded[..3], [0x11, 0x13, 0x0a]);
+        assert_eq!(encoded[3], 16);
+        assert_eq!(
+            &encoded[4..],
+            [
+                0x5b, 0x4d, 0xdb, 0x33, 0xf7, 0x1f, 0x1c, 0x40, 0x96, 0x57, 0x74, 0x41, 0xc0, 0x3d,
+                0xd7, 0x66
+            ]
+        );
+    }
+
+    #[test]
+    fn method_and_control_flow_encode_like_iasl() {
+        // Method (_OSC, 4, NotSerialized) { Return (Arg3) }
+        let encoded = method("_OSC", 4, &return_value(&arg(3)));
+        assert_eq!(
+            encoded,
+            [0x14, 0x08, b'_', b'O', b'S', b'C', 0x04, 0xa4, 0x6b]
+        );
+        // If (LNot (LEqual (Arg1, One))) { Or (CDW1, 0x08, CDW1) }
+        let body = or(&name_ref("CDW1"), &integer(8), &name_ref("CDW1"));
+        let encoded = if_then(&logical_not(&logical_equal(&arg(1), &integer(1))), &body);
+        assert_eq!(
+            encoded,
+            [
+                0xa0, 0x10, 0x92, 0x93, 0x69, 0x01, 0x7d, b'C', b'D', b'W', b'1', 0x0a, 0x08, b'C',
+                b'D', b'W', b'1'
+            ]
+        );
+        assert_eq!(
+            else_then(&store(&local(0), &name_ref("CDW3")))[..4],
+            [0xa1, 0x07, 0x70, 0x60]
+        );
+        assert_eq!(
+            create_dword_field(&arg(3), 4, "CDW2"),
+            [0x8a, 0x6b, 0x0a, 0x04, b'C', b'D', b'W', b'2']
+        );
+        assert_eq!(
+            and(&local(0), &integer(0x1f), &local(0)),
+            [0x7b, 0x60, 0x0a, 0x1f, 0x60]
+        );
     }
 
     #[test]

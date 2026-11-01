@@ -33,8 +33,8 @@ fn next(state: &mut [u64; 4]) -> u64 {
 
 pub fn init(handoff: &Handoff) {
     let state = STATE.get();
-    for (word, chunk) in state.iter_mut().zip(handoff.random_seed.chunks_exact(8)) {
-        *word = u64::from_le_bytes(chunk.try_into().unwrap());
+    for (word, chunk) in state.iter_mut().zip(handoff.random_seed.as_chunks::<8>().0) {
+        *word = u64::from_le_bytes(*chunk);
     }
     // An all-zero state is the one fixed point of the generator.
     state[0] |= 1;

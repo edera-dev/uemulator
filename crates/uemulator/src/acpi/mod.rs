@@ -27,6 +27,8 @@ pub(crate) const REGION_BYTES: u64 = 0x1_0000;
 /// The ECAM window of bus 0, which `boot` reports as reserved in e820 as well.
 pub(crate) const ECAM_RANGE: (u64, u64) = (ECAM_BASE, ECAM_BYTES_PER_BUS);
 const TABLE_ALIGNMENT: usize = 16;
+/// ACPI 6 5.2.10: the FACS must sit on a 64-byte boundary.
+const FACS_ALIGNMENT: usize = 64;
 const PCI_HOST_BRIDGE_DEVFN: u16 = 0;
 const PCI_SLOT_SHIFT: u32 = 3;
 const FIRST_VIRTIO_SLOT: u16 = 1;
@@ -53,14 +55,19 @@ impl Default for AcpiConfig {
     }
 }
 
-/// Appends 16-byte aligned blobs to the region image and reports their guest addresses.
+/// Appends aligned blobs to the region image and reports their guest addresses. `REGION_BASE`
+/// is page aligned, so an offset alignment is an address alignment.
 struct Region {
     image: Vec<u8>,
 }
 
 impl Region {
     fn place(&mut self, bytes: &[u8]) -> u64 {
-        let padding = self.image.len().next_multiple_of(TABLE_ALIGNMENT) - self.image.len();
+        self.place_aligned(bytes, TABLE_ALIGNMENT)
+    }
+
+    fn place_aligned(&mut self, bytes: &[u8], alignment: usize) -> u64 {
+        let padding = self.image.len().next_multiple_of(alignment) - self.image.len();
         self.image.resize(self.image.len() + padding, 0);
         let address = REGION_BASE + self.image.len() as u64;
         self.image.extend_from_slice(bytes);
@@ -102,7 +109,7 @@ pub(crate) fn build(config: &AcpiConfig) -> Result<Vec<u8>, Error> {
     let mut region = Region {
         image: vec![0; tables::RSDP_LENGTH],
     };
-    let facs = region.place(&tables::facs());
+    let facs = region.place_aligned(&tables::facs(), FACS_ALIGNMENT);
     let dsdt = region.place(&dsdt::dsdt(&pci_interrupt_gsis(config.pci_functions)));
     let fadt = region.place(&tables::fadt(dsdt, facs));
     // Level-triggered ISA lines: the PCI functions' and the SCI.

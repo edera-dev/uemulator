@@ -176,11 +176,10 @@ fn fadt_describes_the_pm_blocks_reset_register_and_starts_acpi_enabled() {
     assert_eq!(fadt[128], 6);
     // The extended addresses agree with the legacy ones.
     assert_eq!(u64_at(fadt, 140), u32_at(fadt, 40) as u64, "X_DSDT");
-    assert_eq!(
-        u64_at(fadt, 132),
-        u32_at(fadt, 36) as u64,
-        "X_FIRMWARE_CTRL"
-    );
+    // ACPI 6 5.2.9: at most one of FIRMWARE_CTRL and X_FIRMWARE_CTRL is non-zero (Linux installs
+    // and prints the FACS once per field otherwise). The FACS is below 4 GiB, so the 32-bit one.
+    assert_ne!(u32_at(fadt, 36), 0, "FIRMWARE_CTRL");
+    assert_eq!(u64_at(fadt, 132), 0, "X_FIRMWARE_CTRL");
     assert_eq!(u64_at(fadt, 152), PM1_EVENT_BASE as u64);
     assert_eq!(u64_at(fadt, 176), PM1_CONTROL_BASE as u64);
     assert_eq!(u64_at(fadt, 212), PM_TIMER_BASE as u64);
@@ -193,7 +192,9 @@ fn fadt_points_at_a_dsdt_and_a_facs_that_exist() {
     let dsdt = table_at(&ram, u32_at(fadt, 40) as u64);
     assert_eq!(&dsdt[..4], b"DSDT");
     assert!(checksum_ok(dsdt));
-    let facs = &ram[u32_at(fadt, 36) as usize..][..64];
+    let facs_address = u32_at(fadt, 36) as usize;
+    assert_eq!(facs_address % 64, 0, "the FACS must be 64-byte aligned");
+    let facs = &ram[facs_address..][..64];
     assert_eq!(&facs[..4], b"FACS");
     assert_eq!(u32_at(facs, 4), 64);
 }
@@ -382,6 +383,13 @@ fn walk(bytes: &[u8], mut at: usize, end: usize, scope: &str, names: &mut Vec<St
                 names.push(format!("{scope}.{name}"));
                 at += 1 + length + data_length(bytes, at + 1 + length);
             }
+            // A method's body is code, not namespace: record the name and skip it.
+            0x14 => {
+                let (length, prefix) = package_length(bytes, at + 1);
+                let name_at = at + 1 + prefix;
+                names.push(format!("{scope}.{}", segment(name_at)));
+                at += 1 + length;
+            }
             0x10 | 0x5b => {
                 let device = bytes[at] == 0x5b;
                 assert!(!device || bytes[at + 1] == 0x82, "only Device is used");
@@ -429,6 +437,7 @@ fn dsdt_is_structurally_valid_aml_with_the_expected_namespace() {
         "._SB_.PCI0._UID",
         "._SB_.PCI0._CRS",
         "._SB_.PCI0._PRT",
+        "._SB_.PCI0._OSC",
         "._SB_.COM1",
         "._SB_.COM1._HID",
         "._SB_.COM1._CRS",
@@ -491,4 +500,31 @@ fn install_rejects_ram_too_small_for_the_region() {
         install(&mut ram, &config(1, 0, false)),
         Err(Error::BadConfig(_))
     ));
+}
+
+#[test]
+fn pci_root_bridge_osc_takes_four_arguments_and_grants_what_q35_grants() {
+    let ram = ram_with_tables(&config(1, 0, false));
+    let fadt = find(&ram, "FACP");
+    let dsdt = table_at(&ram, u32_at(fadt, 40) as u64);
+    let at = dsdt.windows(4).position(|w| w == b"_OSC").unwrap();
+    // Method opcode, then a two-byte PkgLength (the body is longer than 63 bytes), then the name.
+    assert_eq!(dsdt[at - 3], 0x14, "a method");
+    let (length, prefix) = package_length(dsdt, at - 2);
+    assert_eq!(prefix, 2);
+    let method = &dsdt[at - 3..at - 2 + length];
+    // Not serialized, four arguments; the PCI host bridge UUID; And (Local0, 0x1F, Local0); the
+    // whole Arg3 buffer comes back.
+    assert_eq!(dsdt[at + 4], 4);
+    let uuid = [
+        0x5b, 0x4d, 0xdb, 0x33, 0xf7, 0x1f, 0x1c, 0x40, 0x96, 0x57, 0x74, 0x41, 0xc0, 0x3d, 0xd7,
+        0x66,
+    ];
+    assert!(method.windows(16).any(|w| w == uuid));
+    assert!(
+        method
+            .windows(5)
+            .any(|w| w == [0x7b, 0x60, 0x0a, 0x1f, 0x60])
+    );
+    assert!(method.ends_with(&[0xa4, 0x6b]));
 }

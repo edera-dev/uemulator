@@ -1021,6 +1021,8 @@ impl Devices {
 
 #[cfg(test)]
 mod smp_tests;
+#[cfg(test)]
+mod tsc_calibration_tests;
 
 #[cfg(test)]
 mod tests {
