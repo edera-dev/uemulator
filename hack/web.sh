@@ -6,6 +6,10 @@
 #   hack/web.sh          build only
 #   hack/web.sh serve    build, then serve
 #
+# WEB_DEMO=1 also builds the demo machine (hack/web/demo.py: Alpine's kernel and minirootfs, pinned
+# and downloaded once into target/web-demo-cache) into demo/, which puts the page in demo mode: one
+# button that boots it. The Pages workflow sets it.
+#
 # Kernel and initramfs: pick files on the page, or run `uemulator quick create alpine --install alpine`
 # once; that machine's netboot files are linked under assets/ and prefilled (UEMULATOR_MACHINE names
 # another Alpine machine). WEB_DISK=IMAGE links a disk image as assets/disk and prefills it; make
@@ -33,6 +37,10 @@ if [ -f "$cache/vmlinuz-virt" ] && [ -f "$cache/initramfs-virt" ]; then
     mkdir -p "$out/assets"
     ln -s "$cache/vmlinuz-virt" "$out/assets/vmlinuz-virt"
     ln -s "$cache/initramfs-virt" "$out/assets/initramfs-virt"
+fi
+
+if [ -n "$WEB_DEMO" ]; then
+    python3 hack/web/demo.py "$out/demo"
 fi
 
 if [ -n "$WEB_DISK" ]; then

@@ -17,6 +17,9 @@ function defaultCmdline({ serial, acpi }) {
 const DEFAULT_CMDLINE_EXTRA = "earlycon=uart8250,io,0x3f8";
 const BUILT_IN_FIRMWARE_URL = "uemulator-firmware.bin";
 const SETTINGS_KEY = "uemulator.settings.v1";
+// Present only when the site was built with WEB_DEMO=1 (hack/web/demo.py), as the Pages build is;
+// its file names are relative to it.
+const DEMO_URL = new URL("demo/demo.json", location.href);
 // isolate.js normally fixes this with a reload before anyone sees it.
 const NOT_ISOLATED = "page is not cross-origin isolated: serve it with hack/web.sh, or allow service workers";
 const FIRMWARE_LABELS = { uefi: "UEFI", none: "Direct kernel", bios: "BIOS", custom: "Firmware image" };
@@ -36,6 +39,9 @@ let clock = null;
 let step = 0;
 // "Boot again" only makes sense once something has booted.
 let hasRun = false;
+// demo.json when the site has one, and what Boot again repeats.
+let demo = null;
+let lastSettings = null;
 const steps = [...document.querySelectorAll(".wizard .step")];
 
 function setStatus(text, kind = "") {
@@ -95,10 +101,11 @@ function problemsWith(s) {
 }
 
 function summaryOf(s) {
-  const media = [s.kernel?.label, s.initrd?.label, s.disk && `disk ${s.disk.label}`].filter(Boolean).join(" + ");
+  const media = s.title ?? [s.kernel?.label, s.initrd?.label, s.disk && `disk ${s.disk.label}`].filter(Boolean).join(" + ");
   return [
+    s.title,
     FIRMWARE_LABELS[s.firmware] + (s.firmwareImage ? ` (${s.firmwareImage.label})` : ""),
-    media || "no media",
+    s.title ? null : media || "no media",
     `${s.memoryMib} MiB`,
     `${s.cpus} vCPU${s.cpus > 1 ? "s" : ""}`,
     s.jit ? "JIT" : "interpreter",
@@ -180,8 +187,35 @@ function render() {
   }));
   $("problems").hidden = problems.length === 0;
   $("problems").replaceChildren(...problems.map(({ text }) => Object.assign(document.createElement("li"), { textContent: text })));
-  $("summary").textContent = summaryOf(s);
+  // The bar describes what Launch would boot while the wizard is open, else what last ran.
+  if (!$("wizard").hidden) $("summary").textContent = summaryOf(s);
   saveSettings();
+}
+
+// The same shape as readSettings, for demo.json's machine; the wizard's fields are left alone.
+function demoSettings(d) {
+  const at = (name) => ({ url: new URL(name, DEMO_URL).href, label: name });
+  const s = {
+    title: d.name,
+    firmware: d.firmware,
+    usesKernel: true,
+    firmwareImage: null,
+    kernel: at(d.kernel),
+    initrd: at(d.initrd),
+    disk: null,
+    extra: d.args ?? "",
+    replaceCmdline: false,
+    serial: d.console === "serial",
+    memoryMib: d.memoryMib,
+    cpus: 1,
+    jit: true,
+    acpi: true,
+    iommu: false,
+    rng: true,
+    reboot: true,
+  };
+  s.cmdline = [defaultCmdline(s), s.extra].filter(Boolean).join(" ");
+  return s;
 }
 
 function go(index) {
@@ -191,13 +225,24 @@ function go(index) {
   steps[step].querySelector("input:not([type=radio]):not([disabled]), select:not([disabled]), input[type=radio]:checked")?.focus({ preventScroll: true });
 }
 
-function showWizard(show) {
-  $("wizard").hidden = !show;
-  if (show) render();
-  else {
+// What sits over the terminal: "demo", "wizard" or nothing.
+function showPanel(name) {
+  $("overlay").hidden = !name;
+  $("demo").hidden = name !== "demo";
+  $("wizard").hidden = name !== "wizard";
+  if (name === "wizard") render();
+  if (!name) {
     fit.fit();
     term.focus();
   }
+}
+
+// Closing the wizard goes back to the demo until something has run; after that, to the terminal,
+// with the bar describing what ran again (Boot again repeats it, not the wizard's edits).
+function closeWizard() {
+  showPanel(demo && !hasRun ? "demo" : null);
+  const shown = lastSettings ?? (demo && demoSettings(demo));
+  if (shown) $("summary").textContent = summaryOf(shown);
 }
 
 // Per-visitor convenience only: files cannot be remembered, and storage may be unavailable.
@@ -299,20 +344,21 @@ function finish(text, kind) {
   setRunning(false);
 }
 
-async function launch() {
+async function launch(s = readSettings()) {
   if (!crossOriginIsolated) {
     setStatus(NOT_ISOLATED, "error");
     return;
   }
-  const s = readSettings();
   const problems = problemsWith(s);
   if (problems.length) {
-    showWizard(true);
+    showPanel("wizard");
     go(problems[0].step);
     return;
   }
-  showWizard(false);
+  showPanel(null);
   hasRun = true;
+  lastSettings = s;
+  $("summary").textContent = summaryOf(s);
   starting = true;
   setRunning(true);
   term.reset();
@@ -387,13 +433,15 @@ for (const button of document.querySelectorAll("button[data-clear]")) {
 }
 $("back").onclick = () => go(step - 1);
 $("next").onclick = () => go(step + 1);
-$("launch").onclick = launch;
-$("relaunch").onclick = launch;
-$("configure").onclick = () => showWizard(true);
-$("wizard-close").onclick = () => showWizard(false);
+$("launch").onclick = () => launch();
+$("relaunch").onclick = () => launch(lastSettings ?? readSettings());
+$("configure").onclick = () => showPanel("wizard");
+$("wizard-close").onclick = closeWizard;
 $("wizard").addEventListener("keydown", (event) => {
-  if (event.key === "Escape") showWizard(false);
+  if (event.key === "Escape") closeWizard();
 });
+$("demo-boot").onclick = () => launch(demoSettings(demo));
+$("demo-custom").onclick = () => showPanel("wizard");
 $("stop").onclick = () => {
   if (control) Atomics.store(control, CTRL.STOP, 1);
 };
@@ -412,8 +460,23 @@ const probes = [["kernel-url", "assets/vmlinuz-virt"], ["initrd-url", "assets/in
     .catch(() => {}));
 Promise.all(probes).then(render);
 
+// Both panels start hidden so the page does not flash the wizard before the demo replaces it.
+const demoReady = fetch(DEMO_URL)
+  .then((response) => (response.ok ? response.json() : null))
+  .catch(() => null)
+  .then((found) => {
+    demo = found;
+    if (demo) {
+      $("demo-boot").textContent = `Boot ${demo.label}`;
+      $("demo-boot").title = `${demo.name}, ${Math.round(demo.bytes / 1e6)} MB download`;
+      $("summary").textContent = summaryOf(demoSettings(demo));
+    }
+    if (!hasRun) showPanel(demo ? "demo" : "wizard");
+  });
+
 if (!crossOriginIsolated) {
   setStatus(NOT_ISOLATED, "error");
 } else if (new URLSearchParams(location.search).has("autoboot")) {
-  Promise.all(probes).then(launch);
+  // In demo mode ?autoboot boots the demo; otherwise the wizard's settings.
+  Promise.all([...probes, demoReady]).then(() => launch(demo ? demoSettings(demo) : readSettings()));
 }

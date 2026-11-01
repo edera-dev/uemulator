@@ -3,7 +3,7 @@
 // and for checking the WebAssembly JIT against a real guest without a browser.
 //
 //   node hack/wasm/boot.mjs [--kernel K] [--initrd I] [--disk D] [--cmdline S] [--memory MiB]
-//                           [--firmware none|uefi|bios] [--cpus N] [--iommu] [--no-acpi]
+//                           [--firmware none|uefi|bios] [--cpus N] [--iommu] [--no-acpi] [--serial]
 //                           [--no-jit] [--until TEXT] [--seconds N]
 //
 // --disk is a raw or udisk image (a file, or an http(s) URL served with range requests) attached
@@ -31,6 +31,7 @@ const { values } = parseArgs({
     firmware: { type: "string", default: "none" },
     iommu: { type: "boolean", default: false },
     "no-acpi": { type: "boolean", default: false },
+    serial: { type: "boolean", default: false },
     wasm: { type: "string", default: new URL("../../target/web/uemulator_web.wasm", import.meta.url).pathname },
     "no-jit": { type: "boolean", default: false },
     until: { type: "string" },
@@ -152,7 +153,7 @@ if (wasm.uw_set_firmware(firmwareKind, upload(firmwareImage), firmwareImage.leng
 }
 const options =
   (values["no-jit"] ? 0 : OPTION.JIT) | (values["no-acpi"] ? 0 : OPTION.ACPI) |
-  (values.iommu ? OPTION.IOMMU : 0) | OPTION.RNG;
+  (values.iommu ? OPTION.IOMMU : 0) | (values.serial ? OPTION.SERIAL_CONSOLE : 0) | OPTION.RNG;
 const failed = wasm.uw_create(
   upload(kernel), kernel.length, upload(initrd), initrd.length, upload(cmdline), cmdline.length,
   Number(values.memory), Number(values.cpus), Math.floor(Date.now() / 1000), 80, 25, options,

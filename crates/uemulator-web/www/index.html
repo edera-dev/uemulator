@@ -93,6 +93,10 @@
   .problems { margin: 0; padding: 10px 14px 10px 30px; border: 1px solid var(--error); border-radius: 8px; color: var(--error); }
   .wizard > footer { display: flex; gap: 8px; align-items: center; padding: 12px 20px; border-top: 1px solid var(--line); }
   .wizard > footer .spacer { flex: 1; }
+  /* Demo mode (demo/demo.json exists, as on the Pages build): boot it, or open the wizard. */
+  .demo-card { max-width: 360px; margin-top: 12vh; }
+  .demo-body { padding: 16px 20px 20px; display: flex; flex-direction: column; gap: 10px; }
+  .demo-body button { padding: 8px 12px; }
 </style>
 </head>
 <body>
@@ -108,8 +112,15 @@
 </header>
 <main>
   <div id="terminal"></div>
-  <div id="wizard" class="overlay">
-    <section class="wizard" role="dialog" aria-modal="true" aria-labelledby="wizard-title">
+  <div id="overlay" class="overlay">
+    <section class="wizard demo-card" id="demo" role="dialog" aria-modal="true" aria-labelledby="demo-title" hidden>
+      <header><h2 id="demo-title">Start a machine</h2></header>
+      <div class="demo-body">
+        <button id="demo-boot" class="primary"></button>
+        <button id="demo-custom">Custom Machine</button>
+      </div>
+    </section>
+    <section class="wizard" id="wizard" role="dialog" aria-modal="true" aria-labelledby="wizard-title" hidden>
       <header>
         <h2 id="wizard-title">New machine</h2>
         <button id="wizard-close" class="icon-button" aria-label="Close settings" title="Close">×</button>
