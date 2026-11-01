@@ -1,0 +1,155 @@
+//! Where a backend that keeps guest registers in host registers or locals for the life of a block
+//! would have to write them back to `Cpu` or reload them: a fault after earlier instructions of
+//! the block wrote registers, an interpreted instruction between inline ones (it reads the written
+//! registers from `Cpu` and writes its own there), byte and word writes to registers the block has
+//! not touched yet, `push rsp`/`pop rsp`, a rotate by CL, a store that ends the block because it
+//! hit translated code, and successors that read what their predecessor wrote (linked exits and
+//! the chain stub). No backend caches registers today; these pin the behavior one would have to
+//! keep.
+//!
+//! Such a backend must also write registers back before the slow-path load and store helpers,
+//! not only before `helper_exec`, and must not write them back after one fails: a nested page
+//! fault in an SVM guest is a #VMEXIT taken inside the helper (`Cpu::vmexit`), which saves the
+//! guest's rsp and rax to the VMCB and loads the host's into `Cpu::gpr`. No case here covers
+//! that one.
+
+use super::diff_tests::*;
+
+/// The non-canonical addresses below fault with #GP(0), or #SS(0) for a stack access.
+const GENERAL_PROTECTION: u8 = 13;
+const STACK_FAULT: u8 = 12;
+
+#[test]
+fn a_faulting_load_sees_the_registers_written_before_it() {
+    // mov rax, 0x1111; mov ah, 0x55; inc r9; mov rdx, 0x8000000000000000; mov rcx, [rdx]; hlt
+    check_stop(
+        &[
+            0x48, 0xc7, 0xc0, 0x11, 0x11, 0x00, 0x00, 0xb4, 0x55, 0x49, 0xff, 0xc1, 0x48, 0xba,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x48, 0x8b, 0x0a, 0xf4,
+        ],
+        fault(GENERAL_PROTECTION, Some(0)),
+    );
+}
+
+#[test]
+fn a_faulting_store_sees_the_registers_written_before_it() {
+    // lea rbx, [rbx + 8]; mov bl, 0x7f; mov rdx, 0x8000000000000000; mov [rdx], rbx; hlt
+    check_stop(
+        &[
+            0x48, 0x8d, 0x5b, 0x08, 0xb3, 0x7f, 0x48, 0xba, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x80, 0x48, 0x89, 0x1a, 0xf4,
+        ],
+        fault(GENERAL_PROTECTION, Some(0)),
+    );
+}
+
+#[test]
+fn a_faulting_pop_leaves_rsp_and_the_earlier_writes() {
+    // mov rax, 5; add rbp, rax; mov rsp, 0x8000000000000000; pop rbx; hlt
+    check_stop(
+        &[
+            0x48, 0xc7, 0xc0, 0x05, 0x00, 0x00, 0x00, 0x48, 0x01, 0xc5, 0x48, 0xbc, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x5b, 0xf4,
+        ],
+        fault(STACK_FAULT, Some(0)),
+    );
+}
+
+#[test]
+fn an_interpreted_instruction_reads_and_writes_registers_between_inline_ones() {
+    // mov rax, 3; mov rcx, 5; mul rcx; add rax, rdx; lea rbx, [rax + rcx]; mov r8, rdx; hlt
+    check(&[
+        0x48, 0xc7, 0xc0, 0x03, 0x00, 0x00, 0x00, 0x48, 0xc7, 0xc1, 0x05, 0x00, 0x00, 0x00, 0x48,
+        0xf7, 0xe1, 0x48, 0x01, 0xd0, 0x48, 0x8d, 0x1c, 0x08, 0x49, 0x89, 0xd0, 0xf4,
+    ]);
+}
+
+#[test]
+fn a_fault_after_an_interpreted_instruction_keeps_what_it_wrote() {
+    // mov rax, 3; mov rcx, 5; mul rcx; mov rdx, 0x8000000000000000; add rax, [rdx]; hlt
+    check_stop(
+        &[
+            0x48, 0xc7, 0xc0, 0x03, 0x00, 0x00, 0x00, 0x48, 0xc7, 0xc1, 0x05, 0x00, 0x00, 0x00,
+            0x48, 0xf7, 0xe1, 0x48, 0xba, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x48,
+            0x03, 0x02, 0xf4,
+        ],
+        fault(GENERAL_PROTECTION, Some(0)),
+    );
+}
+
+#[test]
+fn byte_and_word_writes_to_untouched_registers_keep_the_other_bits() {
+    // mov al, 0x12; mov ah, 0x34; mov bx, 0x5678; mov ch, dl; add dh, al; mov dl, ah; inc si; hlt
+    check(&[
+        0xb0, 0x12, 0xb4, 0x34, 0x66, 0xbb, 0x78, 0x56, 0x88, 0xd5, 0x00, 0xc6, 0x88, 0xe2, 0x66,
+        0xff, 0xc6, 0xf4,
+    ]);
+}
+
+#[test]
+fn byte_writes_merge_into_registers_written_in_full() {
+    // mov rax, -1; mov ah, 0x12; mov ecx, eax; mov cl, 0x80; mov rdx, rcx; sub dh, ah; hlt
+    check(&[
+        0x48, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff, 0xb4, 0x12, 0x89, 0xc1, 0xb1, 0x80, 0x48, 0x89,
+        0xca, 0x28, 0xe6, 0xf4,
+    ]);
+}
+
+#[test]
+fn push_rsp_pushes_the_old_value_and_pop_rsp_keeps_the_popped_one() {
+    // mov rax, rsp; push rsp; pop rbx; push rax; pop rsp; push rsp; pop rcx; hlt
+    check(&[0x48, 0x89, 0xe0, 0x54, 0x5b, 0x50, 0x5c, 0x54, 0x59, 0xf4]);
+    // lea rax, [rsp - 64]; push rax; pop rsp; mov rbx, rsp; hlt
+    check(&[
+        0x48, 0x8d, 0x44, 0x24, 0xc0, 0x50, 0x5c, 0x48, 0x89, 0xe3, 0xf4,
+    ]);
+}
+
+#[test]
+fn a_rotate_by_cl_reads_the_count_just_written() {
+    // mov ecx, 5; rol eax, cl; ror rdx, cl; add rax, rdx; mov ecx, 33; rol esi, cl;
+    // rol rdi, cl; sub rsi, rdi; hlt
+    check(&[
+        0xb9, 0x05, 0x00, 0x00, 0x00, 0xd3, 0xc0, 0x48, 0xd3, 0xca, 0x48, 0x01, 0xd0, 0xb9, 0x21,
+        0x00, 0x00, 0x00, 0xd3, 0xc6, 0x48, 0xd3, 0xc7, 0x48, 0x29, 0xfe, 0xf4,
+    ]);
+}
+
+#[test]
+fn setcc_and_cmov_write_registers_the_block_holds() {
+    // mov eax, 1; cmp rax, rcx; setb ah; cmovae rdx, rax; seta bh; cmovb ebx, ecx; hlt
+    check(&[
+        0xb8, 0x01, 0x00, 0x00, 0x00, 0x48, 0x39, 0xc8, 0x0f, 0x92, 0xc4, 0x48, 0x0f, 0x43, 0xd0,
+        0x0f, 0x97, 0xc7, 0x0f, 0x42, 0xd9, 0xf4,
+    ]);
+}
+
+#[test]
+fn a_store_into_the_running_code_writes_the_registers_back_before_leaving() {
+    // inc rcx; lea rdx, [rip + target]; mov byte ptr [rdx], 0x90; target: inc rcx;
+    // add rcx, rcx; hlt
+    check(&[
+        0x48, 0xff, 0xc1, 0x48, 0x8d, 0x15, 0x03, 0x00, 0x00, 0x00, 0xc6, 0x02, 0x90, 0x48, 0xff,
+        0xc1, 0x48, 0x01, 0xc9, 0xf4,
+    ]);
+}
+
+#[test]
+fn a_loop_through_its_own_link_carries_the_registers() {
+    // mov ecx, 10; xor eax, eax; again: add rax, rcx; lea rbx, [rbx + rax]; dec ecx;
+    // jnz again; hlt
+    check(&[
+        0xb9, 0x0a, 0x00, 0x00, 0x00, 0x31, 0xc0, 0x48, 0x01, 0xc8, 0x48, 0x8d, 0x1c, 0x03, 0xff,
+        0xc9, 0x75, 0xf5, 0xf4,
+    ]);
+}
+
+#[test]
+fn chained_blocks_read_what_their_predecessor_wrote() {
+    // mov rbx, 1; jmp next; next: add rbx, rbx; call func; add rbx, rax; hlt;
+    // func: lea rax, [rbx + 7]; ret
+    check(&[
+        0x48, 0xc7, 0xc3, 0x01, 0x00, 0x00, 0x00, 0xeb, 0x00, 0x48, 0x01, 0xdb, 0xe8, 0x04, 0x00,
+        0x00, 0x00, 0x48, 0x01, 0xc3, 0xf4, 0x48, 0x8d, 0x43, 0x07, 0xc3,
+    ]);
+}

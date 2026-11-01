@@ -153,6 +153,8 @@ mod diff_mov;
 #[cfg(test)]
 mod diff_random;
 #[cfg(test)]
+mod diff_registers;
+#[cfg(test)]
 mod diff_smc;
 #[cfg(test)]
 mod diff_tests;
