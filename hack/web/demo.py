@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Builds the web page's demo machines into OUT (target/web/demo): Alpine's virt kernel, an
-initramfs made from Alpine's minirootfs with an /init that starts a shell on the console, Edera's
-Xen (xen.gz), and demo.json, which puts the page in demo mode: a button per machine, "Alpine
+initramfs made from Alpine's minirootfs with an /init that brings up the network the page's tabs
+share and starts a shell on the console, Edera's Xen (xen.gz), and demo.json, which puts the page in demo mode: a button per machine, "Alpine
 Linux" (the kernel and initramfs) and "Edera Xen" (the same pair as Xen's dom0). `WEB_DEMO=1
 hack/web.sh` runs it, and the Pages workflow sets that.
 
@@ -32,6 +32,17 @@ KERNEL = (f"{RELEASES}/netboot-{ALPINE_VERSION}/vmlinuz-virt",
           "17fbd3efd16f2e7cb1b945f06423b37399ba7d5ac8cdd3665e7f13f363500e85")
 ROOTFS = (f"{RELEASES}/alpine-minirootfs-{ALPINE_VERSION}-x86_64.tar.gz",
           "f8e1cafba9b1b283b5d30d06f9885c8d2bc161ffe9083ade8e2e157813a53407")
+# Only for the virtio-net driver and the packet sockets udhcpc needs, which the virt kernel
+# builds as modules: the minirootfs has none, the netboot initramfs has the ones a network boot
+# needs.
+NETBOOT_INITRAMFS = (f"{RELEASES}/netboot-{ALPINE_VERSION}/initramfs-virt",
+                     "41d55a3fd650c99f5fa2a9dfed1eff3b441186831fd4f8d2223f717d8a28217d")
+# In load order (modules.dep: virtio_net needs net_failover, which needs failover), below
+# usr/lib/modules/VERSION/ in the netboot initramfs.
+NET_MODULES = ["kernel/net/core/failover.ko", "kernel/drivers/net/net_failover.ko",
+               "kernel/drivers/net/virtio_net.ko", "kernel/net/packet/af_packet.ko"]
+# Where /init finds them in the demo's initramfs.
+NET_MODULE_DIR = "lib/modules/net"
 
 XEN_REF = os.path.join(os.path.dirname(os.path.abspath(__file__)), "demo-xen.ref")
 # Where Edera's image keeps them.
@@ -69,12 +80,28 @@ tty=$(cat /sys/class/tty/console/active)
 tty=${{tty##* }}
 exec <>"/dev/$tty" >&0 2>&1
 echo
+# The page's Network switch gives the machine a NIC on the segment this browser's tabs share
+# (docs/plans/13-web.md); one of the tabs answers DHCP. udhcpc gives up after about 10 s, which
+# only happens when no tab serves.
+for module in {" ".join(m.rsplit("/", 1)[1].removesuffix(".ko") for m in NET_MODULES)}; do
+    insmod /{NET_MODULE_DIR}/$module.ko 2>/dev/null
+done
+ip link set lo up
+network="No network."
+if ip link set eth0 up 2>/dev/null; then
+    if udhcpc -i eth0 -q -n -t 5 -T 2 >/dev/null 2>&1; then
+        address=$(ip -4 -o addr show eth0 | awk '{{print $4}}')
+        network="eth0 is $address on the network this browser's other tabs share: 'ping' or 'nc' their machines."
+    else
+        network="eth0 got no address from DHCP; 'udhcpc -i eth0' tries again."
+    fi
+fi
 echo "Alpine Linux {ALPINE_VERSION} on uemulator, running from RAM in your browser."
 if [ "$(cat /sys/hypervisor/type 2>/dev/null)" = xen ]; then
     v=/sys/hypervisor/version
     echo "It is the $(cat /sys/hypervisor/guest_type) dom0 of Xen $(cat $v/major).$(cat $v/minor)$(cat $v/extra); see 'dmesg' and /sys/hypervisor."
 fi
-echo "No network. 'poweroff -f' ends the machine."
+echo "$network 'poweroff -f' ends the machine."
 echo
 export HOME=/root
 cd /root
@@ -219,7 +246,40 @@ class Newc:
         return self.out.getvalue()
 
 
-def initramfs(rootfs_tar_gz):
+def newc_members(archive):
+    """(name, data) of every regular file in a newc archive, or several back to back."""
+    header_len = len(NEWC_MAGIC) + 13 * 8
+    offset = 0
+    while offset + header_len <= len(archive):
+        if archive[offset:offset + len(NEWC_MAGIC)] != NEWC_MAGIC:
+            # Zero padding between concatenated archives.
+            offset += CPIO_ALIGN
+            continue
+        start = offset + len(NEWC_MAGIC)
+        fields = [int(archive[start + 8 * i:start + 8 * (i + 1)], 16) for i in range(13)]
+        mode, file_size, name_size = fields[1], fields[6], fields[11]
+        name_at = offset + header_len
+        name = archive[name_at:name_at + name_size - 1].decode()
+        data_at = name_at + name_size + (-(name_at + name_size) % CPIO_ALIGN)
+        if stat.S_ISREG(mode):
+            yield name, archive[data_at:data_at + file_size]
+        offset = data_at + file_size + (-(data_at + file_size) % CPIO_ALIGN)
+
+
+def net_modules(netboot_initramfs_gz):
+    """{file name: bytes} of NET_MODULES from the netboot initramfs."""
+    found = {}
+    for name, data in newc_members(gzip.decompress(netboot_initramfs_gz)):
+        for module in NET_MODULES:
+            if re.fullmatch(rf"usr/lib/modules/[^/]+/{re.escape(module)}", name):
+                found[os.path.basename(module)] = data
+    missing = [m for m in NET_MODULES if os.path.basename(m) not in found]
+    if missing:
+        sys.exit(f"demo: the netboot initramfs has no {', '.join(missing)}")
+    return found
+
+
+def initramfs(rootfs_tar_gz, modules):
     archive = Newc()
     with tarfile.open(fileobj=io.BytesIO(rootfs_tar_gz), mode="r:gz") as tar:
         for member in tar:
@@ -235,6 +295,13 @@ def initramfs(rootfs_tar_gz):
                 archive.add(name, stat.S_IFLNK | 0o777, member.linkname.encode())
             else:
                 sys.exit(f"demo: {member.name} in the minirootfs is neither a file, directory nor symlink")
+    # The kernel creates no missing parent directories while it unpacks.
+    parent = ""
+    for part in NET_MODULE_DIR.split("/"):
+        parent = f"{parent}/{part}" if parent else part
+        archive.add(parent, stat.S_IFDIR | 0o755)
+    for name, data in modules.items():
+        archive.add(f"{NET_MODULE_DIR}/{name}", stat.S_IFREG | 0o644, data)
     # Where the kernel opens PID 1's first stdin/stdout, before devtmpfs is mounted over /dev.
     archive.add("dev/console", stat.S_IFCHR | 0o600, rdev=(CONSOLE_MAJOR, CONSOLE_MINOR))
     archive.add("init", stat.S_IFREG | 0o755, INIT.encode())
@@ -251,8 +318,9 @@ def main():
 
     kernel = fetch(*KERNEL, args.cache)
     rootfs = fetch(*ROOTFS, args.cache)
+    modules = net_modules(fetch(*NETBOOT_INITRAMFS, args.cache))
     xen, xen_version = fetch_xen(args.cache)
-    files = {"vmlinuz-virt": kernel, "initramfs.gz": initramfs(rootfs), "xen.gz": xen}
+    files = {"vmlinuz-virt": kernel, "initramfs.gz": initramfs(rootfs, modules), "xen.gz": xen}
     for name, data in files.items():
         with open(os.path.join(args.out, name), "wb") as out:
             out.write(data)

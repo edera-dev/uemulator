@@ -1,9 +1,12 @@
 // Runs the emulator. `uw_run` blocks until the guest exits, so it lives here and not on the page.
 // While it runs this worker cannot receive messages: keystrokes, screen input, resizes, frame
-// acknowledgements and the stop request come through the SharedArrayBuffer `control` that main.js
-// shares with us (layout in protocol.js).
-import { CTRL, EVENT_OFFSET, EVENT_RECORDS, EVENT_WORDS, RING_BYTES, RING_OFFSET } from "./protocol.js";
+// acknowledgements, the stop request and the frames from other tabs come through the
+// SharedArrayBuffer `control` that main.js shares with us (layout in protocol.js).
+import {
+  CTRL, EVENT_OFFSET, EVENT_RECORDS, EVENT_WORDS, NET_OFFSET, NET_RING_BYTES, RING_BYTES, RING_OFFSET,
+} from "./protocol.js";
 import { createJitHost } from "./jit_host.js";
+import { createSegmentSender, netRingHasFrames, takeFrame } from "./segment.js";
 
 const OUTPUT_FLUSH_MS = 16;
 const OUTPUT_FLUSH_BYTES = 1 << 16;
@@ -16,6 +19,9 @@ let control;
 const diskSources = [];
 let ring;
 let events;
+let netRing;
+// Posts the guest's frames to the other tabs; only with a network (`uw_set_network`).
+let segment = null;
 let outputChunks = [];
 let outputBytes = 0;
 let lastFlush = 0;
@@ -85,7 +91,7 @@ const host = {
     flushOutput();
     const head = Atomics.load(control, CTRL.HEAD);
     const noEvents = Atomics.load(control, CTRL.EVENT_HEAD) === Atomics.load(control, CTRL.EVENT_TAIL);
-    if (head === Atomics.load(control, CTRL.TAIL) && noEvents) {
+    if (head === Atomics.load(control, CTRL.TAIL) && noEvents && !netRingHasFrames(control)) {
       Atomics.wait(control, CTRL.HEAD, head, IDLE_WAIT_MS);
     }
   },
@@ -102,6 +108,25 @@ const host = {
     }
     Atomics.store(control, CTRL.EVENT_TAIL, tail);
     return count;
+  },
+  host_net_recv(ptr, capacity, fromPtr) {
+    const frame = takeFrame(control, netRing, memoryBytes(ptr, capacity));
+    if (!frame) return 0;
+    // `fromPtr` points at a Rust `u32`, so it is 4-aligned.
+    new Uint32Array(wasm.memory.buffer, address(fromPtr), 1)[0] = frame.from;
+    return frame.length;
+  },
+  host_net_send(ptr, len, destination, tab) {
+    segment.queue(destination, tab >>> 0, memoryBytes(ptr, len).slice());
+  },
+  host_net_flush() {
+    segment.flush();
+  },
+  host_net_serving() {
+    return Atomics.load(control, CTRL.NET_SERVING);
+  },
+  host_net_status(address, peers, serving) {
+    postMessage({ type: "network", address: address >>> 0, peers, serving: serving !== 0 });
   },
   host_frame_ready() {
     return Atomics.load(control, CTRL.FRAME_ACK);
@@ -193,6 +218,7 @@ async function boot(message) {
   control = new Int32Array(message.control, 0, RING_OFFSET / 4);
   ring = new Uint8Array(message.control, RING_OFFSET, RING_BYTES);
   events = new Int32Array(message.control, EVENT_OFFSET, EVENT_RECORDS * EVENT_WORDS);
+  netRing = new Uint8Array(message.control, NET_OFFSET, NET_RING_BYTES);
   const response = await fetch(new URL("uemulator_web.wasm", import.meta.url));
   const { instance } = await WebAssembly.instantiate(await response.arrayBuffer(), { host });
   wasm = instance.exports;
@@ -212,6 +238,14 @@ async function boot(message) {
     wasm.uw_set_hypervisor(
       upload(hypervisor), hypervisor.length, upload(hypervisorCmdline), hypervisorCmdline.length,
     );
+  }
+  if (message.network) {
+    const mac = new Uint8Array(message.network.mac);
+    if (wasm.uw_set_network(upload(mac), mac.length, message.network.tab)) {
+      postMessage({ type: "exit", code: -2, message: `network: ${lastError()}` });
+      return;
+    }
+    segment = createSegmentSender(message.network.tab);
   }
   const kernelPtr = upload(kernel);
   const initrdPtr = upload(initrd);
