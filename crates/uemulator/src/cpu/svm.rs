@@ -296,6 +296,37 @@ impl Svm {
     }
 }
 
+/// Where `exit_histogram_key` puts the detail (port and direction) above the exit code.
+const EXIT_KEY_DETAIL_SHIFT: u32 = 32;
+
+/// The `--debug` exit histogram's key: the exit code, and for I/O exits also the port and the
+/// direction, which is what tells a calibration loop from device traffic.
+pub(crate) fn exit_histogram_key(code: u64, info1: u64) -> u64 {
+    if code == VMEXIT_IOIO {
+        let port_and_direction = (info1 >> IOIO_PORT_SHIFT) << 1 | (info1 & IOIO_IN);
+        code | port_and_direction << EXIT_KEY_DETAIL_SHIFT
+    } else {
+        code & u32::MAX as u64
+    }
+}
+
+pub(crate) fn exit_histogram_label(key: u64) -> String {
+    let code = key & u32::MAX as u64;
+    let detail = key >> EXIT_KEY_DETAIL_SHIFT;
+    match code {
+        VMEXIT_IOIO => format!(
+            "ioio port={:#x} {}",
+            detail >> 1,
+            if detail & 1 != 0 { "in" } else { "out" }
+        ),
+        VMEXIT_NPF => "npf".into(),
+        code if (VMEXIT_EXCEPTION..VMEXIT_INTR).contains(&code) => {
+            format!("exception {}", code - VMEXIT_EXCEPTION)
+        }
+        code => format!("code={code:#x}"),
+    }
+}
+
 fn attrib_to_flags(attrib: u16) -> u32 {
     (((attrib & 0xff) as u32) << 8) | ((((attrib >> 8) & 0xf) as u32) << 20)
 }
@@ -592,6 +623,11 @@ impl Cpu {
         let guest = self.svm.guest.take().expect("vmexit outside a guest");
         let vmcb = guest.vmcb;
         self.svm.last_vmcb = vmcb;
+        if let Some(histogram) = self.svm_exit_histogram.as_mut() {
+            *histogram
+                .entry(exit_histogram_key(code, info1))
+                .or_default() += 1;
+        }
         if let (Some(log), Some(_)) = (&self.log, &self.trace) {
             log(&format!(
                 "svm: #VMEXIT {code:#x} info1={info1:#x} info2={info2:#x} rip={:#x} nrip={next_rip:#x} cs={:#x}:{:#x} flags={:#x} rax={:#x} cr0={:#x} cpl={}",
