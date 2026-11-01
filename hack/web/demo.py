@@ -47,8 +47,11 @@ GZIP_LAYER_TYPES = {
 }
 # Xen keeps the 16550 and passes dom0's console (hvc0) through it. Left to itself Xen gives dom0
 # a share of the memory that is too small for this initramfs at this size, so it is fixed.
+# `dom0=pvh-auto` (Edera's; upstream has only pv and pvh) builds a PVH dom0 when Xen has HVM and
+# an IOMMU and falls back to PV otherwise, so the machine has the IOMMU: without it, or with the
+# page's IOMMU switch turned off, the same demo still boots, as a PV dom0.
 XEN_MEMORY_MIB = 512
-XEN_ARGS = "console=com1 com1=115200,8n1 dom0_mem=384M,max:384M"
+XEN_ARGS = "console=com1 com1=115200,8n1 dom0_mem=384M,max:384M dom0=pvh-auto"
 
 # PID 1. The minirootfs has busybox but no OpenRC, so its own /sbin/init would fail on inittab.
 # The shell gets the console's real tty (the last entry of console/active: ttyS0 or hvc0) as its
@@ -69,7 +72,7 @@ echo
 echo "Alpine Linux {ALPINE_VERSION} on uemulator, running from RAM in your browser."
 if [ "$(cat /sys/hypervisor/type 2>/dev/null)" = xen ]; then
     v=/sys/hypervisor/version
-    echo "It is dom0 of Xen $(cat $v/major).$(cat $v/minor)$(cat $v/extra); see 'dmesg' and /sys/hypervisor."
+    echo "It is the $(cat /sys/hypervisor/guest_type) dom0 of Xen $(cat $v/major).$(cat $v/minor)$(cat $v/extra); see 'dmesg' and /sys/hypervisor."
 fi
 echo "No network. 'poweroff -f' ends the machine."
 echo
@@ -280,6 +283,7 @@ def main():
             "firmware": "uefi",
             "console": "serial",
             "memoryMib": XEN_MEMORY_MIB,
+            "iommu": True,
             "bytes": alpine_bytes + len(files["xen.gz"]),
         },
     ]
