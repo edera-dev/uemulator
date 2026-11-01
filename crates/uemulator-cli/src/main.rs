@@ -235,15 +235,6 @@ enum AdvancedCmd {
         /// Initial ramdisk
         #[arg(long)]
         initramfs: Option<PathBuf>,
-        /// A hypervisor to boot with the kernel as its dom0: Xen as xen.gz (or the uncompressed
-        /// xen), or Edera's xen.efi (an upstream xen.efi cannot take its kernel from the firmware;
-        /// give such a Xen as xen.gz). Needs the UEFI firmware; the console defaults to serial
-        /// (Xen owns the 16550 and gives dom0 hvc0), and --cmdline/--append are dom0's
-        #[arg(long)]
-        hypervisor: Option<PathBuf>,
-        /// The hypervisor's own command line [default: console=com1 com1=115200,8n1]
-        #[arg(long, requires = "hypervisor")]
-        hypervisor_cmdline: Option<String>,
         #[command(flatten)]
         hardware: HardwareArgs,
         #[command(flatten)]
@@ -343,6 +334,7 @@ fn boot_launch(
                 args::Firmware::Uefi => run::run_uefi(
                     Vec::new(),
                     None,
+                    None,
                     &launch.settings,
                     runtime,
                     launch.nvram.as_deref(),
@@ -358,10 +350,16 @@ fn boot_launch(
                                 booted directly, without the menu"
                         .into());
                 }
-                eprintln!("booting the installer through the UEFI firmware");
+                match launch.hypervisor {
+                    Some(_) => eprintln!(
+                        "booting the installer through the UEFI firmware, as the hypervisor's dom0"
+                    ),
+                    None => eprintln!("booting the installer through the UEFI firmware"),
+                }
                 run::run_uefi(
                     launch.kernel,
                     launch.initramfs,
+                    launch.hypervisor,
                     &launch.settings,
                     runtime,
                     launch.nvram.as_deref(),
@@ -511,38 +509,39 @@ fn advanced_command(cmd: AdvancedCmd) -> Result<ExitReason, String> {
         AdvancedCmd::Boot {
             kernel,
             initramfs,
-            hypervisor,
-            hypervisor_cmdline,
             hardware,
             linux,
             firmware,
             runtime,
         } => {
-            let kernel_image = read(&kernel)?;
-            let initramfs_image = initramfs.as_ref().map(read).transpose()?;
-            let settings = settings_of(&hardware, &linux)?;
-            if let Some(hypervisor) = hypervisor {
-                if firmware.firmware.unwrap_or_default() != args::Firmware::Uefi {
+            let firmware = firmware.firmware.unwrap_or_default();
+            let args::HypervisorArgs {
+                hypervisor,
+                hypervisor_cmdline,
+            } = &linux.hypervisor;
+            let hypervisor = match hypervisor {
+                None if hypervisor_cmdline.is_some() => {
+                    return Err("--hypervisor-cmdline needs --hypervisor".into());
+                }
+                None => None,
+                Some(_) if firmware != args::Firmware::Uefi => {
                     return Err(
                         "--hypervisor is booted by the UEFI firmware; use --firmware uefi".into(),
                     );
                 }
-                let hypervisor = run::Hypervisor {
-                    image: read(&hypervisor)?,
-                    cmdline: hypervisor_cmdline,
-                };
-                return run::run_hypervisor(
-                    kernel_image,
-                    initramfs_image,
-                    hypervisor,
-                    &settings,
-                    &runtime,
-                );
-            }
-            match firmware.firmware.unwrap_or_default() {
+                Some(path) => Some(run::Hypervisor {
+                    image: read(path)?,
+                    cmdline: hypervisor_cmdline.clone(),
+                }),
+            };
+            let kernel_image = read(&kernel)?;
+            let initramfs_image = initramfs.as_ref().map(read).transpose()?;
+            let settings = settings_of(&hardware, &linux)?;
+            match firmware {
                 args::Firmware::Uefi => run::run_uefi(
                     kernel_image,
                     initramfs_image,
+                    hypervisor,
                     &settings,
                     &runtime,
                     None,
@@ -583,6 +582,7 @@ fn advanced_command(cmd: AdvancedCmd) -> Result<ExitReason, String> {
             };
             run::run_uefi(
                 Vec::new(),
+                None,
                 None,
                 &settings,
                 &runtime,
@@ -731,8 +731,6 @@ mod tests {
     struct Advanced {
         kernel: PathBuf,
         initramfs: Option<PathBuf>,
-        hypervisor: Option<PathBuf>,
-        hypervisor_cmdline: Option<String>,
         hardware: HardwareArgs,
         linux: LinuxArgs,
         runtime: RuntimeArgs,
@@ -745,8 +743,6 @@ mod tests {
                     AdvancedCmd::Boot {
                         kernel,
                         initramfs,
-                        hypervisor,
-                        hypervisor_cmdline,
                         hardware,
                         linux,
                         firmware: _,
@@ -755,8 +751,6 @@ mod tests {
             } => Advanced {
                 kernel,
                 initramfs,
-                hypervisor,
-                hypervisor_cmdline,
                 hardware,
                 linux,
                 runtime,
@@ -988,26 +982,91 @@ mod tests {
             "--hypervisor-cmdline",
             "console=com1 dom0_mem=512M",
         ]);
-        assert_eq!(boot.hypervisor, Some(PathBuf::from("xen.gz")));
+        let hypervisor = &boot.linux.hypervisor;
+        assert_eq!(hypervisor.hypervisor, Some(PathBuf::from("xen.gz")));
         assert_eq!(
-            boot.hypervisor_cmdline.as_deref(),
+            hypervisor.hypervisor_cmdline.as_deref(),
             Some("console=com1 dom0_mem=512M")
         );
         assert_eq!(
-            advanced_boot(&["advanced", "boot", "--kernel", "k"]).hypervisor,
+            advanced_boot(&["advanced", "boot", "--kernel", "k"])
+                .linux
+                .hypervisor
+                .hypervisor,
             None
         );
-        // A hypervisor command line without a hypervisor would be silently ignored.
+        // A hypervisor command line without a hypervisor would be silently ignored. It is refused
+        // before anything is read, so the kernel need not exist.
+        let Cmd::Advanced { cmd } = parse(&[
+            "advanced",
+            "boot",
+            "--kernel",
+            "missing",
+            "--hypervisor-cmdline",
+            "x",
+        ])
+        .unwrap()
+        .cmd
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            advanced_command(cmd).err().as_deref(),
+            Some("--hypervisor-cmdline needs --hypervisor")
+        );
+    }
+
+    #[test]
+    fn quick_create_edit_and_boot_take_a_hypervisor_and_edit_and_boot_can_remove_it() {
+        for command in ["create", "edit", "boot"] {
+            let mut argv = vec!["quick", command, "m"];
+            if command == "create" {
+                argv.extend(["--install", "alpine"]);
+            }
+            argv.extend([
+                "--hypervisor",
+                "xen.gz",
+                "--hypervisor-cmdline",
+                "dom0_mem=1G",
+            ]);
+            let linux = match parse(&argv).unwrap().cmd {
+                Cmd::Quick {
+                    cmd:
+                        QuickCmd::Create { linux, .. }
+                        | QuickCmd::Edit { linux, .. }
+                        | QuickCmd::Boot { linux, .. },
+                } => linux,
+                _ => unreachable!(),
+            };
+            assert_eq!(linux.hypervisor.hypervisor, Some(PathBuf::from("xen.gz")));
+            assert_eq!(
+                linux.hypervisor.hypervisor_cmdline.as_deref(),
+                Some("dom0_mem=1G")
+            );
+        }
+        for command in ["edit", "boot"] {
+            let remove = match parse(&["quick", command, "m", "--remove-hypervisor"])
+                .unwrap()
+                .cmd
+            {
+                Cmd::Quick {
+                    cmd: QuickCmd::Edit { remove, .. } | QuickCmd::Boot { remove, .. },
+                } => remove,
+                _ => unreachable!(),
+            };
+            assert!(remove.remove_hypervisor);
+        }
+        // There is nothing to remove from a machine that does not exist yet.
         assert_eq!(
             error_kind(&[
-                "advanced",
-                "boot",
-                "--kernel",
-                "k",
-                "--hypervisor-cmdline",
-                "x"
+                "quick",
+                "create",
+                "m",
+                "--install",
+                "alpine",
+                "--remove-hypervisor"
             ]),
-            ErrorKind::MissingRequiredArgument
+            ErrorKind::UnknownArgument
         );
     }
 

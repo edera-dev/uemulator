@@ -3,7 +3,8 @@
 //!
 //! - `HardwareArgs`: memory, disks, NICs, consoles, display, JIT. Every command that describes a
 //!   machine.
-//! - `LinuxArgs`: command line and reboot behaviour. Not on firmware boots, which have neither.
+//! - `LinuxArgs`: command line, reboot behaviour and the hypervisor the kernel can run under. Not
+//!   on firmware boots, which have none of them.
 //! - `RemoveArgs`: `--remove-<device> INDEX`, for commands that start from an existing device list.
 //! - `NewDiskArgs`: `--create-disk`, for commands that own a directory to put the image in.
 //! - `RuntimeArgs`: debugging and pacing for one run; never persisted.
@@ -218,6 +219,27 @@ pub struct LinuxArgs {
     #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = BOOL_FLAG_DEFAULT,
         value_name = "BOOL")]
     pub no_reboot: Option<bool>,
+    #[command(flatten)]
+    pub hypervisor: HypervisorArgs,
+}
+
+/// A hypervisor with the kernel as its dom0. A named machine keeps a copy of the image in its
+/// directory (`--remove-hypervisor` drops it) and boots it with the installer's kernel; `quick
+/// boot` takes one for that run only.
+#[derive(Args, Default)]
+pub struct HypervisorArgs {
+    /// A hypervisor to boot with the kernel as its dom0: Xen as xen.gz (or the uncompressed
+    /// xen), or Edera's xen.efi (an upstream xen.efi cannot take its kernel from the firmware;
+    /// give such a Xen as xen.gz). Needs the UEFI firmware. Xen keeps the 16550 and passes dom0's
+    /// console (hvc0) through it, so the terminal goes on a serial console first in the list;
+    /// --cmdline/--append are dom0's. A named machine runs only installer boots under it: an
+    /// installed disk brings its own boot loader
+    #[arg(long, value_name = "IMAGE")]
+    pub hypervisor: Option<PathBuf>,
+    /// The hypervisor's own command line; an empty value clears a saved one [default:
+    /// console=com1 com1=115200,8n1]
+    #[arg(long, value_name = "ARGS")]
+    pub hypervisor_cmdline: Option<String>,
 }
 
 /// Indices count from 0 in the order the guest sees the devices, and refer to the list as it is
@@ -233,6 +255,9 @@ pub struct RemoveArgs {
     /// Remove the console at INDEX
     #[arg(long, value_name = "INDEX")]
     pub remove_console: Vec<usize>,
+    /// Remove the hypervisor and its command line; the machine's copy of the image is deleted
+    #[arg(long)]
+    pub remove_hypervisor: bool,
 }
 
 #[derive(Args, Default)]
@@ -386,7 +411,7 @@ pub struct Settings {
 }
 
 /// `Some("")` is how a command line clears a saved string.
-fn set_or_clear(slot: &mut Option<String>, value: &Option<String>) {
+pub fn set_or_clear(slot: &mut Option<String>, value: &Option<String>) {
     match value.as_deref() {
         Some("") => *slot = None,
         Some(text) => *slot = Some(text.to_string()),
@@ -675,6 +700,7 @@ mod tests {
                 remove_disk: vec![2, 0],
                 remove_network: vec![0],
                 remove_console: vec![1],
+                remove_hypervisor: false,
             })
             .unwrap();
         assert_eq!(detached, vec![disk("a", false), disk("c", false)]);
@@ -759,6 +785,7 @@ mod tests {
             cmdline: Some(String::new()),
             append: Some("debug".into()),
             no_reboot: Some(false),
+            hypervisor: HypervisorArgs::default(),
         };
         settings.add(&HardwareArgs::default(), &linux, Vec::new());
         assert_eq!(settings.cmdline, None);

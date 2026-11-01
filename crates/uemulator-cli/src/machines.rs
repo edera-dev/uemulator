@@ -5,6 +5,8 @@
 //!   its first boot and removed with the directory
 //! - `artifacts/`: the distro's netboot kernel and initramfs, which `reinstall` throws away and
 //!   `update-artifacts` replaces
+//! - `hypervisor`: a copy of the image `--hypervisor` named, so the machine does not depend on
+//!   the original staying put; kept out of `artifacts/`, which the CLI replaces wholesale
 //! - `disk-<n>.udisk`: the images `--create-disk` made (`disk-<n>.img`, raw, in machines made
 //!   before the udisk format). Disks attached with `--disk` stay where they are; neither kind is
 //!   ever deleted by the CLI.
@@ -16,17 +18,18 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::args::{
-    BootSource, ConsoleArg, DiskSpec, DiskStep, DisplayArg, Firmware, HardwareArgs, LinuxArgs,
-    NetLink, NetModel, Nic, RemoveArgs, Settings, attach_only,
+    BootSource, ConsoleArg, DiskSpec, DiskStep, DisplayArg, Firmware, HardwareArgs, HypervisorArgs,
+    LinuxArgs, NetLink, NetModel, Nic, RemoveArgs, Settings, attach_only, set_or_clear,
 };
 use crate::images;
 use crate::quick::{Artifacts, Distro, artifacts_present, ensure_in, write_atomically};
-use crate::run::DEFAULT_MEMORY_MIB;
+use crate::run::{DEFAULT_MEMORY_MIB, Hypervisor};
 
 const MACHINES_DIR: &str = "machines";
 const MACHINE_FILE: &str = "machine.toml";
 const ARTIFACTS_DIR: &str = "artifacts";
 const NVRAM_FILE: &str = "nvram.kv";
+const HYPERVISOR_FILE: &str = "hypervisor";
 /// Where `update-artifacts` downloads to, so a failed update leaves the old kernel and initramfs
 /// together: the Alpine initramfs and its modloop must come from the release of the kernel.
 const STAGING_DIR: &str = "artifacts.new";
@@ -74,6 +77,11 @@ struct MachineFile {
     boot_from: BootSource,
     #[serde(default)]
     firmware: Firmware,
+    /// `SavedHypervisor::source_name`; the image itself is `HYPERVISOR_FILE`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hypervisor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hypervisor_cmdline: Option<String>,
     #[serde(flatten)]
     settings: Settings,
 }
@@ -84,7 +92,16 @@ pub struct Machine {
     pub install: Distro,
     pub boot_from: BootSource,
     pub firmware: Firmware,
+    /// What installer boots run under; its image is `hypervisor_path`.
+    pub hypervisor: Option<SavedHypervisor>,
     pub settings: Settings,
+}
+
+pub struct SavedHypervisor {
+    /// The name of the file the image was copied from: whether it is xen.gz or xen.efi.
+    pub source_name: String,
+    /// `None` is the library's default.
+    pub cmdline: Option<String>,
 }
 
 impl Machine {
@@ -100,11 +117,17 @@ impl Machine {
         self.dir.join(ARTIFACTS_DIR)
     }
 
+    pub fn hypervisor_path(&self) -> PathBuf {
+        self.dir.join(HYPERVISOR_FILE)
+    }
+
     fn save(&self) -> Result<(), String> {
         let file = MachineFile {
             install: self.install,
             boot_from: self.boot_from,
             firmware: self.firmware,
+            hypervisor: self.hypervisor.as_ref().map(|h| h.source_name.clone()),
+            hypervisor_cmdline: self.hypervisor.as_ref().and_then(|h| h.cmdline.clone()),
             settings: self.settings.clone(),
         };
         let text =
@@ -133,8 +156,62 @@ pub fn load(home: &Path, name: &str) -> Result<Machine, String> {
         install: file.install,
         boot_from: file.boot_from,
         firmware: file.firmware,
+        hypervisor: file.hypervisor.map(|source_name| SavedHypervisor {
+            source_name,
+            cmdline: file.hypervisor_cmdline,
+        }),
         settings: file.settings,
     })
+}
+
+fn hypervisor_needs_uefi(firmware: Firmware) -> String {
+    format!(
+        "a hypervisor is booted by the UEFI firmware, and the machine's firmware is {}: use \
+         --firmware uefi, or do without the hypervisor",
+        firmware.name()
+    )
+}
+
+/// Applies `--remove-hypervisor`, then `--hypervisor` (which keeps a saved command line), then
+/// `--hypervisor-cmdline` to the machine, and checks the result against its firmware. Nothing is
+/// written: the image to copy in, if any, comes back for `install_hypervisor`.
+fn change_hypervisor(
+    machine: &mut Machine,
+    args: &HypervisorArgs,
+    remove: bool,
+) -> Result<Option<PathBuf>, String> {
+    if remove {
+        machine.hypervisor = None;
+    }
+    if let Some(path) = &args.hypervisor {
+        let source_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .ok_or_else(|| format!("--hypervisor {}: not a file", path.display()))?;
+        let cmdline = machine.hypervisor.take().and_then(|saved| saved.cmdline);
+        machine.hypervisor = Some(SavedHypervisor {
+            source_name,
+            cmdline,
+        });
+    }
+    if args.hypervisor_cmdline.is_some() {
+        let Some(saved) = &mut machine.hypervisor else {
+            return Err("--hypervisor-cmdline needs a hypervisor: give --hypervisor IMAGE".into());
+        };
+        set_or_clear(&mut saved.cmdline, &args.hypervisor_cmdline);
+    }
+    if machine.hypervisor.is_some() && machine.firmware != Firmware::Uefi {
+        return Err(hypervisor_needs_uefi(machine.firmware));
+    }
+    Ok(args.hypervisor.clone())
+}
+
+/// Copies `source` in as the machine's hypervisor image, replacing any earlier one whole.
+fn install_hypervisor(machine: &Machine, source: &Path) -> Result<(), String> {
+    let image =
+        fs::File::open(source).map_err(|e| format!("hypervisor {}: {e}", source.display()))?;
+    let path = machine.hypervisor_path();
+    write_atomically(image, &path).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 /// Creates `path` (and its parent directories) as an empty udisk image of `mib` MiB, which takes
@@ -238,14 +315,18 @@ pub fn create(
         if settings.consoles.is_empty() {
             settings.consoles.push(ConsoleArg::Virtio);
         }
-        let machine = Machine {
+        let mut machine = Machine {
             name: name.to_string(),
             dir: dir.clone(),
             install,
             boot_from: boot_from.unwrap_or_default(),
             firmware: firmware.unwrap_or_default(),
+            hypervisor: None,
             settings,
         };
+        if let Some(source) = change_hypervisor(&mut machine, &linux.hypervisor, false)? {
+            install_hypervisor(&machine, &source)?;
+        }
         machine.save()?;
         Ok(machine)
     })();
@@ -261,7 +342,8 @@ pub struct Edited {
     pub detached: Vec<DiskSpec>,
 }
 
-/// Removals first (their indices refer to the saved list), then additions.
+/// Removals first (their indices refer to the saved list), then additions. A removed hypervisor's
+/// image is deleted once the file no longer names it.
 pub fn edit(
     home: &Path,
     name: &str,
@@ -272,12 +354,27 @@ pub fn edit(
     firmware: Option<Firmware>,
 ) -> Result<Edited, String> {
     let mut machine = load(home, name)?;
+    machine.boot_from = boot_from.unwrap_or(machine.boot_from);
+    machine.firmware = firmware.unwrap_or(machine.firmware);
+    // Checked before any disk is created, so a refused edit leaves nothing behind.
+    let new_hypervisor =
+        change_hypervisor(&mut machine, &linux.hypervisor, remove.remove_hypervisor)?;
     let detached = machine.settings.remove_devices(remove)?;
     let disks = persist_disks(&machine.dir, &hardware.disk_steps)?;
     machine.settings.add(hardware, linux, disks);
-    machine.boot_from = boot_from.unwrap_or(machine.boot_from);
-    machine.firmware = firmware.unwrap_or(machine.firmware);
+    if let Some(source) = &new_hypervisor {
+        install_hypervisor(&machine, source)?;
+    }
     machine.save()?;
+    if machine.hypervisor.is_none() {
+        let path = machine.hypervisor_path();
+        match fs::remove_file(&path) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                return Err(format!("remove {}: {e}", path.display()));
+            }
+            _ => {}
+        }
+    }
     Ok(Edited { machine, detached })
 }
 
@@ -293,6 +390,8 @@ pub struct Launch {
     pub firmware: Firmware,
     /// The UEFI variable store of a boot through the UEFI firmware, installer or disk.
     pub nvram: Option<PathBuf>,
+    /// What the installer's kernel boots under, as its dom0. Never on a disk boot.
+    pub hypervisor: Option<Hypervisor>,
     /// The saved settings with this boot's overrides and the distro's defaults applied.
     pub settings: Settings,
 }
@@ -326,6 +425,36 @@ fn read_file(path: &Path) -> Result<Vec<u8>, String> {
     fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))
 }
 
+/// The hypervisor image and command line of one boot: the saved ones with the command line's
+/// changes, which are not saved.
+fn boot_hypervisor(
+    machine: &Machine,
+    args: &HypervisorArgs,
+    remove: bool,
+) -> Result<Option<(PathBuf, Option<String>)>, String> {
+    let saved = machine.hypervisor.as_ref().filter(|_| !remove);
+    let image = match (&args.hypervisor, saved) {
+        (Some(path), _) => path.clone(),
+        (None, Some(_)) => machine.hypervisor_path(),
+        (None, None) if args.hypervisor_cmdline.is_some() => {
+            return Err("--hypervisor-cmdline needs a hypervisor: give --hypervisor IMAGE".into());
+        }
+        (None, None) => return Ok(None),
+    };
+    let mut cmdline = saved.and_then(|saved| saved.cmdline.clone());
+    set_or_clear(&mut cmdline, &args.hypervisor_cmdline);
+    if machine.firmware != Firmware::Uefi {
+        // `quick boot` has no --firmware to suggest.
+        return Err(format!(
+            "a hypervisor is booted by the UEFI firmware, and the machine's firmware is {}: \
+             `quick edit {} --firmware uefi` first",
+            machine.firmware.name(),
+            machine.name
+        ));
+    }
+    Ok(Some((image, cmdline)))
+}
+
 /// A boot of a saved machine with this command line's overrides, which are not saved. Missing
 /// installer artifacts (never fetched, or thrown away by `reinstall`) are fetched first.
 pub fn prepare_boot(
@@ -339,6 +468,7 @@ pub fn prepare_boot(
     let mut settings = machine.settings.clone();
     settings.remove_devices(remove)?;
     settings.add(hardware, linux, attach_only(&hardware.disk_steps)?);
+    let hypervisor = boot_hypervisor(machine, &linux.hypervisor, remove.remove_hypervisor)?;
     let installed = match (
         boot_from.unwrap_or(machine.boot_from),
         settings.disks.first(),
@@ -352,6 +482,17 @@ pub fn prepare_boot(
         (BootSource::Disk, None) => return Err("the machine has no disk to boot".into()),
     };
     if installed {
+        // The installed system's boot loader picks its kernel and starts it itself; the firmware
+        // has nothing to hand to the hypervisor instead.
+        if hypervisor.is_some() {
+            let name = &machine.name;
+            return Err(format!(
+                "the disk has an install on it, and its boot loader cannot start under the \
+                 hypervisor, which boots the installer's kernel as dom0: boot the installer \
+                 (--boot-from installer), or the disk without the hypervisor \
+                 (--remove-hypervisor; `quick edit {name} --remove-hypervisor` for good)"
+            ));
+        }
         if machine.firmware == Firmware::None {
             return Err(
                 "firmware none cannot boot a disk; edit the machine to --firmware bios (a disk installed with none was installed without UEFI) or uefi"
@@ -367,6 +508,7 @@ pub fn prepare_boot(
             initramfs: None,
             firmware: machine.firmware,
             nvram: (machine.firmware == Firmware::Uefi).then(|| machine.nvram_path()),
+            hypervisor: None,
             settings,
         });
     }
@@ -378,6 +520,13 @@ pub fn prepare_boot(
         firmware: machine.firmware,
         // The installer writes the boot entries the installed system is found through.
         nvram: (machine.firmware == Firmware::Uefi).then(|| machine.nvram_path()),
+        hypervisor: match hypervisor {
+            Some((image, cmdline)) => Some(Hypervisor {
+                image: read_file(&image)?,
+                cmdline,
+            }),
+            None => None,
+        },
         settings: with_distro_defaults(settings, machine.install),
     })
 }
@@ -583,6 +732,15 @@ pub fn describe(machine: &Machine) -> String {
     };
     out.push_str(&format!("  boots     {boot}\n"));
     out.push_str(&format!("  firmware  {}\n", machine.firmware.name()));
+    if let Some(hypervisor) = &machine.hypervisor {
+        out.push_str(&format!(
+            "  hypervisor {}, with the installer's kernel as dom0\n",
+            hypervisor.source_name
+        ));
+        if let Some(cmdline) = &hypervisor.cmdline {
+            out.push_str(&format!("             command line {cmdline}\n"));
+        }
+    }
     let display = settings.display.unwrap_or_default();
     match display {
         DisplayArg::Serial => {}
@@ -1136,7 +1294,15 @@ mod tests {
     }
 
     fn launch(machine: &Machine, boot_from: Option<BootSource>) -> Result<Launch, String> {
-        let (hardware, linux, remove) = boot_args(&[]);
+        launch_with(machine, &[], boot_from)
+    }
+
+    fn launch_with(
+        machine: &Machine,
+        extra: &[&str],
+        boot_from: Option<BootSource>,
+    ) -> Result<Launch, String> {
+        let (hardware, linux, remove) = boot_args(extra);
         let fetcher = FakeFetcher::new();
         prepare_boot(machine, &hardware, &linux, &remove, boot_from, |u, d| {
             fetcher.fetch(u, d)
@@ -1865,5 +2031,200 @@ mod tests {
         delete(&plan).unwrap();
         assert!(!machine.nvram_path().exists());
         assert!(!plan.dir.exists());
+    }
+
+    /// A file standing in for a hypervisor image; the CLI only copies it.
+    fn hypervisor_image(dir: &Path, name: &str, contents: &[u8]) -> String {
+        let path = dir.join(name);
+        fs::write(&path, contents).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    fn edit_with(
+        home: &Path,
+        extra: &[&str],
+        firmware: Option<Firmware>,
+    ) -> Result<Edited, String> {
+        let (hardware, linux, remove) = edit_args(extra);
+        edit(home, "m", &hardware, &linux, &remove, None, firmware)
+    }
+
+    #[test]
+    fn a_hypervisor_is_copied_in_kept_through_edits_and_deleted_by_remove_hypervisor() {
+        let home = TempDir::new("machines-hypervisor");
+        let source = TempDir::new("machines-hypervisor-source");
+        let xen_gz = hypervisor_image(source.path(), "xen.gz", b"gzipped xen");
+        let machine = create_machine(
+            home.path(),
+            &[
+                "--hypervisor",
+                &xen_gz,
+                "--hypervisor-cmdline",
+                "console=com1 dom0_mem=1G",
+            ],
+        );
+        let copy = machine.hypervisor_path();
+        // The machine keeps its own copy, so the original can change or go away.
+        fs::remove_file(&xen_gz).unwrap();
+        assert_eq!(fs::read(&copy).unwrap(), b"gzipped xen");
+        let text = fs::read_to_string(home.path().join("machines/m/machine.toml")).unwrap();
+        assert!(text.contains("hypervisor = \"xen.gz\""), "{text}");
+        assert!(
+            text.contains("hypervisor_cmdline = \"console=com1 dom0_mem=1G\""),
+            "{text}"
+        );
+        let loaded = load(home.path(), "m").unwrap().hypervisor.unwrap();
+        assert_eq!(loaded.source_name, "xen.gz");
+        assert_eq!(loaded.cmdline.as_deref(), Some("console=com1 dom0_mem=1G"));
+        let description = describe(&load(home.path(), "m").unwrap());
+        assert!(
+            description.contains("hypervisor xen.gz, with the installer's kernel as dom0"),
+            "{description}"
+        );
+        assert!(
+            description.contains("command line console=com1 dom0_mem=1G"),
+            "{description}"
+        );
+
+        // A new image keeps the saved command line; an empty one clears it.
+        let xen_efi = hypervisor_image(source.path(), "xen.efi", b"MZ xen.efi");
+        let edited = edit_with(home.path(), &["--hypervisor", &xen_efi], None).unwrap();
+        let saved = edited.machine.hypervisor.unwrap();
+        assert_eq!(saved.source_name, "xen.efi");
+        assert_eq!(saved.cmdline.as_deref(), Some("console=com1 dom0_mem=1G"));
+        assert_eq!(fs::read(&copy).unwrap(), b"MZ xen.efi");
+        let edited = edit_with(home.path(), &["--hypervisor-cmdline", ""], None).unwrap();
+        assert_eq!(edited.machine.hypervisor.unwrap().cmdline, None);
+        assert!(copy.is_file());
+
+        let edited = edit_with(home.path(), &["--remove-hypervisor"], None).unwrap();
+        assert!(edited.machine.hypervisor.is_none());
+        assert!(!copy.exists());
+        let text = fs::read_to_string(home.path().join("machines/m/machine.toml")).unwrap();
+        assert!(!text.contains("hypervisor ="), "{text}");
+        assert!(!text.contains("hypervisor_cmdline"), "{text}");
+        assert!(load(home.path(), "m").unwrap().hypervisor.is_none());
+        let error = edit_with(home.path(), &["--hypervisor-cmdline", "x"], None)
+            .err()
+            .expect("a command line without a hypervisor must be refused");
+        assert!(error.contains("needs a hypervisor"), "{error}");
+    }
+
+    #[test]
+    fn a_hypervisor_needs_the_uefi_firmware() {
+        let home = TempDir::new("machines-hypervisor-firmware");
+        let source = TempDir::new("machines-hypervisor-firmware-source");
+        let xen = hypervisor_image(source.path(), "xen.gz", b"xen");
+        let (hardware, linux) = create_args(&["--hypervisor", &xen]);
+        let error = create(
+            home.path(),
+            "m",
+            Distro::Alpine,
+            &hardware,
+            &linux,
+            None,
+            Some(Firmware::Bios),
+        )
+        .err()
+        .expect("a bios machine cannot boot a hypervisor");
+        assert!(error.contains("UEFI firmware"), "{error}");
+        assert!(
+            !home.path().join("machines/m").exists(),
+            "nothing is left behind"
+        );
+
+        create_machine(home.path(), &["--hypervisor", &xen]);
+        let error = edit_with(home.path(), &["--create-disk", "16"], Some(Firmware::Bios))
+            .err()
+            .expect("switching to bios must not strand the hypervisor");
+        assert!(error.contains("UEFI firmware"), "{error}");
+        let unchanged = load(home.path(), "m").unwrap();
+        assert_eq!(unchanged.firmware, Firmware::Uefi);
+        assert_eq!(unchanged.settings.disks.len(), 1, "no disk was created");
+        let edited =
+            edit_with(home.path(), &["--remove-hypervisor"], Some(Firmware::Bios)).unwrap();
+        assert_eq!(edited.machine.firmware, Firmware::Bios);
+        assert!(edited.machine.hypervisor.is_none());
+    }
+
+    #[test]
+    fn installer_boots_run_under_the_hypervisor_and_an_installed_disk_is_refused() {
+        let home = TempDir::new("machines-hypervisor-boot");
+        let source = TempDir::new("machines-hypervisor-boot-source");
+        let xen = hypervisor_image(source.path(), "xen.gz", b"saved xen");
+        let machine = create_machine(
+            home.path(),
+            &["--hypervisor", &xen, "--hypervisor-cmdline", "console=com1"],
+        );
+        let installer = launch(&machine, None).unwrap();
+        assert_eq!(installer.source, BootSource::Installer);
+        let hypervisor = installer.hypervisor.unwrap();
+        assert_eq!(hypervisor.image, b"saved xen");
+        assert_eq!(hypervisor.cmdline.as_deref(), Some("console=com1"));
+        // This run's command line, which is not saved.
+        let once = launch_with(&machine, &["--hypervisor-cmdline", "console=com1 x"], None)
+            .unwrap()
+            .hypervisor
+            .unwrap();
+        assert_eq!(once.cmdline.as_deref(), Some("console=com1 x"));
+        let other = hypervisor_image(source.path(), "other.gz", b"other xen");
+        let once = launch_with(&machine, &["--hypervisor", &other], None)
+            .unwrap()
+            .hypervisor
+            .unwrap();
+        assert_eq!(
+            (once.image.as_slice(), once.cmdline.as_deref()),
+            (b"other xen".as_slice(), Some("console=com1"))
+        );
+        assert!(
+            launch_with(&machine, &["--remove-hypervisor"], None)
+                .unwrap()
+                .hypervisor
+                .is_none()
+        );
+
+        finish_install(&machine);
+        for choice in [None, Some(BootSource::Disk)] {
+            let error = launch(&machine, choice).err().expect("must be refused");
+            assert!(error.contains("--boot-from installer"), "{error}");
+            assert!(
+                error.contains("quick edit m --remove-hypervisor"),
+                "{error}"
+            );
+        }
+        let disk = launch_with(&machine, &["--remove-hypervisor"], None).unwrap();
+        assert_eq!(disk.source, BootSource::Disk);
+        assert!(disk.hypervisor.is_none());
+        let installer = launch(&machine, Some(BootSource::Installer)).unwrap();
+        assert!(installer.hypervisor.is_some());
+    }
+
+    #[test]
+    fn a_hypervisor_can_be_given_for_one_boot_of_a_machine_without_one() {
+        let home = TempDir::new("machines-hypervisor-once");
+        let source = TempDir::new("machines-hypervisor-once-source");
+        let machine = create_machine(home.path(), &[]);
+        let xen = hypervisor_image(source.path(), "xen.gz", b"xen");
+        let installer = launch_with(&machine, &["--hypervisor", &xen], None).unwrap();
+        let hypervisor = installer.hypervisor.unwrap();
+        assert_eq!(
+            (hypervisor.image.as_slice(), hypervisor.cmdline),
+            (b"xen".as_slice(), None)
+        );
+        assert!(
+            load(home.path(), "m").unwrap().hypervisor.is_none(),
+            "not saved"
+        );
+        assert!(!machine.hypervisor_path().exists());
+        let error = launch_with(&machine, &["--hypervisor-cmdline", "x"], None)
+            .err()
+            .expect("a command line without a hypervisor must be refused");
+        assert!(error.contains("needs a hypervisor"), "{error}");
+        let mut bios = machine;
+        bios.firmware = Firmware::Bios;
+        let error = launch_with(&bios, &["--hypervisor", &xen], None)
+            .err()
+            .expect("a bios machine cannot boot a hypervisor");
+        assert!(error.contains("`quick edit m --firmware uefi`"), "{error}");
     }
 }

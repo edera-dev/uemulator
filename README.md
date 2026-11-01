@@ -50,6 +50,7 @@ uemulator quick delete test --yes
 uemulator advanced boot --kernel bzImage --initramfs initrd.img   # your own kernel, through UEFI
 uemulator advanced boot --kernel bzImage --firmware none          # ... or entered directly (no EFI stub needed)
 uemulator advanced boot --kernel bzImage --initramfs initrd.img --hypervisor xen.gz   # Xen (xen.gz or xen.efi) with the kernel as dom0
+uemulator quick create xen --install alpine --hypervisor xen.gz   # a machine whose installer boots as Xen's dom0
 uemulator disk create disk.udisk --size 8192                      # create an empty disk image
 uemulator disk info disk.udisk
 ```

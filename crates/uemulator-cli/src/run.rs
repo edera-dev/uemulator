@@ -240,52 +240,51 @@ pub fn run_firmware(
     run_config(cfg, settings, runtime, tty)
 }
 
-/// A hypervisor for `run_hypervisor`, as read from disk (gzipped or not).
+/// A hypervisor for `run_uefi`, as read from disk (gzipped or not).
 pub struct Hypervisor {
     pub image: Vec<u8>,
     /// `None` is the library's default (Xen's console on the 16550).
     pub cmdline: Option<String>,
 }
 
-/// Like `run_uefi` with a kernel, but the firmware boots `hypervisor` with the kernel as its
-/// dom0. Without a `--console` the console is the 16550: Xen keeps it and passes dom0's console
-/// (`hvc0`) through it, while a virtio console would be a second `hvc` Xen never writes to.
-pub fn run_hypervisor(
-    kernel: Vec<u8>,
-    initramfs: Option<Vec<u8>>,
-    hypervisor: Hypervisor,
-    settings: &Settings,
-    runtime: &RuntimeArgs,
-) -> Result<ExitReason, String> {
-    let tty = std::io::stdin().is_terminal();
-    let mut settings = settings.clone();
-    if settings.consoles.is_empty() {
-        settings.consoles.push(ConsoleArg::Serial);
-    }
-    let mut cfg = build_config(kernel, initramfs, &settings, runtime)?
-        .uefi_firmware(crate::firmware::IMAGE)
-        .hypervisor(hypervisor.image);
-    if let Some(cmdline) = hypervisor.cmdline {
-        cfg = cfg.hypervisor_cmdline(cmdline);
-    }
-    run_config(cfg, &settings, runtime, tty)
+/// Xen keeps the 16550 and passes dom0's console (`hvc0`) through it, while a virtio console is a
+/// second `hvc` in dom0 that nothing writes to. So under a hypervisor the terminal has to be on a
+/// serial console, first in the list, whatever the command line or the saved machine says.
+fn serial_console_first(settings: &mut Settings) {
+    settings
+        .consoles
+        .retain(|console| *console != ConsoleArg::Serial);
+    settings.consoles.insert(0, ConsoleArg::Serial);
 }
 
 /// Like `run`, through the built-in UEFI firmware. An empty `kernel` boots the machine's disks;
-/// otherwise the firmware boots that kernel (an EFI-stub bzImage) with `initramfs`. `nvram` keeps
-/// the firmware's variables in a file; `boot_entry` (loader path, load options) is written into
-/// it first so that a boot goes where the caller asked.
+/// otherwise the firmware boots that kernel (an EFI-stub bzImage, or any bzImage as the dom0 of
+/// `hypervisor`) with `initramfs`. `nvram` keeps the firmware's variables in a file;
+/// `boot_entry` (loader path, load options) is written into it first so that a boot goes where
+/// the caller asked.
 pub fn run_uefi(
     kernel: Vec<u8>,
     initramfs: Option<Vec<u8>>,
+    hypervisor: Option<Hypervisor>,
     settings: &Settings,
     runtime: &RuntimeArgs,
     nvram: Option<&std::path::Path>,
     nvram_setup: &crate::firmware::NvramSetup,
 ) -> Result<ExitReason, String> {
     let tty = std::io::stdin().is_terminal();
+    let mut settings = settings.clone();
+    if hypervisor.is_some() {
+        serial_console_first(&mut settings);
+    }
+    let settings = &settings;
     let mut cfg =
         build_config(kernel, initramfs, settings, runtime)?.uefi_firmware(crate::firmware::IMAGE);
+    if let Some(hypervisor) = hypervisor {
+        cfg = cfg.hypervisor(hypervisor.image);
+        if let Some(cmdline) = hypervisor.cmdline {
+            cfg = cfg.hypervisor_cmdline(cmdline);
+        }
+    }
     match nvram {
         Some(path) => {
             let mut store = uemulator::FileKeyValueStore::open(path).map_err(|e| e.to_string())?;
@@ -443,6 +442,28 @@ mod tests {
     use super::*;
     use crate::test_support::TempDir;
     use crate::{AdvancedCmd, Cmd};
+
+    #[test]
+    fn under_a_hypervisor_the_terminal_is_on_a_serial_console_first() {
+        for (saved, want) in [
+            (vec![], vec![ConsoleArg::Serial]),
+            (
+                vec![ConsoleArg::Virtio],
+                vec![ConsoleArg::Serial, ConsoleArg::Virtio],
+            ),
+            (
+                vec![ConsoleArg::Virtio, ConsoleArg::Serial],
+                vec![ConsoleArg::Serial, ConsoleArg::Virtio],
+            ),
+        ] {
+            let mut settings = Settings {
+                consoles: saved,
+                ..Settings::default()
+            };
+            serial_console_first(&mut settings);
+            assert_eq!(settings.consoles, want);
+        }
+    }
 
     #[test]
     fn only_usernet_gets_offloads() {
