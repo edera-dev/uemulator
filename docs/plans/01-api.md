@@ -71,6 +71,23 @@ pub struct NetOffloads {
     pub takes_guest_segments: bool,  // host takes 64 KiB TCP segments and partial checksums from the guest (CSUM, HOST_TSO4)
     pub sends_large_segments: bool,  // host sends large segments (GUEST_CSUM, GUEST_TSO4, MRG_RXBUF)
 }
+
+// One machine's port on an Ethernet segment shared with machines the host reaches only by
+// messages (the web page's tabs; docs/plans/13-web.md "The shared network"). Pure protocol: no
+// clock, no I/O; the host moves frames between it, the NetHandle and its transport.
+pub struct SegmentAgent { .. }                               // Send + Sync
+impl SegmentAgent {
+    pub fn new(mac: [u8; 6], tab: u32, now_ms: u64) -> Result<Self, Error>; // the NIC's MAC (locally administered unicast) and this host's number on the transport
+    pub fn set_serving(&mut self, serving: bool, now_ms: u64); // the host's election (one at a time) made this agent the DHCP/ARP/ping server for 10.0.2.2
+    pub fn from_guest(&mut self, frame: &[u8], now_ms: u64);
+    pub fn from_segment(&mut self, from_tab: u32, frame: &[u8], now_ms: u64);
+    pub fn tick(&mut self, now_ms: u64);                     // announcements, ageing
+    pub fn take_for_guest(&mut self) -> Vec<Vec<u8>>;
+    pub fn take_for_segment(&mut self) -> Vec<(SegmentDestination, Vec<u8>)>;
+    pub fn status(&self) -> SegmentStatus;
+}
+pub enum SegmentDestination { Everyone, Tab(u32), Server }  // Copy
+pub struct SegmentStatus { pub address: Option<[u8; 4]>, pub peers: usize, pub serving: bool } // Copy
 ```
 
 ## Rules
