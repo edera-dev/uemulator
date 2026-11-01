@@ -9,10 +9,10 @@ use core::ptr;
 
 use crate::boot_menu::{self, Choice, Hotkey, Menu, WAIT_FOREVER};
 use crate::boot_options::{self, Discovered, Existing};
+use crate::console::{print, println};
 use crate::devicepath::{DevicePath, SUBTYPE_PCI, TYPE_HARDWARE};
 use crate::handoff::Payload;
 use crate::load_option::{Candidate, parse, u16_list};
-use crate::serial::{print, println};
 use crate::tables::BOOT_SERVICES;
 use crate::uefi::variable_attribute::{BOOTSERVICE_ACCESS, NON_VOLATILE, RUNTIME_ACCESS};
 use crate::uefi::*;

@@ -3,9 +3,10 @@
 
 use alloc::vec::Vec;
 
-pub const SIZE: usize = 0x338;
+pub const SIZE: usize = 0x358;
 const MAGIC: &[u8; 8] = b"UEMUHAND";
-const VERSION: u32 = 1;
+/// Version 2 added the framebuffer fields.
+const VERSION: u32 = 2;
 
 const VERSION_OFFSET: usize = 0x08;
 const FIRMWARE_BASE: usize = 0x10;
@@ -36,6 +37,13 @@ const INITRD_BASE: usize = 0x318;
 const INITRD_SIZE: usize = 0x320;
 const CMDLINE_BASE: usize = 0x328;
 const CMDLINE_SIZE: usize = 0x330;
+const FRAMEBUFFER_BASE: usize = 0x338;
+const FRAMEBUFFER_SIZE: usize = 0x340;
+const FRAMEBUFFER_WIDTH: usize = 0x348;
+const FRAMEBUFFER_HEIGHT: usize = 0x34c;
+const FRAMEBUFFER_PIXELS_PER_LINE: usize = 0x350;
+/// Every pixel is four bytes, blue, green, red, unused.
+pub const FRAMEBUFFER_BYTES_PER_PIXEL: u64 = 4;
 
 /// e820 type 1; everything else in the list is reserved.
 pub const RAM_USABLE: u32 = 1;
@@ -54,6 +62,17 @@ pub struct Payload {
     pub kernel: (u64, u64),
     pub initrd: Option<(u64, u64)>,
     pub cmdline: (u64, u64),
+}
+
+/// The machine's screen as a linear framebuffer in RAM (reserved in the memory map), which the
+/// firmware draws its console on and publishes as the Graphics Output Protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Framebuffer {
+    pub base: u64,
+    pub size: u64,
+    pub width: u32,
+    pub height: u32,
+    pub pixels_per_line: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +97,8 @@ pub struct Handoff {
     pub tsc_hz: u64,
     /// Present when the machine was given a kernel to boot, which comes before any disk.
     pub payload: Option<Payload>,
+    /// Present when the machine has a display.
+    pub framebuffer: Option<Framebuffer>,
 }
 
 impl Handoff {
@@ -114,6 +135,20 @@ impl Handoff {
             initrd: (u64_at(INITRD_SIZE) != 0).then(|| range(INITRD_BASE, INITRD_SIZE)),
             cmdline: range(CMDLINE_BASE, CMDLINE_SIZE),
         });
+        let framebuffer = Framebuffer {
+            base: u64_at(FRAMEBUFFER_BASE),
+            size: u64_at(FRAMEBUFFER_SIZE),
+            width: u32_at(FRAMEBUFFER_WIDTH),
+            height: u32_at(FRAMEBUFFER_HEIGHT),
+            pixels_per_line: u32_at(FRAMEBUFFER_PIXELS_PER_LINE),
+        };
+        // A framebuffer whose rows do not fit its size would have the firmware draw past it.
+        let consistent = framebuffer.width > 0
+            && framebuffer.height > 0
+            && framebuffer.pixels_per_line >= framebuffer.width
+            && (framebuffer.pixels_per_line as u64)
+                .checked_mul(framebuffer.height as u64 * FRAMEBUFFER_BYTES_PER_PIXEL)
+                .is_some_and(|bytes| bytes <= framebuffer.size);
         Some(Self {
             firmware_base: u64_at(FIRMWARE_BASE),
             firmware_size: u64_at(FIRMWARE_SIZE),
@@ -147,6 +182,7 @@ impl Handoff {
                 .collect(),
             tsc_hz: u64_at(TSC_HZ),
             payload,
+            framebuffer: consistent.then_some(framebuffer),
         })
     }
 }
@@ -219,6 +255,48 @@ mod tests {
                 .initrd,
             None
         );
+    }
+
+    fn put32(page: &mut [u8], at: usize, value: u32) {
+        page[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn with_framebuffer(width: u32, height: u32, pixels_per_line: u32, size: u64) -> Vec<u8> {
+        let mut page = page();
+        put(&mut page, FRAMEBUFFER_BASE, 0xbe00_0000);
+        put(&mut page, FRAMEBUFFER_SIZE, size);
+        put32(&mut page, FRAMEBUFFER_WIDTH, width);
+        put32(&mut page, FRAMEBUFFER_HEIGHT, height);
+        put32(&mut page, FRAMEBUFFER_PIXELS_PER_LINE, pixels_per_line);
+        page
+    }
+
+    #[test]
+    fn parses_the_framebuffer() {
+        let page = with_framebuffer(1280, 800, 1280, 1280 * 800 * 4);
+        assert_eq!(
+            Handoff::parse(&page).unwrap().framebuffer,
+            Some(Framebuffer {
+                base: 0xbe00_0000,
+                size: 1280 * 800 * 4,
+                width: 1280,
+                height: 800,
+                pixels_per_line: 1280,
+            })
+        );
+        assert_eq!(Handoff::parse(&self::page()).unwrap().framebuffer, None);
+    }
+
+    #[test]
+    fn a_framebuffer_whose_rows_do_not_fit_is_ignored() {
+        for page in [
+            with_framebuffer(1280, 800, 1280, 1280 * 800 * 4 - 1),
+            with_framebuffer(1280, 800, 1000, u64::MAX),
+            with_framebuffer(0, 800, 1280, u64::MAX),
+            with_framebuffer(1280, 800, u32::MAX, 16),
+        ] {
+            assert_eq!(Handoff::parse(&page).unwrap().framebuffer, None);
+        }
     }
 
     #[test]

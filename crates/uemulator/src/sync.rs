@@ -85,6 +85,12 @@ mod uefi_stubs {
     pub(crate) struct Condvar;
 
     impl Condvar {
+        /// `std`'s constructor, so shared code builds one the same way on both.
+        #[cfg_attr(not(freestanding), allow(dead_code))]
+        pub const fn new() -> Self {
+            Condvar
+        }
+
         /// The `()` stands in for `std`'s `WaitTimeoutResult`, which no caller inspects.
         pub fn wait_timeout<'a, T>(
             &self,
@@ -95,6 +101,8 @@ mod uefi_stubs {
         }
 
         pub fn notify_one(&self) {}
+
+        pub fn notify_all(&self) {}
     }
 }
 
@@ -187,6 +195,7 @@ mod tests {
         let condvar = Condvar;
         condvar.notify_one();
         condvar.notify_one();
+        condvar.notify_all();
     }
 
     #[test]

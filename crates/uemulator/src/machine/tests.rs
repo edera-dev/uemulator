@@ -277,6 +277,27 @@ mod twin_devices {
     const DEVICE_TYPE_NET: u32 = 1;
     const DEVICE_TYPE_BLOCK: u32 = 2;
     const DEVICE_TYPE_CONSOLE: u32 = 3;
+    const DEVICE_TYPE_GPU: u32 = 16;
+    const DEVICE_TYPE_INPUT: u32 = 18;
+    /// Revision dword: class, subclass, programming interface, revision from the top down.
+    const CLASS_REGISTER: u32 = 0x08;
+    const CLASS_SHIFT: u32 = 8;
+    const VGA_CLASS: u32 = 0x03_00_00;
+    const INPUT_OTHER_CLASS: u32 = 0x09_80_00;
+
+    fn display_config(
+        boot_framebuffer: Option<crate::dev::bootfb::FramebufferRegion>,
+    ) -> DevConfig {
+        let display = crate::display::DisplayHandle::with_size(640, 480);
+        DevConfig {
+            display: Some(crate::dev::DisplayDevices {
+                input: crate::display::InputHandle::for_display(Some(display.clone())),
+                display,
+                boot_framebuffer,
+            }),
+            ..DevConfig::default()
+        }
+    }
 
     fn config_dword(devices: &mut crate::dev::Devices, slot: u32, register: u32) -> u32 {
         devices.io_out(
@@ -346,6 +367,56 @@ mod twin_devices {
         assert_eq!(id_of(&mut mirror, 1), device_id(DEVICE_TYPE_CONSOLE));
         assert_eq!(id_of(&mut mirror, 2), device_id(DEVICE_TYPE_BLOCK));
         assert_eq!(id_of(&mut mirror, 3), device_id(DEVICE_TYPE_NET));
+    }
+
+    #[test]
+    fn the_display_is_a_vga_gpu_then_a_keyboard_and_a_tablet() {
+        let mut devices = Devices::new(ConsoleHandle::default(), display_config(None));
+        assert_eq!(id_of(&mut devices, 1), device_id(DEVICE_TYPE_GPU));
+        assert_eq!(id_of(&mut devices, 2), device_id(DEVICE_TYPE_INPUT));
+        assert_eq!(id_of(&mut devices, 3), device_id(DEVICE_TYPE_INPUT));
+        let class = |devices: &mut Devices, slot| {
+            config_dword(devices, slot, CLASS_REGISTER) >> CLASS_SHIFT
+        };
+        assert_eq!(class(&mut devices, 1), VGA_CLASS);
+        assert_eq!(class(&mut devices, 2), INPUT_OTHER_CLASS);
+    }
+
+    #[test]
+    fn the_display_comes_after_the_nics() {
+        let mut config = display_config(None);
+        config.nets = vec![(MAC, NetHandle::default())];
+        config.virtio_consoles = vec![ConsoleHandle::default()];
+        let mut devices = Devices::new(ConsoleHandle::default(), config);
+        assert_eq!(id_of(&mut devices, 2), device_id(DEVICE_TYPE_NET));
+        assert_eq!(id_of(&mut devices, 3), device_id(DEVICE_TYPE_GPU));
+    }
+
+    #[test]
+    fn the_mirror_has_the_display_functions_and_the_same_boot_framebuffer() {
+        let region = crate::dev::bootfb::FramebufferRegion {
+            base: 0x10_0000,
+            width: 640,
+            height: 480,
+        };
+        let mut main = display_config(Some(region));
+        let twin = mirrored(&mut main);
+        let twin_display = twin.display.as_ref().unwrap();
+        assert_eq!(twin_display.boot_framebuffer, Some(region));
+        assert_eq!(twin_display.display.size(), (640, 480));
+        assert!(!Arc::ptr_eq(
+            &twin_display.display.shared,
+            &main.display.as_ref().unwrap().display.shared
+        ));
+        let mut mirror = Devices::new(ConsoleHandle::default(), twin);
+        let mut original = Devices::new(ConsoleHandle::default(), main);
+        for slot in 1..=4 {
+            assert_eq!(
+                id_of(&mut mirror, slot),
+                id_of(&mut original, slot),
+                "slot {slot}"
+            );
+        }
     }
 
     #[test]
@@ -525,6 +596,27 @@ mod twin_devices {
             ),
             expected_slots([id_bytes(DEVICE_TYPE_NET), NOTHING, NOTHING])
         );
+    }
+
+    #[test]
+    fn a_display_adds_a_gpu_a_keyboard_and_a_tablet() {
+        for jit in auto_and_off() {
+            assert_eq!(
+                probe(
+                    |config| config
+                        .console(ConsoleKind::Serial)
+                        .rng(false)
+                        .display(DisplayMode::Framebuffer),
+                    jit
+                ),
+                expected_slots([
+                    id_bytes(DEVICE_TYPE_GPU),
+                    id_bytes(DEVICE_TYPE_INPUT),
+                    id_bytes(DEVICE_TYPE_INPUT)
+                ]),
+                "{jit:?}"
+            );
+        }
     }
 
     #[test]
@@ -842,6 +934,61 @@ mod multiple_devices {
     #[test]
     fn the_entropy_device_is_on_by_default() {
         assert!(MachineConfig::new().rng);
+    }
+
+    #[test]
+    fn the_display_counts_against_the_pci_bus() {
+        let config = |nets: usize| {
+            let mut config = MachineConfig::new()
+                .kernel(fake_bzimage(&[0xf4]))
+                .console(ConsoleKind::Serial)
+                .rng(false)
+                .display(DisplayMode::Framebuffer);
+            for _ in 0..nets {
+                config = config.net(MAC);
+            }
+            EmulatedMachine::new(config)
+        };
+        assert!(config(MAX_VIRTIO_FUNCTIONS - DISPLAY_FUNCTIONS).is_ok());
+        let message = expect_config_error(config(MAX_VIRTIO_FUNCTIONS - DISPLAY_FUNCTIONS + 1));
+        assert!(message.contains("display"), "{message}");
+    }
+
+    #[test]
+    fn a_machine_has_display_and_input_handles_only_with_a_display() {
+        let without = new_machine(&[0xf4]);
+        assert!(without.display().is_none() && without.input().is_none());
+        let with = EmulatedMachine::new(
+            MachineConfig::new()
+                .kernel(fake_bzimage(&[0xf4]))
+                .display(DisplayMode::Framebuffer)
+                .display_size(800, 600),
+        )
+        .unwrap();
+        assert_eq!(with.display().unwrap().size(), (800, 600));
+        assert!(with.input().unwrap().pointer_move(799, 599));
+    }
+
+    #[test]
+    fn display_sizes_outside_the_supported_range_are_refused() {
+        for (width, height) in [(319, 600), (800, 199), (2561, 600), (800, 1601)] {
+            let message = expect_config_error(EmulatedMachine::new(
+                MachineConfig::new()
+                    .kernel(fake_bzimage(&[0xf4]))
+                    .display(DisplayMode::Framebuffer)
+                    .display_size(width, height),
+            ));
+            assert!(message.contains("display_size"), "{message}");
+        }
+        // Without a display the size is not looked at.
+        assert!(
+            EmulatedMachine::new(
+                MachineConfig::new()
+                    .kernel(fake_bzimage(&[0xf4]))
+                    .display_size(1, 1)
+            )
+            .is_ok()
+        );
     }
 }
 
@@ -1275,6 +1422,24 @@ mod guest_view {
         assert_eq!(
             printed_cmdline(|config| config.cmdline("").cmdline_append("x")),
             " x"
+        );
+    }
+
+    #[test]
+    fn a_display_puts_the_console_on_tty0_after_the_default_and_before_appended_text() {
+        assert_eq!(
+            printed_cmdline(|config| config
+                .acpi(false)
+                .display(DisplayMode::Framebuffer)
+                .cmdline_append("console=ttyS0")),
+            format!("{DEFAULT_CMDLINE} console=tty0 console=ttyS0")
+        );
+        assert_eq!(
+            printed_cmdline(|config| config
+                .cmdline("root=/dev/vda")
+                .display(DisplayMode::Framebuffer)),
+            "root=/dev/vda",
+            "an explicit command line is the embedder's"
         );
     }
 

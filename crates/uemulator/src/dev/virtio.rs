@@ -11,6 +11,8 @@ pub(crate) const DEVICE_TYPE_NET: u16 = 1;
 pub(crate) const DEVICE_TYPE_BLOCK: u16 = 2;
 pub(crate) const DEVICE_TYPE_CONSOLE: u16 = 3;
 pub(crate) const DEVICE_TYPE_RNG: u16 = 4;
+pub(crate) const DEVICE_TYPE_GPU: u16 = 16;
+pub(crate) const DEVICE_TYPE_INPUT: u16 = 18;
 
 /// Feature bit 32. We only implement modern (virtio 1.x) split queues, so the driver must accept it.
 const VIRTIO_F_VERSION_1: u64 = 1 << 32;
@@ -376,7 +378,8 @@ impl Queue {
 /// A virtio device model behind a PCI `Transport`. The callbacks return true when buffers
 /// were completed (or config changed) and the guest should get an interrupt.
 pub(crate) trait VirtioDev: Send {
-    /// Virtio device type (1 net, 2 block, 3 console, 4 entropy). PCI device id is `0x1040 + id`.
+    /// Virtio device type (1 net, 2 block, 3 console, 4 entropy, 16 GPU, 18 input). PCI device id
+    /// is `0x1040 + id`.
     fn device_type(&self) -> u16;
     /// Device-specific feature bits; the transport adds `VIRTIO_F_VERSION_1`.
     fn features(&self) -> u64;

@@ -481,7 +481,9 @@ pub(crate) fn load_firmware(ram: &mut [u8], image: &[u8]) -> Result<BootState, E
 }
 
 pub(crate) mod uefi;
-pub(crate) use uefi::{FirmwareParams, UefiPayload, has_efi_header, load_uefi_firmware};
+pub(crate) use uefi::{
+    FirmwareParams, UefiPayload, framebuffer_region, has_efi_header, load_uefi_firmware,
+};
 
 #[cfg(test)]
 mod tests;
