@@ -299,6 +299,9 @@ pub(crate) struct Svm {
     /// The soft TLB of the side that is not running: the host's while a guest runs, the last
     /// guest's while the host runs. `None` until the first VMRUN.
     pub(crate) parked_tlb: Option<Box<ParkedTlb>>,
+    /// Nested-table leaves the walker resolved for the running guest. `None` until the first
+    /// nested walk.
+    nested_leaves: Option<Box<NestedLeafCache>>,
 }
 
 impl Svm {
@@ -310,6 +313,7 @@ impl Svm {
             guest: None,
             last_vmcb: 0,
             parked_tlb: None,
+            nested_leaves: None,
         }
     }
 }
@@ -354,6 +358,118 @@ struct GuestAddressSpace {
     cr3: u64,
     cr4: u64,
     efer: u64,
+}
+
+/// Leaves of the nested page tables the walker already resolved, so a guest's page walk (up to
+/// five nested walks: one per guest table and one for the page) mostly reads the guest's own
+/// tables. A TLB that caches nested translations is what the architecture describes, so it lives
+/// exactly as long as the guest's TLB: emptied whenever that is (a VMRUN that does not keep it,
+/// INVLPGA), and never consulted for another nested CR3. A hypervisor that changes the nested
+/// tables without asking for a flush sees the old translation, as on hardware.
+///
+/// 4 KiB leaves are direct-mapped by guest-physical page; 2 MiB and 1 GiB leaves (Xen maps a
+/// dom0 with them) go round robin in a short list, like `Cpu::large_pages`.
+pub(crate) struct NestedLeafCache {
+    root: u64,
+    small: [NestedLeaf; NESTED_SMALL_LEAVES],
+    large: [NestedLeaf; NESTED_LARGE_LEAVES],
+    next_large: usize,
+}
+
+const NESTED_SMALL_LEAVES: usize = 256;
+const NESTED_LARGE_LEAVES: usize = 8;
+
+#[derive(Clone, Copy)]
+struct NestedLeaf {
+    /// Guest-physical address of the leaf's first byte; `NO_NESTED_LEAF` when unused.
+    guest_base: u64,
+    host_base: u64,
+    /// log2 of the leaf size.
+    shift: u32,
+    rights: NestedRights,
+}
+
+/// Never a leaf's aligned guest-physical base.
+const NO_NESTED_LEAF: u64 = u64::MAX;
+const EMPTY_NESTED_LEAF: NestedLeaf = NestedLeaf {
+    guest_base: NO_NESTED_LEAF,
+    host_base: 0,
+    shift: NPT_PAGE_SHIFT,
+    rights: ALL_NESTED_RIGHTS,
+};
+
+impl NestedLeafCache {
+    fn empty() -> Box<Self> {
+        Box::new(NestedLeafCache {
+            root: NO_NESTED_LEAF,
+            small: [EMPTY_NESTED_LEAF; NESTED_SMALL_LEAVES],
+            large: [EMPTY_NESTED_LEAF; NESTED_LARGE_LEAVES],
+            next_large: 0,
+        })
+    }
+
+    fn small_slot(guest_physical: u64) -> usize {
+        (guest_physical >> NPT_PAGE_SHIFT) as usize & (NESTED_SMALL_LEAVES - 1)
+    }
+
+    /// The cached leaf covering `guest_physical` under `root`, unless the access needs the walk:
+    /// a store the leaf does not allow yet (not writable, or Dirty still to be set) or a fetch
+    /// it forbids. The walk then sets the bit or raises the nested fault.
+    fn lookup(
+        &self,
+        root: u64,
+        guest_physical: u64,
+        access: super::mem::AccessKind,
+    ) -> Option<(u64, NestedRights)> {
+        if self.root != root {
+            return None;
+        }
+        let covers = |leaf: &&NestedLeaf| {
+            leaf.guest_base != NO_NESTED_LEAF
+                && guest_physical >> leaf.shift == leaf.guest_base >> leaf.shift
+        };
+        let leaf = Some(&self.small[Self::small_slot(guest_physical)])
+            .filter(covers)
+            .or_else(|| self.large.iter().find(covers))?;
+        let allowed = match access {
+            super::mem::AccessKind::Write => leaf.rights.store,
+            super::mem::AccessKind::Exec => leaf.rights.fetch,
+            super::mem::AccessKind::Read => true,
+        };
+        if !allowed {
+            return None;
+        }
+        let offset = guest_physical & ((1u64 << leaf.shift) - 1);
+        Some((leaf.host_base | offset, leaf.rights))
+    }
+
+    fn insert(&mut self, root: u64, leaf: NestedLeaf) {
+        if self.root != root {
+            self.forget();
+            self.root = root;
+        }
+        if leaf.shift == NPT_PAGE_SHIFT {
+            self.small[Self::small_slot(leaf.guest_base)] = leaf;
+            return;
+        }
+        // The same leaf again (a store re-walking a clean one) takes its old slot.
+        let slot = self
+            .large
+            .iter()
+            .position(|cached| cached.shift == leaf.shift && cached.guest_base == leaf.guest_base)
+            .unwrap_or_else(|| {
+                let slot = self.next_large;
+                self.next_large = (slot + 1) % NESTED_LARGE_LEAVES;
+                slot
+            });
+        self.large[slot] = leaf;
+    }
+
+    fn forget(&mut self) {
+        self.small = [EMPTY_NESTED_LEAF; NESTED_SMALL_LEAVES];
+        self.large = [EMPTY_NESTED_LEAF; NESTED_LARGE_LEAVES];
+        self.root = NO_NESTED_LEAF;
+    }
 }
 
 impl ParkedTlb {
@@ -532,13 +648,23 @@ impl Cpu {
         self.svm_instruction_checks()?;
         if self.gpr[RCX] as u32 == HOST_ASID {
             self.invlpg(self.gpr[RAX]);
-        } else if let Some(parked) = self.svm.parked_tlb.as_deref_mut()
-            && matches!(parked.owner, TlbOwner::Guest(_))
-        {
-            parked.owner = TlbOwner::Nobody;
+        } else {
+            if let Some(parked) = self.svm.parked_tlb.as_deref_mut()
+                && matches!(parked.owner, TlbOwner::Guest(_))
+            {
+                parked.owner = TlbOwner::Nobody;
+            }
+            self.forget_nested_leaves();
         }
         self.rip = next;
         Ok(())
+    }
+
+    /// Empties `NestedLeafCache`, together with the guest TLB it belongs to.
+    fn forget_nested_leaves(&mut self) {
+        if let Some(cache) = self.svm.nested_leaves.as_deref_mut() {
+            cache.forget();
+        }
     }
 
     /// Swaps the running TLB with the parked one; `tlb_active_base` follows the new array.
@@ -556,6 +682,7 @@ impl Cpu {
         self.swap_parked_tlb(&mut parked);
         if !keep {
             self.flush_tlb();
+            self.forget_nested_leaves();
         }
         parked.owner = if tlb_control == TLB_CONTROL_FLUSH_ALL {
             TlbOwner::Nobody
@@ -1183,6 +1310,14 @@ impl Cpu {
         let Some(root) = self.svm.guest.as_ref().and_then(|guest| guest.nested_cr3) else {
             return Ok((guest_physical, ALL_NESTED_RIGHTS));
         };
+        if let Some(hit) = self
+            .svm
+            .nested_leaves
+            .as_deref()
+            .and_then(|cache| cache.lookup(root, guest_physical, access))
+        {
+            return Ok(hit);
+        }
         let write = access == super::mem::AccessKind::Write;
         let fetch = access == super::mem::AccessKind::Exec;
         let nx_enabled = self
@@ -1253,6 +1388,18 @@ impl Cpu {
                     store: writable && entry & NPT_DIRTY != 0,
                     fetch: !(no_execute && nx_enabled),
                 };
+                self.svm
+                    .nested_leaves
+                    .get_or_insert_with(NestedLeafCache::empty)
+                    .insert(
+                        root,
+                        NestedLeaf {
+                            guest_base: guest_physical & !alignment_mask,
+                            host_base: base,
+                            shift,
+                            rights,
+                        },
+                    );
                 return Ok((base | (guest_physical & alignment_mask), rights));
             }
             if entry & NPT_ACCESSED == 0
@@ -2323,6 +2470,27 @@ mod tests {
         );
     }
 
+    /// And a fetch from a page the nested tables mark no-execute, after a read cached it.
+    #[test]
+    fn a_fetch_after_a_read_still_faults_on_a_no_execute_nested_page() {
+        // mov rax, [0x800000]; mov rax, 0x800000; jmp rax
+        let mut h = nested_rig(&[
+            0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x80, 0x00, 0x48, 0xc7, 0xc0, 0x00, 0x00, 0x80,
+            0x00, 0xff, 0xe0,
+        ]);
+        // Nested NX counts only with NX on in the host's EFER.
+        h.cpu.efer |= EFER_NXE;
+        h.write(
+            NPT + 0x3000,
+            &(NESTED_REMAPPED_HPA | 7 | NPT_NO_EXECUTE).to_le_bytes(),
+        );
+        h.write(NESTED_REMAPPED_HPA, ASM_CPUID);
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_NPF);
+        assert_eq!(get(&h, VMCB_EXITINFO2, 8), NESTED_REMAPPED_GPA);
+        assert_ne!(get(&h, VMCB_EXITINFO1, 8) & NPF_FETCH, 0);
+    }
+
     /// Likewise a store must reach the nested walk that sets the nested Dirty bit, even after a
     /// read cached the page.
     #[test]
@@ -2603,6 +2771,7 @@ mod tests {
         a_nested_fault_in_the_middle_of_a_block_saves_the_guest_and_restores_the_host,
         a_store_after_a_read_still_faults_on_a_read_only_nested_page,
         a_store_after_a_read_sets_the_nested_dirty_bit,
+        a_fetch_after_a_read_still_faults_on_a_no_execute_nested_page,
         a_pending_virtual_interrupt_is_injected_when_the_guest_can_take_it,
         a_guest_keeps_its_translations_across_an_exit_unless_a_flush_is_asked_for,
         invlpga_drops_the_guests_translations,
