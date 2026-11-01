@@ -1,7 +1,7 @@
 // Boots several machines of the browser build (target/web/uemulator_web.wasm) under Node on one
 // shared Ethernet segment, the way several tabs of the page share one, and checks what the
 // segment promises (docs/plans/13-web.md): each machine gets its own DHCP address in 10.0.2.0/24,
-// they ping each other and talk TCP, and when the machine whose tab serves DHCP goes away another
+// they ping each other and talk TCP (a line, and 4 MiB checked by MD5), and when the machine whose tab serves DHCP goes away another
 // takes over without anyone losing an address.
 //
 //   WEB_DEMO=1 hack/web.sh
@@ -38,6 +38,9 @@ const PROMPT = /~# (\x1b\[6n)?$/;
 // What the demo's /init prints once udhcpc has configured eth0.
 const ADDRESS_LINE = /eth0 is (10\.0\.2\.\d+)\/24/;
 const TCP_PORT = 5000;
+const BULK_PORT = 5001;
+// Eight times the page's 512 KiB frame ring.
+const BULK_KIB = 4096;
 const started = performance.now();
 
 function log(text) {
@@ -196,23 +199,52 @@ async function scenario() {
   b.type("\x03");
   await a.waitFor(PROMPT, a.console.length - 1, "A prompt after nc");
 
+  await bulk(b, a);
+
   log("stopping A, the server");
   await a.stop();
   await waitUntil(() => b.status?.serving, "B to take over serving");
   check(b.status.serving, "B serves after A left");
 
-  // C asks for an address again: the new server knows the one C has, from the announcements.
-  const before = c.address;
-  const [, again] = await c.run("udhcpc -i eth0 -q -n -t 5 -T 2 >/dev/null 2>&1; ip -4 -o addr show eth0", /inet (10\.0\.2\.\d+)\//);
-  check(again === before, `C keeps ${before} when it asks the new server (got ${again})`);
-
+  // D asks the new server before anyone else has said a word to it: the server picks the lowest
+  // free address, so had it missed A's or C's lease (announced to it while A served) D would get
+  // that one.
   const d = start("D");
   await d.boot();
   check(![a, b, c].map((m) => m.address).includes(d.address), `D's ${d.address} differs from A's, B's and C's`);
+
+  const before = c.address;
+  const [, again] = await c.run("udhcpc -i eth0 -q -n -t 5 -T 2 >/dev/null 2>&1; ip -4 -o addr show eth0", /inet (10\.0\.2\.\d+)\//);
+  check(again === before, `C keeps ${before} when it asks the new server (got ${again})`);
   await ping(d, c);
   await ping(b, d);
   await waitUntil(() => [b, c, d].every((m) => m.status?.peers === 2), "the peer counts to drop A");
   check(true, "B, C and D count two peers each once A is gone");
+}
+
+// Sends BULK_KIB of random bytes over TCP from `from` to `to` and compares checksums: MTU-sized
+// frames in both directions, a TCP window's worth in flight, and the page's frame ring wrapped
+// several times over.
+async function bulk(from, to) {
+  const bytes = BULK_KIB * 1024;
+  await to.run(`rm -f /tmp/got; nc -l -p ${BULK_PORT} > /tmp/got & echo listening`, /listening/);
+  const [, sent] = await from.run(
+    `dd if=/dev/urandom of=/tmp/blob bs=1024 count=${BULK_KIB} 2>/dev/null; md5sum /tmp/blob`,
+    /([0-9a-f]{32}) {2}\/tmp\/blob/,
+  );
+  const begun = performance.now();
+  from.type(`nc ${to.address} ${BULK_PORT} < /tmp/blob &\n`);
+  for (;;) {
+    const [, size] = await to.run("wc -c < /tmp/got", /\n(\d+)\r?\n/);
+    if (Number(size) >= bytes) break;
+    if (performance.now() - begun > STEP_TIMEOUT_MS) throw new Error(`${to.name} got ${size} of ${bytes} bytes`);
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+  const seconds = (performance.now() - begun) / 1000;
+  const [, received] = await to.run("md5sum /tmp/got", /([0-9a-f]{32}) {2}\/tmp\/got/);
+  check(received === sent, `${BULK_KIB} KiB over TCP from ${from.name} to ${to.name} arrived intact in about ${seconds.toFixed(1)} s`);
+  // Whichever nc is still waiting.
+  for (const machine of [from, to]) await machine.run("kill %1 2>/dev/null; wait; echo done", /done/);
 }
 
 function waitUntil(condition, what) {
