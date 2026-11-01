@@ -15,9 +15,13 @@
 //! only slow down:
 //! - TSC deadline is advertised (AMD has none) because the local APIC model implements it and
 //!   guests calibrate the timer far faster with it.
-//! - Leaf 7 EDX and `IA32_ARCH_CAPABILITIES` keep the Intel spelling of the speculation-control
-//!   interface (see `sys.rs`), and leaf 0x8000_0021 claims SRSO_NO: the CPU never speculates, so
-//!   no mitigation (retpolines, IBPB on entry, safe-ret thunks) is wanted.
+//! - Leaf 0x8000_0021 claims SRSO_NO, which Turin does not: the CPU never speculates, so it is
+//!   true here, and without it Linux puts an IBPB on every #VMEXIT of a nested KVM guest. The rest
+//!   of the speculation-control interface is Turin's, in the AMD spelling only (leaf 0x8000_0008
+//!   EBX, 0x8000_0021 EAX): automatic IBRS, so Spectre v2 costs one EFER write per CPU at boot,
+//!   and no Intel leaf 7 EDX bits or IA32_ARCH_CAPABILITIES. Linux then reports Spectre v2 as
+//!   "Enhanced / Automatic IBRS", speculative store bypass as "disabled via prctl" (Turin has no
+//!   SSB_NO) and VMSCAPE as "IBPB before exit to userspace" (only after running a KVM guest).
 //! - 40 physical and 48 virtual address bits, not 52 and 57.
 
 use super::sys::{CR4_OSXSAVE, PHYSICAL_ADDRESS_BITS, RAX, RBX, RCX, RDX, VIRTUAL_ADDRESS_BITS};
@@ -322,26 +326,13 @@ const STRUCTURED_ECX: u32 = STRUCTURED_ECX_AVX512_VBMI
     | STRUCTURED_ECX_AVX512_VPOPCNTDQ
     | STRUCTURED_ECX_RDPID;
 
-// Leaf 7 subleaf 0 EDX: the speculation-control interface. The MSRs behind these bits are
-// implemented as inert storage (see `ARCH_CAPABILITIES` in sys.rs).
+// Leaf 7 subleaf 0 EDX. The speculation-control bits Intel defines here (SPEC_CTRL, STIBP,
+// L1D_FLUSH, ARCH_CAPABILITIES, SSBD, bits 26-31) stay clear, as on every AMD part: the AMD
+// spelling is leaf 0x8000_0008 EBX and 0x8000_0021 EAX, and IA32_ARCH_CAPABILITIES and
+// IA32_FLUSH_CMD do not exist (#GP).
 /// FSRM: fast short `rep movsb`.
 const STRUCTURED_FEATURE_FSRM: u32 = 1 << 4;
-/// IA32_SPEC_CTRL and IA32_PRED_CMD (IBRS and IBPB).
-const STRUCTURED_FEATURE_SPEC_CTRL: u32 = 1 << 26;
-/// STIBP bit in IA32_SPEC_CTRL.
-const STRUCTURED_FEATURE_STIBP: u32 = 1 << 27;
-/// IA32_FLUSH_CMD.
-const STRUCTURED_FEATURE_L1D_FLUSH: u32 = 1 << 28;
-/// IA32_ARCH_CAPABILITIES.
-const STRUCTURED_FEATURE_ARCH_CAPABILITIES: u32 = 1 << 29;
-/// SSBD bit in IA32_SPEC_CTRL.
-const STRUCTURED_FEATURE_SSBD: u32 = 1 << 31;
-const STRUCTURED_EDX: u32 = STRUCTURED_FEATURE_FSRM
-    | STRUCTURED_FEATURE_SPEC_CTRL
-    | STRUCTURED_FEATURE_STIBP
-    | STRUCTURED_FEATURE_L1D_FLUSH
-    | STRUCTURED_FEATURE_ARCH_CAPABILITIES
-    | STRUCTURED_FEATURE_SSBD;
+const STRUCTURED_EDX: u32 = STRUCTURED_FEATURE_FSRM;
 
 /// Leaf 7 subleaf 1 EAX bit 5: AVX512_BF16 (vcvtne2ps2bf16, vcvtneps2bf16, vdpbf16ps).
 const STRUCTURED_1_EAX_AVX512_BF16: u32 = 1 << 5;
@@ -583,12 +574,30 @@ const EXT_ADDRESS_CLZERO: u32 = 1 << 0;
 const EXT_ADDRESS_XSAVEERPTR: u32 = 1 << 2;
 /// wbnoinvd (F3 0F 09).
 const EXT_ADDRESS_WBNOINVD: u32 = 1 << 9;
-// The AMD spelling of the speculation-control interface (Linux consults these on AMD vendor
-// CPUs).
+// The AMD speculation-control interface. The CPU never speculates, so every control is accepted
+// and has nothing to restrict; what each bit promises is the MSR behaviour in sys.rs
+// (`SPEC_CTRL_WRITABLE`, `PRED_CMD_WRITABLE`, `EFER_AIBRSE`).
+/// IA32_PRED_CMD bit 0.
 const EXT_ADDRESS_IBPB: u32 = 1 << 12;
+/// IA32_SPEC_CTRL bit 0.
 const EXT_ADDRESS_IBRS: u32 = 1 << 14;
+/// IA32_SPEC_CTRL bit 1.
 const EXT_ADDRESS_STIBP: u32 = 1 << 15;
+/// STIBP is preferred always on: Linux then sets it once (`STIBP: always-on`) with SMT instead of
+/// toggling it per task.
+const EXT_ADDRESS_STIBP_ALWAYS_ON: u32 = 1 << 17;
+/// IBRS also protects against same-mode (user-user, kernel-kernel) branch target injection.
+const EXT_ADDRESS_IBRS_SAME_MODE: u32 = 1 << 19;
+/// EFER.LMSLE (bit 13, long-mode segment limits) does not exist and must be zero: a write of it
+/// is #GP (`EFER_WRMSR_ALLOWED`). KVM keys on this to refuse it to guests too.
+const EXT_ADDRESS_EFER_LMSLE_MBZ: u32 = 1 << 20;
+/// IA32_SPEC_CTRL bit 2.
 const EXT_ADDRESS_SSBD: u32 = 1 << 24;
+/// IA32_SPEC_CTRL bit 7, predictive store forwarding disable.
+const EXT_ADDRESS_PSFD: u32 = 1 << 28;
+/// Not affected by branch type confusion (Retbleed on AMD); Linux would otherwise consult its
+/// family list, which does not name family 1Ah anyway.
+const EXT_ADDRESS_BTC_NO: u32 = 1 << 29;
 /// IBPB also flushes the return predictor; without it Linux marks the CPU "ibpb_no_ret".
 const EXT_ADDRESS_IBPB_RET: u32 = 1 << 30;
 const EXT_ADDRESS_EBX: u32 = EXT_ADDRESS_CLZERO
@@ -597,7 +606,12 @@ const EXT_ADDRESS_EBX: u32 = EXT_ADDRESS_CLZERO
     | EXT_ADDRESS_IBPB
     | EXT_ADDRESS_IBRS
     | EXT_ADDRESS_STIBP
+    | EXT_ADDRESS_STIBP_ALWAYS_ON
+    | EXT_ADDRESS_IBRS_SAME_MODE
+    | EXT_ADDRESS_EFER_LMSLE_MBZ
     | EXT_ADDRESS_SSBD
+    | EXT_ADDRESS_PSFD
+    | EXT_ADDRESS_BTC_NO
     | EXT_ADDRESS_IBPB_RET;
 /// ECX: number of logical processors minus one (7:0), APIC id width in bits (15:12).
 const EXT_ADDRESS_APIC_ID_SIZE_SHIFT: u32 = 12;
@@ -605,12 +619,48 @@ const EXT_ADDRESS_APIC_ID_SIZE_SHIFT: u32 = 12;
 /// Leaf 0x8000_0007 EDX bit 8: invariant TSC, so the kernel trusts it as a clocksource.
 const APM_INVARIANT_TSC: u32 = 1 << 8;
 
-/// Leaf 0x8000_0021 EAX: LFENCE is always dispatch-serializing (nothing to configure through
-/// DE_CFG; the CPU executes in order), and SRSO_NO (see the module comment). ECX: the "not
-/// affected" bits for Transient Scheduler Attacks, which Linux keys on family 0x19 (store-queue
-/// and L1 variants).
+// Leaf 0x8000_0021 EAX.
+/// Data breakpoints never fire while a #DB is being delivered. True because no hardware
+/// breakpoint fires at all (`mov_cr_dr` keeps the debug registers as validated storage).
+const EXT_FEATURES_2_NO_NESTED_DATA_BP: u32 = 1 << 0;
+/// wrmsr to FS_BASE, GS_BASE and KERNEL_GS_BASE is not serializing. Software that relied on it
+/// serializing would have to fence; the emulator serializes everything, so either answer is safe.
+const EXT_FEATURES_2_WRMSR_XX_BASE_NS: u32 = 1 << 1;
+/// LFENCE is always dispatch-serializing (nothing to configure through DE_CFG; the CPU executes
+/// in order).
 const EXT_FEATURES_2_LFENCE_ALWAYS_SERIALIZING: u32 = 1 << 2;
+/// Loading a null selector into a data segment register clears its base: `checked_data_seg`
+/// returns a zero segment for a null selector. Without the bit Linux sets X86_BUG_NULL_SEG and
+/// reloads FS/GS around every context switch.
+const EXT_FEATURES_2_NULL_SEL_CLR_BASE: u32 = 1 << 6;
+/// Automatic IBRS: EFER.AIBRSE (bit 21) is writable and sticks (`EFER_AIBRSE` in sys.rs). Linux
+/// treats it as enhanced IBRS and picks "Mitigation: Enhanced / Automatic IBRS" for Spectre v2,
+/// one EFER write per CPU instead of retpolines.
+const EXT_FEATURES_2_AUTOIBRS: u32 = 1 << 8;
+/// IA32_PRED_CMD bit 7 (selective branch predictor barrier) is accepted. Linux writes it instead
+/// of IBPB when SRSO needs no mitigation, with a plain wrmsr: dropping the MSR bit while this
+/// stays set oopses the guest.
+const EXT_FEATURES_2_SBPB: u32 = 1 << 27;
+/// IBPB flushes every branch type's predictions; nothing to flush here.
+const EXT_FEATURES_2_IBPB_BRTYPE: u32 = 1 << 28;
+/// Not affected by Speculative Return Stack Overflow. Real Turin does not say this (Linux then
+/// picks "IBPB on VMEXIT only"); see the module comment for why the emulator does.
 const EXT_FEATURES_2_SRSO_NO: u32 = 1 << 29;
+/// Not affected by SRSO across the user/kernel boundary, which real Turin does say; implied by
+/// SRSO_NO, and kept so the leaf reads like the hardware's to a consumer that checks only it.
+const EXT_FEATURES_2_SRSO_USER_KERNEL_NO: u32 = 1 << 30;
+const EXT_FEATURES_2_EAX: u32 = EXT_FEATURES_2_NO_NESTED_DATA_BP
+    | EXT_FEATURES_2_WRMSR_XX_BASE_NS
+    | EXT_FEATURES_2_LFENCE_ALWAYS_SERIALIZING
+    | EXT_FEATURES_2_NULL_SEL_CLR_BASE
+    | EXT_FEATURES_2_AUTOIBRS
+    | EXT_FEATURES_2_SBPB
+    | EXT_FEATURES_2_IBPB_BRTYPE
+    | EXT_FEATURES_2_SRSO_NO
+    | EXT_FEATURES_2_SRSO_USER_KERNEL_NO;
+/// Leaf 0x8000_0021 ECX: the "not affected" bits for Transient Scheduler Attacks (store-queue and
+/// L1 variants). Linux's list of affected families stops at 19h and on bare metal it sets these
+/// itself for anything newer; they matter to a consumer that sees the CPU as virtualised.
 const EXT_FEATURES_2_TSA_SQ_NO: u32 = 1 << 1;
 const EXT_FEATURES_2_TSA_L1_NO: u32 = 1 << 2;
 
@@ -769,7 +819,7 @@ impl Cpu {
                 0,
             ),
             LEAF_EXT_FEATURES_2 => (
-                EXT_FEATURES_2_LFENCE_ALWAYS_SERIALIZING | EXT_FEATURES_2_SRSO_NO,
+                EXT_FEATURES_2_EAX,
                 0,
                 EXT_FEATURES_2_TSA_SQ_NO | EXT_FEATURES_2_TSA_L1_NO,
                 0,

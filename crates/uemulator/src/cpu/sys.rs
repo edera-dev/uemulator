@@ -33,52 +33,21 @@ const PERF_COUNTER_MASK: u64 = (1 << 48) - 1;
 pub(crate) const MSR_XSS: u32 = 0xda0;
 pub(crate) const MSR_SPEC_CTRL: u32 = 0x48;
 pub(crate) const MSR_PRED_CMD: u32 = 0x49;
-pub(crate) const MSR_ARCH_CAPABILITIES: u32 = 0x10a;
-pub(crate) const MSR_FLUSH_CMD: u32 = 0x10b;
 
-/// IA32_SPEC_CTRL bits: IBRS, STIBP, SSBD. Any other bit is reserved and #GPs on write.
-const SPEC_CTRL_WRITABLE: u64 = 0b111;
-/// IA32_PRED_CMD bit 0 (IBPB) and IA32_FLUSH_CMD bit 0 (L1D flush): write-only command MSRs.
-/// The emulator has no predictors or L1D to flush, so accepting the write is the whole job.
-const COMMAND_MSR_WRITABLE: u64 = 1;
-
-// IA32_ARCH_CAPABILITIES bits. The emulated CPU executes strictly in order with no speculation,
-// so it states that it is immune to every speculative-execution vulnerability Linux knows about.
-// That makes the kernel pick "Not affected" everywhere (no KPTI, no VERW on exit, no retpolines
-// or return thunks, no BHB clearing loop on syscall entry), which is the point: those
-// mitigations cost guest instructions the emulator would then have to run. Add a bit here only
-// together with the kernel check it silences; a bit that is *not* a "_NO" bit (RSBA, bit 2)
-// must stay clear because it marks the CPU as vulnerable.
-const ARCH_CAP_RDCL_NO: u64 = 1 << 0;
-const ARCH_CAP_IBRS_ALL: u64 = 1 << 1;
-const ARCH_CAP_SKIP_L1DFL_VMENTRY: u64 = 1 << 3;
-const ARCH_CAP_SSB_NO: u64 = 1 << 4;
-const ARCH_CAP_MDS_NO: u64 = 1 << 5;
-const ARCH_CAP_PSCHANGE_MC_NO: u64 = 1 << 6;
-const ARCH_CAP_TAA_NO: u64 = 1 << 8;
-const ARCH_CAP_SBDR_SSDP_NO: u64 = 1 << 13;
-const ARCH_CAP_FBSDP_NO: u64 = 1 << 14;
-const ARCH_CAP_PSDP_NO: u64 = 1 << 15;
-const ARCH_CAP_BHI_NO: u64 = 1 << 20;
-const ARCH_CAP_PBRSB_NO: u64 = 1 << 24;
-const ARCH_CAP_GDS_NO: u64 = 1 << 26;
-const ARCH_CAP_RFDS_NO: u64 = 1 << 27;
-const ARCH_CAP_ITS_NO: u64 = 1 << 62;
-const ARCH_CAPABILITIES: u64 = ARCH_CAP_RDCL_NO
-    | ARCH_CAP_IBRS_ALL
-    | ARCH_CAP_SKIP_L1DFL_VMENTRY
-    | ARCH_CAP_SSB_NO
-    | ARCH_CAP_MDS_NO
-    | ARCH_CAP_PSCHANGE_MC_NO
-    | ARCH_CAP_TAA_NO
-    | ARCH_CAP_SBDR_SSDP_NO
-    | ARCH_CAP_FBSDP_NO
-    | ARCH_CAP_PSDP_NO
-    | ARCH_CAP_BHI_NO
-    | ARCH_CAP_PBRSB_NO
-    | ARCH_CAP_GDS_NO
-    | ARCH_CAP_RFDS_NO
-    | ARCH_CAP_ITS_NO;
+/// IA32_SPEC_CTRL bits (AMD names; leaf 0x8000_0008 EBX advertises each): IBRS, STIBP, SSBD and
+/// PSFD (predictive store forwarding disable). Stored and read back, with nothing to control
+/// because the CPU never speculates. Any other bit is reserved and #GPs on write.
+const SPEC_CTRL_IBRS: u64 = 1 << 0;
+const SPEC_CTRL_STIBP: u64 = 1 << 1;
+const SPEC_CTRL_SSBD: u64 = 1 << 2;
+const SPEC_CTRL_PSFD: u64 = 1 << 7;
+const SPEC_CTRL_WRITABLE: u64 = SPEC_CTRL_IBRS | SPEC_CTRL_STIBP | SPEC_CTRL_SSBD | SPEC_CTRL_PSFD;
+/// IA32_PRED_CMD, a write-only command MSR: IBPB (bit 0) and SBPB (bit 7, the selective barrier
+/// of leaf 0x8000_0021 EAX). There are no predictors to flush, so accepting the write is the whole
+/// job. Linux issues SBPB with an unchecked wrmsr once SBPB is advertised, so the two go together.
+const PRED_CMD_IBPB: u64 = 1 << 0;
+const PRED_CMD_SBPB: u64 = 1 << 7;
+const PRED_CMD_WRITABLE: u64 = PRED_CMD_IBPB | PRED_CMD_SBPB;
 
 // CR0_PE/MP/ET/PG, CR4_PAE and EFER_LME/LMA/NXE live in cpu/mod.rs.
 pub(crate) const CR0_EM: u64 = 1 << 2;
@@ -169,10 +138,16 @@ const DR7: usize = 7;
 const DEBUG_REGISTER_COUNT: usize = 8;
 
 pub(crate) const EFER_SCE: u64 = 1 << 0;
+/// EFER.AIBRSE, automatic IBRS (leaf 0x8000_0021 EAX bit 8): IBRS protection for CPL 0 without
+/// toggling IA32_SPEC_CTRL. Stored and inert. Linux sets it on every CPU (the AP trampoline loads
+/// the BSP's EFER with a plain wrmsr, in 32-bit code), and a KVM guest's EFER carries it into the
+/// VMCB, so `svm::EFER_KNOWN` must accept it too.
+pub(crate) const EFER_AIBRSE: u64 = 1 << 21;
 /// wrmsr to EFER faults if any bit outside this set is 1. LMA is accepted in the value but
 /// never stored: it is recomputed from CR0.PG and EFER.LME on CR0 writes.
-const EFER_WRMSR_ALLOWED: u64 = EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE | super::svm::EFER_SVME;
-const EFER_WRMSR_STORED: u64 = EFER_SCE | EFER_LME | EFER_NXE | super::svm::EFER_SVME;
+const EFER_WRMSR_ALLOWED: u64 =
+    EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE | super::svm::EFER_SVME | EFER_AIBRSE;
+const EFER_WRMSR_STORED: u64 = EFER_SCE | EFER_LME | EFER_NXE | super::svm::EFER_SVME | EFER_AIBRSE;
 
 const EFLAGS_ID: u64 = 1 << 21;
 /// Bit 1 of EFLAGS always reads as 1.
@@ -282,7 +257,6 @@ impl Cpu {
             super::svm::MSR_VM_CR => self.svm.vm_cr,
             super::svm::MSR_VM_HSAVE_PA => self.svm.hsave_pa,
             MSR_SPEC_CTRL => self.spec_ctrl,
-            MSR_ARCH_CAPABILITIES => ARCH_CAPABILITIES,
             MSR_SYSENTER_CS..=MSR_SYSENTER_EIP => self.sysenter[(msr - MSR_SYSENTER_CS) as usize],
             _ => match self.msr_misc.get(&msr) {
                 Some(v) => *v,
@@ -394,8 +368,8 @@ impl Cpu {
                 }
                 self.spec_ctrl = v;
             }
-            MSR_PRED_CMD | MSR_FLUSH_CMD => {
-                if v & !COMMAND_MSR_WRITABLE != 0 {
+            MSR_PRED_CMD => {
+                if v & !PRED_CMD_WRITABLE != 0 {
                     return Err(Exception::general_protection(0));
                 }
             }
@@ -1989,55 +1963,90 @@ mod sys_tests {
         }
 
         #[test]
-        fn spec_ctrl_stores_ibrs_stibp_ssbd_and_rejects_reserved_bits() {
+        fn spec_ctrl_stores_ibrs_stibp_ssbd_psfd_and_rejects_reserved_bits() {
             let mut h = blank();
             assert_eq!(h.cpu.rdmsr(MSR_SPEC_CTRL).unwrap(), 0);
-            h.cpu.wrmsr(MSR_SPEC_CTRL, 0b111).unwrap();
-            assert_eq!(h.cpu.rdmsr(MSR_SPEC_CTRL).unwrap(), 0b111);
-            assert_gp0(h.cpu.wrmsr(MSR_SPEC_CTRL, 1 << 3));
-            assert_eq!(h.cpu.rdmsr(MSR_SPEC_CTRL).unwrap(), 0b111);
+            // IBRS, STIBP, SSBD (bits 0-2) and PSFD (bit 7), each on its own and together
+            for value in [1, 2, 4, 0x80, 0x87] {
+                h.cpu.wrmsr(MSR_SPEC_CTRL, value).unwrap();
+                assert_eq!(h.cpu.rdmsr(MSR_SPEC_CTRL).unwrap(), value);
+            }
+            for reserved in [3, 4, 5, 6, 8, 31, 32, 63] {
+                assert_gp0(h.cpu.wrmsr(MSR_SPEC_CTRL, 1 << reserved));
+                assert_eq!(h.cpu.rdmsr(MSR_SPEC_CTRL).unwrap(), 0x87, "bit {reserved}");
+            }
         }
 
         #[test]
-        fn command_msrs_are_write_only_and_take_bit_zero() {
+        fn pred_cmd_is_write_only_and_takes_ibpb_and_sbpb() {
             let mut h = blank();
-            for msr in [MSR_PRED_CMD, MSR_FLUSH_CMD] {
-                h.cpu.wrmsr(msr, 1).unwrap();
-                h.cpu.wrmsr(msr, 0).unwrap();
-                assert_gp0(h.cpu.wrmsr(msr, 2));
+            // IBPB (bit 0), SBPB (bit 7) and both
+            for value in [0, 1, 0x80, 0x81] {
+                h.cpu.wrmsr(MSR_PRED_CMD, value).unwrap();
+            }
+            for reserved in [1, 2, 6, 8, 63] {
+                assert_gp0(h.cpu.wrmsr(MSR_PRED_CMD, 1 << reserved));
+            }
+            assert_gp0(h.cpu.rdmsr(MSR_PRED_CMD));
+        }
+
+        /// The Intel-only speculation MSRs do not exist on AMD: IA32_ARCH_CAPABILITIES (0x10a) and
+        /// IA32_FLUSH_CMD (0x10b). Linux reads them only behind leaf 7 EDX bits that stay clear.
+        #[test]
+        fn intel_speculation_msrs_do_not_exist() {
+            let mut h = blank();
+            for msr in [0x10a, 0x10b] {
                 assert_gp0(h.cpu.rdmsr(msr));
+                assert_gp0(h.cpu.wrmsr(msr, 1));
             }
         }
 
+        /// Linux sets EFER.AIBRSE on the BSP and copies the BSP's EFER, bit included, into every AP
+        /// through the trampoline: the bit must be accepted in any mode and read back.
         #[test]
-        fn arch_capabilities_claims_immunity_and_is_read_only() {
+        fn efer_aibrse_is_writable_and_sticks() {
             let mut h = blank();
-            let value = h.cpu.rdmsr(MSR_ARCH_CAPABILITIES).unwrap();
-            // RSBA (bit 2) marks the CPU as vulnerable and must stay clear.
-            assert_eq!(value & (1 << 2), 0);
-            for bit in [
-                ARCH_CAP_RDCL_NO,
-                ARCH_CAP_IBRS_ALL,
-                ARCH_CAP_SSB_NO,
-                ARCH_CAP_MDS_NO,
-                ARCH_CAP_BHI_NO,
-            ] {
-                assert_ne!(value & bit, 0);
-            }
-            assert_gp0(h.cpu.wrmsr(MSR_ARCH_CAPABILITIES, 0));
+            let efer = h.cpu.rdmsr(TEST_MSR_EFER).unwrap();
+            h.cpu.wrmsr(TEST_MSR_EFER, efer | EFER_AIBRSE).unwrap();
+            assert_eq!(h.cpu.rdmsr(TEST_MSR_EFER).unwrap(), efer | EFER_AIBRSE);
+            h.cpu.wrmsr(TEST_MSR_EFER, efer).unwrap();
+            assert_eq!(h.cpu.rdmsr(TEST_MSR_EFER).unwrap(), efer);
+            // with paging off and long mode not yet enabled, as in the AP trampoline
+            h.cpu.efer = 0;
+            h.cpu.cr0 &= !CR0_PG;
+            h.cpu
+                .wrmsr(TEST_MSR_EFER, EFER_AIBRSE | EFER_LME_BIT | EFER_NXE_BIT)
+                .unwrap();
+            assert_eq!(h.cpu.efer, EFER_AIBRSE | EFER_LME_BIT | EFER_NXE_BIT);
+        }
+
+        #[test]
+        fn wrmsr_and_rdmsr_of_efer_aibrse_match_the_jit() {
+            // mov ecx, 0xc0000080; rdmsr; bts eax, 21; wrmsr; xor eax, eax; rdmsr; hlt
+            let code = [
+                0xb9, 0x80, 0x00, 0x00, 0xc0, 0x0f, 0x32, 0x0f, 0xba, 0xe8, 0x15, 0x0f, 0x30, 0x31,
+                0xc0, 0x0f, 0x32, 0xf4,
+            ];
+            let (h, stop) = run_with(&code, |_| {});
+            assert_eq!(stop, Stop::Halted);
+            assert_ne!(h.cpu.gpr[RAX] & EFER_AIBRSE, 0);
+            crate::testkit::assert_jit_matches_interpreter(&code, |_| {});
         }
 
         #[test]
         fn speculation_control_cpuid_bits_match_the_msrs() {
             let mut h = blank();
             let [_, _, _, edx] = cpuid(&mut h, 7, 0);
-            // FSRM, SPEC_CTRL, STIBP, L1D_FLUSH, ARCH_CAPABILITIES, SSBD
-            assert_eq!(edx, bits(&[4, 26, 27, 28, 29, 31]));
+            // FSRM; none of Intel's SPEC_CTRL, STIBP, L1D_FLUSH, ARCH_CAPABILITIES, SSBD
+            assert_eq!(edx & bits(&[26, 27, 28, 29, 31]), 0);
             let [_, ebx, _, _] = cpuid(&mut h, 0x8000_0008, 0);
-            // IBPB, IBRS, STIBP and SSBD in the AMD spelling
-            for bit in [12, 14, 15, 24] {
+            // IBPB, IBRS, STIBP, SSBD and PSFD in the AMD spelling, each backed by an MSR bit
+            for bit in [12, 14, 15, 24, 28] {
                 assert_ne!(ebx & (1 << bit), 0, "bit {bit}");
             }
+            let [eax, ..] = cpuid(&mut h, 0x8000_0021, 0);
+            // AUTOIBRS (EFER bit 21) and SBPB (PRED_CMD bit 7)
+            assert_eq!(eax & bits(&[8, 27]), bits(&[8, 27]));
         }
 
         /// Linux's `VULNBL_AMD` names families 0x15-0x17 for RETBLEED (a return thunk on every

@@ -11208,6 +11208,47 @@ mod exec_tests {
         assert!(!pair.cpu().seg[SEG_FS].present());
     }
 
+    /// CPUID 0x8000_0021 EAX bit 6 (NullSelectorClearsBase) promises this: in 64-bit mode a null
+    /// selector loaded by `mov` or `pop` leaves base 0, including the FS and GS bases a wrmsr or
+    /// wrfsbase set, at any CPL and with any RPL. Linux skips its X86_BUG_NULL_SEG workaround on
+    /// the strength of it.
+    #[test]
+    fn a_null_selector_load_clears_the_segment_base() {
+        for (snippet, register) in [
+            (code::MOV_DS_AX, SEG_DS),
+            (code::MOV_ES_AX, SEG_ES),
+            (code::MOV_FS_AX, SEG_FS),
+            (code::MOV_GS_AX, SEG_GS),
+        ] {
+            for (cpl, selector) in [(0, SEL_NULL), (3, SEL_NULL | 3), (0, SEL_NULL | 1)] {
+                let mut pair = Pair::new(snippet);
+                let stop = pair.run_for(1, |h| {
+                    enter_cpl(h, cpl);
+                    h.cpu.seg[register] = gdt_segment(h, SEL_UDATA);
+                    h.cpu.seg[register].base = 0x7fff_1234_5000;
+                    h.cpu.gpr[RAX] = selector as u64;
+                });
+                assert_eq!(stop, Stop::Limit);
+                let segment = pair.cpu().seg[register];
+                assert_eq!(
+                    (segment.sel, segment.base),
+                    (selector, 0),
+                    "{register} cpl {cpl}"
+                );
+            }
+        }
+        for (snippet, register) in [(code::POP_FS, SEG_FS), (code::POP_GS, SEG_GS)] {
+            let mut pair = Pair::new(snippet);
+            let stop = pair.run_for(1, |h| {
+                enter_cpl(h, 0);
+                h.cpu.seg[register].base = 0xffff_8000_0000_1000;
+                stack_with(h, 0x40, SEL_NULL as u64);
+            });
+            assert_eq!(stop, Stop::Limit);
+            assert_eq!(pair.cpu().seg[register].base, 0, "pop into {register}");
+        }
+    }
+
     #[test]
     fn mov_to_a_data_segment_loads_base_and_limit_from_the_descriptor() {
         let mut pair = Pair::new(code::MOV_ES_AX);

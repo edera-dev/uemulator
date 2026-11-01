@@ -164,9 +164,8 @@ fn leaf_7_subleaf_0_features() {
     // AVX512_VBMI UMIP AVX512_VBMI2 GFNI VAES VPCLMULQDQ AVX512_VNNI AVX512_BITALG
     // AVX512_VPOPCNTDQ RDPID
     let ecx = bits(&[1, 2, 6, 8, 9, 10, 11, 12, 14, 22]);
-    // FSRM, then the speculation-control set: IBRS/IBPB, STIBP, L1D_FLUSH, ARCH_CAPABILITIES,
-    // SSBD (see the module comment)
-    let edx = bits(&[4, 26, 27, 28, 29, 31]);
+    // FSRM only: the speculation controls are in the AMD leaves
+    let edx = bits(&[4]);
     // EAX is the highest subleaf
     assert_eq!(cpuid(&mut h, 7, 0), [1, ebx, ecx, edx]);
 }
@@ -348,8 +347,12 @@ fn address_size_leaf_reports_40_physical_and_48_virtual_bits_and_the_extensions(
     assert_eq!(eax & 0xff, 40);
     assert_eq!((eax >> 8) & 0xff, 48);
     assert_eq!(eax >> 16, 0);
-    // CLZERO XSAVEERPTR WBNOINVD IBPB IBRS STIBP SSBD IBPB_RET
-    assert_eq!(ebx, bits(&[0, 2, 9, 12, 14, 15, 24, 30]));
+    // CLZERO XSAVEERPTR WBNOINVD IBPB IBRS STIBP STIBP_ALWAYS_ON IBRS_SAME_MODE EFER_LMSLE_MBZ
+    // SSBD PSFD BTC_NO IBPB_RET; no AMD_SSB_NO, VIRT_SSBD, PPIN, IBRS_ALWAYS_ON
+    assert_eq!(
+        ebx,
+        bits(&[0, 2, 9, 12, 14, 15, 17, 19, 20, 24, 28, 29, 30])
+    );
     assert_eq!((ecx, edx), (0, 0));
     // NC is the processor count minus one, ApicIdSize the bits the ids need
     let mut h = with_topology(8, 2, 0);
@@ -477,11 +480,14 @@ fn every_topology_leaf_describes_the_same_machine() {
 }
 
 #[test]
-fn leaf_0x80000021_says_lfence_serializes_and_tsa_and_srso_cannot_happen() {
+fn leaf_0x80000021_has_turins_speculation_bits_and_srso_no() {
     let mut h = blank();
+    // NO_NESTED_DATA_BP WRMSR_XX_BASE_NS LFENCE_ALWAYS_SERIALIZING NULL_SEL_CLR_BASE AUTOIBRS SBPB
+    // IBPB_BRTYPE SRSO_NO SRSO_USER_KERNEL_NO; no SRSO_BP_SPEC_REDUCE, ERAPS, VERW_CLEAR; ECX:
+    // TSA_SQ_NO, TSA_L1_NO
     assert_eq!(
         cpuid(&mut h, 0x8000_0021, 0),
-        [bits(&[2, 29]), 0, bits(&[1, 2]), 0]
+        [bits(&[0, 1, 2, 6, 8, 27, 28, 29, 30]), 0, bits(&[1, 2]), 0]
     );
 }
 

@@ -16,7 +16,7 @@
 use super::decode::Insn;
 use super::exception::Exception;
 use super::flags::*;
-use super::sys::{CR0_TS, EFER_SCE, RAX, RCX, RDX};
+use super::sys::{CR0_TS, EFER_AIBRSE, EFER_SCE, RAX, RCX, RDX};
 use super::*;
 
 pub(crate) const MSR_VM_CR: u32 = 0xc001_0114;
@@ -219,7 +219,9 @@ const CR0_CD_BIT: u64 = 1 << 30;
 const CR0_NW_BIT: u64 = 1 << 29;
 const CR0_PG_BIT: u64 = 1 << 31;
 const CR0_PE_BIT: u64 = 1;
-const EFER_KNOWN: u64 = EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE | EFER_SVME;
+/// EFER bits a VMCB may hold; any other is a consistency failure (VMEXIT_INVALID). AIBRSE is in
+/// the set because a KVM guest that sees automatic IBRS turns it on and KVM passes its EFER on.
+const EFER_KNOWN: u64 = EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE | EFER_SVME | EFER_AIBRSE;
 const DR_HIGH_BITS: u64 = !0u64 << 32;
 /// Number of ASIDs reported in CPUID 0x8000000A; any non-zero ASID in a VMCB is accepted.
 pub(crate) const SVM_ASIDS: u32 = 64;
@@ -1203,6 +1205,21 @@ mod tests {
         let mut h = rig(&[0x0f, 0xa2, 0xf4]);
         run(&mut h);
         assert_eq!(get(&h, SAVE_EFER, 8) & EFER_LMA, EFER_LMA);
+    }
+
+    #[test]
+    fn a_guest_with_automatic_ibrs_in_efer_runs_and_keeps_it() {
+        let mut h = rig(&[0x0f, 0xa2, 0xf4]);
+        let guest_efer = get(&h, SAVE_EFER, 8);
+        put(&mut h, SAVE_EFER, 8, guest_efer | EFER_AIBRSE);
+        run(&mut h);
+        assert_eq!(
+            get(&h, VMCB_EXITCODE, 8),
+            VMEXIT_CPUID,
+            "not VMEXIT_INVALID"
+        );
+        assert_ne!(get(&h, SAVE_EFER, 8) & EFER_AIBRSE, 0);
+        assert_eq!(h.cpu.efer & EFER_AIBRSE, 0, "the host's EFER comes back");
     }
 
     #[test]
