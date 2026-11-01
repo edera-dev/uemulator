@@ -29,8 +29,21 @@ Follow the kernel's 64-bit boot protocol (Documentation/arch/x86/boot.rst, "64-b
 
 - Exact `__BOOT_CS/DS` selectors for 6.12 (`arch/x86/include/asm/segment.h`) — decompressor reloads its own GDT early, but the first `lretq`/segment loads must not fault.
 - Whether the 6.12 decompressor still far-returns into compat mode for 5-level paging probing (`paging_prepare` / `trampoline`). If so the CPU must support switching CS.L=0 and back with correct decoding. Hence the mode-parameterized decoder.
-- The decompressor's early page-fault/IDT handling and `rdrand`/`rdtsc` KASLR entropy (`nokaslr` skips most).
+- The decompressor's early page-fault/IDT handling and `rdrand`/`rdtsc` KASLR entropy: verified, see KASLR below.
 - `initrd_addr_max` and the `ext_ramdisk_image` fields when the initrd sits above 4 GiB (not needed at 512 MiB).
+
+## KASLR
+
+The default command lines leave KASLR on. Checked on the Alpine 6.18 virt kernel with 2 and 8 GiB, 1 and 4 vCPUs, the JIT and `--verify`, reading `Kernel code` in `/proc/iomem` and `_text` in `/proc/kallsyms`: physical and virtual base differ on every boot, physical slots above 4 GiB included.
+
+- Direct entry: the decompressor picks the physical slot from the zero page's e820 table, stepping around the initrd, command line and setup_data, and maps a slot above our 4 GiB identity map itself through its page-fault handler. Nothing in the zero page opts in: `KASLR_FLAG` in `loadflags` is an output the decompressor sets for the kernel.
+- UEFI with a kernel, or GRUB from the disk: the EFI stub places the kernel with `efi_random_alloc`, which needs `EFI_RNG_PROTOCOL` (`uemulator-firmware/src/rng.rs`) and AllocatePages at an address it chose.
+- The UEFI application: both its emulator path and its hardware path (`hack/uefi/boot.sh`, SVM under QEMU TCG) boot with a different base each time; the hardware path's entropy is the host CPU's own.
+- BIOS disk boot: not booted with KASLR (no BIOS-installed disk was at hand). Its `int 15h` E820 is the same `e820_map` as direct entry and the BIOS keeps nothing above 1 MiB, so the decompressor sees the same usable RAM; what differs is the 32-bit entry, whose page tables are the decompressor's own.
+- Entropy is `rdrand`/`rdseed` (seeded by `MachineConfig::random_seed`), the firmware's RNG (seeded from the same value through the handoff page) and the TSC. The CLI and the web page draw the seed from the host's CSPRNG on every boot; with a fixed seed on the virtual clock a boot is reproducible, which is what `--verify` relies on.
+- Nothing in the emulator depends on where the kernel is: JIT blocks are keyed by physical address and position independent (06-jit.md), and the `--debug` log scanner looks for the printk buffer by content (`Cpu::kernel_log_matches`).
+- Cost: none measurable. Host time from launch to the banner (firmware plus decompressor) and to `Run /init`, Alpine, 2 GiB, JIT, median of 5: 0.43 s and 1.59 s with KASLR against 0.44 s and 1.65 s without on direct entry; 0.43 s and 1.62 s against 0.43 s and 1.63 s through UEFI.
+- Embedders other than the CLI and the web page must pass `random_seed` themselves; the UEFI application seeds from the platform's EFI_RNG_PROTOCOL. Without a seed the virtual clock makes every boot choose the same base (on the realtime clock only TSC jitter varies it).
 
 ## Reset
 

@@ -11,7 +11,7 @@ fit.fit();
 // `acpi=off` goes when ACPI is on and the console word follows the console kind. Only for showing
 // what the guest will get; the library builds the real one and the page appends to it.
 function defaultCmdline({ serial, acpi }) {
-  return [`console=${serial ? "ttyS0" : "hvc0"}`, "earlyprintk=serial,ttyS0", "nokaslr", "mitigations=off", acpi ? "" : "acpi=off", "panic=-1"]
+  return [`console=${serial ? "ttyS0" : "hvc0"}`, "earlyprintk=serial,ttyS0", "mitigations=off", acpi ? "" : "acpi=off", "panic=-1"]
     .filter(Boolean).join(" ");
 }
 const DEFAULT_CMDLINE_EXTRA = "earlycon=uart8250,io,0x3f8";
