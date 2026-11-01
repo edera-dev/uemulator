@@ -235,6 +235,9 @@ function notesFor(s) {
   if (!s.kernel && s.firmware !== "none" && s.drives.length && s.display === "none") {
     warn("The drive's boot loader chooses the kernel's console, usually the screen: without a display you may see nothing after its menu.");
   }
+  if (s.firmware === "uefi" && s.kernel && s.drives.length) {
+    warn("UEFI boots the kernel when one is set; the drives are only attached. Remove the kernel to boot from a drive.");
+  }
   if (s.drives.some((drive) => drive.unreachable)) warn("A drive's URL did not answer; it will fail when the machine starts.");
   return notes;
 }
@@ -412,7 +415,21 @@ function restoreSettings() {
   return saved;
 }
 
+// A kernel left over from an earlier choice wins over every drive under UEFI (the firmware boots
+// the kernel it is given, QEMU -kernel style), so the drive presets drop it, and the kernel preset
+// drops the demo's, along with the command line that went with it.
+function clearKernel() {
+  state.kernel = null;
+  state.initrd = null;
+  $("cmdline").value = "";
+  $("shell").checked = false;
+}
+
+// By URL rather than a flag, so a demo kernel remembered across a reload still counts.
+const isDemoSource = (source) => Boolean(source?.url?.startsWith(new URL(".", DEMO_URL).href));
+
 function applyPreset(name) {
+  if (name === "iso" || name === "disk" || (name === "kernel" && isDemoSource(state.kernel))) clearKernel();
   if (name === "iso") {
     setRadio("firmware", "uefi");
     setRadio("display", "screen");
