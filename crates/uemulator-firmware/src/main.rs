@@ -14,6 +14,7 @@ mod boot_menu;
 mod boot_options;
 mod crc32;
 mod devicepath;
+mod eltorito;
 mod fat;
 mod gpt;
 mod handoff;

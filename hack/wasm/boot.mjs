@@ -2,12 +2,14 @@
 // module and the same host imports as www/worker.js, with the console on stdout. For measuring
 // and for checking the WebAssembly JIT against a real guest without a browser.
 //
-//   node hack/wasm/boot.mjs [--kernel K] [--initrd I] [--disk D] [--cmdline S] [--memory MiB]
+//   node hack/wasm/boot.mjs [--kernel K] [--initrd I] [--disk D]... [--cdrom ISO]... [--cmdline S] [--memory MiB]
 //                           [--firmware none|uefi|bios] [--cpus N] [--iommu] [--no-acpi] [--serial]
 //                           [--no-jit] [--debug] [--wasm FILE] [--until TEXT] [--seconds N]
 //
 // --disk is a raw or udisk image (a file, or an http(s) URL served with range requests) attached
-// as vda the way the page attaches one: read on demand, writes kept in memory. --cmdline is
+// the way the page attaches one: read on demand, writes kept in memory. --cdrom attaches an image
+// read-only, as the page attaches an ISO. Both repeat; the drives are vda, vdb, ... with every
+// --disk before every --cdrom. --cmdline is
 // appended to the library's default command line, as on the page. --firmware uefi reads
 // target/web/uemulator-firmware.bin (hack/web.sh builds it) and boots the kernel through it, or the
 // disk when there is no kernel. --debug turns on the library's debug mode: on exit the state dump,
@@ -27,7 +29,8 @@ const { values } = parseArgs({
   options: {
     kernel: { type: "string" },
     initrd: { type: "string" },
-    disk: { type: "string" },
+    disk: { type: "string", multiple: true, default: [] },
+    cdrom: { type: "string", multiple: true, default: [] },
     cmdline: { type: "string", default: "earlycon=uart8250,io,0x3f8" },
     memory: { type: "string", default: "256" },
     cpus: { type: "string", default: "1" },
@@ -43,7 +46,7 @@ const { values } = parseArgs({
     quiet: { type: "boolean", default: false },
   },
 });
-if (!values.kernel && !values.disk) throw new Error("--kernel or --disk is required");
+if (!values.kernel && !values.disk.length && !values.cdrom.length) throw new Error("--kernel, --disk or --cdrom is required");
 
 const start = performance.now();
 const deadline = start + Number(values.seconds) * 1000;
@@ -54,7 +57,8 @@ let compileMs = 0;
 let compiled = 0;
 const decoder = new TextDecoder();
 const jit = createJitHost();
-const bytes = (ptr, len) => new Uint8Array(wasm.memory.buffer, ptr, len);
+// Pointers arrive as signed i32: `>>> 0` makes the ones past 2 GiB of module memory positive.
+const bytes = (ptr, len) => new Uint8Array(wasm.memory.buffer, ptr >>> 0, len);
 const sleeper = new Int32Array(new SharedArrayBuffer(4));
 
 const host = {
@@ -77,6 +81,11 @@ const host = {
   },
   host_input: () => 0,
   host_resize: () => 0,
+  // No screen here: nothing to draw and no keyboard or pointer events.
+  host_input_events: () => 0,
+  host_frame_ready: () => 0,
+  host_frame() {},
+  host_cursor() {},
   host_should_stop: () => (found || performance.now() > deadline ? 1 : 0),
   host_idle: () => Atomics.wait(sleeper, 0, 0, 1),
   host_random(ptr, len) {
@@ -86,7 +95,7 @@ const host = {
   host_log: (ptr, len) => console.error("log:", decoder.decode(bytes(ptr, len))),
   host_disk_read(source, offset, ptr, len) {
     try {
-      const data = diskSource.read(offset, len);
+      const data = diskSources[source].read(offset, len);
       if (data.length !== len) return 1;
       bytes(ptr, len).set(data);
       diskReads++;
@@ -123,7 +132,7 @@ function openDiskSource(name) {
     close: () => closeSync(fd),
   };
 }
-let diskSource = null;
+const diskSources = [];
 let diskReads = 0;
 let diskBytes = 0;
 
@@ -139,10 +148,10 @@ function upload(data) {
 const kernel = values.kernel ? readFileSync(values.kernel) : new Uint8Array(0);
 const initrd = values.initrd ? readFileSync(values.initrd) : new Uint8Array(0);
 const cmdline = new TextEncoder().encode(values.cmdline);
-if (values.disk) {
-  diskSource = openDiskSource(values.disk);
-  if (wasm.uw_add_disk(0, diskSource.length)) {
-    console.error("disk:", decoder.decode(bytes(wasm.uw_error_ptr(), wasm.uw_error_len())));
+for (const [name, readOnly] of [...values.disk.map((d) => [d, 0]), ...values.cdrom.map((d) => [d, 1])]) {
+  const index = diskSources.push(openDiskSource(name)) - 1;
+  if (wasm.uw_add_disk(index, diskSources[index].length, readOnly)) {
+    console.error(`${name}:`, decoder.decode(bytes(wasm.uw_error_ptr(), wasm.uw_error_len())));
     process.exit(2);
   }
 }
@@ -173,6 +182,6 @@ const seconds = ((performance.now() - runStart) / 1000).toFixed(2);
 console.error(
   `\nexit=${code} found=${found} run=${seconds}s jit=${values["no-jit"] ? "off" : "on"} ` +
     `modules=${compiled} compile=${compileMs.toFixed(0)}ms` +
-    (diskSource ? ` disk-reads=${diskReads} disk-bytes=${diskBytes}` : ""),
+    (diskSources.length ? ` disk-reads=${diskReads} disk-bytes=${diskBytes}` : ""),
 );
 if (code === 4) console.error(decoder.decode(bytes(wasm.uw_error_ptr(), wasm.uw_error_len())));

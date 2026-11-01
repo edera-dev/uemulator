@@ -23,6 +23,8 @@
 
 - ERMS/FSRM done: byte-sized rep slices make `rep movsb` copy-heavy guest workloads ~12x faster (03).
 
+- Live CDs and several drives on the web done (see 13, 19): the page attaches up to eight drives, ISOs read-only, and offers up to 2047 MiB (the most one allocation can be on wasm32; JavaScript reads the module's pointers as unsigned past 2 GiB). At 1 GiB Fedora 44's Server netinst fails exactly as a user saw (`Initramfs unpacking failed: write error`, then `VFS: Unable to mount root fs` on the `drm_panic` screen); at 2047 MiB it reaches Anaconda on the CLI, and on the wasm module under Node it unpacks its initramfs and starts stage 2 from the read-only ISO. Fedora 44 KDE Live's `root=live:CDLABEL=` mounts `/sysroot` from the ISO on `vda` (CLI, direct kernel). The firmware boots a plain El Torito ISO's EFI image: netboot.xyz's iPXE on the CLI and in the page. Not done: BIOS El Torito (isolinux-only ISOs such as Tiny Core's) and a real CD device (`sr0`).
+
 - AVX, AVX2, FMA and F16C done (see 03): VEX.128/256 through the SSE kernels, YMM upper state in XSAVE, gathers, masked moves, a fused multiply-add on the soft-float engine, half-precision conversion. Found while booting Debian: a register-collision bug in the VEX staging that broke glibc's AVX2 `strcmp`, now covered by tests.
 
 - BIOS boot of a disk done (see 17): `MachineConfig::boot_disk` runs the first sector in real mode with the BIOS services as host code, enough for Alpine's syslinux 6.04 to load the installed kernel and boot it to a login prompt; `quick boot` uses it once the disk is not blank.

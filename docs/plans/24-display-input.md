@@ -89,7 +89,7 @@ BYTES_PER_PIXEL, Rect, Frame, FrameUpdate, PointerButton, Cursor, CursorImage
 
 ## Web build
 
-The wasm page (`crates/uemulator-web`, `docs/plans/13-web.md`) shows the same handles on a canvas beside its terminal, with a Terminal | Screen switch: frames and the pointer image through the poll hook (one frame in flight, acknowledged through the control `SharedArrayBuffer`), keyboard and pointer through a record ring in it. The wizard offers the same three displays as the CLI and input on its own.
+The wasm page (`crates/uemulator-web`, `docs/plans/13-web.md`) shows the same handles on a canvas beside its terminal, with a Terminal | Screen switch: frames and the pointer image through the poll hook (one frame in flight, acknowledged through the control `SharedArrayBuffer`), keyboard and pointer through a record ring in it. The settings sidebar offers the same three displays as the CLI and input on its own.
 
 ## Verification (not tests)
 

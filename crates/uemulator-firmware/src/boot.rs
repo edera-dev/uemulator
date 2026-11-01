@@ -43,7 +43,8 @@ fn volumes() -> Vec<Volume> {
         .collect()
 }
 
-/// "UEFI VirtIO disk 3, partition 1" from `PciRoot(0x0)/Pci(0x3,0x0)/HD(1,...)`.
+/// "UEFI VirtIO disk 3, partition 1" from `PciRoot(0x0)/Pci(0x3,0x0)/HD(1,...)`, "UEFI VirtIO
+/// disk 3, CD boot image" from `.../CDROM(...)`.
 fn describe(volume: &DevicePath) -> String {
     let device = volume
         .nodes()
@@ -51,6 +52,9 @@ fn describe(volume: &DevicePath) -> String {
         .last()
         .and_then(|node| node.payload.get(1).copied())
         .unwrap_or(0);
+    if volume.is_cd_rom() {
+        return alloc::format!("UEFI VirtIO disk {device}, CD boot image");
+    }
     match volume.partition() {
         Some((number, ..)) => alloc::format!("UEFI VirtIO disk {device}, partition {number}"),
         None => alloc::format!("UEFI VirtIO disk {device}"),

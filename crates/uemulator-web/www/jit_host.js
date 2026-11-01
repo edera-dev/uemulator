@@ -24,7 +24,8 @@ export function createJitHost() {
       try {
         // Copied out: the memory may grow (and move its buffer) before the engine is done with it,
         // and a view on shared memory is not accepted everywhere.
-        const bytes = new Uint8Array(memory.buffer, ptr, len).slice();
+        // `>>> 0`: a pointer past 2 GiB of module memory arrives as a negative i32.
+        const bytes = new Uint8Array(memory.buffer, ptr >>> 0, len).slice();
         const instance = new WebAssembly.Instance(new WebAssembly.Module(bytes), {
           env: { memory, table },
         });
