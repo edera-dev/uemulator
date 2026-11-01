@@ -226,9 +226,35 @@ fn every_mapped_usage_lands_on_a_key_the_keyboard_advertises() {
 }
 
 #[test]
-fn an_input_handle_without_a_display_scales_against_the_default_size() {
-    let input = InputHandle::for_display(None);
-    assert!(input.pointer_move(DEFAULT_WIDTH - 1, 0));
+fn an_input_handle_without_a_display_scales_against_its_pointer_area() {
+    let input = InputHandle::without_display(640, 480);
+    assert_eq!(input.pointer_area(), (640, 480));
+    assert!(input.pointer_move(639, 240));
     let batch = input.peek(InputDevice::Tablet).unwrap();
     assert_eq!(batch[0].value, POINTER_AXIS_MAX);
+    assert_eq!(batch[1].value, 240 * POINTER_AXIS_MAX / 479);
+}
+
+#[test]
+fn an_input_handle_with_a_display_follows_the_screen_size() {
+    let display = DisplayHandle::with_size(800, 600);
+    let input = InputHandle::for_display(display.clone());
+    assert_eq!(input.pointer_area(), (800, 600));
+    display.publish(1024, 768, |_, _| None);
+    assert_eq!(input.pointer_area(), (1024, 768));
+}
+
+#[test]
+fn a_cursor_change_bumps_its_own_counter_wakes_waiters_and_calls_back() {
+    let display = DisplayHandle::with_size(64, 64);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let seen = calls.clone();
+    display.on_update(move |generation| seen.lock().unwrap().push(generation));
+    assert_eq!(display.cursor(), (0, Cursor::Host));
+    display.set_cursor(Cursor::Hidden);
+    assert_eq!(display.cursor(), (1, Cursor::Hidden));
+    assert_eq!(display.generation(), 0, "the screen did not change");
+    display.set_cursor(Cursor::Hidden);
+    assert_eq!(display.cursor().0, 1, "the same cursor is no change");
+    assert_eq!(*calls.lock().unwrap(), vec![0]);
 }

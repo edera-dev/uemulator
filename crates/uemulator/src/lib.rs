@@ -45,8 +45,8 @@ pub use disk::{
     UdiskUsage,
 };
 pub use display::{
-    BYTES_PER_PIXEL, DisplayHandle, Frame, FrameUpdate, InputHandle, PointerButton, Rect,
-    linux_key_for_usb_usage,
+    BYTES_PER_PIXEL, Cursor, CursorImage, DisplayHandle, Frame, FrameUpdate, InputHandle,
+    PointerButton, Rect, linux_key_for_usb_usage,
 };
 #[cfg(not(freestanding))]
 pub use kv::FileKeyValueStore;
@@ -111,6 +111,18 @@ mod api_tests {
     fn the_display_and_input_surface_has_the_documented_signatures() {
         let _: fn(MachineConfig, DisplayMode) -> MachineConfig = MachineConfig::display;
         let _: fn(MachineConfig, u32, u32) -> MachineConfig = MachineConfig::display_size;
+        let _: fn(MachineConfig, bool) -> MachineConfig = MachineConfig::input;
+        let _: fn(MachineConfig, bool) -> MachineConfig = MachineConfig::console_on_screen;
+        let _: fn(&DisplayHandle) -> (u64, Cursor) = DisplayHandle::cursor;
+        let _: fn(&InputHandle) -> (u32, u32) = InputHandle::pointer_area;
+        let image = CursorImage {
+            width: 1,
+            height: 1,
+            hot_x: 0,
+            hot_y: 0,
+            pixels: vec![0; BYTES_PER_PIXEL],
+        };
+        let _ = [Cursor::Host, Cursor::Hidden, Cursor::Image(image)];
         let _: fn(&EmulatedMachine) -> Option<DisplayHandle> = EmulatedMachine::display;
         let _: fn(&EmulatedMachine) -> Option<InputHandle> = EmulatedMachine::input;
         let _: fn(&DisplayHandle) -> (u32, u32) = DisplayHandle::size;
@@ -154,7 +166,7 @@ mod api_tests {
             PointerButton::Side,
             PointerButton::Extra,
         ];
-        let _ = [DisplayMode::Serial, DisplayMode::Framebuffer];
+        let _ = [DisplayMode::None, DisplayMode::Framebuffer];
     }
 
     #[test]
@@ -174,6 +186,9 @@ mod api_tests {
         is_default::<Frame>();
         is_debug::<Frame>();
         is_debug::<DisplayMode>();
+        is_default::<Cursor>();
+        is_debug::<Cursor>();
+        is_clone::<CursorImage>();
     }
 
     #[test]

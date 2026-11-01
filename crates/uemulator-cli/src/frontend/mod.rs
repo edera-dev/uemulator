@@ -6,11 +6,12 @@ pub mod web;
 
 use uemulator::{DisplayHandle, InputHandle};
 
-/// What a frontend gets of the machine.
+/// What a frontend gets of the machine: its screen, its keyboard and tablet, or both (a machine
+/// with neither has no frontend).
 #[derive(Clone)]
 pub struct Screen {
-    pub display: DisplayHandle,
-    pub input: InputHandle,
+    pub display: Option<DisplayHandle>,
+    pub input: Option<InputHandle>,
 }
 
 /// A way to show the screen. `start` returns once the frontend is up and runs it on threads of

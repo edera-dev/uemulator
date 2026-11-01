@@ -1,5 +1,6 @@
 use super::*;
 use std::io::{Cursor, Read};
+use uemulator::InputHandle;
 
 const KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
 const ACCEPT: &str = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
@@ -11,13 +12,21 @@ fn parse(head: &str) -> Request {
         .unwrap()
 }
 
+/// A viewer bound to `address` that answers to `names` as well.
+fn viewer_at(address: &str, names: &[&str]) -> AllowedHosts {
+    AllowedHosts {
+        bound: address.parse().unwrap(),
+        names: names.iter().map(|name| name.to_string()).collect(),
+    }
+}
+
 /// Where the requests in these tests were sent: the default viewer address.
-fn default_viewer() -> SocketAddr {
-    "127.0.0.1:5800".parse().unwrap()
+fn default_viewer() -> AllowedHosts {
+    viewer_at("127.0.0.1:5800", &[])
 }
 
 fn route_default(request: &Request) -> Route {
-    route(request, default_viewer())
+    route(request, &default_viewer())
 }
 
 fn upgrade_request(origin: Option<&str>) -> String {
@@ -62,7 +71,7 @@ fn a_closed_connection_is_no_request_and_a_cut_one_is_an_error() {
 }
 
 #[test]
-fn the_page_and_the_socket_are_the_only_routes() {
+fn the_page_the_screenshot_and_the_socket_are_the_only_routes() {
     assert_eq!(
         route_default(&parse("GET / HTTP/1.1\r\nHost: 127.0.0.1:5800\r\n\r\n")),
         Route::Page
@@ -72,6 +81,12 @@ fn the_page_and_the_socket_are_the_only_routes() {
             "GET /index.html HTTP/1.1\r\nHost: localhost:5800\r\n\r\n"
         )),
         Route::Page
+    );
+    assert_eq!(
+        route_default(&parse(
+            "GET /screenshot.png HTTP/1.1\r\nHost: 127.0.0.1:5800\r\n\r\n"
+        )),
+        Route::Screenshot
     );
     assert_eq!(
         route_default(&parse(
@@ -115,6 +130,44 @@ fn only_the_viewer_page_itself_may_open_the_socket() {
         route_default(&parse(&upgrade_request(Some("http://127.0.0.1:5801")))),
         Route::Forbidden
     );
+    // A TLS proxy in front: the page is https, the host the same.
+    assert_eq!(
+        route_default(&parse(&upgrade_request(Some("https://127.0.0.1:5800")))),
+        Route::Upgrade(ACCEPT.to_string())
+    );
+}
+
+#[test]
+fn a_name_the_user_gave_the_viewer_is_allowed_on_any_port_and_others_still_are_not() {
+    let named = viewer_at("0.0.0.0:5800", &["vm.example"]);
+    for host in [
+        "vm.example:5800",
+        "VM.EXAMPLE:5800",
+        "vm.example",
+        "vm.example:443",
+    ] {
+        assert!(host_allowed(host, &named), "{host}");
+    }
+    for host in ["evil.example:5800", "vm.example.evil:5800", "vm.example:x"] {
+        assert!(!host_allowed(host, &named), "{host}");
+    }
+    let proxied = upgrade_request_to("vm.example", Some("https://vm.example"));
+    assert_eq!(
+        route(&parse(&proxied), &named),
+        Route::Upgrade(ACCEPT.to_string())
+    );
+    let rebound = upgrade_request_to("evil.example:5800", Some("http://evil.example:5800"));
+    assert_eq!(route(&parse(&rebound), &named), Route::Forbidden);
+    let crossed = upgrade_request_to("vm.example:5800", Some("http://evil.example:5800"));
+    assert_eq!(route(&parse(&crossed), &named), Route::Forbidden);
+}
+
+#[test]
+fn a_host_header_splits_into_name_and_port() {
+    assert_eq!(split_host("a:1"), ("a", Some("1")));
+    assert_eq!(split_host("a"), ("a", None));
+    assert_eq!(split_host("[::1]:5800"), ("::1", Some("5800")));
+    assert_eq!(split_host("[::1]"), ("::1", None));
 }
 
 #[test]
@@ -133,7 +186,7 @@ fn a_rebinding_site_is_refused_even_when_origin_and_host_agree() {
 
 #[test]
 fn the_host_must_name_the_viewer() {
-    let loopback = default_viewer();
+    let loopback = &default_viewer();
     for host in [
         "127.0.0.1:5800",
         "localhost:5800",
@@ -152,11 +205,11 @@ fn the_host_must_name_the_viewer() {
     ] {
         assert!(!host_allowed(host, loopback), "{host}");
     }
-    let lan: SocketAddr = "192.168.1.5:5800".parse().unwrap();
+    let lan = &viewer_at("192.168.1.5:5800", &[]);
     assert!(host_allowed("192.168.1.5:5800", lan));
     assert!(!host_allowed("localhost:5800", lan));
     assert!(!host_allowed("192.168.1.6:5800", lan));
-    let every: SocketAddr = "0.0.0.0:5800".parse().unwrap();
+    let every = &viewer_at("0.0.0.0:5800", &[]);
     assert!(host_allowed("10.1.2.3:5800", every));
     assert!(host_allowed("localhost:5800", every));
     assert!(!host_allowed("evil.example:5800", every));
@@ -191,6 +244,13 @@ fn commands_parse_and_nonsense_is_ignored() {
     );
     assert_eq!(parse_command("w -3"), Some(Command::Wheel { clicks: -3 }));
     assert_eq!(parse_command("r"), Some(Command::ReleaseAll));
+    assert_eq!(
+        parse_command("s 1024 768"),
+        Some(Command::Size {
+            width: 1024,
+            height: 768
+        })
+    );
     assert_eq!(parse_command("a"), Some(Command::Ack));
     for nonsense in [
         "",
@@ -201,6 +261,7 @@ fn commands_parse_and_nonsense_is_ignored() {
         "b 9 1",
         "z 1",
         "w 99999999999",
+        "s 1",
     ] {
         assert_eq!(parse_command(nonsense), None, "{nonsense:?}");
     }
@@ -232,16 +293,90 @@ fn an_update_message_is_the_header_then_a_png() {
     );
 }
 
-/// A viewer on a free loopback port with a blank screen.
+#[test]
+fn the_hello_says_what_the_machine_has() {
+    let both = Screen {
+        display: Some(DisplayHandle::default()),
+        input: Some(InputHandle::default()),
+    };
+    assert_eq!(
+        hello_message(&both),
+        [
+            UPDATE_KIND_HELLO,
+            HELLO_HAS_DISPLAY | HELLO_HAS_INPUT,
+            0x00,
+            0x05,
+            0x20,
+            0x03
+        ],
+        "1280x800"
+    );
+    let input_only = Screen {
+        display: None,
+        input: Some(InputHandle::default()),
+    };
+    assert_eq!(hello_message(&input_only)[1], HELLO_HAS_INPUT);
+}
+
+#[test]
+fn cursor_messages_carry_the_state_the_hotspot_and_an_image() {
+    assert_eq!(
+        cursor_message(&uemulator::Cursor::Host),
+        [UPDATE_KIND_CURSOR, CURSOR_HOST, 0, 0, 0, 0]
+    );
+    assert_eq!(
+        cursor_message(&uemulator::Cursor::Hidden),
+        [UPDATE_KIND_CURSOR, CURSOR_HIDDEN, 0, 0, 0, 0]
+    );
+    let image = uemulator::CursorImage {
+        width: 2,
+        height: 1,
+        hot_x: 1,
+        hot_y: 0,
+        pixels: vec![0; 8],
+    };
+    let message = cursor_message(&uemulator::Cursor::Image(image));
+    assert_eq!(message[..6], [UPDATE_KIND_CURSOR, CURSOR_IMAGE, 1, 0, 0, 0]);
+    assert_eq!(&message[6..10], b"\x89PNG");
+}
+
+#[test]
+fn a_size_command_reaches_the_display_and_input_without_a_screen_is_fine() {
+    let display = DisplayHandle::default();
+    let screen = Screen {
+        display: Some(display.clone()),
+        input: None,
+    };
+    apply(
+        Command::Size {
+            width: 1024,
+            height: 768,
+        },
+        &screen,
+    );
+    // Keys on a machine with no input go nowhere, without a panic.
+    apply(
+        Command::Key {
+            usage: 4,
+            pressed: true,
+        },
+        &screen,
+    );
+    apply(Command::ReleaseAll, &screen);
+}
+
+/// A viewer on a free loopback port with a blank screen and input.
 fn start_viewer() -> SocketAddr {
-    let viewer = WebViewer::bind("127.0.0.1:0").unwrap();
+    start_viewer_with(Screen {
+        display: Some(DisplayHandle::default()),
+        input: Some(InputHandle::default()),
+    })
+}
+
+fn start_viewer_with(screen: Screen) -> SocketAddr {
+    let viewer = WebViewer::bind("127.0.0.1:0", &[]).unwrap();
     let address = viewer.address;
-    let message = Box::new(viewer)
-        .start(Screen {
-            display: DisplayHandle::default(),
-            input: InputHandle::default(),
-        })
-        .unwrap();
+    let message = Box::new(viewer).start(screen).unwrap();
     assert!(message.contains(&format!("http://{address}/")), "{message}");
     address
 }
@@ -287,7 +422,7 @@ fn the_server_serves_the_page() {
 }
 
 #[test]
-fn a_socket_gets_the_whole_screen_first_and_answers_pings() {
+fn a_socket_gets_the_hello_the_cursor_and_the_whole_screen_first_and_answers_pings() {
     let address = start_viewer();
     let mut stream = connect(address);
     let origin = format!("http://{address}");
@@ -300,8 +435,16 @@ fn a_socket_gets_the_whole_screen_first_and_answers_pings() {
         "{head}"
     );
     let mut messages = MessageReader::default();
+    let hello = messages.read(&mut stream).unwrap();
+    assert_eq!(
+        hello.payload[..2],
+        [UPDATE_KIND_HELLO, HELLO_HAS_DISPLAY | HELLO_HAS_INPUT]
+    );
+    let cursor = messages.read(&mut stream).unwrap();
+    assert_eq!(cursor.payload[..2], [UPDATE_KIND_CURSOR, CURSOR_HOST]);
     let first = messages.read(&mut stream).unwrap();
     assert_eq!(first.opcode, OPCODE_BINARY);
+    assert_eq!(first.payload[0], UPDATE_KIND_RECT);
     let word = |index: usize| {
         u16::from_le_bytes([first.payload[1 + 2 * index], first.payload[2 + 2 * index]])
     };
@@ -324,6 +467,63 @@ fn a_socket_gets_the_whole_screen_first_and_answers_pings() {
 }
 
 #[test]
+fn the_screenshot_is_the_whole_screen_as_a_png_and_missing_without_a_screen() {
+    let address = start_viewer();
+    let mut stream = connect(address);
+    let request = format!("GET /screenshot.png HTTP/1.1\r\nHost: {address}\r\n\r\n");
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    let text = String::from_utf8_lossy(&response);
+    assert!(text.starts_with("HTTP/1.1 200 OK\r\n"), "{text}");
+    assert!(text.contains("Content-Type: image/png"), "{text}");
+    let body = response.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    assert_eq!(&response[body..body + 4], b"\x89PNG");
+
+    let address = start_viewer_with(Screen {
+        display: None,
+        input: Some(InputHandle::default()),
+    });
+    let mut stream = connect(address);
+    let request = format!("GET /screenshot.png HTTP/1.1\r\nHost: {address}\r\n\r\n");
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 404 "), "{response}");
+}
+
+#[test]
+fn an_input_only_session_gets_the_hello_and_takes_keys() {
+    let input = InputHandle::default();
+    let address = start_viewer_with(Screen {
+        display: None,
+        input: Some(input.clone()),
+    });
+    let mut stream = connect(address);
+    let handshake = upgrade_request_to(&address.to_string(), None);
+    stream.write_all(handshake.as_bytes()).unwrap();
+    assert!(response_head(&mut stream).starts_with("HTTP/1.1 101 "));
+    let mut messages = MessageReader::default();
+    let hello = messages.read(&mut stream).unwrap();
+    assert_eq!(hello.payload[..2], [UPDATE_KIND_HELLO, HELLO_HAS_INPUT]);
+    stream.write_all(&client_text("k 4 1")).unwrap();
+    let ping = [0x80 | OPCODE_PING, 0x80, 0, 0, 0, 0];
+    stream.write_all(&ping).unwrap();
+    // The pong proves the key line before it was read and applied.
+    assert_eq!(messages.read(&mut stream).unwrap().opcode, OPCODE_PONG);
+    input.release_all();
+}
+
+#[test]
+fn a_viewer_bound_by_name_answers_to_it_and_says_it_in_the_url() {
+    let viewer = WebViewer::bind("localhost:0", &["Proxy.Example".into()]).unwrap();
+    assert_eq!(viewer.name, None, "localhost is an address");
+    assert!(viewer.host.names.contains(&"proxy.example".to_string()));
+    assert!(is_host_name("vm.example"));
+    assert!(!is_host_name("127.0.0.1") && !is_host_name("[::1]") && !is_host_name("::1"));
+}
+
+#[test]
 fn another_sites_socket_is_refused() {
     let address = start_viewer();
     let mut stream = connect(address);
@@ -338,6 +538,6 @@ fn another_sites_socket_is_refused() {
 fn binding_an_address_in_use_says_which() {
     let taken = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = taken.local_addr().unwrap().to_string();
-    let error = WebViewer::bind(&address).err().unwrap();
+    let error = WebViewer::bind(&address, &[]).err().unwrap();
     assert!(error.contains(&address), "{error}");
 }

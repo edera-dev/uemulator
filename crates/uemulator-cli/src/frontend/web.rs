@@ -1,8 +1,9 @@
-//! The built-in web viewer: a small HTTP server that serves one page (`web/viewer.html`) and a
-//! WebSocket at `/ws`. Over the socket the server sends screen updates as PNG rectangles and the
-//! page sends keyboard and mouse events as short text commands. One update is in flight per
-//! viewer at a time (the page acknowledges each after drawing it), so a slow browser or link
-//! gets fewer, larger updates instead of a growing backlog. Protocol in
+//! The built-in web viewer: a small HTTP server that serves one page (`web/viewer.html`), a
+//! WebSocket at `/ws` and the whole screen as `/screenshot.png`. Over the socket the server sends
+//! screen updates as PNG rectangles and the guest's pointer image, and the page sends keyboard
+//! and mouse events and size requests as short text commands. One update is in flight per viewer
+//! at a time (the page acknowledges each after drawing it), so a slow browser or link gets
+//! fewer, larger updates instead of a growing backlog. Protocol in
 //! `docs/plans/24-display-input.md`.
 
 mod png;
@@ -14,7 +15,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use uemulator::{BYTES_PER_PIXEL, DisplayHandle, FrameUpdate, InputHandle, PointerButton, Rect};
+use uemulator::{BYTES_PER_PIXEL, Cursor, DisplayHandle, FrameUpdate, PointerButton, Rect};
 
 use super::{Frontend, Screen};
 use websocket::{
@@ -23,6 +24,7 @@ use websocket::{
 
 const VIEWER_PAGE: &str = include_str!("web/viewer.html");
 const SOCKET_PATH: &str = "/ws";
+const SCREENSHOT_PATH: &str = "/screenshot.png";
 /// The longest request head accepted; the page's requests are a few hundred bytes.
 const MAX_REQUEST_HEAD: usize = 16 * 1024;
 /// A client that does not finish its request head in this time is dropped.
@@ -36,6 +38,18 @@ const MIN_UPDATE_INTERVAL: Duration = Duration::from_millis(16);
 /// endian, then the PNG of the rectangle.
 const UPDATE_KIND_RECT: u8 = 1;
 const UPDATE_HEADER_BYTES: usize = 13;
+/// Pointer message: kind u8, state u8 (`CURSOR_*`), hot spot x and y as u16 little endian, then
+/// for an image its PNG with alpha.
+const UPDATE_KIND_CURSOR: u8 = 2;
+const CURSOR_HOST: u8 = 0;
+const CURSOR_HIDDEN: u8 = 1;
+const CURSOR_IMAGE: u8 = 2;
+/// The first message of a session: kind u8, flags u8 (`HELLO_*`), then the pointer area's width
+/// and height as u16 little endian, so the page knows what to show before any screen update
+/// (a machine with input and no screen gets none).
+const UPDATE_KIND_HELLO: u8 = 3;
+const HELLO_HAS_DISPLAY: u8 = 1 << 0;
+const HELLO_HAS_INPUT: u8 = 1 << 1;
 /// WebSocket close status "going away", sent when the server ends a session.
 const CLOSE_GOING_AWAY: u16 = 1001;
 const WEBSOCKET_VERSION: &str = "13";
@@ -43,22 +57,63 @@ const WEBSOCKET_VERSION: &str = "13";
 pub struct WebViewer {
     listener: TcpListener,
     address: SocketAddr,
+    /// The host name `bind` was given, when it was one: the URL uses it.
+    name: Option<String>,
+    /// Who the viewer is, for the `Host` check.
+    host: AllowedHosts,
+}
+
+/// What a request's `Host` may name: the address the viewer is bound to (`host_allowed` has the
+/// rules for loopback and every-address listeners) and the host names the user gave, lowercase.
+#[derive(Clone, Debug)]
+struct AllowedHosts {
+    bound: SocketAddr,
+    names: Vec<String>,
 }
 
 impl WebViewer {
-    /// Binds `address` (`HOST:PORT`; port 0 picks a free one).
-    pub fn bind(address: &str) -> Result<WebViewer, String> {
+    /// Binds `address` (`HOST:PORT`; port 0 picks a free one). HOST may be a host name, which is
+    /// resolved for the bind and then allowed in `Host` like `allowed_names` (names a reverse
+    /// proxy or DNS gives the viewer).
+    pub fn bind(address: &str, allowed_names: &[String]) -> Result<WebViewer, String> {
         let listener =
             TcpListener::bind(address).map_err(|e| format!("viewer: bind {address}: {e}"))?;
-        let address = listener
+        let bound = listener
             .local_addr()
             .map_err(|e| format!("viewer: {address}: {e}"))?;
-        Ok(WebViewer { listener, address })
+        let name = address
+            .rsplit_once(':')
+            .map(|(host, _)| host)
+            .filter(|host| is_host_name(host))
+            .map(str::to_ascii_lowercase);
+        let names = allowed_names
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .chain(name.clone())
+            .collect();
+        Ok(WebViewer {
+            listener,
+            address: bound,
+            name,
+            host: AllowedHosts { bound, names },
+        })
     }
 
     pub fn url(&self) -> String {
-        format!("http://{}/", self.address)
+        match &self.name {
+            Some(name) => format!("http://{name}:{}/", self.address.port()),
+            None => format!("http://{}/", self.address),
+        }
     }
+}
+
+/// Whether `host` (from `HOST:PORT` or a `Host` header) is a name rather than an address
+/// literal. `localhost` counts as an address: `host_allowed` treats it as loopback.
+fn is_host_name(host: &str) -> bool {
+    !host.is_empty()
+        && !host.starts_with('[')
+        && !host.eq_ignore_ascii_case("localhost")
+        && host.parse::<IpAddr>().is_err()
 }
 
 impl Frontend for WebViewer {
@@ -69,13 +124,13 @@ impl Frontend for WebViewer {
                 " (reachable from the network: anyone who can open it controls the machine)",
             );
         }
-        let (listener, bound) = (self.listener, self.address);
+        let (listener, host) = (self.listener, self.host);
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
-                let screen = screen.clone();
+                let (screen, host) = (screen.clone(), host.clone());
                 std::thread::spawn(move || {
                     // A failed connection only ends that viewer.
-                    let _ = serve_connection(stream, bound, &screen);
+                    let _ = serve_connection(stream, &host, &screen);
                 });
             }
         });
@@ -164,33 +219,52 @@ fn read_request(reader: &mut impl BufRead) -> io::Result<Option<Request>> {
 #[derive(Debug, PartialEq, Eq)]
 enum Route {
     Page,
+    Screenshot,
     /// A WebSocket handshake, with the `Sec-WebSocket-Accept` value to answer.
     Upgrade(String),
     BadRequest,
     /// The request is not from the viewer's own page. A browser sends any site's requests to
     /// 127.0.0.1, so without this a web page could type into the machine: a request must name
-    /// the viewer's address as its `Host` (which defeats DNS rebinding, where another site's
-    /// name resolves to 127.0.0.1 and `Origin` and `Host` agree), and a socket's `Origin` must
-    /// be that same host.
+    /// the viewer's address, or a host name the user gave it, as its `Host` (which defeats DNS
+    /// rebinding, where another site's name resolves to 127.0.0.1 and `Origin` and `Host`
+    /// agree), and a socket's `Origin` must be that same host, over http or https (a TLS proxy).
     Forbidden,
     NotFound,
     MethodNotAllowed,
 }
 
-/// Whether `host` (a `Host` header) names the viewer bound at `bound`: its address and port, or
-/// for a loopback listener any loopback name, or for one on every address any address literal.
-/// Never another name: that is what a rebinding site's requests carry.
-fn host_allowed(host: &str, bound: SocketAddr) -> bool {
-    let Some((name, port)) = host.rsplit_once(':') else {
-        return false;
-    };
-    if port.parse::<u16>().ok() != Some(bound.port()) {
+/// Splits a `Host` header into its name and its port, if it has one: `name`, `name:port`,
+/// `[v6]`, `[v6]:port`.
+fn split_host(host: &str) -> (&str, Option<&str>) {
+    if let Some(rest) = host.strip_prefix('[') {
+        return match rest.split_once(']') {
+            Some((name, tail)) => (name, tail.strip_prefix(':')),
+            None => (host, None),
+        };
+    }
+    match host.rsplit_once(':') {
+        Some((name, port)) => (name, Some(port)),
+        None => (host, None),
+    }
+}
+
+/// Whether `host` (a `Host` header) names the viewer: one of the host names the user gave it,
+/// on any port or none (a reverse proxy on 443 forwards `Host: name`); or the bound address and
+/// port, or for a loopback listener any loopback name, or for one on every address any address
+/// literal. Never another name: that is what a rebinding site's requests carry.
+fn host_allowed(host: &str, allowed: &AllowedHosts) -> bool {
+    let (name, port) = split_host(host);
+    if allowed
+        .names
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(name))
+    {
+        return port.is_none_or(|port| port.parse::<u16>().is_ok());
+    }
+    let bound = allowed.bound;
+    if port.and_then(|port| port.parse::<u16>().ok()) != Some(bound.port()) {
         return false;
     }
-    let name = name
-        .strip_prefix('[')
-        .and_then(|inner| inner.strip_suffix(']'))
-        .unwrap_or(name);
     let listener = bound.ip();
     if name.eq_ignore_ascii_case("localhost") {
         return listener.is_loopback() || listener.is_unspecified();
@@ -202,18 +276,19 @@ fn host_allowed(host: &str, bound: SocketAddr) -> bool {
     })
 }
 
-fn route(request: &Request, bound: SocketAddr) -> Route {
+fn route(request: &Request, allowed: &AllowedHosts) -> Route {
     if request.method != "GET" {
         return Route::MethodNotAllowed;
     }
     let Some(host) = request
         .header("host")
-        .filter(|host| host_allowed(host, bound))
+        .filter(|host| host_allowed(host, allowed))
     else {
         return Route::Forbidden;
     };
     match request.path.as_str() {
         "/" | "/index.html" => Route::Page,
+        SCREENSHOT_PATH => Route::Screenshot,
         SOCKET_PATH => {
             let upgrade = request.header_lists("upgrade", "websocket")
                 && request.header_lists("connection", "upgrade")
@@ -222,9 +297,11 @@ fn route(request: &Request, bound: SocketAddr) -> Route {
                 return Route::BadRequest;
             };
             // No `Origin`: not a browser, nothing to protect against.
-            let same_origin = request
-                .header("origin")
-                .is_none_or(|origin| origin.eq_ignore_ascii_case(&format!("http://{host}")));
+            let same_origin = request.header("origin").is_none_or(|origin| {
+                ["http", "https"]
+                    .iter()
+                    .any(|scheme| origin.eq_ignore_ascii_case(&format!("{scheme}://{host}")))
+            });
             if same_origin {
                 Route::Upgrade(websocket::accept_key(key))
             } else {
@@ -251,7 +328,7 @@ fn write_response(
     stream.flush()
 }
 
-fn serve_connection(stream: TcpStream, bound: SocketAddr, screen: &Screen) -> io::Result<()> {
+fn serve_connection(stream: TcpStream, allowed: &AllowedHosts, screen: &Screen) -> io::Result<()> {
     stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
     stream.set_nodelay(true)?;
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -260,13 +337,21 @@ fn serve_connection(stream: TcpStream, bound: SocketAddr, screen: &Screen) -> io
         return Ok(());
     };
     let plain = "text/plain; charset=utf-8";
-    match route(&request, bound) {
+    match route(&request, allowed) {
         Route::Page => write_response(
             &mut writer,
             "200 OK",
             "text/html; charset=utf-8",
             VIEWER_PAGE.as_bytes(),
         ),
+        Route::Screenshot => match &screen.display {
+            Some(display) => {
+                let frame = display.frame();
+                let png = png::encode_bgrx(frame.width, frame.height, &frame.pixels);
+                write_response(&mut writer, "200 OK", "image/png", &png)
+            }
+            None => write_response(&mut writer, "404 Not Found", plain, b"no screen\n"),
+        },
         Route::Upgrade(accept) => {
             write!(
                 writer,
@@ -304,6 +389,8 @@ enum Command {
     Wheel { clicks: i32 },
     /// `r`: let go of everything (the page lost the focus).
     ReleaseAll,
+    /// `s WIDTH HEIGHT`: ask the guest for this screen size (`DisplayHandle::request_size`).
+    Size { width: u32, height: u32 },
     /// `a`: the last update is drawn; the next may come.
     Ack,
 }
@@ -338,13 +425,26 @@ fn parse_command(text: &str) -> Option<Command> {
             clicks: i32::try_from(number()?).ok()?,
         },
         "r" => Command::ReleaseAll,
+        "s" => Command::Size {
+            width: u32::try_from(number()?).ok()?,
+            height: u32::try_from(number()?).ok()?,
+        },
         "a" => Command::Ack,
         _ => return None,
     };
     Some(command)
 }
 
-fn apply(command: Command, input: &InputHandle) {
+fn apply(command: Command, screen: &Screen) {
+    if let Command::Size { width, height } = command {
+        if let Some(display) = &screen.display {
+            display.request_size(width, height);
+        }
+        return;
+    }
+    let Some(input) = &screen.input else {
+        return;
+    };
     match command {
         Command::Key { usage, pressed } => {
             input.key_usb(usage, pressed);
@@ -359,8 +459,44 @@ fn apply(command: Command, input: &InputHandle) {
             input.scroll(clicks);
         }
         Command::ReleaseAll => input.release_all(),
-        Command::Ack => {}
+        Command::Size { .. } | Command::Ack => {}
     }
+}
+
+/// The session's first message (`UPDATE_KIND_HELLO`).
+fn hello_message(screen: &Screen) -> Vec<u8> {
+    let (width, height) = match (&screen.display, &screen.input) {
+        (Some(display), _) => display.size(),
+        (None, Some(input)) => input.pointer_area(),
+        (None, None) => (0, 0),
+    };
+    let mut flags = 0;
+    if screen.display.is_some() {
+        flags |= HELLO_HAS_DISPLAY;
+    }
+    if screen.input.is_some() {
+        flags |= HELLO_HAS_INPUT;
+    }
+    let mut message = vec![UPDATE_KIND_HELLO, flags];
+    message.extend_from_slice(&(width as u16).to_le_bytes());
+    message.extend_from_slice(&(height as u16).to_le_bytes());
+    message
+}
+
+/// The message that shows `cursor` (`UPDATE_KIND_CURSOR`).
+fn cursor_message(cursor: &Cursor) -> Vec<u8> {
+    let (state, hot_x, hot_y) = match cursor {
+        Cursor::Host => (CURSOR_HOST, 0, 0),
+        Cursor::Hidden => (CURSOR_HIDDEN, 0, 0),
+        Cursor::Image(image) => (CURSOR_IMAGE, image.hot_x, image.hot_y),
+    };
+    let mut message = vec![UPDATE_KIND_CURSOR, state];
+    message.extend_from_slice(&(hot_x as u16).to_le_bytes());
+    message.extend_from_slice(&(hot_y as u16).to_le_bytes());
+    if let Cursor::Image(image) = cursor {
+        message.extend_from_slice(&png::encode_bgra(image.width, image.height, &image.pixels));
+    }
+    message
 }
 
 /// The binary message for one update.
@@ -411,7 +547,7 @@ fn run_session(
 ) -> io::Result<()> {
     let writer = Arc::new(Mutex::new(writer));
     let (acks, acknowledged) = mpsc::channel::<()>();
-    let input = screen.input.clone();
+    let reader_screen = screen.clone();
     let reader_writer = writer.clone();
     // Dropping `acks` when the reader ends tells the update loop the viewer is gone.
     std::thread::spawn(move || {
@@ -427,7 +563,7 @@ fn run_session(
                             Some(Command::Ack) => {
                                 let _ = acks.send(());
                             }
-                            Some(command) => apply(command, &input),
+                            Some(command) => apply(command, &reader_screen),
                             None => {}
                         }
                     }
@@ -441,13 +577,26 @@ fn run_session(
             }
         }
         // Keys held when the tab closed would otherwise stay down in the guest.
-        input.release_all();
+        if let Some(input) = &reader_screen.input {
+            input.release_all();
+        }
         let mut stream = reader_writer.lock().unwrap();
         let _ = write_frame(&mut *stream, OPCODE_CLOSE, &CLOSE_GOING_AWAY.to_be_bytes());
         let _ = stream.shutdown(std::net::Shutdown::Both);
     });
 
-    let display = &screen.display;
+    send(&writer, &hello_message(screen))?;
+    let Some(display) = &screen.display else {
+        // Input only: nothing to send; stay until the viewer leaves.
+        loop {
+            match acknowledged.recv() {
+                Ok(()) => continue,
+                Err(_) => return Ok(()),
+            }
+        }
+    };
+    let (mut cursor_generation, cursor) = display.cursor();
+    send(&writer, &cursor_message(&cursor))?;
     let (update, pixels) = full_update(display);
     let mut generation = update.generation;
     send(&writer, &update_message(&update, &pixels))?;
@@ -460,7 +609,18 @@ fn run_session(
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
         }
-        while display.wait_for_update(generation, UPDATE_WAIT) <= generation {
+        // A pointer change ends the wait too; it goes out at once, outside the one-in-flight
+        // rule (it is a few hundred bytes and the page draws nothing for it).
+        loop {
+            let now = display.wait_for_update(generation, UPDATE_WAIT);
+            let (current, cursor) = display.cursor();
+            if current != cursor_generation {
+                cursor_generation = current;
+                send(&writer, &cursor_message(&cursor))?;
+            }
+            if now > generation {
+                break;
+            }
             if matches!(
                 acknowledged.try_recv(),
                 Err(mpsc::TryRecvError::Disconnected)

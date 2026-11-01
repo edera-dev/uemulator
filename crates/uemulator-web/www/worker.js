@@ -1,7 +1,8 @@
 // Runs the emulator. `uw_run` blocks until the guest exits, so it lives here and not on the page.
-// While it runs this worker cannot receive messages: keystrokes, resizes and the stop request come
-// through the SharedArrayBuffer `control` that main.js shares with us (layout in protocol.js).
-import { CTRL, RING_BYTES, RING_OFFSET } from "./protocol.js";
+// While it runs this worker cannot receive messages: keystrokes, screen input, resizes, frame
+// acknowledgements and the stop request come through the SharedArrayBuffer `control` that main.js
+// shares with us (layout in protocol.js).
+import { CTRL, EVENT_OFFSET, EVENT_RECORDS, EVENT_WORDS, RING_BYTES, RING_OFFSET } from "./protocol.js";
 import { createJitHost } from "./jit_host.js";
 
 const OUTPUT_FLUSH_MS = 16;
@@ -14,6 +15,7 @@ let control;
 // Disk sources by the number `uw_add_disk` was given: { url } or { file }.
 const diskSources = [];
 let ring;
+let events;
 let outputChunks = [];
 let outputBytes = 0;
 let lastFlush = 0;
@@ -77,9 +79,38 @@ const host = {
   host_idle() {
     flushOutput();
     const head = Atomics.load(control, CTRL.HEAD);
-    if (head === Atomics.load(control, CTRL.TAIL)) {
+    const noEvents = Atomics.load(control, CTRL.EVENT_HEAD) === Atomics.load(control, CTRL.EVENT_TAIL);
+    if (head === Atomics.load(control, CTRL.TAIL) && noEvents) {
       Atomics.wait(control, CTRL.HEAD, head, IDLE_WAIT_MS);
     }
+  },
+  host_input_events(ptr, capacity) {
+    const head = Atomics.load(control, CTRL.EVENT_HEAD);
+    let tail = Atomics.load(control, CTRL.EVENT_TAIL);
+    // `ptr` points at a Rust `[i32; N]`, so it is 4-aligned.
+    const out = new Int32Array(wasm.memory.buffer, ptr, capacity * EVENT_WORDS);
+    let count = 0;
+    while (tail !== head && count < capacity) {
+      for (let word = 0; word < EVENT_WORDS; word++) out[count * EVENT_WORDS + word] = events[tail * EVENT_WORDS + word];
+      count++;
+      tail = (tail + 1) % EVENT_RECORDS;
+    }
+    Atomics.store(control, CTRL.EVENT_TAIL, tail);
+    return count;
+  },
+  host_frame_ready() {
+    return Atomics.load(control, CTRL.FRAME_ACK);
+  },
+  host_frame(screenWidth, screenHeight, x, y, width, height, ptr, len) {
+    Atomics.store(control, CTRL.FRAME_ACK, 0);
+    // A copy into a buffer of its own: ImageData refuses views on shared memory, and the
+    // module's memory moves on as soon as this returns.
+    const pixels = memoryBytes(ptr, len).slice();
+    postMessage({ type: "frame", screenWidth, screenHeight, x, y, width, height, pixels: pixels.buffer }, [pixels.buffer]);
+  },
+  host_cursor(kind, width, height, hotX, hotY, ptr, len) {
+    const pixels = memoryBytes(ptr, len).slice();
+    postMessage({ type: "cursor", kind, width, height, hotX, hotY, pixels: pixels.buffer }, [pixels.buffer]);
   },
   host_random(ptr, len) {
     // getRandomValues takes at most 65536 bytes per call and refuses a view on shared memory.
@@ -156,6 +187,7 @@ function upload(bytes) {
 async function boot(message) {
   control = new Int32Array(message.control, 0, RING_OFFSET / 4);
   ring = new Uint8Array(message.control, RING_OFFSET, RING_BYTES);
+  events = new Int32Array(message.control, EVENT_OFFSET, EVENT_RECORDS * EVENT_WORDS);
   const response = await fetch(new URL("uemulator_web.wasm", import.meta.url));
   const { instance } = await WebAssembly.instantiate(await response.arrayBuffer(), { host });
   wasm = instance.exports;

@@ -152,22 +152,25 @@ enum Source {
     Message(InterruptRequest),
 }
 
-/// The graphical console's devices and the handles they share with the host.
+/// The screen's devices and the handle they share with the host.
 #[derive(Clone)]
 pub(crate) struct DisplayDevices {
     pub display: DisplayHandle,
-    pub input: InputHandle,
     /// The UEFI firmware's framebuffer in RAM, shown while no virtio-gpu driver owns the screen.
     /// Only a machine booted through the firmware has one.
     pub boot_framebuffer: Option<FramebufferRegion>,
 }
 
-/// PCI functions `DisplayDevices` adds: the GPU, the keyboard and the tablet.
-pub(crate) const DISPLAY_FUNCTIONS: usize = 3;
+/// PCI functions `DevConfig::display` adds: the GPU.
+pub(crate) const DISPLAY_FUNCTIONS: usize = 1;
+/// PCI functions `DevConfig::input` adds: the keyboard and the tablet.
+pub(crate) const INPUT_FUNCTIONS: usize = 2;
 
 /// What to attach to the PCI bus; every device is optional and may repeat. Functions take slots
-/// (and legacy IRQ lines) in this order: virtio consoles, disks, nets, the display's GPU,
-/// keyboard and tablet, then the entropy source, each in list order.
+/// (and legacy IRQ lines) in this order: virtio consoles, disks, nets, the GPU, the keyboard and
+/// tablet, then the entropy source, each in list order. A machine with both a display and input
+/// has the GPU, keyboard and tablet in consecutive slots, as before they could be chosen apart:
+/// installed guests and firmware boot entries remember slot numbers.
 #[derive(Default)]
 pub(crate) struct DevConfig {
     pub disks: Vec<Disk>,
@@ -184,8 +187,10 @@ pub(crate) struct DevConfig {
     pub cpus: usize,
     /// Adds a virtio-rng function, last in slot order, fed by this source.
     pub rng: Option<RngSource>,
-    /// Adds the graphical console (`DISPLAY_FUNCTIONS` functions) after the NICs.
+    /// Adds the screen (`DISPLAY_FUNCTIONS` functions) after the NICs.
     pub display: Option<DisplayDevices>,
+    /// Adds the keyboard and tablet (`INPUT_FUNCTIONS` functions) after the GPU.
+    pub input: Option<InputHandle>,
 }
 
 /// Most virtio functions one machine can hold (PCI slots 1..=31).
@@ -284,7 +289,7 @@ fn civil(days_since_unix_epoch: i64) -> (i64, u64, u64) {
 
 impl Devices {
     pub fn new(console: ConsoleHandle, cfg: DevConfig) -> Self {
-        // Order decides PCI slot and legacy IRQ: consoles, disks, nets, display, rng.
+        // Order decides PCI slot and legacy IRQ: consoles, disks, nets, GPU, input, rng.
         let mut virtio_devices = Vec::new();
         let mut uart_peer_console = None;
         for (position, handle) in cfg.virtio_consoles.into_iter().enumerate() {
@@ -304,15 +309,17 @@ impl Devices {
             virtio_devices.push(Transport::new(Box::new(VirtioGpu::new(
                 display.display.clone(),
             ))));
-            for kind in [InputDevice::Keyboard, InputDevice::Tablet] {
-                virtio_devices.push(Transport::new(Box::new(VirtioInput::new(
-                    kind,
-                    display.input.clone(),
-                ))));
-            }
             boot_framebuffer = display
                 .boot_framebuffer
                 .map(|region| BootFramebuffer::new(region, display.display));
+        }
+        if let Some(input) = cfg.input {
+            for kind in [InputDevice::Keyboard, InputDevice::Tablet] {
+                virtio_devices.push(Transport::new(Box::new(VirtioInput::new(
+                    kind,
+                    input.clone(),
+                ))));
+            }
         }
         if let Some(source) = cfg.rng {
             virtio_devices.push(Transport::new(Box::new(VirtioRng::new(source))));

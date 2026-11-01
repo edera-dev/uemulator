@@ -14,7 +14,8 @@ use crate::cpu::{Cpu, DEFAULT_RANDOM_SEED};
 use crate::dev::host_entropy;
 use crate::dev::kv::SharedKeyValueStore;
 use crate::dev::{
-    DISPLAY_FUNCTIONS, DevConfig, DisplayDevices, EntropyFn, MAX_VIRTIO_FUNCTIONS, RngSource,
+    DISPLAY_FUNCTIONS, DevConfig, DisplayDevices, EntropyFn, INPUT_FUNCTIONS, MAX_VIRTIO_FUNCTIONS,
+    RngSource,
 };
 use crate::disk::Disk;
 use crate::display::{self, DisplayHandle, InputHandle};
@@ -123,19 +124,19 @@ pub enum ConsoleKind {
     Virtio,
 }
 
-/// Whether the machine has a graphical console next to its text consoles.
+/// Whether the machine has a screen next to its text consoles. Keyboard and pointer are a choice
+/// of their own (`MachineConfig::input`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DisplayMode {
-    /// Text consoles only (`MachineConfig::console`), the machine of earlier versions.
+    /// No screen: text consoles only (`MachineConfig::console`).
     #[default]
-    Serial,
-    /// A virtio-gpu display with a virtio keyboard and tablet, driven from the host through
-    /// `EmulatedMachine::display()` and `input()`. Booted through the UEFI firmware, the firmware
-    /// draws its console and boot menu on it and hands it to the OS as a GOP framebuffer, and
-    /// the keyboard reaches the firmware's text input. The default command line gains
-    /// `console=tty0`, so the kernel log and `/dev/console` are on the screen while the text
-    /// console keeps a copy of the log and early boot text stays on the 16550. Layout in
-    /// `docs/plans/24-display-input.md`.
+    None,
+    /// A virtio-gpu screen, shown by the host through `EmulatedMachine::display()`. Booted
+    /// through the UEFI firmware, the firmware draws its console and boot menu on it and hands it
+    /// to the OS as a GOP framebuffer. Unless `MachineConfig::console_on_screen(false)`, the
+    /// default command line gains `console=tty0`, so the kernel log and `/dev/console` are on
+    /// the screen while the text console keeps a copy of the log and early boot text stays on
+    /// the 16550. Layout in `docs/plans/24-display-input.md`.
     Framebuffer,
 }
 
@@ -182,6 +183,9 @@ pub struct MachineConfig {
     consoles: Vec<ConsoleKind>,
     display: DisplayMode,
     display_size: (u32, u32),
+    /// `None` follows the display: input devices come with a screen unless asked otherwise.
+    input: Option<bool>,
+    console_on_screen: bool,
     iommu: bool,
     acpi: bool,
     jit: JitMode,
@@ -216,8 +220,10 @@ impl Default for MachineConfig {
             disks: Vec::new(),
             net_macs: Vec::new(),
             consoles: Vec::new(),
-            display: DisplayMode::Serial,
+            display: DisplayMode::None,
             display_size: (display::DEFAULT_WIDTH, display::DEFAULT_HEIGHT),
+            input: None,
+            console_on_screen: true,
             iommu: false,
             acpi: true,
             jit: JitMode::Auto,
@@ -352,15 +358,35 @@ impl MachineConfig {
         self
     }
 
-    /// Adds a graphical console (`DisplayMode::Framebuffer`) or not (`Serial`, the default).
+    /// Adds a screen (`DisplayMode::Framebuffer`) or not (`None`, the default).
     pub fn display(mut self, mode: DisplayMode) -> Self {
         self.display = mode;
         self
     }
 
+    /// Adds a virtio keyboard and tablet, fed through `EmulatedMachine::input()`, or leaves
+    /// them out. By default a machine has them exactly when it has a screen; without one they
+    /// still reach the guest's input layer (`/dev/input`, the firmware's text input), with
+    /// pointer positions relative to `display_size`.
+    pub fn input(mut self, on: bool) -> Self {
+        self.input = Some(on);
+        self
+    }
+
+    /// Whether the screen is the guest's interactive console when the machine has one (the
+    /// default): the default command line then ends in `console=tty0`, so `/dev/console`, and
+    /// with it init's shell, is on the screen. With `false` the first text console stays the
+    /// guest's console and the screen shows only what the guest runs on its virtual terminals
+    /// (a distro's login on tty1). No effect without a display or with an explicit `cmdline`.
+    pub fn console_on_screen(mut self, on: bool) -> Self {
+        self.console_on_screen = on;
+        self
+    }
+
     /// The screen size the display starts with and offers the guest, 320x200 to 2560x1600
     /// (default 1280x800). The firmware's framebuffer keeps it; a guest driver may switch modes
-    /// later (`DisplayHandle::request_size`).
+    /// later (`DisplayHandle::request_size`). Without a display it is the area input pointer
+    /// positions are relative to.
     pub fn display_size(mut self, width: u32, height: u32) -> Self {
         self.display_size = (width, height);
         self
@@ -558,21 +584,20 @@ struct Vcpu {
     reboot: Option<RebootImage>,
 }
 
-/// The display devices for one boot: the embedder's handles, and the boot framebuffer only
+/// The display devices for one boot: the embedder's handle, and the boot framebuffer only
 /// when the UEFI firmware publishes one (at the place `framebuffer_region` derives from the RAM
 /// size, which is the same on every boot).
 fn display_devices(
-    handles: &Option<(DisplayHandle, InputHandle)>,
+    display: &Option<DisplayHandle>,
     firmware: Option<&boot::FirmwareParams>,
     ram_top: u64,
 ) -> Option<DisplayDevices> {
-    let (display, input) = handles.as_ref()?;
+    let display = display.as_ref()?;
     let boot_framebuffer = firmware
         .and_then(|params| params.framebuffer)
         .map(|(width, height)| boot::framebuffer_region(ram_top, width, height));
     Some(DisplayDevices {
         display: display.clone(),
-        input: input.clone(),
         boot_framebuffer,
     })
 }
@@ -594,7 +619,8 @@ struct RebootImage {
     key_value_store: Option<SharedKeyValueStore>,
     rng: Option<RngSource>,
     /// The embedder holds these; the new devices must be built around them, like the NICs.
-    display: Option<(DisplayHandle, InputHandle)>,
+    display: Option<DisplayHandle>,
+    input: Option<InputHandle>,
     /// Set when the machine boots UEFI firmware: that image and handoff replace the kernel.
     uefi: Option<(Vec<u8>, boot::FirmwareParams)>,
 }
@@ -794,12 +820,14 @@ fn mirrored_devices(main: &mut DevConfig, main_uart: &ConsoleHandle) -> (DevConf
         // only, and the twin's screen is never looked at.
         display: main.display.as_ref().map(|devices| {
             let (width, height) = devices.display.size();
-            let display = DisplayHandle::with_size(width, height);
             DisplayDevices {
-                input: InputHandle::for_display(Some(display.clone())),
-                display,
+                display: DisplayHandle::with_size(width, height),
                 boot_framebuffer: devices.boot_framebuffer,
             }
+        }),
+        input: main.input.as_ref().map(|input| {
+            let (width, height) = input.pointer_area();
+            InputHandle::without_display(width, height)
         }),
     };
     (devices, twin_uart)
@@ -881,6 +909,7 @@ impl Vcpu {
                 cpus: image.cpus,
                 rng: image.rng.clone(),
                 display,
+                input: image.input.clone(),
             };
         }
     }
@@ -933,11 +962,7 @@ impl Vcpu {
         }
         // The same for keystrokes and pointer moves.
         #[cfg(not(freestanding))]
-        let input = self
-            .devcfg
-            .display
-            .as_ref()
-            .map(|devices| devices.input.clone());
+        let input = self.devcfg.input.clone();
         #[cfg(not(freestanding))]
         if let Some(input) = &input {
             let thread = std::thread::current();
@@ -1066,8 +1091,10 @@ pub struct EmulatedMachine {
     consoles: Vec<ConsoleHandle>,
     /// Same queues as the virtio-net devices in `Vcpu::devcfg`, in configuration order.
     nets: Vec<NetHandle>,
-    /// With `DisplayMode::Framebuffer`: the screen and the keyboard and tablet.
-    display: Option<(DisplayHandle, InputHandle)>,
+    /// With `DisplayMode::Framebuffer`: the screen.
+    display: Option<DisplayHandle>,
+    /// With `MachineConfig::input` (by default together with the screen): keyboard and tablet.
+    input: Option<InputHandle>,
     stop: Arc<AtomicBool>,
 }
 
@@ -1150,8 +1177,9 @@ impl EmulatedMachine {
                 .map(RngSource::Host)
         };
         let has_display = cfg.display == DisplayMode::Framebuffer;
+        let has_input = cfg.input.unwrap_or(has_display);
         let (display_width, display_height) = cfg.display_size;
-        if has_display
+        if (has_display || has_input)
             && (!(display::MIN_WIDTH..=display::MAX_WIDTH).contains(&display_width)
                 || !(display::MIN_HEIGHT..=display::MAX_HEIGHT).contains(&display_height))
         {
@@ -1167,11 +1195,12 @@ impl EmulatedMachine {
             + disk_count
             + cfg.net_macs.len()
             + rng.is_some() as usize
-            + if has_display { DISPLAY_FUNCTIONS } else { 0 };
+            + if has_display { DISPLAY_FUNCTIONS } else { 0 }
+            + if has_input { INPUT_FUNCTIONS } else { 0 };
         if functions > MAX_VIRTIO_FUNCTIONS {
             return Err(Error::BadConfig(format!(
-                "{functions} virtio devices configured (consoles, disks, NICs, the display and \
-                 the entropy source); the PCI bus has room for {MAX_VIRTIO_FUNCTIONS}"
+                "{functions} virtio devices configured (consoles, disks, NICs, the display, \
+                 input and the entropy source); the PCI bus has room for {MAX_VIRTIO_FUNCTIONS}"
             )));
         }
         let mut cmdline = cfg.cmdline.clone().unwrap_or_else(|| {
@@ -1190,7 +1219,7 @@ impl EmulatedMachine {
             // The last `console=` is `/dev/console`, where init and its shell go: the screen.
             // The text console stays a kernel log console, and a `cmdline_append` with its own
             // `console=` still comes after this and wins.
-            if has_display {
+            if has_display && cfg.console_on_screen {
                 default.push_str(" console=tty0");
             }
             default
@@ -1284,10 +1313,10 @@ impl EmulatedMachine {
             .filter(|(kind, _)| **kind == ConsoleKind::Virtio)
             .map(|(_, handle)| handle.clone())
             .collect();
-        let display = has_display.then(|| {
-            let display = DisplayHandle::with_size(display_width, display_height);
-            let input = InputHandle::for_display(Some(display.clone()));
-            (display, input)
+        let display = has_display.then(|| DisplayHandle::with_size(display_width, display_height));
+        let input = has_input.then(|| match &display {
+            Some(display) => InputHandle::for_display(display.clone()),
+            None => InputHandle::without_display(display_width, display_height),
         });
         let devcfg = DevConfig {
             disks: cfg.disks,
@@ -1302,6 +1331,7 @@ impl EmulatedMachine {
                 uefi.as_ref().map(|(_, params)| params),
                 ram.len() as u64,
             ),
+            input: input.clone(),
         };
         let boot_ram = cfg.verify.then(|| ram.clone());
         // Verification cannot restart (the twin's devices cannot be rebuilt in step), so it keeps
@@ -1320,6 +1350,7 @@ impl EmulatedMachine {
                     key_value_store: cfg.key_value_store,
                     rng: devcfg.rng.clone(),
                     display: display.clone(),
+                    input: input.clone(),
                     uefi,
                 }
             });
@@ -1353,18 +1384,20 @@ impl EmulatedMachine {
             consoles,
             nets: net_handles,
             display,
+            input,
             stop,
         })
     }
 
     /// The screen, with `DisplayMode::Framebuffer`.
     pub fn display(&self) -> Option<DisplayHandle> {
-        self.display.as_ref().map(|(display, _)| display.clone())
+        self.display.clone()
     }
 
-    /// The keyboard and tablet, with `DisplayMode::Framebuffer`.
+    /// The keyboard and tablet, when the machine has them (`MachineConfig::input`; by default
+    /// together with a screen).
     pub fn input(&self) -> Option<InputHandle> {
-        self.display.as_ref().map(|(_, input)| input.clone())
+        self.input.clone()
     }
 
     /// The first configured console (the only one unless `MachineConfig::console` was called
