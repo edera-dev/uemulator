@@ -351,6 +351,7 @@ extern "efiapi" fn exit_boot_services(_image: Handle, map_key: usize) -> Status 
         return INVALID_PARAMETER;
     }
     disks::shutdown();
+    crate::virtio_input::shutdown();
     console::detach();
     cpu::mask_interrupts();
     SYSTEM_TABLE.get().boot_services = ptr::null_mut();

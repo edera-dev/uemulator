@@ -99,6 +99,7 @@ pub fn init(handoff: &Handoff) {
     rng::init(handoff);
     crate::serial::trace!("rng done");
     console::init();
+    console::attach_screen(handoff.framebuffer);
     crate::serial::trace!("console done");
     install_utility_protocols();
     crate::serial::trace!("install_utility_protocols done");
@@ -108,6 +109,9 @@ pub fn init(handoff: &Handoff) {
     crate::serial::trace!("pci done");
     disks::init();
     crate::serial::trace!("disks done");
+    crate::gop::init(handoff.framebuffer);
+    crate::virtio_input::init();
+    crate::serial::trace!("display and keyboard done");
     tables::seal_all();
 }
 

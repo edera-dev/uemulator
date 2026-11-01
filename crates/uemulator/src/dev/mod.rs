@@ -2,6 +2,7 @@
 use crate::prelude::*;
 pub(crate) mod acpi_pm;
 pub(crate) mod apic;
+pub(crate) mod bootfb;
 pub(crate) mod guestmem;
 pub(crate) mod handle;
 pub(crate) mod hpet;
@@ -14,16 +15,20 @@ mod pit;
 mod serial;
 mod vblk;
 mod vcons;
+mod vgpu;
+mod vinput;
 mod virtio;
 mod vnet;
 mod vrng;
 
 use crate::console::ConsoleHandle;
 use crate::disk::Disk;
+use crate::display::{DisplayHandle, InputDevice, InputHandle};
 use crate::netdev::NetHandle;
 use crate::sync::Arc;
 use acpi_pm::AcpiPm;
 use apic::{Interrupt, Ipi, Lapic};
+use bootfb::{BootFramebuffer, FramebufferRegion};
 use guestmem::GuestMem;
 use hpet::{Hpet, HpetOutput};
 use ioapic::IoApic;
@@ -35,6 +40,8 @@ use pit::Pit;
 use serial::Uart;
 use vblk::VirtioBlk;
 use vcons::VirtioConsole;
+use vgpu::VirtioGpu;
+use vinput::VirtioInput;
 use virtio::Transport;
 use vnet::VirtioNet;
 use vrng::VirtioRng;
@@ -145,8 +152,22 @@ enum Source {
     Message(InterruptRequest),
 }
 
+/// The graphical console's devices and the handles they share with the host.
+#[derive(Clone)]
+pub(crate) struct DisplayDevices {
+    pub display: DisplayHandle,
+    pub input: InputHandle,
+    /// The UEFI firmware's framebuffer in RAM, shown while no virtio-gpu driver owns the screen.
+    /// Only a machine booted through the firmware has one.
+    pub boot_framebuffer: Option<FramebufferRegion>,
+}
+
+/// PCI functions `DisplayDevices` adds: the GPU, the keyboard and the tablet.
+pub(crate) const DISPLAY_FUNCTIONS: usize = 3;
+
 /// What to attach to the PCI bus; every device is optional and may repeat. Functions take slots
-/// (and legacy IRQ lines) in this order: virtio consoles, disks, nets, then the entropy source, each in list order.
+/// (and legacy IRQ lines) in this order: virtio consoles, disks, nets, the display's GPU,
+/// keyboard and tablet, then the entropy source, each in list order.
 #[derive(Default)]
 pub(crate) struct DevConfig {
     pub disks: Vec<Disk>,
@@ -163,6 +184,8 @@ pub(crate) struct DevConfig {
     pub cpus: usize,
     /// Adds a virtio-rng function, last in slot order, fed by this source.
     pub rng: Option<RngSource>,
+    /// Adds the graphical console (`DISPLAY_FUNCTIONS` functions) after the NICs.
+    pub display: Option<DisplayDevices>,
 }
 
 /// Most virtio functions one machine can hold (PCI slots 1..=31).
@@ -211,6 +234,8 @@ pub(crate) struct Devices {
     /// The vCPU threads' shared state while the machine runs one thread per vCPU: what the device
     /// model tells them at every release of the device lock.
     links: Option<Arc<crate::cpu::vcpus::VcpuLinks>>,
+    /// Scanned on every tick while the guest's GPU driver does not own the screen.
+    boot_framebuffer: Option<BootFramebuffer>,
 }
 
 /// Mask of the low `size` bytes of a port value; sizes of 4 or more cover the whole dword.
@@ -259,7 +284,7 @@ fn civil(days_since_unix_epoch: i64) -> (i64, u64, u64) {
 
 impl Devices {
     pub fn new(console: ConsoleHandle, cfg: DevConfig) -> Self {
-        // Order decides PCI slot and legacy IRQ: consoles, disks, nets, rng.
+        // Order decides PCI slot and legacy IRQ: consoles, disks, nets, display, rng.
         let mut virtio_devices = Vec::new();
         let mut uart_peer_console = None;
         for (position, handle) in cfg.virtio_consoles.into_iter().enumerate() {
@@ -273,6 +298,21 @@ impl Devices {
         }
         for (mac, handle) in cfg.nets {
             virtio_devices.push(Transport::new(Box::new(VirtioNet::new(mac, handle))));
+        }
+        let mut boot_framebuffer = None;
+        if let Some(display) = cfg.display {
+            virtio_devices.push(Transport::new(Box::new(VirtioGpu::new(
+                display.display.clone(),
+            ))));
+            for kind in [InputDevice::Keyboard, InputDevice::Tablet] {
+                virtio_devices.push(Transport::new(Box::new(VirtioInput::new(
+                    kind,
+                    display.input.clone(),
+                ))));
+            }
+            boot_framebuffer = display
+                .boot_framebuffer
+                .map(|region| BootFramebuffer::new(region, display.display));
         }
         if let Some(source) = cfg.rng {
             virtio_devices.push(Transport::new(Box::new(VirtioRng::new(source))));
@@ -312,6 +352,7 @@ impl Devices {
             uart_peer_console,
             reset_requested: false,
             links: None,
+            boot_framebuffer,
         }
     }
 
@@ -801,6 +842,9 @@ impl Devices {
         let mut raise = Vec::new();
         let mut messages = Vec::new();
         self.pci.poll_collecting(mem, &mut raise, &mut messages);
+        if let Some(framebuffer) = &mut self.boot_framebuffer {
+            framebuffer.tick(now, mem);
+        }
         for irq in raise {
             self.pic.raise(irq);
         }

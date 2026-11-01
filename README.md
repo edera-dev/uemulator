@@ -145,6 +145,7 @@ The threaded tests only catch ordering bugs on a native aarch64 host; under Rose
 | virtio-blk | Raw images, optional read-only, any number (`vda`, `vdb`, ...); embedders implement `BlockBackend` for their own storage |
 | virtio-net | Several NICs, each with its own MAC. Links: user-mode NAT, a tiny loopback gateway, or frames over UDP |
 | virtio-rng | On by default, feeds the guest's entropy pool from the host |
+| virtio-gpu, virtio-input (`--display framebuffer`) | 2D display (VGA class, as QEMU's `virtio-vga`, so that Linux's `virtio_gpu` is the boot display and removes a firmware framebuffer driver), keyboard and absolute tablet; the UEFI firmware draws its console on a RAM framebuffer it publishes as GOP and reads the keyboard. The CLI shows it in a browser |
 
 The user-mode NAT is a from-scratch network stack: DHCP, DNS, ICMP echo, UDP and TCP, the guest at 10.0.2.15 and the gateway at 10.0.2.2, which also reaches the host's loopback. What is verified through it: Fedora's `dnf` installing Xen, and DHCP for the Alpine netboot kernel through UEFI. The Alpine installer's `apk` could not fetch its index in the environment the UEFI checks ran in.
 
@@ -192,6 +193,9 @@ cargo run --release -- quick reinstall test --install alpine
 # more of everything
 cargo run --release -- quick create big --install fedora --memory 8192 --cpus 8 --iommu
 
+# a screen, keyboard and mouse in the browser (the URL is printed at boot)
+cargo run --release -- quick boot test --display framebuffer
+
 # a kernel you already have, with every option spelled out
 cargo run --release -- advanced boot --kernel vmlinuz --initramfs initrd --memory 2048 --firmware none
 ```
@@ -229,6 +233,7 @@ let reason = machine.wait();            // Shutdown, Reset, TripleFault, Stopped
 | `firmware`, `boot_disk` | Real-mode firmware image, or a disk's boot sector through the BIOS |
 | `memory_mib`, `cpus`, `smp`, `thread_spawner` | RAM, vCPUs, scheduling mode, host threads for freestanding builds |
 | `disk(Disk)`, `net(mac)`, `console(ConsoleKind)`, `rng`, `iommu`, `acpi` | Devices. `Disk::from_backend` takes your own `BlockBackend` |
+| `display(DisplayMode)`, `display_size` | Graphical console; `EmulatedMachine::display()` gives the frames (damage rectangles, a generation counter, a wait or a callback), `input()` takes keys and absolute pointer events |
 | `jit(JitMode)`, `clock(ClockMode)`, `verify_jit`, `debug` | Engine and time source |
 | `reboot`, `unix_time`, `random_seed`, `entropy` | Reset policy, fixed RTC, deterministic seeds |
 | `log`, `poll`, `host_clock` | Hooks: diagnostics, a poll callback for single-threaded hosts, a monotonic clock |
@@ -254,6 +259,7 @@ Shared by `quick create|edit|boot` and `advanced boot` unless noted.
 | `--network-link-udp LOCAL,REMOTE` | Frames over a UDP socket pair. A NIC with no link has no host side |
 | `--console virtio\|serial` | Default virtio (`hvc0`). `serial` is `ttyS0`, for kernels without a built-in `virtio_console`. Repeatable, serial at most once; the first is primary and gets the terminal |
 | `--iommu` | Adds the AMD IOMMU |
+| `--display serial\|framebuffer` | Default serial (text consoles only). `framebuffer` adds a virtio-gpu screen with a virtio keyboard and tablet, served by the built-in web viewer; the kernel's console moves to the screen (`console=tty0`) and the terminal keeps the kernel log |
 | `--disable-jit`, `--disable-rng`, `--no-reboot` | Each takes `=false` to turn a saved setting back off |
 | `--cmdline`, `--append` | Replace or extend the kernel command line; an empty value clears a saved one. They apply to the installer, not to a disk boot |
 | `--firmware uefi\|bios\|none` | Default `uefi` (`quick create`, `quick edit`, `advanced boot`) |
@@ -261,7 +267,7 @@ Shared by `quick create|edit|boot` and `advanced boot` unless noted.
 
 ### Run options
 
-`quick boot` and the `advanced` commands: `--time UNIX` (fix the RTC; guest behavior must not depend on it), `--timeout SECS`, `--debug` (dump CPU state and scan guest RAM for the kernel log ring buffer on exit, plus the JIT's interpreter-fallback histogram), `--verify` (lockstep JIT check, single vCPU only).
+`quick boot` and the `advanced` commands: `--viewer-address ADDRESS:PORT` (where the viewer of a `--display framebuffer` machine listens; default `127.0.0.1:5800`, port 0 picks one; anyone who can reach it controls the keyboard), `--time UNIX` (fix the RTC; guest behavior must not depend on it), `--timeout SECS`, `--debug` (dump CPU state and scan guest RAM for the kernel log ring buffer on exit, plus the JIT's interpreter-fallback histogram), `--verify` (lockstep JIT check, single vCPU only).
 
 ### What a machine boots (`--boot-from`)
 
@@ -368,6 +374,7 @@ What is not done, or not checked, as of this writing:
 | `19-uefi-firmware.md`, `12-uefi.md` | The firmware, and the UEFI application |
 | `13-web.md` | Browser port and the WebAssembly JIT |
 | `21-ryzen-7000-parity.md`, `22-smp-threads.md` | Planned CPU work, threaded SMP |
+| `24-display-input.md` | Graphical console: virtio-gpu, virtio-input, GOP, the web viewer |
 
 `../ext/qemu-uplink` is read-only reference for behavior (`plans/09-qemu-map.md`). The Rust is written from scratch, not transliterated.
 

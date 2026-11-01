@@ -34,6 +34,12 @@ impl EmulatedMachine {
 
 pub enum ExitReason { Shutdown, Reset, TripleFault, Stopped, Internal(String) }
 
+// Graphical console (plans/24-display-input.md)
+MachineConfig::display(DisplayMode::Framebuffer)    // Serial (default) | Framebuffer: virtio-gpu, keyboard, tablet
+MachineConfig::display_size(width, height)          // default 1280x800
+EmulatedMachine::display() -> Option<DisplayHandle> // size, generation, frame, update_since, wait_for_update, on_update, request_size
+EmulatedMachine::input() -> Option<InputHandle>     // key (Linux code), key_usb, pointer_move, pointer_button, scroll, release_all
+
 pub struct ConsoleHandle { .. }
 impl ConsoleHandle {
     pub fn write(&self, bytes: &[u8]);                       // host → guest (serial RX)

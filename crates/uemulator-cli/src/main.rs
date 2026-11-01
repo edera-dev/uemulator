@@ -1,5 +1,6 @@
 mod args;
 mod firmware;
+mod frontend;
 mod images;
 mod machines;
 mod netgw;

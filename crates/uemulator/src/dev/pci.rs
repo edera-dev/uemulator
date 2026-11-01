@@ -2,9 +2,10 @@ use super::guestmem::GuestMem;
 use super::iommu::{self, InterruptRequest, Iommu};
 use super::size_mask;
 use super::virtio::{
-    COMMON_CFG_OFFSET, DEVICE_CFG_OFFSET, DEVICE_TYPE_BLOCK, DEVICE_TYPE_CONSOLE, DEVICE_TYPE_NET,
-    ISR_OFFSET, MSIX_CONTROL_ENABLE, MSIX_CONTROL_FUNCTION_MASK, MSIX_PBA_OFFSET,
-    MSIX_TABLE_OFFSET, NOTIFY_OFF_MULTIPLIER, NOTIFY_OFFSET, REGION_SIZE, Transport,
+    COMMON_CFG_OFFSET, DEVICE_CFG_OFFSET, DEVICE_TYPE_BLOCK, DEVICE_TYPE_CONSOLE, DEVICE_TYPE_GPU,
+    DEVICE_TYPE_INPUT, DEVICE_TYPE_NET, ISR_OFFSET, MSIX_CONTROL_ENABLE,
+    MSIX_CONTROL_FUNCTION_MASK, MSIX_PBA_OFFSET, MSIX_TABLE_OFFSET, NOTIFY_OFF_MULTIPLIER,
+    NOTIFY_OFFSET, REGION_SIZE, Transport,
 };
 #[cfg(freestanding)]
 use crate::prelude::*;
@@ -100,6 +101,15 @@ const CLASS_STORAGE: u8 = 0x01;
 const SUBCLASS_SCSI: u8 = 0x00;
 const CLASS_COMMUNICATION: u8 = 0x07;
 const SUBCLASS_COMMUNICATION_OTHER: u8 = 0x80;
+/// The GPU is a VGA-compatible display controller, as QEMU's `virtio-vga`, not display-other as
+/// `virtio-gpu-pci`: Linux's driver removes the firmware's framebuffer (`efifb`, `simpledrm`)
+/// only for a VGA-class device, which is also the one the VGA arbiter makes the boot display.
+/// Without that the console stays on the dead firmware framebuffer while the screen shows the
+/// driver's (`plans/24-display-input.md`).
+const CLASS_DISPLAY: u8 = 0x03;
+const SUBCLASS_VGA: u8 = 0x00;
+const CLASS_INPUT: u8 = 0x09;
+const SUBCLASS_INPUT_OTHER: u8 = 0x80;
 
 /// Vendor-specific capability id used by every virtio PCI capability.
 const CAP_ID_VENDOR_SPECIFIC: u8 = 0x09;
@@ -190,6 +200,8 @@ impl PciFunction {
         let (subclass, class) = match device_type {
             DEVICE_TYPE_NET => (SUBCLASS_ETHERNET, CLASS_NETWORK),
             DEVICE_TYPE_BLOCK => (SUBCLASS_SCSI, CLASS_STORAGE),
+            DEVICE_TYPE_GPU => (SUBCLASS_VGA, CLASS_DISPLAY),
+            DEVICE_TYPE_INPUT => (SUBCLASS_INPUT_OTHER, CLASS_INPUT),
             _ => (SUBCLASS_COMMUNICATION_OTHER, CLASS_COMMUNICATION),
         };
         b[CFG_SUBCLASS] = subclass;

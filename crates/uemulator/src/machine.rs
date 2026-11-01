@@ -13,8 +13,11 @@ use crate::cpu::vcpus::ThreadSpawner;
 use crate::cpu::{Cpu, DEFAULT_RANDOM_SEED};
 use crate::dev::host_entropy;
 use crate::dev::kv::SharedKeyValueStore;
-use crate::dev::{DevConfig, EntropyFn, MAX_VIRTIO_FUNCTIONS, RngSource};
+use crate::dev::{
+    DISPLAY_FUNCTIONS, DevConfig, DisplayDevices, EntropyFn, MAX_VIRTIO_FUNCTIONS, RngSource,
+};
 use crate::disk::Disk;
+use crate::display::{self, DisplayHandle, InputHandle};
 use crate::kv::{KeyValueStore, MemoryKeyValueStore};
 use crate::netdev::NetHandle;
 use crate::platform::{DEFAULT_CMDLINE, DEFAULT_SERIAL_CMDLINE};
@@ -120,6 +123,22 @@ pub enum ConsoleKind {
     Virtio,
 }
 
+/// Whether the machine has a graphical console next to its text consoles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DisplayMode {
+    /// Text consoles only (`MachineConfig::console`), the machine of earlier versions.
+    #[default]
+    Serial,
+    /// A virtio-gpu display with a virtio keyboard and tablet, driven from the host through
+    /// `EmulatedMachine::display()` and `input()`. Booted through the UEFI firmware, the firmware
+    /// draws its console and boot menu on it and hands it to the OS as a GOP framebuffer, and
+    /// the keyboard reaches the firmware's text input. The default command line gains
+    /// `console=tty0`, so the kernel log and `/dev/console` are on the screen while the text
+    /// console keeps a copy of the log and early boot text stays on the 16550. Layout in
+    /// `plans/24-display-input.md`.
+    Framebuffer,
+}
+
 pub const MIN_CPUS: usize = 1;
 /// The APIC id fits one byte in xAPIC mode, and the I/O APIC and IPI routing keep one bit per
 /// vCPU in a `u64`.
@@ -161,6 +180,8 @@ pub struct MachineConfig {
     disks: Vec<Disk>,
     net_macs: Vec<[u8; 6]>,
     consoles: Vec<ConsoleKind>,
+    display: DisplayMode,
+    display_size: (u32, u32),
     iommu: bool,
     acpi: bool,
     jit: JitMode,
@@ -195,6 +216,8 @@ impl Default for MachineConfig {
             disks: Vec::new(),
             net_macs: Vec::new(),
             consoles: Vec::new(),
+            display: DisplayMode::Serial,
+            display_size: (display::DEFAULT_WIDTH, display::DEFAULT_HEIGHT),
             iommu: false,
             acpi: true,
             jit: JitMode::Auto,
@@ -326,6 +349,20 @@ impl MachineConfig {
     /// `ConsoleHandle`, in call order (`EmulatedMachine::consoles()`).
     pub fn console(mut self, kind: ConsoleKind) -> Self {
         self.consoles.push(kind);
+        self
+    }
+
+    /// Adds a graphical console (`DisplayMode::Framebuffer`) or not (`Serial`, the default).
+    pub fn display(mut self, mode: DisplayMode) -> Self {
+        self.display = mode;
+        self
+    }
+
+    /// The screen size the display starts with and offers the guest, 320x200 to 2560x1600
+    /// (default 1280x800). The firmware's framebuffer keeps it; a guest driver may switch modes
+    /// later (`DisplayHandle::request_size`).
+    pub fn display_size(mut self, width: u32, height: u32) -> Self {
+        self.display_size = (width, height);
         self
     }
 
@@ -521,6 +558,25 @@ struct Vcpu {
     reboot: Option<RebootImage>,
 }
 
+/// The display devices for one boot: the embedder's handles, and the boot framebuffer only
+/// when the UEFI firmware publishes one (at the place `framebuffer_region` derives from the RAM
+/// size, which is the same on every boot).
+fn display_devices(
+    handles: &Option<(DisplayHandle, InputHandle)>,
+    firmware: Option<&boot::FirmwareParams>,
+    ram_top: u64,
+) -> Option<DisplayDevices> {
+    let (display, input) = handles.as_ref()?;
+    let boot_framebuffer = firmware
+        .and_then(|params| params.framebuffer)
+        .map(|(width, height)| boot::framebuffer_region(ram_top, width, height));
+    Some(DisplayDevices {
+        display: display.clone(),
+        input: input.clone(),
+        boot_framebuffer,
+    })
+}
+
 /// Everything `boot::load` needs to lay the guest out again, plus the parts of the device set
 /// that cannot be rebuilt from the old `Devices` (the disk is recovered from them instead).
 struct RebootImage {
@@ -537,6 +593,8 @@ struct RebootImage {
     acpi: Option<AcpiConfig>,
     key_value_store: Option<SharedKeyValueStore>,
     rng: Option<RngSource>,
+    /// The embedder holds these; the new devices must be built around them, like the NICs.
+    display: Option<(DisplayHandle, InputHandle)>,
     /// Set when the machine boots UEFI firmware: that image and handoff replace the kernel.
     uefi: Option<(Vec<u8>, boot::FirmwareParams)>,
 }
@@ -732,6 +790,17 @@ fn mirrored_devices(main: &mut DevConfig, main_uart: &ConsoleHandle) -> (DevConf
         cpus: main.cpus,
         // Verification always runs on a seeded stream, so cloning gives the twin the same bytes.
         rng: main.rng.clone(),
+        // Same functions and the same boot framebuffer region; host input reaches the main CPU
+        // only, and the twin's screen is never looked at.
+        display: main.display.as_ref().map(|devices| {
+            let (width, height) = devices.display.size();
+            let display = DisplayHandle::with_size(width, height);
+            DisplayDevices {
+                input: InputHandle::for_display(Some(display.clone())),
+                display,
+                boot_framebuffer: devices.boot_framebuffer,
+            }
+        }),
     };
     (devices, twin_uart)
 }
@@ -797,6 +866,11 @@ impl Vcpu {
                 Ok(boot) => self.boot = boot,
                 Err(e) => return ExitReason::Internal(format!("reboot: {e}")),
             }
+            let display = display_devices(
+                &image.display,
+                image.uefi.as_ref().map(|(_, params)| params),
+                ram.len() as u64,
+            );
             self.ram = ram;
             self.devcfg = DevConfig {
                 disks: finished.disks,
@@ -806,6 +880,7 @@ impl Vcpu {
                 key_value_store: image.key_value_store.clone(),
                 cpus: image.cpus,
                 rng: image.rng.clone(),
+                display,
             };
         }
     }
@@ -855,6 +930,18 @@ impl Vcpu {
         for net in &nets {
             let thread = std::thread::current();
             net.set_device_waker(Some(Arc::new(move || thread.unpark())));
+        }
+        // The same for keystrokes and pointer moves.
+        #[cfg(not(freestanding))]
+        let input = self
+            .devcfg
+            .display
+            .as_ref()
+            .map(|devices| devices.input.clone());
+        #[cfg(not(freestanding))]
+        if let Some(input) = &input {
+            let thread = std::thread::current();
+            input.set_device_waker(Some(Arc::new(move || thread.unpark())));
         }
         let mut cpu = Cpu::new(
             ram,
@@ -952,6 +1039,10 @@ impl Vcpu {
         for net in &nets {
             net.set_device_waker(None);
         }
+        #[cfg(not(freestanding))]
+        if let Some(input) = &input {
+            input.set_device_waker(None);
+        }
         let finished = Finished {
             ram_bytes,
             disks: cpu
@@ -975,6 +1066,8 @@ pub struct EmulatedMachine {
     consoles: Vec<ConsoleHandle>,
     /// Same queues as the virtio-net devices in `Vcpu::devcfg`, in configuration order.
     nets: Vec<NetHandle>,
+    /// With `DisplayMode::Framebuffer`: the screen and the keyboard and tablet.
+    display: Option<(DisplayHandle, InputHandle)>,
     stop: Arc<AtomicBool>,
 }
 
@@ -1056,12 +1149,29 @@ impl EmulatedMachine {
                 .or_else(host_entropy)
                 .map(RngSource::Host)
         };
-        let functions =
-            virtio_console_count + disk_count + cfg.net_macs.len() + rng.is_some() as usize;
+        let has_display = cfg.display == DisplayMode::Framebuffer;
+        let (display_width, display_height) = cfg.display_size;
+        if has_display
+            && (!(display::MIN_WIDTH..=display::MAX_WIDTH).contains(&display_width)
+                || !(display::MIN_HEIGHT..=display::MAX_HEIGHT).contains(&display_height))
+        {
+            return Err(Error::BadConfig(format!(
+                "display_size must be between {}x{} and {}x{}",
+                display::MIN_WIDTH,
+                display::MIN_HEIGHT,
+                display::MAX_WIDTH,
+                display::MAX_HEIGHT
+            )));
+        }
+        let functions = virtio_console_count
+            + disk_count
+            + cfg.net_macs.len()
+            + rng.is_some() as usize
+            + if has_display { DISPLAY_FUNCTIONS } else { 0 };
         if functions > MAX_VIRTIO_FUNCTIONS {
             return Err(Error::BadConfig(format!(
-                "{functions} virtio devices configured (consoles, disks, NICs and the entropy source); \
-                 the PCI bus has room for {MAX_VIRTIO_FUNCTIONS}"
+                "{functions} virtio devices configured (consoles, disks, NICs, the display and \
+                 the entropy source); the PCI bus has room for {MAX_VIRTIO_FUNCTIONS}"
             )));
         }
         let mut cmdline = cfg.cmdline.clone().unwrap_or_else(|| {
@@ -1072,11 +1182,18 @@ impl EmulatedMachine {
                 DEFAULT_SERIAL_CMDLINE
             };
             // The defaults are the table-less ones (`Platform` hosts need `acpi=off`).
-            if cfg.acpi {
+            let mut default = if cfg.acpi {
                 default.replace(ACPI_OFF_WORD, "").replace("  ", " ")
             } else {
                 default.to_string()
+            };
+            // The last `console=` is `/dev/console`, where init and its shell go: the screen.
+            // The text console stays a kernel log console, and a `cmdline_append` with its own
+            // `console=` still comes after this and wins.
+            if has_display {
+                default.push_str(" console=tty0");
             }
+            default
         });
         for extra in &cfg.cmdline_extra {
             cmdline.push(' ');
@@ -1125,6 +1242,7 @@ impl EmulatedMachine {
                 random_seed: cfg.random_seed.unwrap_or(DEFAULT_RANDOM_SEED),
                 rsdp: 0,
                 acpi_region: (0, 0),
+                framebuffer: has_display.then_some(cfg.display_size),
             };
             (image.clone(), params)
         });
@@ -1166,6 +1284,11 @@ impl EmulatedMachine {
             .filter(|(kind, _)| **kind == ConsoleKind::Virtio)
             .map(|(_, handle)| handle.clone())
             .collect();
+        let display = has_display.then(|| {
+            let display = DisplayHandle::with_size(display_width, display_height);
+            let input = InputHandle::for_display(Some(display.clone()));
+            (display, input)
+        });
         let devcfg = DevConfig {
             disks: cfg.disks,
             nets,
@@ -1174,6 +1297,11 @@ impl EmulatedMachine {
             key_value_store: cfg.key_value_store.clone(),
             cpus: cfg.cpus,
             rng: rng.clone(),
+            display: display_devices(
+                &display,
+                uefi.as_ref().map(|(_, params)| params),
+                ram.len() as u64,
+            ),
         };
         let boot_ram = cfg.verify.then(|| ram.clone());
         // Verification cannot restart (the twin's devices cannot be rebuilt in step), so it keeps
@@ -1191,6 +1319,7 @@ impl EmulatedMachine {
                     acpi,
                     key_value_store: cfg.key_value_store,
                     rng: devcfg.rng.clone(),
+                    display: display.clone(),
                     uefi,
                 }
             });
@@ -1223,8 +1352,19 @@ impl EmulatedMachine {
             started: false,
             consoles,
             nets: net_handles,
+            display,
             stop,
         })
+    }
+
+    /// The screen, with `DisplayMode::Framebuffer`.
+    pub fn display(&self) -> Option<DisplayHandle> {
+        self.display.as_ref().map(|(display, _)| display.clone())
+    }
+
+    /// The keyboard and tablet, with `DisplayMode::Framebuffer`.
+    pub fn input(&self) -> Option<InputHandle> {
+        self.display.as_ref().map(|(_, input)| input.clone())
     }
 
     /// The first configured console (the only one unless `MachineConfig::console` was called

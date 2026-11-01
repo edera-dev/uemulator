@@ -1,17 +1,23 @@
 //! The text console on the 16550: `SimpleTextOutput` writes UTF-8 and ANSI escape sequences to
-//! a terminal, `SimpleTextInput(Ex)` reads keystrokes from it.
+//! a terminal, `SimpleTextInput(Ex)` reads keystrokes from it. A machine with a screen gets the
+//! same text drawn on its framebuffer (`text_screen.rs`) and keystrokes from its virtio keyboard
+//! too, like a console splitter: both consoles always show the same thing.
 
 use core::ffi::c_void;
 use core::ptr;
 
 use crate::events;
+use crate::gop;
+use crate::handoff::Framebuffer;
 use crate::keys;
 use crate::protocols;
 use crate::serial;
 use crate::sync::Global;
 use crate::tables::SYSTEM_TABLE;
+use crate::text_screen::{AnsiParser, Geometry, TextScreen};
 use crate::time;
 use crate::uefi::*;
+use crate::virtio_input;
 
 const COLUMNS: usize = 80;
 const ROWS: usize = 25;
@@ -27,6 +33,8 @@ const BACKGROUND_MASK: usize = 0x07;
 /// EFI numbers colours blue=1, green=2, red=4; ANSI numbers red=1, green=2, blue=4.
 const ANSI_FROM_EFI: [u8; 8] = [0, 4, 2, 6, 1, 5, 3, 7];
 const BRIGHT: usize = 8;
+/// The attribute bits `EFI_TEXT_ATTR` defines (the top bit is reserved).
+const ATTRIBUTE_MASK: usize = 0x7f;
 
 #[repr(C)]
 struct KeyState {
@@ -66,6 +74,73 @@ static CONSOLE: Global<Console> = Global::new(Console {
     column: 0,
     row: 0,
 });
+
+/// The text console on the framebuffer, with the framebuffer it draws on.
+static SCREEN: Global<Option<(TextScreen, Framebuffer)>> = Global::new(None);
+
+/// Runs `draw` on the framebuffer console if the machine has one.
+fn on_screen(draw: impl FnOnce(&mut TextScreen, &mut [u32])) {
+    if let Some((screen, framebuffer)) = SCREEN.get() {
+        draw(screen, gop::pixels(framebuffer));
+    }
+}
+
+/// Reads the control sequences in the firmware's own text (`Writer`) for the screen.
+static ANSI: Global<Option<AnsiParser>> = Global::new(None);
+
+/// The firmware's own messages and menus (`boot.rs`): to the serial terminal as they are, and
+/// onto the screen with their control sequences interpreted. Lines end in `\n` alone.
+pub struct Writer;
+
+impl core::fmt::Write for Writer {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        let _ = serial::Serial.write_str(text);
+        on_screen(|screen, pixels| {
+            let parser = ANSI.get().get_or_insert_with(AnsiParser::default);
+            for character in text.chars() {
+                if character == '\n' {
+                    parser.feed(screen, pixels, '\r');
+                }
+                parser.feed(screen, pixels, character);
+            }
+        });
+        Ok(())
+    }
+}
+
+macro_rules! print {
+    ($($argument:tt)*) => {{
+        use core::fmt::Write;
+        let _ = write!($crate::console::Writer, $($argument)*);
+    }};
+}
+
+macro_rules! println {
+    () => { $crate::console::print!("\n") };
+    ($($argument:tt)*) => {{
+        use core::fmt::Write;
+        let _ = writeln!($crate::console::Writer, $($argument)*);
+    }};
+}
+
+pub(crate) use {print, println};
+
+/// Starts drawing the console on `framebuffer` (cleared to black first).
+pub fn attach_screen(framebuffer: Option<Framebuffer>) {
+    let Some(framebuffer) = framebuffer else {
+        return;
+    };
+    let Some(geometry) = Geometry::fit(
+        framebuffer.width as usize,
+        framebuffer.height as usize,
+        framebuffer.pixels_per_line as usize,
+    ) else {
+        return;
+    };
+    let screen = TextScreen::new(geometry);
+    screen.repaint(gop::pixels(&framebuffer));
+    *SCREEN.get() = Some((screen, framebuffer));
+}
 
 static OUTPUT_MODE: Global<SimpleTextOutputMode> = Global::new(SimpleTextOutputMode {
     max_mode: MODE_COUNT,
@@ -153,6 +228,13 @@ extern "efiapi" fn output_string(_: *mut SimpleTextOutput, string: *const u16) -
         if character == '\n' {
             serial::write_byte(b'\r');
         }
+        // The terminal turns the line feed into CR LF (above), so the screen does too.
+        on_screen(|screen, pixels| {
+            if character == '\n' {
+                screen.put(pixels, '\r');
+            }
+            screen.put(pixels, character);
+        });
         for byte in character.encode_utf8(&mut utf8).bytes() {
             serial::write_byte(byte);
         }
@@ -201,11 +283,13 @@ extern "efiapi" fn set_attribute(_: *mut SimpleTextOutput, attribute: usize) -> 
     let _ = write!(sequence, "{ESCAPE}[0;{ansi_foreground};{ansi_background}m");
     emit(&sequence);
     OUTPUT_MODE.get().attribute = attribute as i32;
+    on_screen(|screen, _| screen.set_attribute((attribute & ATTRIBUTE_MASK) as u8));
     SUCCESS
 }
 
 extern "efiapi" fn clear_screen(_: *mut SimpleTextOutput) -> Status {
     emit("\x1b[2J\x1b[H");
+    on_screen(|screen, pixels| screen.clear(pixels));
     let console = CONSOLE.get();
     console.column = 0;
     console.row = 0;
@@ -225,6 +309,7 @@ extern "efiapi" fn set_cursor_position(
     use core::fmt::Write;
     let _ = write!(sequence, "{ESCAPE}[{};{}H", row + 1, column + 1);
     emit(&sequence);
+    on_screen(|screen, pixels| screen.set_cursor(pixels, column, row));
     let console = CONSOLE.get();
     console.column = column;
     console.row = row;
@@ -241,12 +326,16 @@ extern "efiapi" fn enable_cursor(_: *mut SimpleTextOutput, visible: u8) -> Statu
         "\x1b[?25l"
     });
     OUTPUT_MODE.get().cursor_visible = (visible != 0) as u8;
+    on_screen(|screen, pixels| screen.show_cursor(pixels, visible != 0));
     SUCCESS
 }
 
 /// Decodes one waiting keystroke into the lookahead slot.
 fn fill_pending() {
     let console = CONSOLE.get();
+    if console.pending_key.is_none() {
+        console.pending_key = virtio_input::read_key();
+    }
     if console.pending_key.is_none() {
         console.pending_key = keys::decode(serial::read_byte, || {
             keys::following_byte(serial::read_byte, time::now_ns)

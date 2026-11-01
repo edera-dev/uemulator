@@ -17,6 +17,7 @@ mod console;
 mod cpu;
 mod dev;
 mod disk;
+mod display;
 mod jit;
 mod kv;
 mod machine;
@@ -43,12 +44,16 @@ pub use disk::{
     REMOTE_CHUNK_BYTES, RawImage, RemoteImage, Udisk, UdiskBacking, UdiskInfo, UdiskOptions,
     UdiskUsage,
 };
+pub use display::{
+    BYTES_PER_PIXEL, DisplayHandle, Frame, FrameUpdate, InputHandle, PointerButton, Rect,
+    linux_key_for_usb_usage,
+};
 #[cfg(not(freestanding))]
 pub use kv::FileKeyValueStore;
 pub use kv::{KeyValueError, KeyValueStore, MemoryKeyValueStore};
 pub use machine::{
-    ClockMode, ConsoleKind, EmulatedMachine, Error, ExitReason, JitMode, MAX_MEMORY_MIB,
-    MIN_MEMORY_MIB, MachineConfig, SmpMode, StopHandle,
+    ClockMode, ConsoleKind, DisplayMode, EmulatedMachine, Error, ExitReason, JitMode,
+    MAX_MEMORY_MIB, MIN_MEMORY_MIB, MachineConfig, SmpMode, StopHandle,
 };
 pub use netdev::{NetHandle, NetOffloads};
 pub use platform::{DEFAULT_CMDLINE, DEFAULT_SERIAL_CMDLINE, Platform, load_linux};
@@ -100,6 +105,75 @@ mod api_tests {
         let _: &str = DEFAULT_CMDLINE;
         let _: &str = DEFAULT_SERIAL_CMDLINE;
         let _: fn(ConsoleHandle) -> Platform = Platform::new;
+    }
+
+    #[test]
+    fn the_display_and_input_surface_has_the_documented_signatures() {
+        let _: fn(MachineConfig, DisplayMode) -> MachineConfig = MachineConfig::display;
+        let _: fn(MachineConfig, u32, u32) -> MachineConfig = MachineConfig::display_size;
+        let _: fn(&EmulatedMachine) -> Option<DisplayHandle> = EmulatedMachine::display;
+        let _: fn(&EmulatedMachine) -> Option<InputHandle> = EmulatedMachine::input;
+        let _: fn(&DisplayHandle) -> (u32, u32) = DisplayHandle::size;
+        let _: fn(&DisplayHandle) -> u64 = DisplayHandle::generation;
+        let _: fn(&DisplayHandle) -> Frame = DisplayHandle::frame;
+        let _: fn(&DisplayHandle, u64, &mut Vec<u8>) -> Option<FrameUpdate> =
+            DisplayHandle::update_since;
+        let _: fn(&DisplayHandle, u64, std::time::Duration) -> u64 = DisplayHandle::wait_for_update;
+        let _: fn(&DisplayHandle, u32, u32) = DisplayHandle::request_size;
+        let _ = |display: &DisplayHandle| display.on_update(|_generation: u64| {});
+        let _: fn(&InputHandle, u16, bool) -> bool = InputHandle::key;
+        let _: fn(&InputHandle, u16, bool) -> bool = InputHandle::key_usb;
+        let _: fn(&InputHandle, u32, u32) -> bool = InputHandle::pointer_move;
+        let _: fn(&InputHandle, PointerButton, bool) -> bool = InputHandle::pointer_button;
+        let _: fn(&InputHandle, i32) -> bool = InputHandle::scroll;
+        let _: fn(&InputHandle) = InputHandle::release_all;
+        let _: fn(u16) -> Option<u16> = linux_key_for_usb_usage;
+        let _: usize = BYTES_PER_PIXEL;
+        let update = FrameUpdate {
+            generation: 1,
+            width: 2,
+            height: 3,
+            rect: Rect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 3,
+            },
+        };
+        let frame = Frame {
+            width: update.width,
+            height: update.height,
+            generation: update.generation,
+            pixels: Vec::new(),
+        };
+        assert!(!update.rect.is_empty() && frame.pixels.is_empty());
+        let _ = [
+            PointerButton::Left,
+            PointerButton::Right,
+            PointerButton::Middle,
+            PointerButton::Side,
+            PointerButton::Extra,
+        ];
+        let _ = [DisplayMode::Serial, DisplayMode::Framebuffer];
+    }
+
+    #[test]
+    fn display_and_input_handles_cross_threads_and_clone() {
+        is_send_sync::<DisplayHandle>();
+        is_send_sync::<InputHandle>();
+        is_clone::<DisplayHandle>();
+        is_clone::<InputHandle>();
+        is_default::<DisplayHandle>();
+        is_default::<InputHandle>();
+        is_copy::<DisplayMode>();
+        is_copy::<Rect>();
+        is_copy::<PointerButton>();
+        is_copy::<FrameUpdate>();
+        is_default::<DisplayMode>();
+        is_default::<Rect>();
+        is_default::<Frame>();
+        is_debug::<Frame>();
+        is_debug::<DisplayMode>();
     }
 
     #[test]

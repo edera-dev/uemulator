@@ -3,9 +3,10 @@
 //! offsets under tests of its own.
 
 use super::{
-    BOOT_CODE_DESCRIPTOR, BOOT_CS, BOOT_DS, BootMode, BootState, Error, GDT_ADDR, PML4, e820_map,
-    put, write_gdt_and_page_tables,
+    BOOT_CODE_DESCRIPTOR, BOOT_CS, BOOT_DS, BootMode, BootState, E820_RAM, E820_RESERVED, Error,
+    GDT_ADDR, PML4, e820_map, put, write_gdt_and_page_tables,
 };
+use crate::dev::bootfb::FramebufferRegion;
 use crate::dev::kv::{KV_PORT_BASE, KV_PORT_COUNT};
 #[cfg(freestanding)]
 use crate::prelude::*;
@@ -27,8 +28,9 @@ const IMAGE_FOOTPRINT_OFFSET: usize = 16;
 const MAX_FOOTPRINT: u64 = 64 << 20;
 
 const HANDOFF_MAGIC: &[u8; 8] = b"UEMUHAND";
-const HANDOFF_VERSION: u32 = 1;
-pub(crate) const HANDOFF_SIZE: usize = 0x338;
+/// Version 2 added the framebuffer fields at 0x338.
+const HANDOFF_VERSION: u32 = 2;
+pub(crate) const HANDOFF_SIZE: usize = 0x358;
 
 const HANDOFF_VERSION_OFFSET: usize = 0x08;
 const HANDOFF_SIZE_OFFSET: usize = 0x0c;
@@ -63,6 +65,18 @@ const HANDOFF_INITRD_BASE: usize = 0x318;
 const HANDOFF_INITRD_SIZE: usize = 0x320;
 const HANDOFF_CMDLINE_BASE: usize = 0x328;
 const HANDOFF_CMDLINE_SIZE: usize = 0x330;
+/// The boot framebuffer (`dev/bootfb.rs`): base u64, size u64, width u32, height u32, pixels
+/// per scan line u32, pad. Size 0: the machine has no display.
+const HANDOFF_FRAMEBUFFER_BASE: usize = 0x338;
+const HANDOFF_FRAMEBUFFER_SIZE: usize = 0x340;
+const HANDOFF_FRAMEBUFFER_WIDTH: usize = 0x348;
+const HANDOFF_FRAMEBUFFER_HEIGHT: usize = 0x34c;
+const HANDOFF_FRAMEBUFFER_PIXELS_PER_LINE: usize = 0x350;
+/// The framebuffer starts on a 2 MiB boundary so that the guest can map it with large pages
+/// (Linux's `ioremap` of a firmware framebuffer, an OS's direct map) without splitting one
+/// around RAM it does own.
+const FRAMEBUFFER_ALIGNMENT: u64 = 2 << 20;
+const PAGE_BYTES: u64 = 0x1000;
 /// Each payload piece starts on its own page: the firmware reserves them page by page.
 const PAYLOAD_ALIGNMENT: u64 = 0x1000;
 /// Free RAM the firmware and the kernel's EFI stub still need after the payload is placed, on top
@@ -94,6 +108,53 @@ pub(crate) struct FirmwareParams {
     pub rsdp: u64,
     /// The guest RAM the ACPI tables occupy (reported as ACPI reclaim memory), (0, 0) for none.
     pub acpi_region: (u64, u64),
+    /// Width and height of the boot framebuffer the firmware publishes as its GOP, when the
+    /// machine has a display (`framebuffer_region` says where it goes).
+    pub framebuffer: Option<(u32, u32)>,
+}
+
+/// Where a machine with `ram_top` bytes of flat RAM keeps a `width` x `height` boot framebuffer:
+/// the top of the RAM below the PCI hole, page-rounded and aligned down to
+/// `FRAMEBUFFER_ALIGNMENT`. The firmware's payload is placed below it and the memory map reports
+/// it as reserved, so the firmware never allocates it and the OS never takes it for RAM. The
+/// machine computes the same region for the device that scans it, so this must stay a pure
+/// function of its arguments.
+pub(crate) fn framebuffer_region(ram_top: u64, width: u32, height: u32) -> FramebufferRegion {
+    let region = FramebufferRegion {
+        base: 0,
+        width,
+        height,
+    };
+    let bytes = region.pixel_bytes().next_multiple_of(PAGE_BYTES);
+    let base = ram::low_ram_end(ram_top).saturating_sub(bytes) & !(FRAMEBUFFER_ALIGNMENT - 1);
+    FramebufferRegion { base, ..region }
+}
+
+/// Bytes of RAM the region takes out of the map: whole pages.
+fn reserved_bytes(region: &FramebufferRegion) -> u64 {
+    region.pixel_bytes().next_multiple_of(PAGE_BYTES)
+}
+
+/// `regions` (an e820 map) with `base..base + size` cut out of the RAM entry holding it and
+/// listed as reserved instead.
+fn reserve(regions: Vec<(u64, u64, u32)>, base: u64, size: u64) -> Vec<(u64, u64, u32)> {
+    let end = base + size;
+    let mut out = Vec::with_capacity(regions.len() + 2);
+    for (start, length, kind) in regions {
+        let stop = start + length;
+        if kind != E820_RAM || end <= start || base >= stop {
+            out.push((start, length, kind));
+            continue;
+        }
+        if base > start {
+            out.push((start, base - start, E820_RAM));
+        }
+        out.push((base, size, E820_RESERVED));
+        if stop > end {
+            out.push((end, stop - end, E820_RAM));
+        }
+    }
+    out
 }
 
 /// What the firmware boots instead of looking at the disks: placed at the top of the RAM below
@@ -157,11 +218,13 @@ fn place_payload(
     ram: &mut [u8],
     payload: &UefiPayload,
     floor: u64,
+    ceiling: u64,
 ) -> Result<PlacedPayload, Error> {
     let too_big = || Error::BadConfig("kernel and initramfs do not fit in guest memory".into());
-    // The top of the RAM below the PCI hole: there may be more RAM above 4 GiB, but the payload
-    // is one contiguous run and that RAM is not contiguous with this one.
-    let mut top = ram::low_ram_end(ram.len() as u64) & !(PAYLOAD_ALIGNMENT - 1);
+    // Below `ceiling`, the top of the RAM below the PCI hole or the framebuffer: there may be
+    // more RAM above 4 GiB, but the payload is one contiguous run and that RAM is not contiguous
+    // with this one.
+    let mut top = ceiling & !(PAYLOAD_ALIGNMENT - 1);
     let mut place = |data: &[u8]| -> Result<(u64, u64), Error> {
         let size = data.len() as u64;
         let base = top
@@ -178,7 +241,7 @@ fn place_payload(
     };
     let kernel = place(payload.kernel)?;
     let cmdline = place(payload.cmdline.as_bytes())?;
-    if top - floor < initrd.1 + PAYLOAD_HEADROOM_BYTES {
+    if top.saturating_sub(floor) < initrd.1 + PAYLOAD_HEADROOM_BYTES {
         return Err(too_big());
     }
     Ok(PlacedPayload {
@@ -227,8 +290,22 @@ pub(crate) fn load_uefi_firmware(
         ));
     }
     put(ram, FIRMWARE_BASE, image)?;
+    let framebuffer = params
+        .framebuffer
+        .map(|(width, height)| framebuffer_region(ram_top, width, height));
+    let ceiling = framebuffer.map_or(ram::low_ram_end(ram_top), |region| region.base);
+    if FIRMWARE_BASE + footprint > ceiling {
+        return Err(Error::BadConfig(
+            "guest memory too small for firmware and framebuffer".into(),
+        ));
+    }
     let placed = match payload {
-        Some(payload) => Some(place_payload(ram, payload, FIRMWARE_BASE + footprint)?),
+        Some(payload) => Some(place_payload(
+            ram,
+            payload,
+            FIRMWARE_BASE + footprint,
+            ceiling,
+        )?),
         None => None,
     };
 
@@ -248,7 +325,10 @@ pub(crate) fn load_uefi_firmware(
     handoff.put_u16(HANDOFF_PCI_CONFIG_PORT, PCI_CONFIG_ADDRESS_PORT);
     handoff.put_u32(HANDOFF_VERSION_OFFSET, HANDOFF_VERSION);
     handoff.put_u32(HANDOFF_SIZE_OFFSET, HANDOFF_SIZE as u32);
-    let regions = e820_map(ram_top);
+    let regions = match &framebuffer {
+        Some(region) => reserve(e820_map(ram_top), region.base, reserved_bytes(region)),
+        None => e820_map(ram_top),
+    };
     debug_assert!(regions.len() <= MAX_RAM_REGIONS && MMIO_REGIONS.len() <= MAX_MMIO_REGIONS);
     handoff.put_u32(HANDOFF_RAM_REGION_COUNT, regions.len() as u32);
     handoff.put_u32(HANDOFF_MMIO_REGION_COUNT, MMIO_REGIONS.len() as u32);
@@ -268,6 +348,13 @@ pub(crate) fn load_uefi_firmware(
         },
     );
     handoff.put_u64(HANDOFF_TSC_HZ, TSC_HZ);
+    if let Some(region) = &framebuffer {
+        handoff.put_u64(HANDOFF_FRAMEBUFFER_BASE, region.base);
+        handoff.put_u64(HANDOFF_FRAMEBUFFER_SIZE, region.pixel_bytes());
+        handoff.put_u32(HANDOFF_FRAMEBUFFER_WIDTH, region.width);
+        handoff.put_u32(HANDOFF_FRAMEBUFFER_HEIGHT, region.height);
+        handoff.put_u32(HANDOFF_FRAMEBUFFER_PIXELS_PER_LINE, region.width);
+    }
     if let Some(placed) = placed {
         for (base_at, size_at, (base, size)) in [
             (HANDOFF_KERNEL_BASE, HANDOFF_KERNEL_SIZE, placed.kernel),
@@ -335,7 +422,12 @@ mod tests {
             random_seed: 7,
             rsdp: 0,
             acpi_region: (0, 0),
+            framebuffer: None,
         }
+    }
+
+    fn u32_at(ram: &[u8], at: u64) -> u32 {
+        u32::from_le_bytes(ram[at as usize..at as usize + 4].try_into().unwrap())
     }
 
     fn u64_at(ram: &[u8], at: u64) -> u64 {
@@ -406,6 +498,121 @@ mod tests {
         assert!(
             initrd_range.0 > kernel_range.0,
             "the initramfs sits at the very top"
+        );
+    }
+
+    /// (base, size, e820 type) of every RAM region the handoff lists.
+    fn ram_regions(ram: &[u8]) -> Vec<(u64, u64, u32)> {
+        let count = u32_at(ram, HANDOFF_ADDR + HANDOFF_RAM_REGION_COUNT as u64) as usize;
+        (0..count)
+            .map(|index| {
+                let at = HANDOFF_ADDR + (HANDOFF_RAM_REGIONS + index * RAM_REGION_BYTES) as u64;
+                (u64_at(ram, at), u64_at(ram, at + 8), u32_at(ram, at + 16))
+            })
+            .collect()
+    }
+
+    const FRAMEBUFFER_WIDTH: u32 = 1280;
+    const FRAMEBUFFER_HEIGHT: u32 = 800;
+
+    fn with_framebuffer() -> FirmwareParams {
+        FirmwareParams {
+            framebuffer: Some((FRAMEBUFFER_WIDTH, FRAMEBUFFER_HEIGHT)),
+            ..params()
+        }
+    }
+
+    #[test]
+    fn the_framebuffer_is_described_in_the_handoff_and_reserved_in_the_map() {
+        let (_, ram) = load(&image(ENTRY, 0x2000), &with_framebuffer()).unwrap();
+        let region = framebuffer_region(RAM_BYTES as u64, FRAMEBUFFER_WIDTH, FRAMEBUFFER_HEIGHT);
+        let field = |offset: usize| HANDOFF_ADDR + offset as u64;
+        assert_eq!(u64_at(&ram, field(HANDOFF_FRAMEBUFFER_BASE)), region.base);
+        assert_eq!(
+            u64_at(&ram, field(HANDOFF_FRAMEBUFFER_SIZE)),
+            (FRAMEBUFFER_WIDTH * FRAMEBUFFER_HEIGHT * 4) as u64
+        );
+        assert_eq!(
+            u32_at(&ram, field(HANDOFF_FRAMEBUFFER_WIDTH)),
+            FRAMEBUFFER_WIDTH
+        );
+        assert_eq!(
+            u32_at(&ram, field(HANDOFF_FRAMEBUFFER_HEIGHT)),
+            FRAMEBUFFER_HEIGHT
+        );
+        assert_eq!(
+            u32_at(&ram, field(HANDOFF_FRAMEBUFFER_PIXELS_PER_LINE)),
+            FRAMEBUFFER_WIDTH
+        );
+        assert_eq!(region.base % FRAMEBUFFER_ALIGNMENT, 0);
+        let regions = ram_regions(&ram);
+        let reserved = regions
+            .iter()
+            .find(|(base, _, _)| *base == region.base)
+            .expect("a region at the framebuffer");
+        assert_eq!(reserved.2, E820_RESERVED);
+        assert!(reserved.1 >= region.pixel_bytes());
+        for (base, size, kind) in &regions {
+            let overlaps = *base < region.base + reserved.1 && region.base < base + size;
+            assert!(!overlaps || *kind == E820_RESERVED, "{regions:x?}");
+        }
+        let ram_total: u64 = regions
+            .iter()
+            .filter(|(_, _, kind)| *kind == E820_RAM)
+            .map(|(_, size, _)| size)
+            .sum();
+        assert!(ram_total < RAM_BYTES as u64 - region.pixel_bytes());
+    }
+
+    #[test]
+    fn without_a_display_the_framebuffer_fields_are_zero_and_the_map_is_unchanged() {
+        let (_, ram) = load(&image(ENTRY, 0x2000), &params()).unwrap();
+        assert_eq!(range_at(&ram, HANDOFF_FRAMEBUFFER_BASE), (0, 0));
+        assert_eq!(ram_regions(&ram), e820_map(RAM_BYTES as u64));
+    }
+
+    #[test]
+    fn the_payload_goes_below_the_framebuffer() {
+        let mut ram = vec![0u8; RAM_BYTES];
+        let initrd = vec![0x49; 9000];
+        let payload = UefiPayload {
+            kernel: &[0x4b; 5000],
+            initrd: Some(&initrd),
+            cmdline: "x",
+        };
+        let parameters = with_framebuffer();
+        load_uefi_firmware(
+            &mut ram,
+            &image(ENTRY, 0x2000),
+            &parameters,
+            None,
+            Some(&payload),
+        )
+        .unwrap();
+        let region = framebuffer_region(RAM_BYTES as u64, FRAMEBUFFER_WIDTH, FRAMEBUFFER_HEIGHT);
+        let (initrd_base, initrd_size) = range_at(&ram, HANDOFF_INITRD_BASE);
+        assert!(initrd_base + initrd_size <= region.base);
+    }
+
+    #[test]
+    fn reserving_splits_the_ram_entry_around_the_hole() {
+        let map = vec![(0, 0x1000, E820_RAM), (0x10_0000, 0x90_0000, E820_RAM)];
+        assert_eq!(
+            reserve(map, 0x40_0000, 0x10_0000),
+            vec![
+                (0, 0x1000, E820_RAM),
+                (0x10_0000, 0x30_0000, E820_RAM),
+                (0x40_0000, 0x10_0000, E820_RESERVED),
+                (0x50_0000, 0x50_0000, E820_RAM),
+            ]
+        );
+        let at_the_top = vec![(0x10_0000, 0x90_0000, E820_RAM)];
+        assert_eq!(
+            reserve(at_the_top, 0x90_0000, 0x10_0000),
+            vec![
+                (0x10_0000, 0x80_0000, E820_RAM),
+                (0x90_0000, 0x10_0000, E820_RESERVED)
+            ]
         );
     }
 

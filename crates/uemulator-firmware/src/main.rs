@@ -17,6 +17,7 @@ mod devicepath;
 mod fat;
 mod gpt;
 mod handoff;
+mod keymap;
 mod keys;
 mod load_option;
 mod memory_map;
@@ -25,6 +26,7 @@ mod pe;
 mod smbios;
 mod sync;
 mod text;
+mod text_screen;
 mod uefi;
 mod variable_store;
 
@@ -40,6 +42,8 @@ mod disks;
 mod events;
 #[cfg(target_os = "none")]
 mod files;
+#[cfg(target_os = "none")]
+mod gop;
 #[cfg(target_os = "none")]
 mod images;
 #[cfg(target_os = "none")]
@@ -70,6 +74,10 @@ mod time;
 mod variables;
 #[cfg(target_os = "none")]
 mod virtio_blk;
+#[cfg(target_os = "none")]
+mod virtio_input;
+#[cfg(target_os = "none")]
+mod virtio_pci;
 
 #[cfg(not(target_os = "none"))]
 fn main() {

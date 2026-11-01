@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>uemulator screen</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #111; color: #bbb;
+    font: 13px/1.4 system-ui, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  #bar { display: flex; gap: 16px; padding: 4px 12px; background: #1c1c1c;
+    border-bottom: 1px solid #2a2a2a; white-space: nowrap; overflow: hidden; }
+  #state.down { color: #e66; }
+  #state.up { color: #6c6; }
+  #hint { margin-left: auto; color: #777; }
+  #stage { flex: 1; display: flex; align-items: center; justify-content: center;
+    min-height: 0; padding: 8px; }
+  canvas { background: #000; outline: none; max-width: 100%; max-height: 100%;
+    cursor: default; box-shadow: 0 0 0 1px #333; }
+  canvas:focus { box-shadow: 0 0 0 2px #4a7bd0; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <span id="state" class="down">connecting</span>
+  <span id="size"></span>
+  <span id="rate"></span>
+  <span id="hint">click the screen to type into the machine</span>
+</div>
+<div id="stage"><canvas id="screen" width="640" height="400" tabindex="0"></canvas></div>
+<script>
+"use strict";
+// Protocol (crates/uemulator-cli/src/frontend/web.rs): the server sends binary updates, a kind
+// byte (1) then screen width, screen height, x, y, width, height as little-endian u16, then a
+// PNG of that rectangle; the page answers "a" once it is drawn. The page sends text commands:
+// "k USAGE 0|1" (key by USB HID usage), "m X Y" (pointer in screen pixels), "b INDEX 0|1"
+// (0 left, 1 right, 2 middle, 3 back, 4 forward), "w CLICKS" (wheel, positive up), "r" (release
+// everything).
+
+// KeyboardEvent.code to USB HID keyboard usage (UI Events KeyboardEvent code values are defined
+// by the USB usage they come from).
+const USAGES = (() => {
+  const map = {};
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("").forEach((c, i) => map["Key" + c] = 0x04 + i);
+  "123456789".split("").forEach((c, i) => map["Digit" + c] = 0x1e + i);
+  map.Digit0 = 0x27;
+  for (let i = 1; i <= 12; i++) map["F" + i] = 0x3a + i - 1;
+  for (let i = 13; i <= 24; i++) map["F" + i] = 0x68 + i - 13;
+  "123456789".split("").forEach((c, i) => map["Numpad" + c] = 0x59 + i);
+  Object.assign(map, {
+    Enter: 0x28, Escape: 0x29, Backspace: 0x2a, Tab: 0x2b, Space: 0x2c, Minus: 0x2d,
+    Equal: 0x2e, BracketLeft: 0x2f, BracketRight: 0x30, Backslash: 0x31, Semicolon: 0x33,
+    Quote: 0x34, Backquote: 0x35, Comma: 0x36, Period: 0x37, Slash: 0x38, CapsLock: 0x39,
+    PrintScreen: 0x46, ScrollLock: 0x47, Pause: 0x48, Insert: 0x49, Home: 0x4a, PageUp: 0x4b,
+    Delete: 0x4c, End: 0x4d, PageDown: 0x4e, ArrowRight: 0x4f, ArrowLeft: 0x50,
+    ArrowDown: 0x51, ArrowUp: 0x52, NumLock: 0x53, NumpadDivide: 0x54, NumpadMultiply: 0x55,
+    NumpadSubtract: 0x56, NumpadAdd: 0x57, NumpadEnter: 0x58, Numpad0: 0x62,
+    NumpadDecimal: 0x63, IntlBackslash: 0x64, ContextMenu: 0x65, Power: 0x66,
+    NumpadEqual: 0x67, AudioVolumeMute: 0x7f, AudioVolumeUp: 0x80, AudioVolumeDown: 0x81,
+    NumpadComma: 0x85, IntlRo: 0x87, KanaMode: 0x88, IntlYen: 0x89, Convert: 0x8a,
+    NonConvert: 0x8b, Lang1: 0x90, Lang2: 0x91, ControlLeft: 0xe0, ShiftLeft: 0xe1,
+    AltLeft: 0xe2, MetaLeft: 0xe3, ControlRight: 0xe4, ShiftRight: 0xe5, AltRight: 0xe6,
+    MetaRight: 0xe7,
+  });
+  return map;
+})();
+// MouseEvent.button to the server's button index.
+const BUTTONS = { 0: 0, 1: 2, 2: 1, 3: 3, 4: 4 };
+const RECONNECT_MS = 1000;
+const HEADER_BYTES = 13;
+
+const canvas = document.getElementById("screen");
+const context = canvas.getContext("2d", { alpha: false });
+const state = document.getElementById("state");
+const sizeLabel = document.getElementById("size");
+const rateLabel = document.getElementById("rate");
+let socket = null;
+let drawn = 0;
+let pendingMove = null;
+
+function send(text) {
+  if (socket && socket.readyState === WebSocket.OPEN) socket.send(text);
+}
+
+function setState(text, up) {
+  state.textContent = text;
+  state.className = up ? "up" : "down";
+}
+
+function fit() {
+  // Shrink to fit the window, never enlarge: one guest pixel per CSS pixel keeps text crisp.
+  const stage = document.getElementById("stage");
+  const scale = Math.min(1, (stage.clientWidth - 16) / canvas.width,
+    (stage.clientHeight - 16) / canvas.height);
+  canvas.style.width = Math.floor(canvas.width * scale) + "px";
+  canvas.style.height = Math.floor(canvas.height * scale) + "px";
+}
+window.addEventListener("resize", fit);
+
+async function draw(buffer) {
+  const view = new DataView(buffer);
+  if (view.getUint8(0) !== 1) return;
+  const word = (i) => view.getUint16(1 + 2 * i, true);
+  const [width, height, x, y] = [word(0), word(1), word(2), word(3)];
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+    sizeLabel.textContent = width + "×" + height;
+    fit();
+  }
+  const image = await createImageBitmap(new Blob([buffer.slice(HEADER_BYTES)],
+    { type: "image/png" }));
+  context.drawImage(image, x, y);
+  image.close();
+  drawn++;
+}
+
+function connect() {
+  setState("connecting", false);
+  const url = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws";
+  socket = new WebSocket(url);
+  socket.binaryType = "arraybuffer";
+  // Updates are drawn strictly in order; each is acknowledged once on the canvas.
+  let chain = Promise.resolve();
+  socket.onopen = () => setState("connected", true);
+  socket.onmessage = (event) => {
+    chain = chain.then(() => draw(event.data)).catch(() => {}).then(() => send("a"));
+  };
+  socket.onclose = () => {
+    setState("disconnected, retrying", false);
+    socket = null;
+    setTimeout(connect, RECONNECT_MS);
+  };
+}
+
+function position(event) {
+  const box = canvas.getBoundingClientRect();
+  const x = Math.floor((event.clientX - box.left) * canvas.width / box.width);
+  const y = Math.floor((event.clientY - box.top) * canvas.height / box.height);
+  return [Math.max(0, Math.min(canvas.width - 1, x)),
+    Math.max(0, Math.min(canvas.height - 1, y))];
+}
+
+// One move per animation frame: the latest position is all that matters.
+function flushMove() {
+  if (pendingMove) send("m " + pendingMove[0] + " " + pendingMove[1]);
+  pendingMove = null;
+}
+canvas.addEventListener("mousemove", (event) => {
+  if (!pendingMove) requestAnimationFrame(flushMove);
+  pendingMove = position(event);
+});
+canvas.addEventListener("mousedown", (event) => {
+  canvas.focus();
+  flushMove();
+  const [x, y] = position(event);
+  send("m " + x + " " + y);
+  if (event.button in BUTTONS) send("b " + BUTTONS[event.button] + " 1");
+  event.preventDefault();
+});
+canvas.addEventListener("mouseup", (event) => {
+  if (event.button in BUTTONS) send("b " + BUTTONS[event.button] + " 0");
+  event.preventDefault();
+});
+canvas.addEventListener("contextmenu", (event) => event.preventDefault());
+canvas.addEventListener("wheel", (event) => {
+  // One click per event, in the direction of the scroll: trackpads send many small events.
+  if (event.deltaY !== 0) send("w " + (event.deltaY < 0 ? 1 : -1));
+  event.preventDefault();
+}, { passive: false });
+
+// Some keyboards leave KeyboardEvent.code empty (on-screen keyboards, synthetic events) and
+// give only the character. For those, the US-layout key that types it, and whether it needs
+// shift: [usage, shifted].
+const CHARACTERS = (() => {
+  const map = {};
+  "abcdefghijklmnopqrstuvwxyz".split("").forEach((c, i) => {
+    map[c] = [0x04 + i, false];
+    map[c.toUpperCase()] = [0x04 + i, true];
+  });
+  "1234567890".split("").forEach((c, i) => map[c] = [0x1e + i, false]);
+  "!@#$%^&*()".split("").forEach((c, i) => map[c] = [0x1e + i, true]);
+  const pairs = ["-_", "=+", "[{", "]}", "\\|", null, ";:", "'\"", "`~", ",<", ".>", "/?"];
+  pairs.forEach((pair, i) => {
+    if (pair) {
+      map[pair[0]] = [0x2d + i, false];
+      map[pair[1]] = [0x2d + i, true];
+    }
+  });
+  map[" "] = [0x2c, false];
+  return map;
+})();
+const LEFT_SHIFT = 0xe1;
+
+function key(event, pressed) {
+  // Repeats come from the guest's own autorepeat; the browser's would double them.
+  const repeat = pressed && event.repeat;
+  const usage = USAGES[event.code];
+  if (usage !== undefined) {
+    if (!repeat) send("k " + usage + " " + (pressed ? 1 : 0));
+    event.preventDefault();
+    return;
+  }
+  const typed = CHARACTERS[event.key];
+  if (typed === undefined) return;
+  event.preventDefault();
+  // Typed whole on the press: the release of such a key carries nothing to match it with.
+  if (!pressed || repeat) return;
+  const [character, shifted] = typed;
+  const shift = shifted && !event.shiftKey;
+  if (shift) send("k " + LEFT_SHIFT + " 1");
+  send("k " + character + " 1");
+  send("k " + character + " 0");
+  if (shift) send("k " + LEFT_SHIFT + " 0");
+}
+canvas.addEventListener("keydown", (event) => key(event, true));
+canvas.addEventListener("keyup", (event) => key(event, false));
+// Releases are lost while another window has the focus; let go of everything instead.
+canvas.addEventListener("blur", () => send("r"));
+window.addEventListener("blur", () => send("r"));
+
+setInterval(() => {
+  rateLabel.textContent = drawn + " updates/s";
+  drawn = 0;
+}, 1000);
+
+fit();
+connect();
+canvas.focus();
+</script>
+</body>
+</html>

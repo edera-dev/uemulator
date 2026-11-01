@@ -1,7 +1,8 @@
 //! The options every way of booting shares. They come in groups so each command takes exactly the
 //! ones that mean something to it:
 //!
-//! - `HardwareArgs`: memory, disks, NICs, consoles, JIT. Every command that describes a machine.
+//! - `HardwareArgs`: memory, disks, NICs, consoles, display, JIT. Every command that describes a
+//!   machine.
 //! - `LinuxArgs`: command line and reboot behaviour. Not on firmware boots, which have neither.
 //! - `RemoveArgs`: `--remove-<device> INDEX`, for commands that start from an existing device list.
 //! - `NewDiskArgs`: `--create-disk`, for commands that own a directory to put the image in.
@@ -60,6 +61,23 @@ pub enum ConsoleArg {
     /// hvc0; the host terminal size is forwarded and follows resizes
     Virtio,
 }
+
+/// `--display KIND`: whether the machine has a screen, keyboard and mouse.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DisplayArg {
+    /// Text consoles only: the terminal is the machine's console
+    #[default]
+    Serial,
+    /// A virtio-gpu screen with a virtio keyboard and tablet, shown in a browser by the built-in
+    /// viewer (`--viewer-address`); the kernel's console moves to the screen (tty0) and the
+    /// terminal keeps a copy of the kernel log
+    Framebuffer,
+}
+
+/// Where the web viewer listens unless `--viewer-address` says otherwise: loopback only, on the
+/// port VNC's HTTP viewers have used (5800).
+pub const DEFAULT_VIEWER_ADDRESS: &str = "127.0.0.1:5800";
 
 /// `--smp MODE`: how the vCPUs of a multi-processor guest run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
@@ -146,6 +164,10 @@ pub struct HardwareArgs {
     /// be given once [default: virtio]
     #[arg(long, value_enum, value_name = "KIND")]
     pub console: Vec<ConsoleArg>,
+    /// The machine's display: serial (text consoles only) or framebuffer (a screen, keyboard and
+    /// mouse in the browser viewer) [default: serial]
+    #[arg(long, value_enum, value_name = "KIND")]
+    pub display: Option<DisplayArg>,
     /// Run the interpreter only; `--disable-jit=false` turns it back on
     #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = BOOL_FLAG_DEFAULT,
         value_name = "BOOL")]
@@ -297,6 +319,11 @@ pub struct RuntimeArgs {
     /// Stop the machine after this many seconds
     #[arg(long, value_name = "SECS")]
     pub timeout: Option<u64>,
+    /// Where the viewer of a `--display framebuffer` machine listens, as ADDRESS:PORT (port 0
+    /// picks a free one). Anyone who can reach it controls the machine's keyboard and mouse
+    /// [default: 127.0.0.1:5800]
+    #[arg(long, value_name = "ADDRESS:PORT")]
+    pub viewer_address: Option<String>,
 }
 
 /// Everything about a machine that outlives one run, and what `run` needs to build it. `None` and
@@ -319,6 +346,8 @@ pub struct Settings {
     pub disable_jit: bool,
     pub disable_rng: bool,
     pub iommu: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display: Option<DisplayArg>,
     // The arrays come last: TOML wants every plain value before the first table.
     pub consoles: Vec<ConsoleArg>,
     pub disks: Vec<DiskSpec>,
@@ -417,6 +446,9 @@ impl Settings {
         }
         if let Some(iommu) = hardware.iommu {
             self.iommu = iommu;
+        }
+        if hardware.display.is_some() {
+            self.display = hardware.display;
         }
         set_or_clear(&mut self.cmdline, &linux.cmdline);
         set_or_clear(&mut self.append, &linux.append);
@@ -722,6 +754,7 @@ mod tests {
             disable_jit: false,
             disable_rng: true,
             iommu: true,
+            display: Some(DisplayArg::Framebuffer),
             consoles: vec![ConsoleArg::Virtio, ConsoleArg::Serial],
             disks: vec![disk("/x/disk-0.img", false), disk("/y.iso", true)],
             networks: vec![
@@ -741,6 +774,31 @@ mod tests {
         };
         let text = toml::to_string(&settings).unwrap();
         assert_eq!(toml::from_str::<Settings>(&text).unwrap(), settings);
+    }
+
+    #[test]
+    fn the_display_is_saved_as_a_plain_word_and_replaced_by_a_later_choice() {
+        let mut settings = Settings::default();
+        let framebuffer = HardwareArgs {
+            display: Some(DisplayArg::Framebuffer),
+            ..HardwareArgs::default()
+        };
+        settings.add(&framebuffer, &LinuxArgs::default(), Vec::new());
+        let text = toml::to_string(&settings).unwrap();
+        assert!(text.contains("display = \"framebuffer\""), "{text}");
+        settings.add(&HardwareArgs::default(), &LinuxArgs::default(), Vec::new());
+        assert_eq!(settings.display, Some(DisplayArg::Framebuffer), "kept");
+        let serial = HardwareArgs {
+            display: Some(DisplayArg::Serial),
+            ..HardwareArgs::default()
+        };
+        settings.add(&serial, &LinuxArgs::default(), Vec::new());
+        assert_eq!(settings.display, Some(DisplayArg::Serial));
+        assert!(
+            !toml::to_string(&Settings::default())
+                .unwrap()
+                .contains("display")
+        );
     }
 
     #[test]
