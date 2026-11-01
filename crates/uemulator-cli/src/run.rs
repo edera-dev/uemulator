@@ -237,18 +237,21 @@ pub fn run_uefi(
     settings: &Settings,
     runtime: &RuntimeArgs,
     nvram: Option<&std::path::Path>,
-    boot_entry: Option<(&str, &str)>,
+    nvram_setup: &crate::firmware::NvramSetup,
 ) -> Result<ExitReason, String> {
     let tty = std::io::stdin().is_terminal();
     let mut cfg =
         build_config(kernel, initramfs, settings, runtime)?.uefi_firmware(crate::firmware::IMAGE);
-    if let Some(path) = nvram {
-        let mut store = uemulator::FileKeyValueStore::open(path).map_err(|e| e.to_string())?;
-        if let Some((loader, options)) = boot_entry {
-            crate::firmware::set_boot_entry(&mut store, loader, options)
-                .map_err(|e| e.to_string())?;
+    match nvram {
+        Some(path) => {
+            let mut store = uemulator::FileKeyValueStore::open(path).map_err(|e| e.to_string())?;
+            nvram_setup.apply(&mut store).map_err(|e| e.to_string())?;
+            cfg = cfg.key_value_store(store);
         }
-        cfg = cfg.key_value_store(store);
+        None if nvram_setup.boot_menu || nvram_setup.boot_timeout.is_some() => {
+            return Err("--boot-menu and --boot-timeout need --nvram".into());
+        }
+        None => {}
     }
     run_config(cfg, settings, runtime, tty)
 }

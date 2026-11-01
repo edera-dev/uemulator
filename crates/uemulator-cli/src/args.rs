@@ -264,6 +264,25 @@ pub struct BootSourceArgs {
     pub boot_from: Option<BootSource>,
 }
 
+/// Variables written into the nvram before a boot through the UEFI firmware.
+#[derive(Args, Default)]
+pub struct UefiBootArgs {
+    /// Open the UEFI firmware's boot menu on this boot (Esc, F2 or F12 during the countdown
+    /// does too)
+    #[arg(long)]
+    pub boot_menu: bool,
+    /// Seconds the UEFI firmware counts down before booting, kept in the nvram (its `Timeout`
+    /// variable; 0 boots at once, 65535 waits in the menu)
+    #[arg(long, value_name = "SECS")]
+    pub boot_timeout: Option<u16>,
+}
+
+impl UefiBootArgs {
+    pub fn any(&self) -> bool {
+        self.boot_menu || self.boot_timeout.is_some()
+    }
+}
+
 #[derive(Args, Default)]
 pub struct RuntimeArgs {
     /// Run the JIT in lockstep with the interpreter and stop at the first divergence

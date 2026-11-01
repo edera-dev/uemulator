@@ -22,6 +22,7 @@
 
 use alloc::collections::VecDeque;
 
+use super::bios_keys::KeyDecoder;
 use super::exception::Exception;
 use super::flags::{CF, IF, ZF};
 use super::modes::real_mode_segment;
@@ -221,8 +222,10 @@ const LOG_KEY_BIOS_UNSUPPORTED: u64 = 0xb105_1000;
 
 /// What the BIOS remembers between calls.
 pub(crate) struct Bios {
-    /// Keys read from the console that no `int 16h` has taken yet.
-    keys: VecDeque<u8>,
+    /// Keys read from the console that no `int 16h` has taken yet, as key words (scan code in
+    /// AH, character in AL).
+    keys: VecDeque<u16>,
+    key_decoder: KeyDecoder,
     /// Where the terminal's cursor is, so `int 10h` only moves it when the caller asks for a
     /// different place.
     row: u8,
@@ -365,6 +368,7 @@ impl Cpu {
         let ram_top = self.ram.len() as u64;
         self.bios = Some(Box::new(Bios {
             keys: VecDeque::new(),
+            key_decoder: KeyDecoder::default(),
             row: 0,
             column: 0,
             drives,
@@ -699,18 +703,33 @@ impl Cpu {
 
     // ----- keyboard ----------------------------------------------------------------------
 
-    /// Moves what the console has received into the key queue.
+    /// Moves what the console has received into the key queue, turning escape sequences into
+    /// scan codes (`bios_keys`). The UART paces host input, so a sequence may take several calls
+    /// to arrive; one still pending with the line quiet was the Escape key.
     fn bios_collect_keys(&mut self) {
         for _ in 0..KEY_QUEUE_LIMIT {
             if self.port_read(UART_LINE_STATUS_PORT) & UART_DATA_READY == 0 {
                 break;
             }
             let byte = self.port_read(UART_DATA_PORT) as u8;
-            if let Some(bios) = self.bios.as_mut()
-                && bios.keys.len() < KEY_QUEUE_LIMIT
-            {
-                bios.keys.push_back(byte);
+            let now = self.now_ns();
+            if let Some(bios) = self.bios.as_mut() {
+                for key in bios.key_decoder.push(byte, now) {
+                    if bios.keys.len() < KEY_QUEUE_LIMIT {
+                        bios.keys.push_back(key);
+                    }
+                }
             }
+        }
+        if self.dev.lock().serial_input_pending() {
+            return;
+        }
+        let now = self.now_ns();
+        if let Some(bios) = self.bios.as_mut()
+            && let Some(escape) = bios.key_decoder.expire(now)
+            && bios.keys.len() < KEY_QUEUE_LIMIT
+        {
+            bios.keys.push_back(escape);
         }
     }
 
@@ -724,7 +743,7 @@ impl Cpu {
                     if let Some(bios) = self.bios.as_mut() {
                         bios.keys.pop_front();
                     }
-                    self.set_reg16(RAX, u16::from_le_bytes([key, 0]));
+                    self.set_reg16(RAX, key);
                 }
                 None => {
                     let frame = self.frame();
@@ -738,7 +757,7 @@ impl Cpu {
             // Is there a key: ZF clear and the key in AX, or ZF set.
             0x01 | 0x11 => match pending {
                 Some(key) => {
-                    self.set_reg16(RAX, u16::from_le_bytes([key, 0]));
+                    self.set_reg16(RAX, key);
                     self.set_returned_flag(ZF, false);
                 }
                 None => self.set_returned_flag(ZF, true),
@@ -1159,6 +1178,16 @@ mod tests {
     const READ_TICKS: [u8; 5] = [0x30, 0xe4, 0xcd, 0x1a, 0xf4];
     /// mov ah,1; int 0x16
     const KEY_STATUS: [u8; 5] = [0xb4, 0x01, 0xcd, 0x16, 0xf4];
+    /// The way GRUB reads keys, polling function 1 before taking the key with function 0:
+    /// wait: mov ah,1; int 0x16; jz wait; mov ah,0; int 0x16
+    const POLL_KEY: [u8; 11] = [
+        0xb4, 0x01, 0xcd, 0x16, 0x74, 0xfa, 0xb4, 0x00, 0xcd, 0x16, 0xf4,
+    ];
+    /// Two keys as `POLL_KEY` reads them, the first left in BX.
+    const POLL_TWO_KEYS: [u8; 22] = [
+        0xb4, 0x01, 0xcd, 0x16, 0x74, 0xfa, 0xb4, 0x00, 0xcd, 0x16, 0x89, 0xc3, 0xb4, 0x01, 0xcd,
+        0x16, 0x74, 0xfa, 0xb4, 0x00, 0xcd, 0x16,
+    ];
     /// int 8; int 8
     const TWO_TIMER_TICKS: [u8; 5] = [0xcd, 0x08, 0xcd, 0x08, 0xf4];
     /// int 0x11; mov bx,ax; int 0x12
@@ -1206,6 +1235,30 @@ mod tests {
             "{}",
             harness.cpu.dump_regs()
         );
+    }
+
+    /// Runs a snippet that loops on `int` calls: `run_delivering` restarts its budget at every
+    /// interrupt, so it would never stop. Returns how the run ended within `interrupts` calls.
+    /// The devices see guest time pass between calls, as the machine's event tick shows it them.
+    fn run_polling(harness: &mut Harness, interrupts: usize) -> Stop {
+        for _ in 0..interrupts {
+            let now = harness.cpu.now_ns();
+            harness.cpu.tick_devices(now);
+            match harness.run(1_000) {
+                Stop::Fault {
+                    vector,
+                    error_code,
+                    software,
+                } => {
+                    if let Some(reason) = harness.cpu.deliver_event(vector, error_code, software) {
+                        return Stop::Exit(format!("{reason:?}"));
+                    }
+                }
+                Stop::Limit => {}
+                other => return other,
+            }
+        }
+        Stop::Limit
     }
 
     fn carry(harness: &Harness) -> bool {
@@ -1604,6 +1657,41 @@ mod tests {
         let mut harness = machine_with(patterned_disk(), &KEY_STATUS);
         run_to_halt(&mut harness);
         assert!(harness.cpu.eflags_full() & ZF != 0, "ZF set: no key");
+    }
+
+    #[test]
+    fn an_arrow_key_from_the_terminal_reads_as_its_scan_code() {
+        // The UART hands the sequence over a byte per character time (87 us of guest time),
+        // so function 1 sees it arrive in pieces.
+        let mut code = POLL_TWO_KEYS.to_vec();
+        code.push(0xf4);
+        let mut harness = machine_with(patterned_disk(), &code);
+        harness.console.write(b"\x1b[Ax");
+        assert_eq!(run_polling(&mut harness, 1_000_000), Stop::Halted);
+        assert_eq!(
+            harness.cpu.reg16(RBX),
+            0x4800,
+            "up arrow: scan 0x48, no character"
+        );
+        assert_eq!(harness.cpu.reg16(RAX), b'x' as u16);
+    }
+
+    #[test]
+    fn the_escape_key_alone_still_arrives() {
+        let mut harness = machine_with(patterned_disk(), &POLL_KEY);
+        harness.console.write(b"\x1b");
+        assert_eq!(
+            run_polling(&mut harness, 10_000),
+            Stop::Limit,
+            "not yet: it may be a sequence"
+        );
+        harness.cpu.idle_skipped_ns += super::super::bios_keys::LONE_ESCAPE_TIMEOUT_NS;
+        assert_eq!(run_polling(&mut harness, 100), Stop::Halted);
+        assert_eq!(
+            harness.cpu.reg16(RAX),
+            0x011b,
+            "escape: scan 1, character 0x1b"
+        );
     }
 
     #[test]

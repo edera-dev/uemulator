@@ -10,6 +10,7 @@ use crate::protocols;
 use crate::serial;
 use crate::sync::Global;
 use crate::tables::SYSTEM_TABLE;
+use crate::time;
 use crate::uefi::*;
 
 const COLUMNS: usize = 80;
@@ -247,7 +248,9 @@ extern "efiapi" fn enable_cursor(_: *mut SimpleTextOutput, visible: u8) -> Statu
 fn fill_pending() {
     let console = CONSOLE.get();
     if console.pending_key.is_none() {
-        console.pending_key = keys::decode(serial::read_byte);
+        console.pending_key = keys::decode(serial::read_byte, || {
+            keys::following_byte(serial::read_byte, time::now_ns)
+        });
     }
 }
 
@@ -261,6 +264,11 @@ extern "efiapi" fn wait_for_key_notify(event: Event, _: *mut c_void) {
 fn take_key() -> Option<InputKey> {
     fill_pending();
     CONSOLE.get().pending_key.take()
+}
+
+/// A waiting keystroke, for the boot manager's own menu.
+pub fn read_key() -> Option<InputKey> {
+    take_key()
 }
 
 extern "efiapi" fn input_reset(_: *mut SimpleTextInput, _: u8) -> Status {

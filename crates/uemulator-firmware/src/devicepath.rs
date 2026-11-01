@@ -148,7 +148,6 @@ impl DevicePath {
             .then(|| Self(self.0[length..].to_vec()))
     }
 
-    #[cfg(test)]
     /// The hard-drive node's partition, if the path has one: (number, first block, blocks).
     pub fn partition(&self) -> Option<(u32, u64, u64)> {
         self.nodes()
@@ -162,6 +161,42 @@ impl DevicePath {
                     u64::from_le_bytes(p[12..20].try_into().unwrap()),
                 )
             })
+    }
+
+    /// What identifies the partition a hard-drive node names: partition number, then signature,
+    /// partition format and signature type (UEFI 2.9 10.3.5.1). The start and size are left
+    /// out, as the short-form match in 3.1.2 leaves them out.
+    fn partition_identity(payload: &[u8]) -> Option<([u8; 4], [u8; 18])> {
+        const NUMBER: core::ops::Range<usize> = 0..4;
+        const IDENTITY: core::ops::Range<usize> = 20..38;
+        Some((
+            payload.get(NUMBER)?.try_into().ok()?,
+            payload.get(IDENTITY)?.try_into().ok()?,
+        ))
+    }
+
+    /// For a short-form path, one that starts at a hard-drive node as efibootmgr writes them
+    /// (`HD(1,GPT,...)/\EFI\debian\shimx64.efi`): the full path through whichever of
+    /// `volumes` is that partition, or `None` when the path is not of that form or no volume
+    /// matches (UEFI 2.9 3.1.2). Without this, nothing but the file name would pick the volume,
+    /// and with two installs that boots the wrong one.
+    pub fn expand_hard_drive<'a>(
+        &self,
+        volumes: impl IntoIterator<Item = &'a DevicePath>,
+    ) -> Option<DevicePath> {
+        let first = self.nodes().next()?;
+        if (first.kind, first.subtype) != (TYPE_MEDIA, SUBTYPE_HARD_DRIVE) {
+            return None;
+        }
+        let wanted = Self::partition_identity(first.payload)?;
+        let rest = Self(self.0[NODE_HEADER_BYTES + first.payload.len()..].to_vec());
+        volumes.into_iter().find_map(|volume| {
+            let partition = volume
+                .nodes()
+                .filter(|node| (node.kind, node.subtype) == (TYPE_MEDIA, SUBTYPE_HARD_DRIVE))
+                .last()?;
+            (Self::partition_identity(partition.payload)? == wanted).then(|| volume.append(&rest))
+        })
     }
 
     /// The path from its first file-path node on, or the whole path when it has none. This is what
@@ -445,6 +480,60 @@ mod tests {
 
     fn disk_path() -> DevicePath {
         DevicePath::new().acpi_pci_root().pci(3, 0)
+    }
+
+    fn partition_path(disk: u8, number: u32, guid: Guid) -> DevicePath {
+        DevicePath::new().acpi_pci_root().pci(disk, 0).hard_drive(
+            number,
+            0x800,
+            0x40000,
+            guid.to_bytes(),
+            PARTITION_FORMAT_GPT,
+            SIGNATURE_GUID,
+        )
+    }
+
+    #[test]
+    fn a_short_form_path_expands_through_the_matching_partition() {
+        let first = Guid::new(1, 2, 3, [4; 8]);
+        let second = Guid::new(5, 6, 7, [8; 8]);
+        let volumes = [partition_path(1, 1, first), partition_path(2, 1, second)];
+        // efibootmgr writes the start and size too, but they are not part of the match.
+        let short = DevicePath::new()
+            .hard_drive(
+                1,
+                0,
+                0,
+                second.to_bytes(),
+                PARTITION_FORMAT_GPT,
+                SIGNATURE_GUID,
+            )
+            .file_path("\\EFI\\debian\\shimx64.efi");
+        assert_eq!(
+            short.expand_hard_drive(&volumes),
+            Some(volumes[1].clone().file_path("\\EFI\\debian\\shimx64.efi"))
+        );
+    }
+
+    #[test]
+    fn only_short_forms_with_a_known_partition_expand() {
+        let guid = Guid::new(1, 2, 3, [4; 8]);
+        let volumes = [partition_path(1, 1, guid)];
+        let full = volumes[0].clone().file_path("\\x.efi");
+        assert_eq!(full.expand_hard_drive(&volumes), None);
+        let file_only = DevicePath::new().file_path("\\x.efi");
+        assert_eq!(file_only.expand_hard_drive(&volumes), None);
+        let other_partition = DevicePath::new()
+            .hard_drive(
+                2,
+                0,
+                0,
+                guid.to_bytes(),
+                PARTITION_FORMAT_GPT,
+                SIGNATURE_GUID,
+            )
+            .file_path("\\x.efi");
+        assert_eq!(other_partition.expand_hard_drive(&volumes), None);
     }
 
     #[test]

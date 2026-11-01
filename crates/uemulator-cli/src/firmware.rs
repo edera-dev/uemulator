@@ -15,6 +15,9 @@ const MEDIA_DEVICE_PATH: u8 = 4;
 const FILE_PATH_SUBTYPE: u8 = 4;
 const END_DEVICE_PATH: [u8; 4] = [0x7f, 0xff, 4, 0];
 const NODE_HEADER_BYTES: usize = 4;
+/// `EFI_OS_INDICATIONS_BOOT_TO_FW_UI`: the firmware opens its boot menu on the next start and
+/// clears the bit.
+const OS_INDICATIONS_BOOT_TO_FW_UI: u64 = 1 << 0;
 
 /// The firmware's key for a variable (`var/<guid>/<name>`, `plans/19-uefi-firmware.md`).
 fn variable_key(name: &str) -> Vec<u8> {
@@ -73,6 +76,49 @@ pub fn set_boot_entry(
         }
     }
     store.set(&order_key, &variable_value(&order))
+}
+
+/// Data of a variable as stored: the value after its attributes.
+fn variable_data(store: &mut dyn KeyValueStore, name: &str) -> Option<Vec<u8>> {
+    store
+        .get(&variable_key(name))
+        .and_then(|value| value.get(4..).map(<[u8]>::to_vec))
+}
+
+/// What to write into a machine's nvram before it boots through the UEFI firmware.
+#[derive(Default)]
+pub struct NvramSetup<'a> {
+    /// A loader path and its load options for `Boot0000`, first in `BootOrder`.
+    pub boot_entry: Option<(&'a str, &'a str)>,
+    /// Open the boot menu once, through `OsIndications`, as `systemctl reboot --firmware-setup`
+    /// does from inside the guest.
+    pub boot_menu: bool,
+    /// The `Timeout` variable: seconds the firmware counts down before the default boot.
+    pub boot_timeout: Option<u16>,
+}
+
+impl NvramSetup<'_> {
+    pub fn apply(&self, store: &mut dyn KeyValueStore) -> Result<(), KeyValueError> {
+        if let Some((loader, options)) = self.boot_entry {
+            set_boot_entry(store, loader, options)?;
+        }
+        if self.boot_menu {
+            let indications = variable_data(store, "OsIndications")
+                .and_then(|data| Some(u64::from_le_bytes(data.get(..8)?.try_into().ok()?)))
+                .unwrap_or(0);
+            store.set(
+                &variable_key("OsIndications"),
+                &variable_value(&(indications | OS_INDICATIONS_BOOT_TO_FW_UI).to_le_bytes()),
+            )?;
+        }
+        if let Some(seconds) = self.boot_timeout {
+            store.set(
+                &variable_key("Timeout"),
+                &variable_value(&seconds.to_le_bytes()),
+            )?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -240,5 +286,42 @@ mod tests {
             String::from_utf8_lossy(&output)
         );
         assert_eq!(exit, ExitReason::Shutdown);
+    }
+
+    #[test]
+    fn the_boot_menu_request_keeps_the_other_indications() {
+        let mut store = MemoryKeyValueStore::new();
+        let file_capsule_delivery = 1u64 << 2;
+        store
+            .set(
+                &variable_key("OsIndications"),
+                &variable_value(&file_capsule_delivery.to_le_bytes()),
+            )
+            .unwrap();
+        let setup = NvramSetup {
+            boot_menu: true,
+            boot_timeout: Some(5),
+            ..NvramSetup::default()
+        };
+        setup.apply(&mut store).unwrap();
+        assert_eq!(
+            variable_data(&mut store, "OsIndications").unwrap(),
+            (file_capsule_delivery | OS_INDICATIONS_BOOT_TO_FW_UI).to_le_bytes()
+        );
+        assert_eq!(
+            variable_data(&mut store, "Timeout").unwrap(),
+            5u16.to_le_bytes()
+        );
+        assert_eq!(
+            store.get(&variable_key("Timeout")).unwrap()[..4],
+            ATTRIBUTES_NV_BS_RT.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn an_empty_setup_writes_nothing() {
+        let mut store = MemoryKeyValueStore::new();
+        NvramSetup::default().apply(&mut store).unwrap();
+        assert!(store.list(b"").is_empty());
     }
 }

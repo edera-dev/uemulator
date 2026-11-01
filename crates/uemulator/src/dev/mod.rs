@@ -322,6 +322,12 @@ impl Devices {
         self.pci.into_disks()
     }
 
+    /// Whether host input is still on its way to the 16550, for the BIOS keyboard.
+    #[cfg(not(freestanding))]
+    pub fn serial_input_pending(&self) -> bool {
+        self.uart.input_pending()
+    }
+
     /// How many disks the guest can see; the BIOS numbers them 0x80, 0x81, ... in this order.
     #[cfg(not(freestanding))]
     pub fn disk_count(&mut self) -> usize {

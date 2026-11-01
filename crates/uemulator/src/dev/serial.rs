@@ -196,6 +196,12 @@ impl Uart {
         .then_some(self.next_byte_ns)
     }
 
+    /// Whether host input is in the receive buffer or still held back by the pacing.
+    #[cfg(not(freestanding))]
+    pub fn input_pending(&self) -> bool {
+        !self.rx.is_empty() || (self.rx_enabled && self.console.has_input())
+    }
+
     pub fn set_rx_enabled(&mut self, on: bool) {
         self.rx_enabled = on;
     }

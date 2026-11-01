@@ -18,7 +18,7 @@ use uemulator::ExitReason;
 
 use args::{
     BootSourceArgs, FirmwareArgs, HardwareArgs, LinuxArgs, NewDiskArgs, RemoveArgs, RuntimeArgs,
-    Settings, attach_only,
+    Settings, UefiBootArgs, attach_only,
 };
 use quick::Distro;
 
@@ -183,6 +183,8 @@ enum QuickCmd {
         #[command(flatten)]
         source: BootSourceArgs,
         #[command(flatten)]
+        uefi: UefiBootArgs,
+        #[command(flatten)]
         runtime: RuntimeArgs,
     },
     /// Throw away a machine's kernel and initramfs and download fresh ones; the disk and the
@@ -269,6 +271,8 @@ enum AdvancedCmd {
         #[arg(long, value_name = "OPTIONS", requires = "boot_loader")]
         boot_options: Option<String>,
         #[command(flatten)]
+        uefi: UefiBootArgs,
+        #[command(flatten)]
         hardware: HardwareArgs,
         #[command(flatten)]
         runtime: RuntimeArgs,
@@ -307,7 +311,19 @@ fn settings_of(hardware: &HardwareArgs, linux: &LinuxArgs) -> Result<Settings, S
     Ok(settings)
 }
 
-fn boot_launch(launch: machines::Launch, runtime: &RuntimeArgs) -> Result<ExitReason, String> {
+fn boot_launch(
+    launch: machines::Launch,
+    uefi: &UefiBootArgs,
+    runtime: &RuntimeArgs,
+) -> Result<ExitReason, String> {
+    if uefi.any() && launch.firmware != args::Firmware::Uefi {
+        return Err("--boot-menu and --boot-timeout need a machine with --firmware uefi".into());
+    }
+    let nvram_setup = firmware::NvramSetup {
+        boot_entry: None,
+        boot_menu: uefi.boot_menu,
+        boot_timeout: uefi.boot_timeout,
+    };
     match launch.source {
         args::BootSource::Disk => {
             eprintln!("booting from the disk");
@@ -319,13 +335,18 @@ fn boot_launch(launch: machines::Launch, runtime: &RuntimeArgs) -> Result<ExitRe
                     &launch.settings,
                     runtime,
                     launch.nvram.as_deref(),
-                    None,
+                    &nvram_setup,
                 ),
                 args::Firmware::None => Err("firmware none cannot boot a disk".into()),
             }
         }
         _ => match launch.firmware {
             args::Firmware::Uefi => {
+                if uefi.boot_menu {
+                    return Err("--boot-menu is for disk boots: the installer's kernel is \
+                                booted directly, without the menu"
+                        .into());
+                }
                 eprintln!("booting the installer through the UEFI firmware");
                 run::run_uefi(
                     launch.kernel,
@@ -333,7 +354,7 @@ fn boot_launch(launch: machines::Launch, runtime: &RuntimeArgs) -> Result<ExitRe
                     &launch.settings,
                     runtime,
                     launch.nvram.as_deref(),
-                    None,
+                    &nvram_setup,
                 )
             }
             args::Firmware::Bios | args::Firmware::None => {
@@ -382,7 +403,7 @@ fn quick_command(cmd: QuickCmd) -> Result<Option<ExitReason>, String> {
                 None,
                 quick::download,
             )?;
-            boot_launch(launch, &RuntimeArgs::default()).map(Some)
+            boot_launch(launch, &UefiBootArgs::default(), &RuntimeArgs::default()).map(Some)
         }
         QuickCmd::Edit {
             name,
@@ -417,6 +438,7 @@ fn quick_command(cmd: QuickCmd) -> Result<Option<ExitReason>, String> {
             linux,
             remove,
             source,
+            uefi,
             runtime,
         } => {
             let machine = machines::load(&home, &name)?;
@@ -428,7 +450,7 @@ fn quick_command(cmd: QuickCmd) -> Result<Option<ExitReason>, String> {
                 source.boot_from,
                 quick::download,
             )?;
-            boot_launch(launch, &runtime).map(Some)
+            boot_launch(launch, &uefi, &runtime).map(Some)
         }
         QuickCmd::Reinstall { name, install } => {
             let machine = machines::reinstall(&home, &name, install, quick::download)?;
@@ -493,7 +515,7 @@ fn advanced_command(cmd: AdvancedCmd) -> Result<ExitReason, String> {
                     &settings,
                     &runtime,
                     None,
-                    None,
+                    &firmware::NvramSetup::default(),
                 ),
                 args::Firmware::None => {
                     run::run(kernel_image, initramfs_image, &settings, &runtime)
@@ -516,19 +538,25 @@ fn advanced_command(cmd: AdvancedCmd) -> Result<ExitReason, String> {
             nvram,
             boot_loader,
             boot_options,
+            uefi,
             hardware,
             runtime,
         } => {
             let settings = settings_of(&hardware, &LinuxArgs::default())?;
+            let nvram_setup = firmware::NvramSetup {
+                boot_entry: boot_loader
+                    .as_deref()
+                    .map(|loader| (loader, boot_options.as_deref().unwrap_or(""))),
+                boot_menu: uefi.boot_menu,
+                boot_timeout: uefi.boot_timeout,
+            };
             run::run_uefi(
                 Vec::new(),
                 None,
                 &settings,
                 &runtime,
                 nvram.as_deref(),
-                boot_loader
-                    .as_deref()
-                    .map(|loader| (loader, boot_options.as_deref().unwrap_or(""))),
+                &nvram_setup,
             )
         }
     }

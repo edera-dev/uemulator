@@ -14,9 +14,13 @@ use crate::variable_store::{VariableError, Variables};
 
 static VARIABLES: Global<Variables<KvPort>> = Global::new(Variables::new());
 
-const OS_INDICATIONS_SUPPORTED: u64 = 0;
-/// `EFI_BOOT_OPTION_SUPPORT_KEY` | `EFI_BOOT_OPTION_SUPPORT_APP`.
-const BOOT_OPTION_SUPPORT: u32 = 0x3;
+/// `EFI_OS_INDICATIONS_BOOT_TO_FW_UI`: an OS sets it in `OsIndications` (`systemctl reboot
+/// --firmware-setup`) to land in the boot menu on the next start.
+pub const OS_INDICATIONS_BOOT_TO_FW_UI: u64 = 1 << 0;
+const OS_INDICATIONS_SUPPORTED: u64 = OS_INDICATIONS_BOOT_TO_FW_UI;
+/// `EFI_BOOT_OPTION_SUPPORT_APP`: the menu launches application entries. Not `..._KEY`: there
+/// are no `Key####` hot keys.
+const BOOT_OPTION_SUPPORT: u32 = 0x2;
 const PLATFORM_LANGUAGES: &[u8] = b"en-US\0";
 
 pub fn attach_store(port: KvPort) {
@@ -61,6 +65,22 @@ pub fn read(name: &str, guid: &Guid) -> Option<Vec<u8>> {
 pub fn write(name: &str, guid: &Guid, attributes: u32, data: &[u8]) {
     let units: Vec<u16> = name.encode_utf16().collect();
     let _ = VARIABLES.get().set(&units, guid, attributes, data, false);
+}
+
+/// The numbers of every `Boot####` variable, parseable or not.
+pub fn boot_option_numbers() -> Vec<u16> {
+    let variables = VARIABLES.get();
+    let mut numbers = Vec::new();
+    let (mut name, mut guid) = (Vec::new(), guids::GLOBAL_VARIABLE);
+    while let Ok((next_name, next_guid)) = variables.next(&name, &guid, false) {
+        if next_guid == guids::GLOBAL_VARIABLE
+            && let Some(number) = crate::load_option::number_of(&text::to_string(&next_name))
+        {
+            numbers.push(number);
+        }
+        (name, guid) = (next_name, next_guid);
+    }
+    numbers
 }
 
 fn status_of(error: VariableError) -> Status {

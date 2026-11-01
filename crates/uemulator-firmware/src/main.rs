@@ -10,6 +10,8 @@
 
 extern crate alloc;
 
+mod boot_menu;
+mod boot_options;
 mod crc32;
 mod devicepath;
 mod fat;

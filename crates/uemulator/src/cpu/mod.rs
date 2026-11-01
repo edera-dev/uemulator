@@ -6,6 +6,8 @@ mod avx_special;
 // The BIOS disk boot is for hosted machines only (`plans/17-bios.md`).
 #[cfg(not(freestanding))]
 mod bios;
+#[cfg(not(freestanding))]
+mod bios_keys;
 mod bmi;
 mod cpuid;
 pub(crate) mod decode;

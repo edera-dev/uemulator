@@ -199,6 +199,11 @@ extern "efiapi" fn reset_system(
         // recognises a power-off.
         halt_forever()
     }
+    reset_machine()
+}
+
+/// A full reset through the reset control register, as `ResetSystem(EfiResetCold)` does.
+pub fn reset_machine() -> ! {
     outb(RESET_CONTROL_PORT, RESET_CONTROL_FULL_RESET);
     halt_forever()
 }

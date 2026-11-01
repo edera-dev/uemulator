@@ -18,7 +18,7 @@
 | 11h, 12h | equipment word and base memory from the BDA |
 | 13h | drives 80h+ in disk order: reset, status, CHS read/write (255 heads x 63 sectors), parameters (08h), type (15h), EDD install check (41h), extended read/write (42h/43h, segmented or flat buffer), extended parameters (48h) |
 | 15h | E820 (the same three-entry map as the direct boot), E801, 88h, 87h block copy, A20 gate (always open, RAM is flat), delay; everything else fails with AH = 86h |
-| 16h | keys come from the UART's receive side; with none, 00h/10h halt until the next interrupt and retry |
+| 16h | keys come from the UART's receive side; with none, 00h/10h halt until the next interrupt and retry. Terminal escape sequences become key words (`cpu/bios_keys.rs`): arrows, Home/End, PgUp/PgDn, Ins/Del and F1-F12 return AL=0 and the scan code in AH (GRUB maps AH only when AL is 0); Esc, Enter, Backspace (and DEL) and Tab carry their scan codes; other bytes are AL alone. The UART paces input, so a sequence can take several calls to arrive; an unfinished one counts as Escape once the line has held nothing for 50 ms |
 | 18h, 19h | no boot device; bootstrap again |
 | 1Ah | tick count and the RTC time and date from CMOS |
 
