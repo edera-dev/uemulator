@@ -315,6 +315,9 @@ const STRUCTURED_ECX_AVX512_BITALG: u32 = 1 << 12;
 const STRUCTURED_ECX_AVX512_VPOPCNTDQ: u32 = 1 << 14;
 /// rdpid: IA32_TSC_AUX into a register.
 const STRUCTURED_ECX_RDPID: u32 = 1 << 22;
+/// movdiri and movdir64b (Zen 5): direct stores of a register and of 64 bytes (`sse_ext.rs`).
+const STRUCTURED_ECX_MOVDIRI: u32 = 1 << 27;
+const STRUCTURED_ECX_MOVDIR64B: u32 = 1 << 28;
 const STRUCTURED_ECX: u32 = STRUCTURED_ECX_AVX512_VBMI
     | STRUCTURED_ECX_UMIP
     | STRUCTURED_ECX_AVX512_VBMI2
@@ -324,7 +327,9 @@ const STRUCTURED_ECX: u32 = STRUCTURED_ECX_AVX512_VBMI
     | STRUCTURED_ECX_AVX512_VNNI
     | STRUCTURED_ECX_AVX512_BITALG
     | STRUCTURED_ECX_AVX512_VPOPCNTDQ
-    | STRUCTURED_ECX_RDPID;
+    | STRUCTURED_ECX_RDPID
+    | STRUCTURED_ECX_MOVDIRI
+    | STRUCTURED_ECX_MOVDIR64B;
 
 // Leaf 7 subleaf 0 EDX. The speculation-control bits Intel defines here (SPEC_CTRL, STIBP,
 // L1D_FLUSH, ARCH_CAPABILITIES, SSBD, bits 26-31) stay clear, as on every AMD part: the AMD
@@ -332,8 +337,12 @@ const STRUCTURED_ECX: u32 = STRUCTURED_ECX_AVX512_VBMI
 // IA32_FLUSH_CMD do not exist (#GP).
 /// FSRM: fast short `rep movsb`.
 const STRUCTURED_FEATURE_FSRM: u32 = 1 << 4;
-const STRUCTURED_EDX: u32 = STRUCTURED_FEATURE_FSRM;
+/// vp2intersectd/q (Zen 5), `avx512_misc.rs`.
+const STRUCTURED_FEATURE_AVX512_VP2INTERSECT: u32 = 1 << 8;
+const STRUCTURED_EDX: u32 = STRUCTURED_FEATURE_FSRM | STRUCTURED_FEATURE_AVX512_VP2INTERSECT;
 
+/// Leaf 7 subleaf 1 EAX bit 4: AVX-VNNI (Zen 5), the VEX forms of vpdpbusd(s)/vpdpwssd(s).
+const STRUCTURED_1_EAX_AVX_VNNI: u32 = 1 << 4;
 /// Leaf 7 subleaf 1 EAX bit 5: AVX512_BF16 (vcvtne2ps2bf16, vcvtneps2bf16, vdpbf16ps).
 const STRUCTURED_1_EAX_AVX512_BF16: u32 = 1 << 5;
 /// Highest subleaf of leaf 7.
@@ -637,6 +646,10 @@ const EXT_FEATURES_2_NULL_SEL_CLR_BASE: u32 = 1 << 6;
 /// treats it as enhanced IBRS and picks "Mitigation: Enhanced / Automatic IBRS" for Spectre v2,
 /// one EFER write per CPU instead of retpolines.
 const EXT_FEATURES_2_AUTOIBRS: u32 = 1 << 8;
+/// prefetchit0/prefetchit1 (`0F 18 /7` and `/6` with a RIP-relative operand, Zen 5): code
+/// prefetch hints, which execute as the no-ops the whole `0F 18..1F` hint space already is and
+/// never touch (or fault on) their operand.
+const EXT_FEATURES_2_PREFETCHI: u32 = 1 << 20;
 /// IA32_PRED_CMD bit 7 (selective branch predictor barrier) is accepted. Linux writes it instead
 /// of IBPB when SRSO needs no mitigation, with a plain wrmsr: dropping the MSR bit while this
 /// stays set oopses the guest.
@@ -654,6 +667,7 @@ const EXT_FEATURES_2_EAX: u32 = EXT_FEATURES_2_NO_NESTED_DATA_BP
     | EXT_FEATURES_2_LFENCE_ALWAYS_SERIALIZING
     | EXT_FEATURES_2_NULL_SEL_CLR_BASE
     | EXT_FEATURES_2_AUTOIBRS
+    | EXT_FEATURES_2_PREFETCHI
     | EXT_FEATURES_2_SBPB
     | EXT_FEATURES_2_IBPB_BRTYPE
     | EXT_FEATURES_2_SRSO_NO
@@ -704,7 +718,12 @@ impl Cpu {
                     STRUCTURED_ECX,
                     STRUCTURED_EDX,
                 ),
-                1 => (STRUCTURED_1_EAX_AVX512_BF16, 0, 0, 0),
+                1 => (
+                    STRUCTURED_1_EAX_AVX_VNNI | STRUCTURED_1_EAX_AVX512_BF16,
+                    0,
+                    0,
+                    0,
+                ),
                 _ => (0, 0, 0, 0),
             },
             LEAF_EXTENDED_TOPOLOGY => {

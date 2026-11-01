@@ -6,6 +6,7 @@
 use super::decode::{EVEX_OP_FLAG, Insn, VEX_OP_FLAG};
 use super::exception::Exception;
 use super::sse::Prefix;
+use super::sse::evex::misc::{VNNI_FIRST_OPCODE, VNNI_LAST_OPCODE, vnni_dword};
 use super::sse::ext::{Op, decode_op};
 use super::{Cpu, ExecResult};
 
@@ -775,6 +776,30 @@ impl Cpu {
             }
             (OPCODE_MAP_0F38, 0x13, P66) | (OPCODE_MAP_0F3A, 0x1d, P66) => {
                 self.exec_f16c(i, next)?;
+            }
+            // AVX-VNNI: the VEX forms of vpdpbusd(s)/vpdpwssd(s), W0 only, the destination as
+            // accumulator; the arithmetic is shared with the EVEX (AVX512_VNNI) forms
+            (OPCODE_MAP_0F38, VNNI_FIRST_OPCODE..=VNNI_LAST_OPCODE, P66) => {
+                gate!();
+                require!(!wide_w);
+                let (second_low, second_high) = self.vector_operand(i, next, operand_bytes)?;
+                let accumulate = |old: u128, first: u128, second: u128| {
+                    dwords(core::array::from_fn(|k| {
+                        vnni_dword(
+                            opcode,
+                            lane_u32(old, k),
+                            lane_u32(first, k),
+                            lane_u32(second, k),
+                        )
+                    }))
+                };
+                let low = accumulate(self.xmm[reg], self.xmm[vvvv], second_low);
+                let high = if l {
+                    accumulate(self.ymm_hi[reg], self.ymm_hi[vvvv], second_high)
+                } else {
+                    0
+                };
+                self.set_vector(reg, low, high, l);
             }
             _ => return Ok(false),
         }

@@ -1157,3 +1157,131 @@ mod extensions {
         assert_eq!((out[0], out[1]), (0x63, 0x7c), "AES S-box of 0 and 1");
     }
 }
+
+/// AVX512_VP2INTERSECT. Encodings from the assembler (`hack/asm.sh`); the reference is the SDM's
+/// double loop over element pairs.
+mod pair_intersection {
+    use super::*;
+
+    /// vp2intersectd k2, zmm1, zmm2
+    const VP2INTERSECTD_Z: &[u8] = &[0x62, 0xf2, 0x77, 0x48, 0x68, 0xd2, 0xf4];
+    /// vp2intersectq k2, zmm1, zmm2
+    const VP2INTERSECTQ_Z: &[u8] = &[0x62, 0xf2, 0xf7, 0x48, 0x68, 0xd2, 0xf4];
+    /// vp2intersectq k6, xmm1, xmm2
+    const VP2INTERSECTQ_X: &[u8] = &[0x62, 0xf2, 0xf7, 0x08, 0x68, 0xf2, 0xf4];
+    /// vp2intersectd k0, zmm1, zmmword ptr [rsi]
+    const VP2INTERSECTD_Z_MEMORY: &[u8] = &[0x62, 0xf2, 0x77, 0x48, 0x68, 0x06, 0xf4];
+    /// vp2intersectd k4, ymm1, dword ptr [rsi]{1to8}
+    const VP2INTERSECTD_Y_BROADCAST: &[u8] = &[0x62, 0xf2, 0x77, 0x38, 0x68, 0x26, 0xf4];
+    /// VP2INTERSECTD_Z with ModRM.reg = 3: the pair is still k2, k3.
+    const VP2INTERSECTD_Z_ODD: &[u8] = &[0x62, 0xf2, 0x77, 0x48, 0x68, 0xda, 0xf4];
+    /// VP2INTERSECTD_Z with EVEX.aaa = 1, and with EVEX.z set.
+    const VP2INTERSECTD_Z_MASKED: &[u8] = &[0x62, 0xf2, 0x77, 0x49, 0x68, 0xd2, 0xf4];
+    const VP2INTERSECTD_Z_ZEROING: &[u8] = &[0x62, 0xf2, 0x77, 0xc8, 0x68, 0xd2, 0xf4];
+
+    const OPMASK_JUNK: u64 = 0xdead_beef_f00d_cafe;
+
+    /// Elements drawn from a few values so that both sources share some and miss others.
+    fn sparse(seed: u64, size: usize) -> Vector {
+        let mut rng = Rng(seed);
+        build(64, size, |_| rng.next() % 24)
+    }
+
+    fn reference(first: &Vector, second: &Vector, size: usize, count: usize) -> (u64, u64) {
+        let (mut first_bits, mut second_bits) = (0, 0);
+        for j in 0..count {
+            for k in 0..count {
+                if element(first, size, j) == element(second, size, k) {
+                    first_bits |= 1 << j;
+                    second_bits |= 1 << k;
+                }
+            }
+        }
+        (first_bits, second_bits)
+    }
+
+    fn setup(h: &mut Harness, first: Vector, second: Vector) {
+        h.cpu.set_zmm(1, first);
+        h.cpu.set_zmm(2, second);
+        h.write(DATA, &bytes_of(&second));
+        h.cpu.opmask = [OPMASK_JUNK; 8];
+    }
+
+    #[test]
+    fn each_mask_of_the_pair_marks_the_elements_found_in_the_other_source() {
+        for (code, size, bytes, even) in [
+            (VP2INTERSECTD_Z, 4usize, 64usize, 2usize),
+            (VP2INTERSECTQ_Z, 8, 64, 2),
+            (VP2INTERSECTQ_X, 8, 16, 6),
+            (VP2INTERSECTD_Z_MEMORY, 4, 64, 0),
+            (VP2INTERSECTD_Z_ODD, 4, 64, 2),
+        ] {
+            for seed in [0xb1, 0xb2, 0xb3] {
+                let (first, second) = (sparse(seed, size), sparse(seed ^ 0xff, size));
+                let h = run(code, |h| setup(h, first, second));
+                let want = reference(&first, &second, size, bytes / size);
+                assert_eq!(
+                    (h.cpu.opmask[even], h.cpu.opmask[even + 1]),
+                    want,
+                    "{code:02x?} seed {seed:#x}"
+                );
+                for (k, value) in h.cpu.opmask.iter().enumerate() {
+                    if k != even && k != even + 1 {
+                        assert_eq!(*value, OPMASK_JUNK, "{code:02x?}: k{k} is not in the pair");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_broadcast_second_source_compares_every_element_with_one_value() {
+        let first = sparse(0xc1, 4);
+        let mut second = [0u128; 4];
+        set_element(&mut second, 4, 0, element(&first, 4, 5));
+        let h = run(VP2INTERSECTD_Y_BROADCAST, |h| setup(h, first, second));
+        let broadcast = build(32, 4, |_| element(&first, 4, 5));
+        let (first_bits, second_bits) = reference(&first, &broadcast, 4, 8);
+        assert_eq!(
+            (h.cpu.opmask[4], h.cpu.opmask[5]),
+            (first_bits, second_bits)
+        );
+        assert_eq!(
+            second_bits, 0xff,
+            "every copy of the broadcast value matches"
+        );
+    }
+
+    #[test]
+    fn write_masking_and_zeroing_are_invalid() {
+        for code in [VP2INTERSECTD_Z_MASKED, VP2INTERSECTD_Z_ZEROING] {
+            let stop = stop_of(code, |h| setup(h, sparse(1, 4), sparse(2, 4)));
+            assert_eq!(
+                stop,
+                Stop::Fault {
+                    vector: 6,
+                    error_code: None,
+                    software: false
+                },
+                "{code:02x?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vp2intersect_runs_identically_under_the_jit() {
+        for code in [
+            VP2INTERSECTD_Z,
+            VP2INTERSECTQ_X,
+            VP2INTERSECTD_Y_BROADCAST,
+            VP2INTERSECTD_Z_MASKED,
+        ] {
+            crate::testkit::assert_jit_matches_interpreter(code, |h| {
+                h.cpu.cr4 = (h.cpu.cr4 & !(1 << 9)) | CR4_OSXSAVE;
+                h.cpu.xcr0 = XCR0_SUPPORTED;
+                h.cpu.gpr[RSI] = DATA;
+                setup(h, sparse(3, 4), sparse(4, 4));
+            });
+        }
+    }
+}

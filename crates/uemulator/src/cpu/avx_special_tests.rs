@@ -1902,3 +1902,164 @@ fn vpcmpistrm_zeroes_the_upper_half_of_xmm0() {
     assert_eq!(h.run(10), Stop::Halted);
     assert_eq!(h.cpu.ymm_hi[0], 0);
 }
+
+/// AVX-VNNI: the VEX encodings of the VNNI dot products. Encodings from `hack/asm.sh` (`{vex}`
+/// selects VEX over EVEX); the reference is the SDM's per-dword sum.
+mod avx_vnni {
+    use super::*;
+
+    /// {vex} vpdpbusd / vpdpbusds / vpdpwssd / vpdpwssds ymm0, ymm1, ymm2
+    const VPDPBUSD_Y: &[u8] = &[0xc4, 0xe2, 0x75, 0x50, 0xc2, 0xf4];
+    const VPDPBUSDS_Y: &[u8] = &[0xc4, 0xe2, 0x75, 0x51, 0xc2, 0xf4];
+    const VPDPWSSD_Y: &[u8] = &[0xc4, 0xe2, 0x75, 0x52, 0xc2, 0xf4];
+    const VPDPWSSDS_Y: &[u8] = &[0xc4, 0xe2, 0x75, 0x53, 0xc2, 0xf4];
+    /// {vex} vpdpbusd xmm0, xmm1, xmm2
+    const VPDPBUSD_X: &[u8] = &[0xc4, 0xe2, 0x71, 0x50, 0xc2, 0xf4];
+    /// {vex} vpdpwssds xmm0, xmm1, xmmword ptr [rsi]
+    const VPDPWSSDS_XM: &[u8] = &[0xc4, 0xe2, 0x71, 0x53, 0x06, 0xf4];
+    /// {vex} vpdpbusd ymm0, ymm1, ymmword ptr [rsi]
+    const VPDPBUSD_YM: &[u8] = &[0xc4, 0xe2, 0x75, 0x50, 0x06, 0xf4];
+    /// {vex} vpdpbusd ymm1, ymm1, ymm1: every operand the same register
+    const VPDPBUSD_Y_SAME: &[u8] = &[0xc4, 0xe2, 0x75, 0x50, 0xc9, 0xf4];
+    /// VPDPBUSD_Y with VEX.W = 1, which AVX-VNNI does not define
+    const VPDPBUSD_Y_W1: &[u8] = &[0xc4, 0xe2, 0xf5, 0x50, 0xc2, 0xf4];
+
+    /// The SDM's VPDPBUSD/VPDPWSSD: per dword, the accumulator plus four products of unsigned
+    /// bytes of `first` with signed bytes of `second` (or two products of signed words).
+    fn reference(opcode: u8, accumulator: &Ymm, first: &Ymm, second: &Ymm, dwords: usize) -> Ymm {
+        let mut out = [0u32; 8];
+        for k in 0..dwords {
+            let mut sum = dword(accumulator, k) as i32 as i64;
+            if opcode >= 0x52 {
+                for j in 0..2 {
+                    let at = 4 * k + 2 * j;
+                    let a = i16::from_le_bytes([first[at], first[at + 1]]) as i64;
+                    let b = i16::from_le_bytes([second[at], second[at + 1]]) as i64;
+                    sum += a * b;
+                }
+            } else {
+                for j in 0..4 {
+                    sum += first[4 * k + j] as i64 * second[4 * k + j] as i8 as i64;
+                }
+            }
+            out[k] = if opcode & 1 == 1 {
+                sum.clamp(i32::MIN as i64, i32::MAX as i64) as u32
+            } else {
+                sum as u32
+            };
+        }
+        from_dwords(&out[..dwords])
+    }
+
+    fn inputs_with_extremes() -> Vec<(Ymm, Ymm, Ymm)> {
+        let mut rng = Rng(0x5eed_0fa7_7e11);
+        let mut cases: Vec<(Ymm, Ymm, Ymm)> =
+            (0..8).map(|_| (rng.ymm(), rng.ymm(), rng.ymm())).collect();
+        // accumulators at the i32 limits with the largest products of either sign, so the
+        // saturating forms clamp and the others wrap
+        let near_max = from_dwords(&[0x7fff_fff0; 8]);
+        let near_min = from_dwords(&[0x8000_0010; 8]);
+        cases.push((near_max, [0xff; 32], [0x7f; 32]));
+        cases.push((near_min, [0xff; 32], [0x80; 32]));
+        cases.push((near_max, [0x80; 32], [0x80; 32]));
+        cases
+    }
+
+    #[test]
+    fn vex_dot_products_accumulate_into_the_destination() {
+        for (accumulator, first, second) in inputs_with_extremes() {
+            for (code, opcode) in [
+                (VPDPBUSD_Y, 0x50),
+                (VPDPBUSDS_Y, 0x51),
+                (VPDPWSSD_Y, 0x52),
+                (VPDPWSSDS_Y, 0x53),
+            ] {
+                let h = run(code, |h| {
+                    set(h, 0, accumulator);
+                    set(h, 1, first);
+                    set(h, 2, second);
+                });
+                assert_eq!(
+                    get(&h, 0),
+                    reference(opcode, &accumulator, &first, &second, 8),
+                    "{code:02x?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_128_bit_form_zeroes_the_upper_half_and_memory_sources_work() {
+        for (accumulator, first, second) in inputs_with_extremes() {
+            let h = run(VPDPBUSD_X, |h| {
+                set(h, 0, accumulator);
+                set(h, 1, first);
+                set(h, 2, second);
+            });
+            assert_eq!(
+                get(&h, 0),
+                zero_upper(reference(0x50, &accumulator, &first, &second, 4))
+            );
+            let h = run(VPDPWSSDS_XM, |h| {
+                set(h, 0, accumulator);
+                set(h, 1, first);
+                h.write(DATA, &second[..16]);
+            });
+            assert_eq!(
+                get(&h, 0),
+                zero_upper(reference(0x53, &accumulator, &first, &second, 4))
+            );
+            let h = run(VPDPBUSD_YM, |h| {
+                set(h, 0, accumulator);
+                set(h, 1, first);
+                h.write(DATA, &second);
+            });
+            assert_eq!(
+                get(&h, 0),
+                reference(0x50, &accumulator, &first, &second, 8)
+            );
+        }
+    }
+
+    #[test]
+    fn one_register_as_every_operand_reads_it_before_writing_it() {
+        let value = Rng(0xa11a5).ymm();
+        let h = run(VPDPBUSD_Y_SAME, |h| set(h, 1, value));
+        assert_eq!(get(&h, 1), reference(0x50, &value, &value, &value, 8));
+    }
+
+    #[test]
+    fn vex_w1_is_invalid() {
+        let mut h = harness(VPDPBUSD_Y_W1);
+        assert_eq!(
+            h.run(10),
+            Stop::Fault {
+                vector: 6,
+                error_code: None,
+                software: false
+            }
+        );
+    }
+
+    #[test]
+    fn avx_vnni_runs_identically_under_the_jit() {
+        let (accumulator, first, second) = inputs_with_extremes()[0];
+        for code in [
+            VPDPBUSD_Y,
+            VPDPWSSDS_Y,
+            VPDPBUSD_X,
+            VPDPBUSD_YM,
+            VPDPBUSD_Y_W1,
+        ] {
+            crate::testkit::assert_jit_matches_interpreter(code, |h| {
+                h.cpu.cr4 = (h.cpu.cr4 & !(1 << 9)) | CR4_OSXSAVE;
+                h.cpu.xcr0 = XCR0_X87 | XCR0_SSE | XCR0_AVX;
+                h.cpu.gpr[RSI] = DATA;
+                set(h, 0, accumulator);
+                set(h, 1, first);
+                set(h, 2, second);
+                h.write(DATA, &second);
+            });
+        }
+    }
+}

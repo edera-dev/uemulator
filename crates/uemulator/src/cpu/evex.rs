@@ -32,7 +32,7 @@ mod lanes;
 #[path = "avx512_mask.rs"]
 pub(in crate::cpu) mod mask;
 #[path = "avx512_misc.rs"]
-mod misc;
+pub(in crate::cpu) mod misc;
 
 /// A vector register as four 128-bit lanes, lane 0 least significant.
 pub(in crate::cpu) type Vector = [u128; 4];

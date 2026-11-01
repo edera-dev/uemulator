@@ -162,18 +162,18 @@ fn leaf_7_subleaf_0_features() {
         0, 3, 5, 7, 8, 9, 10, 16, 17, 18, 19, 20, 21, 23, 24, 28, 29, 30, 31,
     ]);
     // AVX512_VBMI UMIP AVX512_VBMI2 GFNI VAES VPCLMULQDQ AVX512_VNNI AVX512_BITALG
-    // AVX512_VPOPCNTDQ RDPID
-    let ecx = bits(&[1, 2, 6, 8, 9, 10, 11, 12, 14, 22]);
-    // FSRM only: the speculation controls are in the AMD leaves
-    let edx = bits(&[4]);
+    // AVX512_VPOPCNTDQ RDPID MOVDIRI MOVDIR64B; no PKU, LA57, CET_SS
+    let ecx = bits(&[1, 2, 6, 8, 9, 10, 11, 12, 14, 22, 27, 28]);
+    // FSRM and AVX512_VP2INTERSECT; the speculation controls are in the AMD leaves
+    let edx = bits(&[4, 8]);
     // EAX is the highest subleaf
     assert_eq!(cpuid(&mut h, 7, 0), [1, ebx, ecx, edx]);
 }
 
 #[test]
-fn leaf_7_subleaf_1_has_avx512_bf16_and_nothing_else() {
+fn leaf_7_subleaf_1_has_avx_vnni_and_avx512_bf16_and_nothing_else() {
     let mut h = blank();
-    assert_eq!(cpuid(&mut h, 7, 1), [1 << 5, 0, 0, 0]);
+    assert_eq!(cpuid(&mut h, 7, 1), [bits(&[4, 5]), 0, 0, 0]);
     for subleaf in [2, 5, 0x8000_0000] {
         assert_eq!(cpuid(&mut h, 7, subleaf), [0, 0, 0, 0], "subleaf {subleaf}");
     }
@@ -482,12 +482,17 @@ fn every_topology_leaf_describes_the_same_machine() {
 #[test]
 fn leaf_0x80000021_has_turins_speculation_bits_and_srso_no() {
     let mut h = blank();
-    // NO_NESTED_DATA_BP WRMSR_XX_BASE_NS LFENCE_ALWAYS_SERIALIZING NULL_SEL_CLR_BASE AUTOIBRS SBPB
-    // IBPB_BRTYPE SRSO_NO SRSO_USER_KERNEL_NO; no SRSO_BP_SPEC_REDUCE, ERAPS, VERW_CLEAR; ECX:
-    // TSA_SQ_NO, TSA_L1_NO
+    // NO_NESTED_DATA_BP WRMSR_XX_BASE_NS LFENCE_ALWAYS_SERIALIZING NULL_SEL_CLR_BASE AUTOIBRS
+    // PREFETCHI SBPB IBPB_BRTYPE SRSO_NO SRSO_USER_KERNEL_NO; no SRSO_BP_SPEC_REDUCE, ERAPS,
+    // VERW_CLEAR; ECX: TSA_SQ_NO, TSA_L1_NO
     assert_eq!(
         cpuid(&mut h, 0x8000_0021, 0),
-        [bits(&[0, 1, 2, 6, 8, 27, 28, 29, 30]), 0, bits(&[1, 2]), 0]
+        [
+            bits(&[0, 1, 2, 6, 8, 20, 27, 28, 29, 30]),
+            0,
+            bits(&[1, 2]),
+            0
+        ]
     );
 }
 

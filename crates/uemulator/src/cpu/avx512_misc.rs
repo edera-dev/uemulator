@@ -11,6 +11,40 @@ const IFMA_BITS: u32 = 52;
 const IFMA_MASK: u64 = (1 << IFMA_BITS) - 1;
 /// vdbpsadbw adds up the differences of this many bytes per 16-bit result.
 const DBPSADBW_WINDOW: usize = 4;
+/// `0F 38 50..=53`: vpdpbusd, vpdpbusds, vpdpwssd, vpdpwssds, in both the EVEX (AVX512_VNNI) and
+/// VEX (AVX-VNNI, `avx_special.rs`) encodings. Bit 0 of the opcode selects saturation, bit 1
+/// word instead of byte products.
+pub(in crate::cpu) const VNNI_FIRST_OPCODE: u8 = 0x50;
+pub(in crate::cpu) const VNNI_LAST_OPCODE: u8 = 0x53;
+const VNNI_SATURATING: u8 = 1;
+const VNNI_WORDS: u8 = 2;
+/// `EVEX.F2.0F38 68`: vp2intersectd (W0) and vp2intersectq (W1).
+const OPCODE_VP2INTERSECT: u8 = 0x68;
+/// vp2intersect writes the opmask pair k(reg & 6), k(reg & 6 | 1).
+const MASK_PAIR_EVEN: u8 = 0b110;
+
+/// One dword of a VNNI dot product: `accumulator` plus the four products of `first`'s unsigned
+/// bytes with `second`'s signed bytes, or the two products of their signed words. The saturating
+/// forms clamp the sum to i32; the others wrap. `first` is the VEX.vvvv/EVEX.vvvv source and
+/// `second` the r/m one; swapping them changes which bytes are unsigned.
+pub(in crate::cpu) fn vnni_dword(opcode: u8, accumulator: u32, first: u32, second: u32) -> u32 {
+    let products: i64 = if opcode & VNNI_WORDS != 0 {
+        (0..2)
+            .map(|j| (first >> (16 * j)) as i16 as i64 * (second >> (16 * j)) as i16 as i64)
+            .sum()
+    } else {
+        (0..4)
+            .map(|j| (first >> (8 * j)) as u8 as i64 * (second >> (8 * j)) as i8 as i64)
+            .sum()
+    };
+    let total = accumulator as i32 as i64 + products;
+    if opcode & VNNI_SATURATING != 0 {
+        total.clamp(i32::MIN as i64, i32::MAX as i64) as u32
+    } else {
+        total as u32
+    }
+}
+
 impl Cpu {
     pub(super) fn exec_evex_misc(
         &mut self,
@@ -22,6 +56,10 @@ impl Cpu {
         wide: bool,
     ) -> ExecResult<bool> {
         use Prefix::*;
+        if (map, opcode, prefix) == (OPCODE_MAP_0F38, OPCODE_VP2INTERSECT, F2) {
+            self.intersect_into_mask_pair(i, next, wide)?;
+            return Ok(true);
+        }
         if prefix != P66 {
             return self.exec_evex_fp(i, next, map, opcode, prefix, wide);
         }
@@ -56,32 +94,15 @@ impl Cpu {
                 })?;
             }
             // vpdpbusd(s) and vpdpwssd(s): dot products accumulated into the destination
-            (OPCODE_MAP_0F38, 0x50..=0x53) if !wide => {
-                let saturating = opcode & 1 == 1;
-                let words = opcode >= 0x52;
+            (OPCODE_MAP_0F38, VNNI_FIRST_OPCODE..=VNNI_LAST_OPCODE) if !wide => {
                 self.exec_vector_op(i, next, OpShape::elementwise(4), |_, old, a, b, bytes| {
                     Ok(build(bytes, 4, |k| {
-                        let sum: i64 = if words {
-                            (0..2)
-                                .map(|j| {
-                                    signed(element(a, 2, 2 * k + j), 2)
-                                        * signed(element(b, 2, 2 * k + j), 2)
-                                })
-                                .sum()
-                        } else {
-                            (0..4)
-                                .map(|j| {
-                                    element(a, 1, 4 * k + j) as i64
-                                        * signed(element(b, 1, 4 * k + j), 1)
-                                })
-                                .sum()
-                        };
-                        let total = signed(element(old, 4, k), 4) + sum;
-                        if saturating {
-                            total.clamp(i32::MIN as i64, i32::MAX as i64) as u64
-                        } else {
-                            total as u64
-                        }
+                        vnni_dword(
+                            opcode,
+                            element(old, 4, k) as u32,
+                            element(a, 4, k) as u32,
+                            element(b, 4, k) as u32,
+                        ) as u64
                     }))
                 })?;
             }
@@ -230,6 +251,35 @@ impl Cpu {
             }
         }
         self.opmask[(i.reg & 7) as usize] = bits;
+        Ok(())
+    }
+
+    /// vp2intersectd/q (AVX512_VP2INTERSECT): compares every element of the first source (vvvv)
+    /// with every element of the second (r/m, broadcast allowed). Bit j of the even mask register
+    /// of the pair ModRM.reg names (bit 0 of the field is ignored) says element j of the first
+    /// source equals some element of the second; bit k of the odd one, the same for element k of
+    /// the second. No write mask and no zeroing: EVEX.aaa or EVEX.z set is #UD.
+    fn intersect_into_mask_pair(&mut self, i: &Insn, next: u64, wide: bool) -> ExecResult<()> {
+        if i.evex_mask != 0 || i.evex_zeroing {
+            return Err(Exception::invalid_opcode());
+        }
+        let size = if wide { 8 } else { 4 };
+        let bytes = self.vector_bytes(i, Rounding::None)?;
+        let second = self.fetch_rm(i, next, RmShape::full(bytes, size))?;
+        let first = self.zmm(i.vex_v as usize);
+        let count = bytes / size;
+        let (mut first_matches, mut second_matches) = (0u64, 0u64);
+        for j in 0..count {
+            for k in 0..count {
+                if element(&first, size, j) == element(&second, size, k) {
+                    first_matches |= 1 << j;
+                    second_matches |= 1 << k;
+                }
+            }
+        }
+        let even = (i.reg & MASK_PAIR_EVEN) as usize;
+        self.opmask[even] = first_matches;
+        self.opmask[even + 1] = second_matches;
         Ok(())
     }
 }

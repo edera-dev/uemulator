@@ -10039,6 +10039,28 @@ mod exec_tests {
         }
     }
 
+    /// PREFETCHI (CPUID 0x8000_0021 EAX bit 20): prefetchit0/prefetchit1 are `0F 18 /7` and `/6`
+    /// with a RIP-relative operand, inside the hint space, so they change nothing and never fault,
+    /// even when the line they name is unmapped, in the interpreter and the JIT alike.
+    #[test]
+    fn prefetchit0_and_prefetchit1_are_hints_that_never_fault() {
+        // prefetchit0 [rip+0x1000]; prefetchit1 [rip-0x100000]
+        for snippet in [
+            &[0x0f, 0x18, 0x3d, 0x00, 0x10, 0x00, 0x00, 0xf4][..],
+            &[0x0f, 0x18, 0x35, 0x00, 0x00, 0xf0, 0xff, 0xf4][..],
+        ] {
+            let regs: Vec<(usize, u64)> =
+                (0..16).map(|r| (r, 0x2222_0000 * (r as u64 + 1))).collect();
+            let pair = run_regs(snippet, &regs);
+            for (r, v) in &regs {
+                if *r != RSP {
+                    assert_eq!(pair.reg(*r), *v, "{snippet:02x?} register {r}");
+                }
+            }
+            assert_eq!(pair.cpu().rip, CODE_BASE + snippet.len() as u64);
+        }
+    }
+
     /// (operand size, memory form, register form, locked memory form) of a read-modify-write family.
     type SnippetFamily = (u8, &'static [u8], &'static [u8], &'static [u8]);
 

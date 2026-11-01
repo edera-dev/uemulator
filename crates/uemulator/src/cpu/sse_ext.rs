@@ -4,8 +4,8 @@
 //!
 //! Only the legacy (non-VEX) encodings exist, so every vector instruction needs its mandatory
 //! prefix and a 16-byte aligned `m128` operand except where noted. All of them obey the usual SSE
-//! enable rules (`Cpu::sse_gate`). CRC32 and MOVBE are integer instructions that live in the same
-//! opcode map and skip the gate.
+//! enable rules (`Cpu::sse_gate`). CRC32, MOVBE, ADCX/ADOX, MOVDIRI and MOVDIR64B are integer
+//! instructions that live in the same opcode map and skip the gate.
 //!
 //! The MMX-register forms of SSSE3 (`0F 38 xx` / `0F 3A 0F` without a prefix) are deliberately
 //! left as #UD (logged once as unimplemented): glibc and the kernel only use the XMM forms, and
@@ -28,6 +28,8 @@ const OPCODE_MAP_0F38: u16 = 2;
 const OPCODE_MAP_0F3A: u16 = 3;
 /// `0F 38 F6`: ADCX with a 66 prefix, ADOX with F3 (VEX-encoded, the same opcode is MULX).
 const OPCODE_ADX: u8 = 0xf6;
+const OPCODE_MOVDIR64B: u8 = 0xf8;
+const OPCODE_MOVDIRI: u8 = 0xf9;
 
 /// The operation of an instruction, decoded from (map, opcode, prefix).
 #[derive(Clone, Copy)]
@@ -817,6 +819,56 @@ impl Cpu {
         Ok(())
     }
 
+    /// MOVDIRI (NP 0F 38 F9): a 32-bit store of a general register, 64-bit under REX.W, with
+    /// direct-store (write-combining, non-temporal) semantics that only matter to a cache: here
+    /// it is a plain store, which is also atomic for the aligned case the SDM guarantees. Memory
+    /// destination only; no flags change, no SSE enable rules.
+    fn movdiri(&mut self, i: &Insn, next: u64) -> ExecResult<()> {
+        if i.md == MODRM_MOD_REGISTER {
+            return Err(Exception::invalid_opcode());
+        }
+        let size = if i.opsize == 8 { 8 } else { 4 };
+        let location = self.modrm_location(i, next)?;
+        let value = self.read_gpr(i.reg, size, true);
+        self.store_operand(location, size, i, value)
+    }
+
+    /// MOVDIR64B (66 0F 38 F8): copies the 64 bytes at the ModRM memory operand (any alignment) to
+    /// ES:[reg], where the general register named by ModRM.reg holds an offset of the address size
+    /// (16, 32 or 64 bits). The destination offset must be 64-byte aligned (#GP(0)), so it lies in
+    /// one page: the source is read in full first, and a fault on the destination's first store
+    /// leaves memory untouched. The SDM promises the 64-byte write is a single unit to other
+    /// agents; with one host thread per vCPU the eight 8-byte stores below are not, which no
+    /// guest has been seen to depend on (`plans/21-ryzen-7000-parity.md`).
+    fn movdir64b(&mut self, i: &Insn, next: u64) -> ExecResult<()> {
+        const BYTES: u64 = 64;
+        const CHUNK: u8 = 8;
+        if i.md == MODRM_MOD_REGISTER {
+            return Err(Exception::invalid_opcode());
+        }
+        let offset = self.gpr[i.reg as usize]
+            & if i.addr16 {
+                0xffff
+            } else if i.addr32 {
+                0xffff_ffff
+            } else {
+                u64::MAX
+            };
+        if !offset.is_multiple_of(BYTES) {
+            return Err(Exception::general_protection(0));
+        }
+        let destination = self.segment_access(SEG_ES, offset, BYTES as u8, true)?;
+        let source = self.linear_address(i, self.effective_address(i, next))?;
+        let mut data = [0u64; (BYTES / CHUNK as u64) as usize];
+        for (k, word) in data.iter_mut().enumerate() {
+            *word = self.read(source + k as u64 * CHUNK as u64, CHUNK)?;
+        }
+        for (k, word) in data.iter().enumerate() {
+            self.write(destination + k as u64 * CHUNK as u64, CHUNK, *word)?;
+        }
+        Ok(())
+    }
+
     /// ADCX (66 0F 38 F6) and ADOX (F3 0F 38 F6): add with carry where the carry chain is CF
     /// (ADCX) or OF (ADOX) and the other flags stay untouched, so two independent chains can be
     /// interleaved. 32 bits, or 64 under REX.W; a 32-bit result zero-extends. No SSE enable rules.
@@ -986,6 +1038,20 @@ impl Cpu {
                 Prefix::Np | Prefix::P66 => self.movbe(i, next).map(|()| true),
                 Prefix::F3 => Ok(false),
             };
+        }
+        // F2/F3 0F 38 F8 are ENQCMD/ENQCMDS (not implemented, not advertised): #UD, like the 66
+        // and F2/F3 forms of MOVDIRI
+        if map == OPCODE_MAP_0F38 && opcode == OPCODE_MOVDIR64B {
+            if prefix != Prefix::P66 {
+                return Err(Exception::invalid_opcode());
+            }
+            return self.movdir64b(i, next).map(|()| true);
+        }
+        if map == OPCODE_MAP_0F38 && opcode == OPCODE_MOVDIRI {
+            if prefix != Prefix::Np {
+                return Err(Exception::invalid_opcode());
+            }
+            return self.movdiri(i, next).map(|()| true);
         }
         if map == OPCODE_MAP_0F38 && opcode == OPCODE_ADX {
             return match prefix {
@@ -4630,7 +4696,180 @@ mod tests {
         }
     }
 
+    mod direct_stores {
+        use super::*;
+
+        /// 64-byte aligned, away from the bytes at `DATA` the source is read from.
+        const DESTINATION: u64 = DATA + 0x400;
+        /// Canonical, but outside the harness's page tables.
+        const UNMAPPED_ADDRESS: u64 = 0x0000_7000_0000_0000;
+
+        fn source_bytes() -> [u8; 128] {
+            core::array::from_fn(|k| (k as u8).wrapping_mul(37).wrapping_add(11))
+        }
+
+        fn page_fault(stop: Stop) -> bool {
+            matches!(stop, Stop::Fault { vector: 14, .. })
+        }
+
+        #[test]
+        fn movdiri_stores_a_dword_or_a_qword_and_nothing_else() {
+            let mut rig = Rig::new();
+            rig.h.cpu.gpr[RAX] = 0x1122_3344_5566_7788;
+            for (asm, size) in [("movdiri [rsi], eax", 4usize), ("movdiri [rsi], rax", 8)] {
+                rig.h.write(DATA, &[0xaa; 16]);
+                rig.reset();
+                rig.h.cpu.set_eflags_arith(ARITH_FLAGS);
+                assert_eq!(rig.exec(asm), Stop::Halted, "{asm}");
+                let written = rig.h.read(DATA, 16);
+                assert_eq!(
+                    written[..size],
+                    0x1122_3344_5566_7788u64.to_le_bytes()[..size],
+                    "{asm}"
+                );
+                assert!(
+                    written[size..].iter().all(|&b| b == 0xaa),
+                    "{asm} wrote too much"
+                );
+                assert_eq!(rig.flags(), ARITH_FLAGS, "{asm} changed the flags");
+            }
+        }
+
+        #[test]
+        fn movdir64b_copies_64_bytes_from_any_source_to_an_aligned_destination() {
+            let mut rig = Rig::new();
+            let source = source_bytes();
+            // an unaligned source, and the 67 prefix truncating the destination register
+            for (asm, source_at, destination_register) in [
+                ("movdir64b rdi, [rsi]", DATA + 3, DESTINATION),
+                (
+                    "addr32 movdir64b edi, [esi]",
+                    DATA + 5,
+                    0xffff_ffff_0000_0000 | DESTINATION,
+                ),
+            ] {
+                rig.h.write(DATA, &source);
+                rig.h.write(DESTINATION - 16, &[0xcc; 96]);
+                rig.reset();
+                rig.h.cpu.gpr[RSI] = source_at;
+                rig.h.cpu.gpr[RDI] = destination_register;
+                assert_eq!(rig.exec(asm), Stop::Halted, "{asm}");
+                let offset = (source_at - DATA) as usize;
+                assert_eq!(
+                    rig.h.read(DESTINATION, 64),
+                    source[offset..offset + 64],
+                    "{asm}"
+                );
+                assert_eq!(rig.h.read(DESTINATION - 16, 16), [0xcc; 16], "{asm} below");
+                assert_eq!(rig.h.read(DESTINATION + 64, 16), [0xcc; 16], "{asm} above");
+            }
+        }
+
+        #[test]
+        fn movdir64b_faults_leave_the_destination_untouched() {
+            let mut rig = Rig::new();
+            rig.h.write(DATA, &source_bytes());
+            // a destination that is not 64-byte aligned is #GP(0), even when it is only 8 off
+            for misaligned in [DESTINATION + 8, DESTINATION + 1, DESTINATION + 32] {
+                rig.h.write(DESTINATION, &[0xcc; 128]);
+                rig.reset();
+                rig.h.cpu.gpr[RDI] = misaligned;
+                assert_eq!(rig.exec("movdir64b rdi, [rsi]"), gp0(), "{misaligned:#x}");
+                assert_eq!(rig.h.read(DESTINATION, 128), [0xcc; 128]);
+            }
+            // an unmapped source page faults before any byte is stored
+            rig.h.write(DESTINATION, &[0xcc; 64]);
+            rig.reset();
+            rig.h.cpu.gpr[RSI] = UNMAPPED_ADDRESS;
+            rig.h.cpu.gpr[RDI] = DESTINATION;
+            assert!(page_fault(rig.exec("movdir64b rdi, [rsi]")));
+            assert_eq!(rig.h.read(DESTINATION, 64), [0xcc; 64]);
+            // and an unmapped destination faults with the source read and nothing written
+            rig.reset();
+            rig.h.cpu.gpr[RDI] = UNMAPPED_ADDRESS;
+            assert!(page_fault(rig.exec("movdir64b rdi, [rsi]")));
+        }
+
+        #[test]
+        fn register_forms_and_the_other_prefixes_are_invalid() {
+            let mut rig = Rig::new();
+            for asm in [
+                ".byte 0x0f, 0x38, 0xf9, 0xc0",
+                ".byte 0x66, 0x0f, 0x38, 0xf8, 0xc0",
+                ".byte 0x66, 0x0f, 0x38, 0xf9, 0x06",
+                ".byte 0x0f, 0x38, 0xf8, 0x3e",
+                ".byte 0xf2, 0x0f, 0x38, 0xf8, 0x3e",
+                ".byte 0xf3, 0x0f, 0x38, 0xf8, 0x3e",
+            ] {
+                rig.h.cpu.gpr[RDI] = DESTINATION;
+                assert_eq!(rig.run(asm), ud(), "{asm}");
+            }
+        }
+
+        #[test]
+        fn direct_stores_need_no_sse_enable_bits_and_match_the_jit() {
+            let mut rig = Rig::new();
+            rig.reset();
+            rig.h.cpu.cr4 &= !CR4_OSFXSR;
+            rig.h.cpu.cr0 |= CR0_TS | CR0_EM;
+            rig.h.cpu.gpr[RDI] = DESTINATION;
+            assert_eq!(rig.exec("movdir64b rdi, [rsi]"), Stop::Halted);
+            for asm in [
+                "movdiri [rsi], eax",
+                "movdiri [rsi], rax",
+                "movdir64b rdi, [rsi]",
+                "addr32 movdir64b edi, [esi]",
+            ] {
+                assert_jit_matches_interpreter(code(asm), |h| {
+                    h.cpu.gpr[RSI] = DATA + 3;
+                    h.cpu.gpr[RDI] = DESTINATION;
+                    h.cpu.gpr[RAX] = 0x1122_3344_5566_7788;
+                    h.write(DATA, &source_bytes());
+                });
+            }
+            // the misaligned destination's #GP too
+            assert_jit_matches_interpreter(code("movdir64b rdi, [rsi]"), |h| {
+                h.cpu.gpr[RSI] = DATA;
+                h.cpu.gpr[RDI] = DESTINATION + 8;
+            });
+        }
+    }
+
     const SNIPPETS: &[(&str, &[u8])] = &[
+        ("movdiri [rsi], eax", &[0x0f, 0x38, 0xf9, 0x06, 0xf4]),
+        ("movdiri [rsi], rax", &[0x48, 0x0f, 0x38, 0xf9, 0x06, 0xf4]),
+        (
+            "movdir64b rdi, [rsi]",
+            &[0x66, 0x0f, 0x38, 0xf8, 0x3e, 0xf4],
+        ),
+        (
+            "addr32 movdir64b edi, [esi]",
+            &[0x67, 0x66, 0x0f, 0x38, 0xf8, 0x3e, 0xf4],
+        ),
+        (
+            ".byte 0x0f, 0x38, 0xf9, 0xc0",
+            &[0x0f, 0x38, 0xf9, 0xc0, 0xf4],
+        ),
+        (
+            ".byte 0x66, 0x0f, 0x38, 0xf8, 0xc0",
+            &[0x66, 0x0f, 0x38, 0xf8, 0xc0, 0xf4],
+        ),
+        (
+            ".byte 0x66, 0x0f, 0x38, 0xf9, 0x06",
+            &[0x66, 0x0f, 0x38, 0xf9, 0x06, 0xf4],
+        ),
+        (
+            ".byte 0x0f, 0x38, 0xf8, 0x3e",
+            &[0x0f, 0x38, 0xf8, 0x3e, 0xf4],
+        ),
+        (
+            ".byte 0xf2, 0x0f, 0x38, 0xf8, 0x3e",
+            &[0xf2, 0x0f, 0x38, 0xf8, 0x3e, 0xf4],
+        ),
+        (
+            ".byte 0xf3, 0x0f, 0x38, 0xf8, 0x3e",
+            &[0xf3, 0x0f, 0x38, 0xf8, 0x3e, 0xf4],
+        ),
         ("movddup xmm0, xmm1", &[0xf2, 0x0f, 0x12, 0xc1, 0xf4]),
         ("movddup xmm0, [rsi]", &[0xf2, 0x0f, 0x12, 0x06, 0xf4]),
         ("movsldup xmm0, xmm1", &[0xf3, 0x0f, 0x12, 0xc1, 0xf4]),
