@@ -37,6 +37,8 @@ const VMCB_IOPM_BASE: u64 = 0x40;
 const VMCB_MSRPM_BASE: u64 = 0x48;
 const VMCB_TSC_OFFSET: u64 = 0x50;
 const VMCB_ASID: u64 = 0x58;
+/// One byte: which translations VMRUN flushes before it starts the guest (APM 15.16.1).
+const VMCB_TLB_CONTROL: u64 = 0x5c;
 const VMCB_V_INTR: u64 = 0x60;
 const VMCB_INTERRUPT_SHADOW: u64 = 0x68;
 const VMCB_EXITCODE: u64 = 0x70;
@@ -210,6 +212,15 @@ const V_PRIORITY_MASK: u64 = 0xf;
 const V_IGNORE_TPR: u64 = 1 << 20;
 const V_VECTOR_SHIFT: u32 = 32;
 
+// TLB_CONTROL. Every value but `NOTHING` empties the guest's TLB here; `FLUSH_ALL` also empties
+// the host's.
+const TLB_CONTROL_NOTHING: u64 = 0;
+const TLB_CONTROL_FLUSH_ALL: u64 = 1;
+#[cfg(test)]
+const TLB_CONTROL_FLUSH_GUEST: u64 = 3;
+#[cfg(test)]
+const TLB_CONTROL_FLUSH_GUEST_NON_GLOBAL: u64 = 7;
+
 const INTERRUPT_SHADOW: u64 = 1;
 const NP_ENABLE: u64 = 1;
 const VECTOR_INTERCEPT_BITMAP_BITS: u32 = 32;
@@ -225,6 +236,8 @@ const EFER_KNOWN: u64 = EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE | EFER_SVME | 
 const DR_HIGH_BITS: u64 = !0u64 << 32;
 /// Number of ASIDs reported in CPUID 0x8000000A; any non-zero ASID in a VMCB is accepted.
 pub(crate) const SVM_ASIDS: u32 = 64;
+/// The host's ASID; a VMCB may not use it.
+const HOST_ASID: u32 = 0;
 
 /// CPUID 0x8000000A EDX: nested paging, next-RIP save, VMCB clean bits (every VMRUN reloads the
 /// whole VMCB, which clean bits permit), flush-by-ASID (every VMRUN flushes the whole TLB).
@@ -253,6 +266,7 @@ struct Host {
 /// change them while the guest runs) and the host state to return to.
 pub(crate) struct Guest {
     vmcb: u64,
+    asid: u32,
     intercept_cr: u32,
     intercept_dr: u32,
     intercept_exceptions: u32,
@@ -282,6 +296,9 @@ pub(crate) struct Svm {
     /// The VMCB of the guest that exited last, so an exit that happened while delivering an event
     /// can still report that event (`exit_int_info`).
     last_vmcb: u64,
+    /// The soft TLB of the side that is not running: the host's while a guest runs, the last
+    /// guest's while the host runs. `None` until the first VMRUN.
+    pub(crate) parked_tlb: Option<Box<ParkedTlb>>,
 }
 
 impl Svm {
@@ -292,7 +309,60 @@ impl Svm {
             gif: true,
             guest: None,
             last_vmcb: 0,
+            parked_tlb: None,
         }
+    }
+}
+
+/// A soft TLB (both CPL halves and the large-page cache) set aside by VMRUN or #VMEXIT.
+///
+/// With ASIDs, hardware flushes nothing at VMRUN or #VMEXIT (APM 15.16): host translations
+/// (ASID 0) survive the guest's run and the guest's survive the host's exit handling, and the
+/// hypervisor asks for a flush with TLB_CONTROL or a new ASID when it changes the guest's nested
+/// tables. Flushing both ways cost every exit a refill of the host's working set and, worse, the
+/// guest a two-dimensional walk (up to 24 table reads) per page it touches again; a PVH dom0's
+/// PIT calibration alone is 100k exits. So the two sides swap TLBs instead (a pointer swap, then
+/// `tlb_active_base` follows).
+///
+/// The parked entries are live state, not a snapshot: everything that revokes write tags
+/// (`Cpu::revoke_write_tags_for`, `revoke_stale_write_tags`) must reach them too, or a guest
+/// store to a page that became code while it was out skips `code_written`.
+pub(crate) struct ParkedTlb {
+    pub(crate) entries: Vec<TlbEntry>,
+    pub(crate) large_pages: [LargePage; LARGE_PAGE_CACHE_ENTRIES],
+    owner: TlbOwner,
+}
+
+/// Whose translations a `ParkedTlb` holds.
+#[derive(Clone, Copy, PartialEq)]
+enum TlbOwner {
+    /// Nobody's: the entries must not be used.
+    Nobody,
+    Host,
+    Guest(GuestAddressSpace),
+}
+
+/// What a guest's translations were made under. A guest that comes back with anything here
+/// different gets an empty TLB. Only the ASID and the nested tables matter architecturally; the
+/// paging state is there because the hypervisor may rewrite it in the VMCB (a shadow-paging
+/// hypervisor swaps CR3), and a needless flush costs time, never correctness.
+#[derive(Clone, Copy, PartialEq)]
+struct GuestAddressSpace {
+    asid: u32,
+    nested_cr3: Option<u64>,
+    cr0: u64,
+    cr3: u64,
+    cr4: u64,
+    efer: u64,
+}
+
+impl ParkedTlb {
+    fn empty() -> Box<Self> {
+        Box::new(ParkedTlb {
+            entries: vec![TLB_EMPTY; 2 * TLB_ENTRIES_PER_MODE],
+            large_pages: [LARGE_PAGE_EMPTY; LARGE_PAGE_CACHE_ENTRIES],
+            owner: TlbOwner::Nobody,
+        })
     }
 }
 
@@ -455,12 +525,57 @@ impl Cpu {
         Ok(())
     }
 
-    /// 0F 01 DF: invalidates the TLB (the TLB here is not tagged with ASIDs, so everything goes).
+    /// 0F 01 DF: invalidates the page at rAX in ASID ECX. ASID 0 is the host's own TLB, which is
+    /// the running one; any other drops the parked guest TLB whole (more than the one page, which
+    /// is allowed: it is a cache).
     pub(super) fn invlpga(&mut self, next: u64) -> ExecResult<()> {
         self.svm_instruction_checks()?;
-        self.flush_tlb();
+        if self.gpr[RCX] as u32 == HOST_ASID {
+            self.invlpg(self.gpr[RAX]);
+        } else if let Some(parked) = self.svm.parked_tlb.as_deref_mut()
+            && matches!(parked.owner, TlbOwner::Guest(_))
+        {
+            parked.owner = TlbOwner::Nobody;
+        }
         self.rip = next;
         Ok(())
+    }
+
+    /// Swaps the running TLB with the parked one; `tlb_active_base` follows the new array.
+    fn swap_parked_tlb(&mut self, parked: &mut ParkedTlb) {
+        core::mem::swap(&mut self.tlb, &mut parked.entries);
+        core::mem::swap(&mut self.large_pages, &mut parked.large_pages);
+        self.set_cpl(self.cpl);
+    }
+
+    /// VMRUN, with the guest's state loaded: parks the host's TLB and takes the guest's back if
+    /// it was made in `space` and TLB_CONTROL asks for no flush, else starts the guest empty.
+    fn enter_guest_tlb(&mut self, space: GuestAddressSpace, tlb_control: u64) {
+        let mut parked = self.svm.parked_tlb.take().unwrap_or_else(ParkedTlb::empty);
+        let keep = tlb_control == TLB_CONTROL_NOTHING && parked.owner == TlbOwner::Guest(space);
+        self.swap_parked_tlb(&mut parked);
+        if !keep {
+            self.flush_tlb();
+        }
+        parked.owner = if tlb_control == TLB_CONTROL_FLUSH_ALL {
+            TlbOwner::Nobody
+        } else {
+            TlbOwner::Host
+        };
+        self.svm.parked_tlb = Some(parked);
+    }
+
+    /// #VMEXIT, with the host's state restored: parks the guest's TLB (made in `space`) for its
+    /// next VMRUN and takes the host's back.
+    fn leave_guest_tlb(&mut self, space: GuestAddressSpace) {
+        let mut parked = self.svm.parked_tlb.take().unwrap_or_else(ParkedTlb::empty);
+        let host = parked.owner == TlbOwner::Host;
+        self.swap_parked_tlb(&mut parked);
+        if !host {
+            self.flush_tlb();
+        }
+        parked.owner = TlbOwner::Guest(space);
+        self.svm.parked_tlb = Some(parked);
     }
 
     /// 0F 01 D8. Saves the host state, loads the guest state from the VMCB at rAX, checks the
@@ -525,6 +640,7 @@ impl Cpu {
         let nested = self.vmcb_read(vmcb, VMCB_NP_ENABLE, 8) & NP_ENABLE != 0;
         let guest = Guest {
             vmcb,
+            asid: asid as u32,
             intercept_cr: self.vmcb_read(vmcb, VMCB_INTERCEPT_CR, 4) as u32,
             intercept_dr: self.vmcb_read(vmcb, VMCB_INTERCEPT_DR, 4) as u32,
             intercept_exceptions: self.vmcb_read(vmcb, VMCB_INTERCEPT_EXCEPTIONS, 4) as u32,
@@ -584,8 +700,17 @@ impl Cpu {
             self.vmcb_read(vmcb, VMCB_INTERRUPT_SHADOW, 8) & INTERRUPT_SHADOW != 0;
         self.halted = false;
         self.svm.gif = true;
+        let space = GuestAddressSpace {
+            asid: guest.asid,
+            nested_cr3: guest.nested_cr3,
+            cr0: self.cr0,
+            cr3: self.cr3,
+            cr4: self.cr4,
+            efer: self.efer,
+        };
         self.svm.guest = Some(Box::new(guest));
-        self.flush_tlb();
+        let tlb_control = self.vmcb_read(vmcb, VMCB_TLB_CONTROL, 1);
+        self.enter_guest_tlb(space, tlb_control);
         self.flush_decode();
         // PAE paging latches the guest's four PDPT entries now (through nested paging, if on).
         if self.paging_mode() == super::mem::PagingMode::Pae {
@@ -652,6 +777,16 @@ impl Cpu {
         self.vmcb_set_table(vmcb, SAVE_GDTR, &gdtr);
         self.vmcb_set_table(vmcb, SAVE_IDTR, &idtr);
         let (cpl, efer, cr4, cr3, cr0) = (self.cpl, self.efer, self.cr4, self.cr3, self.cr0);
+        // What the guest's TLB holds now was made under this; the VMCB keeps the same values, so
+        // a VMRUN of an unchanged VMCB finds them equal (`enter_guest_tlb`).
+        let space = GuestAddressSpace {
+            asid: guest.asid,
+            nested_cr3: guest.nested_cr3,
+            cr0,
+            cr3,
+            cr4,
+            efer,
+        };
         self.vmcb_write(vmcb, SAVE_CPL, 1, cpl as u64);
         // LMA is read-only and hardware-maintained; it is saved as the processor had it.
         self.vmcb_write(vmcb, SAVE_EFER, 8, efer);
@@ -718,7 +853,7 @@ impl Cpu {
         self.interrupt_shadow = false;
         self.halted = false;
         self.svm.gif = false;
-        self.flush_tlb();
+        self.leave_guest_tlb(space);
         self.flush_decode();
         Exception::Vmexit
     }
@@ -2227,6 +2362,128 @@ mod tests {
         let _ = (SCRATCH, AccessKind::Read);
     }
 
+    /// Host-physical page the second run's nested tables send `NESTED_REMAPPED_GPA` to.
+    const REMAPPED_AGAIN_HPA: u64 = 0xa0_0000;
+    /// mov rax, [0x800000]; cpuid; mov rax, [0x800000]; cpuid
+    const READ_REMAPPED_TWICE: &[u8] = &[
+        0x48, 0xa1, 0, 0, 0x80, 0, 0, 0, 0, 0, 0x0f, 0xa2, 0x48, 0xa1, 0, 0, 0x80, 0, 0, 0, 0, 0,
+        0x0f, 0xa2,
+    ];
+    /// vmrun; mov rcx, [VMCB + NEXT_RIP]; mov [VMCB + SAVE_RIP], rcx; mov [nested PTE], r10
+    /// mov dword ptr [r8], r9d; vmrun; hlt: runs the guest to its first cpuid, skips it the way a
+    /// hypervisor does, remaps the page the guest read through the nested tables without a
+    /// flush, writes r9d to r8 (a VMCB field), and runs the guest again.
+    const REMAP_BETWEEN_RUNS: &[u8] = &[
+        0x0f, 0x01, 0xd8, 0x48, 0x8b, 0x0c, 0x25, 0xc8, 0x00, 0x3f, 0x00, 0x48, 0x89, 0x0c, 0x25,
+        0x78, 0x05, 0x3f, 0x00, 0x4c, 0x89, 0x14, 0x25, 0x00, 0x30, 0x28, 0x00, 0x45, 0x89, 0x08,
+        0x0f, 0x01, 0xd8, 0xf4,
+    ];
+    const BEFORE_REMAP: u64 = 0xfeed_face_cafe_beef;
+    const AFTER_REMAP: u64 = 0x0123_4567_89ab_cdef;
+
+    /// What the guest's second read returns after the host remapped the page between its two
+    /// runs and stored `value` at VMCB `offset` (`size` bytes).
+    fn second_read_after_remap(tlb_control: u64, offset: u64, value: u32) -> u64 {
+        let mut h = nested_rig(READ_REMAPPED_TWICE);
+        h.write(CODE_BASE, REMAP_BETWEEN_RUNS);
+        h.write(NESTED_REMAPPED_HPA, &BEFORE_REMAP.to_le_bytes());
+        h.write(REMAPPED_AGAIN_HPA, &AFTER_REMAP.to_le_bytes());
+        put(&mut h, VMCB_TLB_CONTROL, 1, tlb_control);
+        h.cpu.gpr[8] = VMCB + offset;
+        h.cpu.gpr[9] = value as u64;
+        h.cpu.gpr[10] = REMAPPED_AGAIN_HPA | 7;
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_CPUID);
+        assert_eq!(get(&h, SAVE_RIP, 8), GUEST_CODE + 22, "the second cpuid");
+        get(&h, SAVE_RAX, 8)
+    }
+
+    /// APM 15.16: with ASIDs the TLB is not flushed by VMRUN or #VMEXIT; the hypervisor asks for
+    /// a flush with TLB_CONTROL or moves the guest to a new ASID. A guest that comes back with
+    /// its ASID and nothing asked keeps its translations, stale ones included.
+    #[test]
+    fn a_guest_keeps_its_translations_across_an_exit_unless_a_flush_is_asked_for() {
+        assert_eq!(
+            second_read_after_remap(TLB_CONTROL_NOTHING, VMCB_ASID, 1),
+            BEFORE_REMAP
+        );
+        for flush in [
+            TLB_CONTROL_FLUSH_ALL,
+            TLB_CONTROL_FLUSH_GUEST,
+            TLB_CONTROL_FLUSH_GUEST_NON_GLOBAL,
+        ] {
+            assert_eq!(
+                second_read_after_remap(flush, VMCB_ASID, 1),
+                AFTER_REMAP,
+                "TLB_CONTROL {flush}"
+            );
+        }
+        assert_eq!(
+            second_read_after_remap(TLB_CONTROL_NOTHING, VMCB_ASID, 2),
+            AFTER_REMAP,
+            "a new ASID"
+        );
+        // A guest CR3 the hypervisor changed is taken for another address space (here the same
+        // tables with PWT set; more flushing than the architecture asks for, never less).
+        const CR3_PWT: u64 = 1 << 3;
+        let cr3 = rig(ASM_CPUID).cpu.cr3;
+        assert_eq!(
+            second_read_after_remap(TLB_CONTROL_NOTHING, SAVE_CR3, (cr3 | CR3_PWT) as u32),
+            AFTER_REMAP,
+            "another guest CR3"
+        );
+    }
+
+    #[test]
+    fn invlpga_drops_the_guests_translations() {
+        // vmrun; mov rcx, [VMCB + NEXT_RIP]; mov [VMCB + SAVE_RIP], rcx; mov [nested PTE], r10
+        // mov eax, 0x800000; mov ecx, 1; invlpga; mov eax, 0x3f0000; vmrun; hlt
+        let host = [
+            0x0f, 0x01, 0xd8, 0x48, 0x8b, 0x0c, 0x25, 0xc8, 0x00, 0x3f, 0x00, 0x48, 0x89, 0x0c,
+            0x25, 0x78, 0x05, 0x3f, 0x00, 0x4c, 0x89, 0x14, 0x25, 0x00, 0x30, 0x28, 0x00, 0xb8,
+            0x00, 0x00, 0x80, 0x00, 0xb9, 0x01, 0x00, 0x00, 0x00, 0x0f, 0x01, 0xdf, 0xb8, 0x00,
+            0x00, 0x3f, 0x00, 0x0f, 0x01, 0xd8, 0xf4,
+        ];
+        let mut h = nested_rig(READ_REMAPPED_TWICE);
+        h.write(CODE_BASE, &host);
+        h.write(NESTED_REMAPPED_HPA, &BEFORE_REMAP.to_le_bytes());
+        h.write(REMAPPED_AGAIN_HPA, &AFTER_REMAP.to_le_bytes());
+        h.cpu.gpr[10] = REMAPPED_AGAIN_HPA | 7;
+        run(&mut h);
+        assert_eq!(get(&h, SAVE_RAX, 8), AFTER_REMAP);
+    }
+
+    /// The guest's translations wait in a second TLB while the host runs. A page the host starts
+    /// translating as code then must lose its write tags there too, or the guest's next store to
+    /// it skips `code_written` and stale translated code survives.
+    #[test]
+    fn a_page_flagged_as_code_while_the_guest_is_out_loses_the_guests_write_tags() {
+        // mov [0x800000], rax; cpuid; mov [0x800000], rax; cpuid
+        let guest = [
+            0x48, 0xa3, 0, 0, 0x80, 0, 0, 0, 0, 0, 0x0f, 0xa2, 0x48, 0xa3, 0, 0, 0x80, 0, 0, 0, 0,
+            0, 0x0f, 0xa2,
+        ];
+        // vmrun; mov rcx, [VMCB + NEXT_RIP]; mov [VMCB + SAVE_RIP], rcx; hlt; vmrun; hlt
+        let host = [
+            0x0f, 0x01, 0xd8, 0x48, 0x8b, 0x0c, 0x25, 0xc8, 0x00, 0x3f, 0x00, 0x48, 0x89, 0x0c,
+            0x25, 0x78, 0x05, 0x3f, 0x00, 0xf4, 0x0f, 0x01, 0xd8, 0xf4,
+        ];
+        let mut h = nested_rig(&guest);
+        h.write(CODE_BASE, &host);
+        run(&mut h);
+        let page = (NESTED_REMAPPED_HPA >> PAGE_SHIFT) as usize;
+        h.cpu.mark_code(NESTED_REMAPPED_HPA);
+        assert_ne!(h.cpu.page_has_code.get(page), 0);
+        h.cpu.halted = false;
+        run(&mut h);
+        assert_eq!(get(&h, SAVE_RIP, 8), GUEST_CODE + 22, "the second cpuid");
+        assert_eq!(
+            h.cpu.page_has_code.get(page),
+            0,
+            "the guest's store went through code_written"
+        );
+    }
+
     #[test]
     fn without_nested_paging_the_translation_is_the_identity() {
         let mut h = rig(ASM_CPUID);
@@ -2267,5 +2524,8 @@ mod tests {
         nested_page_faults_exit_with_the_gpa_and_error_code,
         a_nested_fault_in_the_middle_of_a_block_saves_the_guest_and_restores_the_host,
         a_pending_virtual_interrupt_is_injected_when_the_guest_can_take_it,
+        a_guest_keeps_its_translations_across_an_exit_unless_a_flush_is_asked_for,
+        invlpga_drops_the_guests_translations,
+        a_page_flagged_as_code_while_the_guest_is_out_loses_the_guests_write_tags,
     );
 }

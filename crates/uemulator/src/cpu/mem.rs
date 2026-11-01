@@ -85,6 +85,16 @@ const PF_INSTRUCTION_FETCH: u32 = 1 << 4;
 const LOG_KEY_UNMAPPED_READ: u64 = 1 << 62;
 const LOG_KEY_UNMAPPED_WRITE: u64 = 1 << 61;
 
+/// The physical page an entry's write tag lets stores reach: tag + addend is the page's host
+/// address, minus `ram_base` its physical address.
+pub(super) fn write_tag_page(entry: &TlbEntry, ram_base: u64) -> usize {
+    (entry
+        .tag_w
+        .wrapping_add(entry.addend)
+        .wrapping_sub(ram_base)
+        >> PAGE_SHIFT) as usize
+}
+
 /// Slot of `linear` in `Cpu::tlb`: direct-mapped by page number, in the user half if `user`.
 /// The JIT's inline probe computes the same index.
 #[inline]
@@ -822,20 +832,20 @@ impl Cpu {
         self.revoke_write_tags_for(page);
     }
 
-    /// Drops this vCPU's write tags that point into physical page `page`.
+    /// Drops this vCPU's write tags that point into physical page `page`, in the running TLB and
+    /// in the one SVM parked (`svm::ParkedTlb`), which comes back without a refill.
     pub(super) fn revoke_write_tags_for(&mut self, page: usize) {
         let ram_base = self.ram_base;
-        for entry in self.tlb.iter_mut() {
-            // tag + addend is the page's host address, minus ram_base its physical address.
-            if entry.tag_w != TLB_TAG_INVALID
-                && (entry
-                    .tag_w
-                    .wrapping_add(entry.addend)
-                    .wrapping_sub(ram_base)
-                    >> PAGE_SHIFT) as usize
-                    == page
-            {
-                entry.tag_w = TLB_TAG_INVALID;
+        let parked = self
+            .svm
+            .parked_tlb
+            .as_deref_mut()
+            .map(|parked| &mut parked.entries);
+        for entries in core::iter::once(&mut self.tlb).chain(parked) {
+            for entry in entries.iter_mut() {
+                if entry.tag_w != TLB_TAG_INVALID && write_tag_page(entry, ram_base) == page {
+                    entry.tag_w = TLB_TAG_INVALID;
+                }
             }
         }
     }
