@@ -705,6 +705,24 @@ fn rol_ror_whose_flags_are_overwritten() {
     ]);
 }
 
+/// Rotates whose CF and OF the next block reads, and whose SF/ZF/PF/AF are still the compare's
+/// (or, for a CL count of zero, all of them are): every rotate ends its block with a jmp, so the
+/// flags are live at its end. Linux's PV start-up runs 134M of `rol r64, imm8; jmp`.
+#[test]
+fn rol_ror_flags_reach_the_next_block() {
+    // mov rdx, [rbx]; mov [rbx], rdx; cmp rax, rcx; rol rsi, 25; jmp 1f; 1: jc 2f; seto dl
+    // sete dh; 2: ror dword ptr [rbx], 3; jmp 3f; 3: setc al; seto ah; sets cl; mov cl, 64
+    // rol rdi, cl; jmp 4f; 4: setz r9b; mov cl, 9; ror r8d, cl; jmp 5f; 5: seto r10b
+    // setc r11b; hlt
+    check(&[
+        0x48, 0x8b, 0x13, 0x48, 0x89, 0x13, 0x48, 0x39, 0xc8, 0x48, 0xc1, 0xc6, 0x19, 0xeb, 0x00,
+        0x72, 0x06, 0x0f, 0x90, 0xc2, 0x0f, 0x94, 0xc6, 0xc1, 0x0b, 0x03, 0xeb, 0x00, 0x0f, 0x92,
+        0xc0, 0x0f, 0x90, 0xc4, 0x0f, 0x98, 0xc1, 0xb1, 0x40, 0x48, 0xd3, 0xc7, 0xeb, 0x00, 0x41,
+        0x0f, 0x94, 0xc1, 0xb1, 0x09, 0x41, 0xd3, 0xc8, 0xeb, 0x00, 0x41, 0x0f, 0x90, 0xc2, 0x41,
+        0x0f, 0x92, 0xc3, 0xf4,
+    ]);
+}
+
 #[test]
 fn rcl_rcr_by_immediate_use_the_carry_flag() {
     // stc; rcl rax, 1; rcl ecx, 3; clc; rcr rdx, 1; stc; rcr r9w, 5; stc; rcl r10b, 2; hlt

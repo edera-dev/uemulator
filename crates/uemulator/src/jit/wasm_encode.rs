@@ -26,6 +26,7 @@ pub(crate) mod op {
     pub const CALL_INDIRECT: u8 = 0x11;
     /// Tail call (WebAssembly 3.0, shipped in Chrome 112, Firefox 121 and Safari 18.2).
     pub const RETURN_CALL_INDIRECT: u8 = 0x13;
+    pub const DROP: u8 = 0x1a;
     pub const SELECT: u8 = 0x1b;
     pub const LOCAL_GET: u8 = 0x20;
     pub const LOCAL_SET: u8 = 0x21;

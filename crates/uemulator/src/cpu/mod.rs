@@ -549,6 +549,9 @@ pub(crate) struct Cpu {
     /// How many times each kind of instruction went through `helper_exec` (see
     /// `jit::helpers::histogram_key`), counted only when debugging: what is left to lower.
     pub helper_histogram: Option<alloc::collections::BTreeMap<u64, u64>>,
+    /// How many #VMEXITs of each exit code (with the port number for I/O exits, see
+    /// `svm::exit_histogram_key`) the guest hypervisor took, counted only when debugging.
+    pub svm_exit_histogram: Option<alloc::collections::BTreeMap<u64, u64>>,
     /// This vCPU's number, which is also the APIC id it starts with, and how many there are.
     pub cpu_index: u32,
     pub cpu_count: u32,
@@ -894,6 +897,7 @@ impl Cpu {
             slow_access_insn: 0,
             trace: None,
             helper_histogram: None,
+            svm_exit_histogram: None,
             cpu_index: 0,
             cpu_count,
             multi: cpu_count > 1,
@@ -1464,6 +1468,15 @@ impl Cpu {
             s += &format!("instructions through the interpreter: {total}\n");
             for (key, count) in counts.into_iter().take(HISTOGRAM_DUMP_ENTRIES) {
                 s += &format!("  {count:>12}  {}\n", decode::histogram_label(*key));
+            }
+        }
+        if let Some(histogram) = &self.svm_exit_histogram {
+            let mut counts: Vec<_> = histogram.iter().collect();
+            counts.sort_by_key(|&(_, count)| core::cmp::Reverse(*count));
+            let total: u64 = counts.iter().map(|&(_, count)| *count).sum();
+            s += &format!("svm exits: {total}\n");
+            for (key, count) in counts.into_iter().take(HISTOGRAM_DUMP_ENTRIES) {
+                s += &format!("  {count:>12}  {}\n", svm::exit_histogram_label(*key));
             }
         }
         if let Some(trace) = &self.trace {

@@ -161,6 +161,8 @@ pub(crate) struct Addrs {
     pub ld_stack: u32,
     pub st_stack: u32,
     pub cond: u32,
+    /// `helper_set_rotate_flags`, called through `COND_TYPE` (its result is dropped).
+    pub rotate_flags: u32,
     pub out: u32,
     /// Table slot of the chain stub, or 0 when blocks return to the run loop between each other.
     pub chain: u32,
@@ -1374,12 +1376,20 @@ impl<'a> Gen<'a> {
         self.flags = None;
     }
 
-    /// `rol`/`ror` of a 32- or 64-bit operand by an immediate (`count`: masked, non-zero) or CL,
-    /// when nothing reads the flags they would change (`flags_dead_after`). The wasm rotates take
-    /// their count modulo the width, which is the x86 count mask at these sizes; a CL count of
-    /// zero still writes the destination, zero-extending a 32-bit one, as the interpreter does.
+    /// `rol`/`ror` of a 32- or 64-bit operand by an immediate (`count`: masked, non-zero) or CL.
+    /// The wasm rotates take their count modulo the width, which is the x86 count mask at these
+    /// sizes; a CL count of zero still writes the destination, zero-extending a 32-bit one, as the
+    /// interpreter does, and changes no flag.
+    ///
+    /// A rotate replaces CF and OF and keeps SF/ZF/PF/AF, which only the lazy record of whatever
+    /// wrote them can tell, so with `merge_flags` CF and OF are packed (CF in bit 0, OF in bit 1,
+    /// OF for every count as `Cpu::shift_rotate` computes it) for `helper_set_rotate_flags`, which
+    /// merges them after the store succeeded. Without it (`flags_dead_after`: a later instruction
+    /// of the block overwrites every flag) the flags are not computed at all. A rotate whose block
+    /// ends right after it (`rol; jmp`, Linux's PV start-up runs 134M of them) needs the merge:
+    /// the successor, an interrupt frame or `--verify` may look.
     #[allow(clippy::too_many_arguments)]
-    fn rotate_without_flags(
+    fn rotate(
         &mut self,
         insn: &Insn,
         left: bool,
@@ -1389,6 +1399,7 @@ impl<'a> Gen<'a> {
         next: u64,
         index: u32,
         rip: u64,
+        merge_flags: bool,
     ) -> bool {
         self.load_dst(insn, dst, VALUE, size, next, index, rip);
         self.c.local_get(VALUE);
@@ -1418,7 +1429,60 @@ impl<'a> Gen<'a> {
         }
         self.c.local_set(SCRATCH_B);
         self.flags = None;
-        self.store_dst(dst, size, SCRATCH_B, index, rip)
+        if merge_flags {
+            // SCRATCH = CF | OF << 1. A left rotation's CF is the new low bit and OF the new
+            // msb ^ CF; a right rotation's CF is the new msb and OF the msb ^ the bit below it.
+            let msb = 8 * size as i64 - 1;
+            let (carry_bit, other_bit) = if left { (0, msb) } else { (msb, msb - 1) };
+            self.result_bit(carry_bit);
+            self.c.local_tee(SCRATCH);
+            self.result_bit(other_bit);
+            self.c
+                .op(op::I64_XOR)
+                .i64_const(1)
+                .op(op::I64_SHL)
+                .local_get(SCRATCH)
+                .op(op::I64_OR)
+                .local_set(SCRATCH);
+            if count.is_none() {
+                // The masked count, read before the store: `rol rcx, cl` overwrites it.
+                self.read_reg(GUEST_RCX, false, 1);
+                self.c
+                    .i64_const(8 * size as i64 - 1)
+                    .op(op::I64_AND)
+                    .local_set(CARRY);
+            }
+        }
+        let stored = self.store_dst(dst, size, SCRATCH_B, index, rip);
+        if merge_flags {
+            if count.is_none() {
+                self.c
+                    .local_get(CARRY)
+                    .op(op::I64_EQZ)
+                    .op(op::I32_EQZ)
+                    .begin_if(BLOCK_VOID);
+            }
+            self.c
+                .local_get(CPU)
+                .local_get(SCRATCH)
+                .i32_const(self.addrs.rotate_flags as i32)
+                .call_indirect(COND_TYPE)
+                .op(op::DROP);
+            if count.is_none() {
+                self.end();
+            }
+        }
+        stored
+    }
+
+    /// Pushes bit `bit` of the rotated value in `SCRATCH_B` as an i64 0 or 1.
+    fn result_bit(&mut self, bit: i64) {
+        self.c
+            .local_get(SCRATCH_B)
+            .i64_const(bit)
+            .op(op::I64_SHR_U)
+            .i64_const(1)
+            .op(op::I64_AND);
     }
 
     fn jcc(&mut self, cc: u8, target: u64, next: u64, retired: u32) {
@@ -1461,9 +1525,10 @@ impl<'a> Gen<'a> {
     /// Lower instruction `index` inline if it is a supported form. Returns false with nothing
     /// emitted otherwise (callers fall back to `helper_exec`), so every `return false` below must
     /// come before the first emit for that arm. Which forms are lowered mirrors `emit_x64.rs`
-    /// except for narrow shifts and BMI, and rotates and 64-bit imul only when their flags are dead
-    /// (`flags_dead_after`); adc/sbb are lowered at 32 and 64
-    /// bits, as on the native backends.
+    /// except for narrow shifts and BMI, 64-bit imul only when its flags are dead
+    /// (`flags_dead_after`), and rol/ror at 32 and 64 bits as the aarch64 backend has them (CF/OF
+    /// merged by a helper unless dead); adc/sbb are lowered at 32 and 64 bits, as on the native
+    /// backends.
     fn try_inline(&mut self, index: usize, rip: u64, next: u64) -> bool {
         let insn: Insn = self.insns[index];
         self.skip_flag_record = !self.flag_record_needed[index];
@@ -1552,13 +1617,9 @@ impl<'a> Gen<'a> {
                     rip,
                 );
             }
-            // rol/ror at 32 and 64 bits whose CF and OF nothing reads; the flags they keep
-            // (SF, ZF, PF, AF) would need the interpreter to merge.
-            0xc1 | 0xd1 | 0xd3
-                if wide
-                    && matches!(insn.reg & 7, SHIFT_ROL | SHIFT_ROR)
-                    && flags_dead_after(self.insns, index) =>
-            {
+            // rol/ror at 32 and 64 bits; CF and OF are merged into the flags by a helper unless
+            // a later instruction of the block overwrites them all.
+            0xc1 | 0xd1 | 0xd3 if wide && matches!(insn.reg & 7, SHIFT_ROL | SHIFT_ROR) => {
                 let count = match insn.op {
                     0xc1 => Some(insn.imm as u32 & (8 * osz as u32 - 1)),
                     0xd1 => Some(1),
@@ -1567,7 +1628,7 @@ impl<'a> Gen<'a> {
                 if count == Some(0) {
                     return false;
                 }
-                store = self.rotate_without_flags(
+                store = self.rotate(
                     &insn,
                     insn.reg & 7 == SHIFT_ROL,
                     Self::rm_dst(&insn, osz),
@@ -1576,6 +1637,7 @@ impl<'a> Gen<'a> {
                     next,
                     k,
                     rip,
+                    !flags_dead_after(self.insns, index),
                 );
             }
             0xc1 | 0xd1 | 0xd3 if wide && matches!(insn.reg & 7, SHIFT_SHL..=SHIFT_SAR) => {

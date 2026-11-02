@@ -79,6 +79,20 @@ pub(crate) extern "C" fn helper_exec_pair(cpu: &mut Cpu, pair: &[u64; 2], page_b
 /// resolve from the lazy flags. `packed` has CF in bit 0 and OF in bit 1.
 #[cfg(target_arch = "aarch64")]
 pub(crate) extern "C" fn helper_set_rotate_flags(cpu: &mut Cpu, packed: u64) {
+    merge_rotate_flags(cpu, packed);
+}
+
+/// `helper_set_rotate_flags` for the WebAssembly blocks, in the `(cpu, u64) -> u64` shape of
+/// `helper_cond` so it is called through a function type every block module already declares
+/// (`wasm_encode::COND_TYPE`). Always returns 0.
+#[cfg(target_arch = "wasm32")]
+pub(crate) extern "C" fn helper_set_rotate_flags(cpu: &mut Cpu, packed: u64) -> u64 {
+    merge_rotate_flags(cpu, packed);
+    0
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "wasm32"))]
+fn merge_rotate_flags(cpu: &mut Cpu, packed: u64) {
     use crate::cpu::flags::{AF, CF, OF, PF, SF, ZF};
     let mut flags = cpu.eflags_full() & (PF | AF | ZF | SF);
     if packed & 1 != 0 {

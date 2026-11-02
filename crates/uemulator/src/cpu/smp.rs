@@ -252,18 +252,22 @@ impl Cpu {
         }
         self.code_mark_seen = self.code_mark_epoch;
         let ram_base = self.ram_base;
-        for entry in self.tlb.iter_mut() {
-            if entry.tag_w == TLB_TAG_INVALID {
-                continue;
-            }
-            // tag + addend is the page's host address, minus ram_base its physical address.
-            let page = (entry
-                .tag_w
-                .wrapping_add(entry.addend)
-                .wrapping_sub(ram_base)
-                >> PAGE_SHIFT) as usize;
-            if self.page_has_code.get_or_zero(page) != 0 {
-                entry.tag_w = TLB_TAG_INVALID;
+        // The TLB SVM parked comes back without a refill, so it is revoked too.
+        let parked = self
+            .svm
+            .parked_tlb
+            .as_deref_mut()
+            .map(|parked| &mut parked.entries);
+        for entries in core::iter::once(&mut self.tlb).chain(parked) {
+            for entry in entries.iter_mut() {
+                if entry.tag_w != TLB_TAG_INVALID
+                    && self
+                        .page_has_code
+                        .get_or_zero(super::mem::write_tag_page(entry, ram_base))
+                        != 0
+                {
+                    entry.tag_w = TLB_TAG_INVALID;
+                }
             }
         }
     }

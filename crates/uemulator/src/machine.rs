@@ -1041,6 +1041,7 @@ impl Vcpu {
         if self.debug {
             cpu.trace = Some(Default::default());
             cpu.helper_histogram = Some(Default::default());
+            cpu.svm_exit_histogram = Some(Default::default());
         }
         // Lockstep needs both CPUs to idle identically, and the twin skips to the next timer at
         // once, so verification always runs on virtual time (a realtime main CPU sleeps in 2 ms
