@@ -28,12 +28,12 @@ start=$(python3 -c 'import time; print(time.time())')
 if [ "$engine" = wasm ]; then
     node "$root/hack/wasm/boot.mjs" --wasm "${WASM:-$root/target/web/uemulator_web.wasm}" \
         --kernel "$demo/vmlinuz-virt" --initrd "$demo/initramfs.gz" --memory 512 --firmware uefi \
-        "${iommu[@]}" --hypervisor "$demo/xen.gz" --hypervisor-cmdline "$xen_args" --cmdline "" \
+        ${iommu[@]+"${iommu[@]}"} --hypervisor "$demo/xen.gz" --hypervisor-cmdline "$xen_args" --cmdline "" \
         --seconds 300 >"$log" 2>&1 </dev/null &
 else
     "${UEMULATOR_BIN:-$root/target/release/uemulator}" advanced boot \
         --kernel "$demo/vmlinuz-virt" --initramfs "$demo/initramfs.gz" --memory 512 \
-        "${iommu[@]}" --hypervisor "$demo/xen.gz" --hypervisor-cmdline "$xen_args" \
+        ${iommu[@]+"${iommu[@]}"} --hypervisor "$demo/xen.gz" --hypervisor-cmdline "$xen_args" \
         >"$log" 2>&1 </dev/null &
 fi
 pid=$!

@@ -243,7 +243,7 @@ Workload: the web demo's Xen machine (Edera's Xen 4.22.1-pre `xen.gz` pinned in 
 
 | configuration | before | after |
 |---|---:|---:|
-| PV, native | 5.64 | 5.65 (5.27 -> 5.13 in a quieter run) |
+| PV, native | 5.64 | 5.65 (5.25 -> 5.12 in quieter interleaved runs) |
 | PV + IOMMU, native | 5.77 | 5.59 |
 | PVH + IOMMU, native | 4.31 | 3.47 (4.04 -> 3.29 in a quieter run) |
 | PV, Node | 23.66 | 20.57 |
@@ -260,6 +260,8 @@ Where the time was (`sample` natively, `node --cpu-prof` on the web build, `--de
 - **Xen waited a second for the RTC.** It reads the CMOS clock by waiting up to a second for update-in-progress to rise, and the RTC never raised it. It now does for the last 244 us of each second (`docs/plans/07-devices.md`); the wait is now until the next second of the machine's clock (0.7 s natively, about 0.4 s under Node, where Xen gets there later).
 - **134M `rol r64, imm8` through the interpreter under Node in a PV boot.** Linux's PV start-up runs a hash loop that ends its block with `rol rbx, 25; jmp`; the WebAssembly backend only lowered rotates whose flags a later instruction of the block overwrote. Rotates are now always inline, with CF/OF merged by `helper_set_rotate_flags` when they may be read: the PV dom0's start-up phase went from 10.4 s to 7.5 s under Node, and interpreter calls in the boot from 165M to 25M.
 
+`--verify` (JIT in lockstep with the interpreter) boots both the PVH dom0 behind the IOMMU and the PV dom0 to the shell with no divergence (133 s and 237 s), and `hack/kvm/run.sh` passes (KVM inside the guest on the emulator's SVM, which relies on TLB_CONTROL and ASIDs).
+
 Found on the way: the soft TLB of a nested guest took its write and exec tags from the guest's page tables alone, so after a read cached a page, a store went through without the nested page fault a read-only nested mapping (Xen's log-dirty mode, read-only p2m types) must raise and without setting the nested Dirty bit, and a fetch ignored nested NX. Fixed (`NestedRights`) with tests.
 
 What is left, in order of size:
@@ -267,6 +269,7 @@ What is left, in order of size:
 - **Xen inflating the dom0 kernel: 1.0 s natively, 2.0 s under Node** (the "Building a P[V|VH] Dom0" phase; Xen's gunzip in the JIT). Handing Xen the ELF inside the bzImage instead (`--kernel vmlinux`, which Xen accepts as is) takes the phase to 0.08 s: PVH 3.25 -> 2.35 s and PV 5.0 -> 4.2 s natively, PVH 13.9 -> 12.5 s and PV 21.4 -> 17.7 s under Node. Doing that in the library (inflate a gzip payload with `boot/inflate.rs` when booting a hypervisor) changes what the firmware hands Xen compared with GRUB, needs ~26 MiB more RAM for the boot module, and its cost under WebAssembly is unmeasured, so it is not done; if it is, make it an option the demo turns on.
 - **The dom0 kernel itself under Node: 8.9 s of a PVH boot** against 6.2 s for the same kernel without Xen. General JIT speed (round 1 and 2's register pinning conclusion) and the WebAssembly backend's gaps: `mul r64`, `shrd`, 64-bit `imul` with live flags and `cmpxchg` still go through the interpreter (about 10M calls in a boot), and `Cpu::step_block` itself is 16% of the samples under Node (cold steps and lookups).
 - **The RTC wait** (0.4 to 0.7 s): it is up to a second on hardware too; only the phase of the machine's clock decides it.
-- **A PV dom0's start-up under Node (7.5 s from Xen's hand-over to dom0's first console line, 1.8 s natively)**: not profiled yet. A PV kernel runs in ring 3 and makes its page-table changes by hypercall, so the next look is at what the hypercall and exception paths (`syscall`, `iretq`, #PF delivery) cost in the WebAssembly backend.
+- **A PV dom0's start-up: 1.8 s natively, 7.5 s under Node** (from Xen's hand-over to dom0's first console line), and natively 45% of it is the rotate flag merge: `helper_set_rotate_flags` and the `flags::compute` it calls for SF/ZF/PF/AF, once per iteration of the `rol rbx, 25; jmp` hash loop (134M times). The same helper serves the WebAssembly backend now. Making the merge cheap (computing the kept flags inline when the previous flag writer is in the same block, or a lazy record that keeps the previous one and overrides CF/OF) is the next step for PV. The x86-64 backend does not lower rotates at all, so an x86-64 host still sends those 134M through the interpreter (not measured here: no x86-64 host; Rosetta would not be representative).
+- Native PV start-up measured about 0.05 to 0.1 s (3 to 5%) slower after the nested-leaf-cache commit, in interleaved runs on the loaded host (1.78 s before, 1.80 to 1.91 s after; the nested-rights commit alone is 1.77 to 1.80 s). A PV dom0 never enters SVM, so the cache's code does not run; inlining the walker's no-nested-paging path did not change it, and what is left (the `Cpu` layout shifting with the new `Svm` field) was not pursued. The PV boot is still 0.1 s faster overall natively (the RTC).
 - **The wasm block cache flushes once in a PV boot** (76k blocks against `MAX_BLOCKS` = 65536); raising it costs engine memory per instance (the boot peaks at 1.8 GB RSS under Node already).
 - The IOMMU: per-access cost is now within 2 ns of no IOMMU (`docs/plans/16-iommu.md`); the device lock around every DMA was left alone (nothing here measures it, and the threading rules make it the riskiest part).
