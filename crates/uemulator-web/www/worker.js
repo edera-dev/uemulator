@@ -232,6 +232,7 @@ function upload(bytes) {
 }
 
 async function boot(message) {
+  jit.useCompileQueue(message.compileQueue);
   control = new Int32Array(message.control, 0, RING_OFFSET / 4);
   ring = new Uint8Array(message.control, RING_OFFSET, RING_BYTES);
   events = new Int32Array(message.control, EVENT_OFFSET, EVENT_RECORDS * EVENT_WORDS);

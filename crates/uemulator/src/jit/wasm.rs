@@ -1,16 +1,24 @@
 //! The WebAssembly backend's code cache and `Cpu::step_block`. Same job as `native.rs`, much less
 //! machinery: there is no executable buffer to manage, no code to patch and no second thread to
-//! share it with. A block is a module of its own (`emit_wasm`, `wasm_encode`); the host turns its
-//! bytes into a function in the emulator's function table (`host_jit_compile`, implemented by
-//! `www/jit_host.js`) and the block is then called through that table slot like any function
-//! pointer: on wasm32 a pointer to a function is its table index.
+//! share it with. A block is a function in a module (`emit_wasm`, `wasm_encode`); the host turns
+//! the module's bytes into functions in the emulator's function table (`host_jit_compile`,
+//! implemented by `www/jit_host.js`) and a block is then called through its table slot like any
+//! function pointer: on wasm32 a pointer to a function is its table index.
 //!
-//! Because compiling a module costs the engine tens of microseconds, a block is only compiled once
-//! its first instruction has run `COMPILE_THRESHOLD` times in the interpreter; until then
-//! `step_block` interprets one instruction. Tests build with a threshold of zero. Measured on an
-//! Alpine boot (V8): about 15 µs per module for `new WebAssembly.Module`, 3 µs to instantiate and
-//! another 18 µs of Liftoff compilation on the block's first call, so 35k blocks cost ~1.8 s;
-//! thresholds of 5, 15 and 100 were no faster than 40.
+//! Compiling costs the engine ~38 µs a block on the thread that does it (V8: making the module,
+//! instantiating it, and compiling the function on its first call), so a block is only compiled
+//! once its first instruction has run `COMPILE_THRESHOLD` times in the interpreter; until then
+//! `step_block` interprets one instruction. Tests build with a threshold of zero.
+//!
+//! Where the host has a compile worker (V8 only, see `www/jit_host.js`), a hot block's function
+//! is generated here and queued (`State::pending`), and the queued blocks go to the worker as one
+//! module (`host_jit_submit`) while it has none of ours, so they batch up while it is busy. The
+//! block runs in the interpreter until the worker is done (`host_jit_ready`, or `PATIENCE`); then
+//! `host_jit_compile` makes the same bytes into a module here, which V8 serves from its
+//! process-wide cache already compiled, for about a microsecond a block. Batching and the worker
+//! together took the Alpine demo's boot to `Run /init` from 5.4 to 3.7 s under Node
+//! (docs/plans/13-web.md). Without a worker, `host_jit_submit` refuses and every block is
+//! compiled here as it gets hot, in a module of its own.
 //!
 //! There is no code to patch, so the native backends' direct links become link cells: memory a
 //! block's same-page exits read the successor's table slot from (`emit_wasm::LINK_CELL_BLOCK`),
@@ -25,7 +33,7 @@
 
 #[cfg(freestanding)]
 use crate::prelude::*;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use core::cell::UnsafeCell;
 use core::mem::{offset_of, size_of};
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
@@ -47,16 +55,27 @@ use crate::sync::{Arc, Mutex};
 #[link(wasm_import_module = "host")]
 unsafe extern "C" {
     /// Instantiates the module at `ptr..ptr + len` against the emulator's memory and function
-    /// table and returns the table slot of its `block` export, or -1 if the engine refused it.
-    fn host_jit_compile(ptr: *const u8, len: usize) -> i32;
+    /// table and puts its exports "0" to `count - 1` in table slots, whose numbers it writes to
+    /// `slots`. Returns 0, or -1 if the engine refused the module.
+    fn host_jit_compile(ptr: *const u8, len: usize, slots: *mut u32, count: usize) -> i32;
     /// Gives a slot back; the host empties it so the engine can free the instance.
     fn host_jit_release(slot: i32);
+    /// Hands a copy of the module to the host's compile worker and returns a ticket, or -1 when
+    /// there is no compile worker or it has no room: the module is then compiled at once.
+    fn host_jit_submit(ptr: *const u8, len: usize) -> i32;
+    /// Whether the compile worker is done with `ticket` (or the host gave up waiting for it).
+    fn host_jit_ready(ticket: i32) -> i32;
 }
 
 /// Times the first instruction of a block must run in the interpreter before the block is
 /// compiled. The engine needs tens of microseconds per module, so this is what keeps the cold
 /// start-up code of a boot (most of it runs once) from being slower than interpreting it.
 const COMPILE_THRESHOLD: u32 = 40;
+/// `COMPILE_THRESHOLD` once a compile worker takes modules (`State::pump`): compiling then costs
+/// this thread a few microseconds a block instead of ~38, and the Alpine boot to `Run /init`
+/// took 3.7 s at 10 against 4.0 at 40 (3 and 5 were slower again: more code compiled that runs
+/// only a few times).
+const COMPILE_THRESHOLD_WITH_WORKER: u32 = 10;
 /// A `Heat` count that means the engine refused this block: it is interpreted from now on.
 const NEVER_COMPILE: u32 = u32::MAX;
 const HEAT_BITS: usize = 16;
@@ -74,10 +93,36 @@ const _: () = assert!(LINK_CELL_SIZE as usize == size_of::<AtomicU64>());
 /// What the probe module returns.
 const PROBE_RESULT: i64 = 0x7e57_ab1e;
 
+/// Most blocks one module holds. A module costs the engine a fixed amount on top of its
+/// functions (13 µs a block alone, 1 µs a block at 64 in V8, docs/plans/13-web.md); a batch is
+/// rarely full, 128 and 256 measured the same.
+const MAX_BATCH_BLOCKS: usize = 64;
+/// Modules handed to the compile worker and not installed yet. Blocks that get hot while this
+/// many are out wait in `State::queued` and go out together in the next module. One is what
+/// batches them best: the Alpine boot to `Run /init` took 4.0 s at one (64 blocks a module),
+/// 4.1 s at two, 4.2 s at four (16 a module) and 5.1 s at 64 modules of one block.
+const MAX_IN_FLIGHT: usize = 1;
+/// Passes through a pending block the interpreter may make before this thread stops waiting for
+/// the compile worker and instantiates the block's module itself: `PATIENCE` times the block's
+/// instruction count in steps, at its first instruction or inside it, so a loop within the block
+/// runs out of patience as soon as passes through all of it would. The worker can be
+/// milliseconds behind in a burst of new blocks, and a hot loop runs thousands of times in that.
+/// The engine then reuses what the worker already compiled, or compiles just the functions that
+/// run. Unbatched, waiting for the worker alone was no faster than compiling here; 4 to 32 measured
+/// within noise of each other.
+const PATIENCE: u32 = 8;
+
+/// The table slots of `module`'s `count` functions, or `None` if the engine refused it.
+fn compile_functions(module: &[u8], count: usize) -> Option<Vec<u32>> {
+    let mut slots = vec![0u32; count];
+    // SAFETY: the host only reads the bytes and writes `count` slots during the call.
+    let status =
+        unsafe { host_jit_compile(module.as_ptr(), module.len(), slots.as_mut_ptr(), count) };
+    (status == 0).then_some(slots)
+}
+
 fn compile_module(module: &[u8]) -> Option<u32> {
-    // SAFETY: the host only reads the bytes during the call.
-    let slot = unsafe { host_jit_compile(module.as_ptr(), module.len()) };
-    u32::try_from(slot).ok()
+    compile_functions(module, 1).map(|slots| slots[0])
 }
 
 fn release_slot(slot: u32) {
@@ -208,6 +253,58 @@ struct Block {
     _links: Box<[AtomicU64]>,
 }
 
+/// A block whose function is generated but not installed: queued, or in a module the compile
+/// worker has. Holds what the code points into (`Block::_insns`, `Block::_links`) from the moment
+/// the code is generated.
+struct PendingBlock {
+    /// Matches `Pending::serial` for as long as the block may still be installed.
+    serial: u64,
+    phys_addr: u64,
+    pages: Vec<u64>,
+    insns: Box<[Insn]>,
+    links: Box<[AtomicU64]>,
+    compiled: emit_wasm::CompiledBlock,
+}
+
+/// The `State::pending` entry of a block.
+struct Pending {
+    /// Physical address just past the block's last instruction (same page as its start).
+    end: u64,
+    serial: u64,
+    /// Guest instructions in it.
+    insns: u32,
+    /// Its instructions the interpreter ran while it was pending (`PATIENCE`).
+    steps: u32,
+}
+
+/// One module handed to the compile worker: the blocks' functions in order, exported as "0", "1"...
+struct Batch {
+    ticket: u32,
+    module: Vec<u8>,
+    blocks: Vec<PendingBlock>,
+}
+
+/// Where a physical address stands against the pending blocks.
+enum PendingAt {
+    /// A pending block starts there.
+    Head,
+    /// It is inside the pending block starting at this address, past its first instruction.
+    Inside(u64),
+    Outside,
+}
+
+/// Stands in for the host's compile worker in tests: modules are done only when the test says
+/// (`Jit::finish_compiles`), or after `finish_after_polls` asks.
+#[cfg(test)]
+#[derive(Default)]
+struct FakeCompiler {
+    submitted: u32,
+    /// Tickets below this are done.
+    finished: u32,
+    finish_after_polls: Option<u32>,
+    polls: u32,
+}
+
 /// A vCPU's handle on the code cache. The cache itself (`SharedJit`) belongs to the machine and
 /// every handle (`sibling`) shares it.
 pub(crate) struct Jit {
@@ -232,6 +329,8 @@ struct SharedJit {
     compile_threshold: AtomicU32,
     #[cfg(test)]
     test_block_limit: core::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    fake_compiler: Mutex<Option<FakeCompiler>>,
     state: Mutex<State>,
 }
 
@@ -242,6 +341,17 @@ struct State {
     /// Physical page number -> blocks that decoded bytes from it.
     page_blocks: BTreeMap<u64, Vec<u32>>,
     heat: Box<[Heat]>,
+    /// Blocks generated but not installed, by physical address. A block is installed only while
+    /// its entry is here with its serial: a write to its page (`Jit::invalidate_page`) or a flush
+    /// removes the entry, and its function, compiled from the old bytes, is then thrown away when
+    /// its module comes back. Straddlers are never pending: they are compiled at once.
+    pending: BTreeMap<u64, Pending>,
+    /// Pending blocks not handed out yet, waiting for room in `in_flight`.
+    queued: Vec<PendingBlock>,
+    /// Modules the compile worker has, in the order they were handed out (it finishes them in
+    /// that order).
+    in_flight: VecDeque<Batch>,
+    next_serial: u64,
     stats: JitStats,
 }
 
@@ -264,13 +374,25 @@ pub(crate) struct JitStats {
     pub stale_decodes: u64,
     /// Blocks the host refused to instantiate; they run in the interpreter.
     pub compile_failures: u64,
-    /// Guest instructions the interpreter ran because their block was not hot yet.
+    /// Guest instructions the interpreter ran because their block was not hot yet (or its
+    /// module was not ready).
     pub cold_steps: u64,
+    /// Modules instantiated for blocks; fewer than `translated` when modules hold several.
+    pub modules: u64,
+    /// Modules handed to the compile worker.
+    pub submitted: u64,
+    /// Modules this thread instantiated before the compile worker was done (`PATIENCE`).
+    pub impatient: u64,
+    /// Generated blocks thrown away before they were installed: their page was written, or the
+    /// cache was flushed, while their module was being compiled.
+    pub abandoned: u64,
 }
 
-/// What `Jit::install` found.
+/// What `Jit::install` and `Jit::enqueue` found.
 enum Install {
     Ready(u32),
+    /// The block waits for its module (`State::pending`).
+    Queued,
     /// A page the decode read was written since: decode again.
     Stale,
     /// No room for another block: flush the cache, then decode again.
@@ -283,10 +405,51 @@ impl SharedJit {
     fn lock(&self) -> impl core::ops::DerefMut<Target = State> + '_ {
         self.state.lock().unwrap()
     }
+
+    fn block_limit(&self) -> usize {
+        #[cfg(test)]
+        return self
+            .test_block_limit
+            .load(Ordering::Relaxed)
+            .min(MAX_BLOCKS);
+        #[cfg(not(test))]
+        MAX_BLOCKS
+    }
+
+    /// The ticket of `module` at the compile worker, or `None` if it should be compiled now.
+    fn submit(&self, module: &[u8]) -> Option<u32> {
+        #[cfg(test)]
+        if let Some(fake) = self.fake_compiler.lock().unwrap().as_mut() {
+            fake.submitted += 1;
+            return Some(fake.submitted - 1);
+        }
+        // SAFETY: the host copies the bytes during the call.
+        let ticket = unsafe { host_jit_submit(module.as_ptr(), module.len()) };
+        u32::try_from(ticket).ok()
+    }
+
+    fn ready(&self, ticket: u32) -> bool {
+        #[cfg(test)]
+        if let Some(fake) = self.fake_compiler.lock().unwrap().as_mut() {
+            if ticket >= fake.finished
+                && let Some(polls) = fake.finish_after_polls
+            {
+                fake.polls += 1;
+                if fake.polls >= polls {
+                    fake.finished = fake.submitted;
+                    fake.polls = 0;
+                }
+            }
+            return ticket < fake.finished;
+        }
+        // SAFETY: plain call; the host only looks the ticket up.
+        unsafe { host_jit_ready(ticket as i32) != 0 }
+    }
 }
 
 impl State {
-    /// Drops every block and gives their slots back. No generated code may be running.
+    /// Drops every block and gives their slots back, and forgets the pending ones. No generated
+    /// code may be running.
     fn flush(&mut self, shared: &SharedJit) {
         for block in self.blocks.drain(..) {
             release_slot(block.slot);
@@ -298,7 +461,185 @@ impl State {
         shared.jump_cache.clear();
         self.block_map.clear();
         self.page_blocks.clear();
+        // The worker finishes the modules it has, and nothing will ask for them.
+        let dropped =
+            self.queued.len() + self.in_flight.iter().map(|b| b.blocks.len()).sum::<usize>();
+        self.stats.abandoned += dropped as u64;
+        self.queued.clear();
+        self.in_flight.clear();
+        self.pending.clear();
         self.stats.resets += 1;
+    }
+
+    /// Counts one more interpreted step of the pending block at `phys_addr`; its serial once it
+    /// has run out of `PATIENCE`.
+    fn out_of_patience(&mut self, phys_addr: u64) -> Option<u64> {
+        let pending = self.pending.get_mut(&phys_addr)?;
+        pending.steps = pending.steps.saturating_add(1);
+        (pending.steps >= PATIENCE.saturating_mul(pending.insns)).then_some(pending.serial)
+    }
+
+    fn is_pending(&self, block: &PendingBlock) -> bool {
+        self.pending
+            .get(&block.phys_addr)
+            .is_some_and(|pending| pending.serial == block.serial)
+    }
+
+    /// Makes block `index` of a translation live: in the block map, valid, and found by its pages.
+    #[allow(clippy::too_many_arguments)]
+    fn register(
+        &mut self,
+        shared: &SharedJit,
+        key: BlockKey,
+        slot: u32,
+        insns: Box<[Insn]>,
+        links: Box<[AtomicU64]>,
+        pages: Vec<u64>,
+        compiled: &emit_wasm::CompiledBlock,
+    ) -> u32 {
+        self.stats.inlined += compiled.inlined as u64;
+        self.stats.flag_records_skipped += compiled.flag_records_skipped as u64;
+        self.stats.total += insns.len() as u64;
+        let index = self.blocks.len() as u32;
+        self.block_map.insert(key, index);
+        self.blocks.push(Block {
+            key,
+            slot,
+            _insns: insns,
+            _links: links,
+        });
+        shared.valid[index as usize].store(1, Ordering::Release);
+        for page in pages {
+            self.page_blocks.entry(page).or_default().push(index);
+        }
+        self.stats.translated += 1;
+        index
+    }
+
+    /// Installs the modules the compile worker has finished, oldest first, then hands it queued
+    /// blocks while it has room (or compiles them here when there is no worker). `waiting` is
+    /// the pending block one of whose instructions is about to be interpreted: once it has run
+    /// out of `PATIENCE` its module is installed now, done or not. Returns true when a
+    /// module did not fit: the caller flushes the cache, which also drops it.
+    fn pump(&mut self, shared: &SharedJit, waiting: Option<u64>) -> bool {
+        while let Some(batch) = self.in_flight.front() {
+            if !shared.ready(batch.ticket) {
+                break;
+            }
+            let batch = self.in_flight.pop_front().unwrap();
+            if !self.install_batch(shared, batch) {
+                return true;
+            }
+        }
+        if let Some(serial) = waiting.and_then(|phys_addr| self.out_of_patience(phys_addr)) {
+            let holds = |batch: &Batch| batch.blocks.iter().any(|block| block.serial == serial);
+            let batch = match self.in_flight.iter().position(holds) {
+                Some(position) => self.in_flight.remove(position),
+                None => self
+                    .queued
+                    .iter()
+                    .position(|block| block.serial == serial)
+                    .map(|position| {
+                        let block = self.queued.remove(position);
+                        let module = wasm_encode::module_of_functions(&[block.compiled.function()]);
+                        Batch {
+                            ticket: 0,
+                            module,
+                            blocks: vec![block],
+                        }
+                    }),
+            };
+            if let Some(batch) = batch {
+                self.stats.impatient += 1;
+                if !self.install_batch(shared, batch) {
+                    return true;
+                }
+            }
+        }
+        while self.in_flight.len() < MAX_IN_FLIGHT && !self.queued.is_empty() {
+            let count = self.queued.len().min(MAX_BATCH_BLOCKS);
+            let blocks: Vec<PendingBlock> = self.queued.drain(..count).collect();
+            let functions: Vec<_> = blocks.iter().map(|b| b.compiled.function()).collect();
+            let module = wasm_encode::module_of_functions(&functions);
+            let batch = Batch {
+                ticket: 0,
+                module,
+                blocks,
+            };
+            match shared.submit(&batch.module) {
+                Some(ticket) => {
+                    self.stats.submitted += 1;
+                    shared
+                        .compile_threshold
+                        .fetch_min(COMPILE_THRESHOLD_WITH_WORKER, Ordering::Relaxed);
+                    self.in_flight.push_back(Batch { ticket, ..batch });
+                }
+                None => {
+                    if !self.install_batch(shared, batch) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Instantiates `batch`'s module and installs the blocks in it that are still pending.
+    /// Returns false, installing nothing, if they would not fit in the cache.
+    fn install_batch(&mut self, shared: &SharedJit, batch: Batch) -> bool {
+        let Batch { module, blocks, .. } = batch;
+        let live = blocks.iter().filter(|b| self.is_pending(b)).count();
+        if live == 0 {
+            self.stats.abandoned += blocks.len() as u64;
+            return true;
+        }
+        if self.blocks.len() + live > shared.block_limit() {
+            self.stats.abandoned += blocks.len() as u64;
+            return false;
+        }
+        let Some(slots) = compile_functions(&module, blocks.len()) else {
+            // A bug in the generator: these blocks stay interpreted.
+            for block in &blocks {
+                if !self.is_pending(block) {
+                    continue;
+                }
+                self.pending.remove(&block.phys_addr);
+                self.stats.compile_failures += 1;
+                self.heat[heat_index(block.phys_addr)] = Heat {
+                    phys: block.phys_addr,
+                    count: NEVER_COMPILE,
+                };
+            }
+            return true;
+        };
+        self.stats.modules += 1;
+        for (block, slot) in blocks.into_iter().zip(slots) {
+            if !self.is_pending(&block) {
+                // Its page was written while the module was compiled: the code is stale.
+                release_slot(slot);
+                self.stats.abandoned += 1;
+                continue;
+            }
+            self.pending.remove(&block.phys_addr);
+            let PendingBlock {
+                phys_addr,
+                pages,
+                insns,
+                links,
+                compiled,
+                ..
+            } = block;
+            self.register(
+                shared,
+                (phys_addr, NO_SECOND_PAGE),
+                slot,
+                insns,
+                links,
+                pages,
+                &compiled,
+            );
+        }
+        true
     }
 }
 
@@ -369,11 +710,17 @@ impl Jit {
             }),
             #[cfg(test)]
             test_block_limit: core::sync::atomic::AtomicUsize::new(usize::MAX),
+            #[cfg(test)]
+            fake_compiler: Mutex::new(None),
             state: Mutex::new(State {
                 blocks: Vec::new(),
                 block_map: BTreeMap::new(),
                 page_blocks: BTreeMap::new(),
                 heat: vec![Heat::default(); 1 << HEAT_BITS].into_boxed_slice(),
+                pending: BTreeMap::new(),
+                queued: Vec::new(),
+                in_flight: VecDeque::new(),
+                next_serial: 0,
                 stats: JitStats::default(),
             }),
         });
@@ -408,6 +755,30 @@ impl Jit {
     /// Only the native backend has a window between decoding and registering to widen.
     #[cfg(test)]
     pub fn set_install_pause_micros(&self, _micros: u64) {}
+
+    /// Compiles modules as a compile worker would: they are done when `finish_compiles` says,
+    /// or after `finish_after_polls` asks for them.
+    #[cfg(test)]
+    fn use_fake_compiler(&self, finish_after_polls: Option<u32>) {
+        *self.shared.fake_compiler.lock().unwrap() = Some(FakeCompiler {
+            finish_after_polls,
+            ..FakeCompiler::default()
+        });
+    }
+
+    /// Every module submitted so far is done.
+    #[cfg(test)]
+    fn finish_compiles(&self) {
+        let mut fake = self.shared.fake_compiler.lock().unwrap();
+        let fake = fake.as_mut().unwrap();
+        fake.finished = fake.submitted;
+    }
+
+    /// Physical addresses of the pending blocks, in order.
+    #[cfg(test)]
+    fn pending_starts(&self) -> Vec<u64> {
+        self.shared.lock().pending.keys().copied().collect()
+    }
 
     #[cfg(test)]
     pub fn block_count(&self) -> usize {
@@ -458,6 +829,17 @@ impl Jit {
         let mut state = shared.lock();
         shared.invalidations.fetch_add(1, Ordering::AcqRel);
         flags.set(ppn as usize, 0);
+        // Pending blocks of the page lose their entry, so their modules are thrown away when they
+        // come back (`State::install_batch`). They have no index yet, hence before the return.
+        let page_start = ppn << PAGE_SHIFT;
+        let stale: Vec<u64> = state
+            .pending
+            .range(page_start..page_start + PAGE_SIZE)
+            .map(|(&phys_addr, _)| phys_addr)
+            .collect();
+        for phys_addr in stale {
+            state.pending.remove(&phys_addr);
+        }
         let Some(indices) = state.page_blocks.remove(&ppn) else {
             return;
         };
@@ -561,10 +943,61 @@ impl Jit {
         heat.count >= threshold
     }
 
-    /// Decodes up to `MAX_INSNS` instructions at `rip` (physical `phys_addr`), compiles them and
-    /// returns the table slot of the block, or `None` when the host refuses the module (which
-    /// then stays interpreted). `rip` must be `cpu.rip`: a page-straddling instruction decodes
-    /// through `Cpu::fetch_decode`, which reads it.
+    /// Where `phys_addr` stands against the pending blocks.
+    fn pending_at(&self, phys_addr: u64) -> PendingAt {
+        let state = self.shared.lock();
+        match state.pending.range(..=phys_addr).next_back() {
+            Some((&start, _)) if start == phys_addr => PendingAt::Head,
+            Some((&start, pending)) if phys_addr < pending.end => PendingAt::Inside(start),
+            _ => PendingAt::Outside,
+        }
+    }
+
+    /// `State::pump`, flushing the cache when a finished module does not fit.
+    fn pump(&mut self, cpu: &mut Cpu, waiting: Option<u64>) {
+        let shared = self.shared.clone();
+        if shared.lock().pump(&shared, waiting) {
+            self.flush(cpu);
+        }
+    }
+
+    /// A miss in the block map: the block's slot if it can run compiled now. Otherwise the
+    /// caller interprets one instruction, and this counts toward compiling the block.
+    ///
+    /// Any instruction of a pending block checks whether modules are back. Its instructions after
+    /// the first run in the interpreter until then without counting heat: if they did, every
+    /// instruction of a hot block would reach the threshold while its module is compiled and get
+    /// a block of its own. A branch target inside it waits for the outer block's module too, and
+    /// a loop there counts toward the outer block's `PATIENCE`.
+    fn compile_on_miss(
+        &mut self,
+        cpu: &mut Cpu,
+        rip: u64,
+        phys_addr: u64,
+    ) -> Result<Option<u64>, Exception> {
+        match self.pending_at(phys_addr) {
+            PendingAt::Head => {
+                self.pump(cpu, Some(phys_addr));
+                return Ok(self.lookup(rip, phys_addr));
+            }
+            // Once the outer block is installed this address counts heat again, next time.
+            PendingAt::Inside(start) => {
+                self.pump(cpu, Some(start));
+                return Ok(None);
+            }
+            PendingAt::Outside => {}
+        }
+        if !self.is_hot(phys_addr) {
+            return Ok(None);
+        }
+        self.try_translate(cpu, rip, phys_addr)
+    }
+
+    /// Decodes up to `MAX_INSNS` instructions at `rip` (physical `phys_addr`) and compiles them.
+    /// Returns the table slot of the block, or `None` when it waits for its module (with a
+    /// compile worker) or the host refused the module (it then stays interpreted). `rip` must be
+    /// `cpu.rip`: a page-straddling instruction decodes through `Cpu::fetch_decode`, which reads
+    /// it.
     fn try_translate(
         &mut self,
         cpu: &mut Cpu,
@@ -583,6 +1016,11 @@ impl Jit {
             let decoded = decode_block(cpu, rip, phys_addr)?;
             match self.install(decoded, rip, phys_addr, generation, &cpu.page_has_code) {
                 Install::Ready(slot) => return Ok(Some(slot as u64)),
+                Install::Queued => {
+                    // Without a compile worker this installs it at once.
+                    self.pump(cpu, None);
+                    return Ok(self.lookup(rip, phys_addr));
+                }
                 Install::Stale => {}
                 Install::Full => self.flush(cpu),
                 Install::Refused => {
@@ -607,7 +1045,8 @@ impl Jit {
     }
 
     /// The part of `try_translate` under the lock: the checks that make the decoded bytes still
-    /// good, then compile and register the block.
+    /// good, then generate the block's code. A straddler is compiled and registered here; any
+    /// other block is queued for its module (`State::pump`).
     fn install(
         &mut self,
         decoded: Decoded,
@@ -636,14 +1075,7 @@ impl Jit {
             self.fill_jump_cache(rip, phys_addr, decoded.second_page, slot, index);
             return Install::Ready(slot);
         }
-        #[cfg(test)]
-        let limit = shared
-            .test_block_limit
-            .load(Ordering::Relaxed)
-            .min(MAX_BLOCKS);
-        #[cfg(not(test))]
-        let limit = MAX_BLOCKS;
-        if state.blocks.len() >= limit {
+        if state.blocks.len() >= shared.block_limit() {
             return Install::Full;
         }
         let Decoded {
@@ -678,25 +1110,35 @@ impl Jit {
                 links.as_ptr() as usize as u32
             },
         );
-        let Some(slot) = compile_module(&compiled.module) else {
+        if second_page == NO_SECOND_PAGE {
+            let serial = state.next_serial;
+            state.next_serial += 1;
+            state.pending.insert(
+                phys_addr,
+                Pending {
+                    // `end_rip` is an offset in the page, like every rip of a block.
+                    end: (phys_addr & !PAGE_MASK) + end_rip,
+                    serial,
+                    insns: insns.len() as u32,
+                    steps: 0,
+                },
+            );
+            state.queued.push(PendingBlock {
+                serial,
+                phys_addr,
+                pages,
+                insns,
+                links,
+                compiled,
+            });
+            return Install::Queued;
+        }
+        let module = wasm_encode::module_of_functions(&[compiled.function()]);
+        let Some(slot) = compile_module(&module) else {
             return Install::Refused;
         };
-        state.stats.inlined += compiled.inlined as u64;
-        state.stats.flag_records_skipped += compiled.flag_records_skipped as u64;
-        state.stats.total += insns.len() as u64;
-        let index = state.blocks.len() as u32;
-        state.block_map.insert(key, index);
-        state.blocks.push(Block {
-            key,
-            slot,
-            _insns: insns,
-            _links: links,
-        });
-        shared.valid[index as usize].store(1, Ordering::Release);
-        for page in pages {
-            state.page_blocks.entry(page).or_default().push(index);
-        }
-        state.stats.translated += 1;
+        state.stats.modules += 1;
+        let index = state.register(&shared, key, slot, insns, links, pages, &compiled);
         self.fill_jump_cache(rip, phys_addr, second_page, slot, index);
         Install::Ready(slot)
     }
@@ -764,8 +1206,7 @@ impl Cpu {
         };
         let slot = match cached {
             Some(slot) => Some(slot),
-            None if !jit.is_hot(phys_addr) => None,
-            None => match jit.try_translate(self, rip, phys_addr) {
+            None => match jit.compile_on_miss(self, rip, phys_addr) {
                 Ok(slot) => slot,
                 Err(exception) => {
                     self.jit = Some(jit);
@@ -782,7 +1223,7 @@ impl Cpu {
             self.last_block_insns = 1;
             return self.step();
         };
-        // SAFETY: the host put a function of this type in the slot (`wasm_encode::block_module`).
+        // SAFETY: the host put a function of this type in the slot (`CompiledBlock::function`).
         let run_block: extern "C" fn(*mut Cpu) -> u64 =
             unsafe { core::mem::transmute(slot as usize) };
         let exit_code = run_block(self as *mut Cpu);
@@ -1018,16 +1459,17 @@ mod tests {
         assert_eq!(jit.link_cells(body)[0], (body, jit.slot_of(body)));
     }
 
+    // mov ecx, 3; xor eax, eax; again: mov dl, cl; mov [rip + tgt + 2], dl; jmp tgt;
+    // tgt: add eax, 0x7f; dec ecx; jnz again; hlt
+    // Each pass patches the immediate of the `add` to ecx before jumping to it: 3 + 2 + 1.
+    const PATCH_THEN_JUMP: [u8; 25] = [
+        0xb9, 0x03, 0x00, 0x00, 0x00, 0x31, 0xc0, 0x88, 0xca, 0x88, 0x15, 0x04, 0x00, 0x00, 0x00,
+        0xeb, 0x00, 0x83, 0xc0, 0x7f, 0xff, 0xc9, 0x75, 0xef, 0xf4,
+    ];
+
     #[test]
     fn a_store_into_the_linked_destination_never_runs_its_stale_code() {
-        // mov ecx, 3; xor eax, eax; again: mov dl, cl; mov [rip + tgt + 2], dl; jmp tgt;
-        // tgt: add eax, 0x7f; dec ecx; jnz again; hlt
-        // Each pass patches the immediate of the `add` to ecx before jumping to it, from a block
-        // whose exit to it is linked after the first pass: 3 + 2 + 1.
-        const PATCH_THEN_JUMP: [u8; 25] = [
-            0xb9, 0x03, 0x00, 0x00, 0x00, 0x31, 0xc0, 0x88, 0xca, 0x88, 0x15, 0x04, 0x00, 0x00,
-            0x00, 0xeb, 0x00, 0x83, 0xc0, 0x7f, 0xff, 0xc9, 0x75, 0xef, 0xf4,
-        ];
+        // The jmp's exit to the patched block is linked after the first pass.
         let mut harness = Harness::new(&PATCH_THEN_JUMP);
         assert!(harness.enable_jit());
         assert_eq!(harness.run(1000), Stop::Halted);
@@ -1187,6 +1629,178 @@ mod tests {
         );
         // rol rbx, 25; jmp next; next: hlt: the successor may read the flags
         assert_eq!(inlined_in(&[0x48, 0xc1, 0xc3, 0x19, 0xeb, 0x00, 0xf4]), 2);
+    }
+
+    // add rax, 1; hlt
+    const ADD_ONE_THEN_HLT: [u8; 5] = [0x48, 0x83, 0xc0, 0x01, 0xf4];
+
+    fn harness_with_a_compile_worker(code: &[u8], finish_after_polls: Option<u32>) -> Harness {
+        let mut harness = Harness::new(code);
+        assert!(harness.enable_jit());
+        harness
+            .cpu
+            .jit
+            .as_ref()
+            .unwrap()
+            .use_fake_compiler(finish_after_polls);
+        harness
+    }
+
+    #[test]
+    fn with_a_compile_worker_a_hot_block_is_interpreted_until_its_module_is_ready() {
+        let mut harness = harness_with_a_compile_worker(&ADD_ONE_THEN_HLT, None);
+        let run_again = |harness: &mut Harness| {
+            harness.cpu.halted = false;
+            harness.cpu.rip = CODE_BASE;
+            assert_eq!(harness.run(100), Stop::Halted);
+        };
+        assert_eq!(harness.run(100), Stop::Halted);
+        run_again(&mut harness);
+        let stats = harness.cpu.jit.as_ref().unwrap().stats();
+        assert_eq!(stats.translated, 0, "{stats:?}");
+        assert_eq!(stats.cold_steps, 4, "add and hlt, twice: {stats:?}");
+        harness.cpu.jit.as_ref().unwrap().finish_compiles();
+        run_again(&mut harness);
+        let stats = harness.cpu.jit.as_ref().unwrap().stats();
+        assert_eq!(stats.translated, 1, "{stats:?}");
+        assert_eq!(stats.cold_steps, 4, "the third run is compiled: {stats:?}");
+        assert_eq!(harness.cpu.gpr[0], 3);
+    }
+
+    #[test]
+    fn a_block_whose_page_is_written_while_its_module_is_compiled_is_never_installed() {
+        let mut harness = harness_with_a_compile_worker(&ADD_ONE_THEN_HLT, None);
+        assert_eq!(harness.run(100), Stop::Halted);
+        assert_eq!(harness.cpu.gpr[0], 1);
+        // add rax, 5, and what a guest store to the code makes of it
+        harness.write(CODE_BASE + 3, &[5]);
+        harness.cpu.code_written((CODE_BASE >> PAGE_SHIFT) as usize);
+        harness.cpu.jit.as_ref().unwrap().finish_compiles();
+        harness.cpu.halted = false;
+        harness.cpu.rip = CODE_BASE;
+        harness.cpu.gpr[0] = 0;
+        assert_eq!(harness.run(100), Stop::Halted);
+        assert_eq!(
+            harness.cpu.gpr[0], 5,
+            "the module of the old bytes did not run"
+        );
+        assert!(harness.cpu.jit.as_ref().unwrap().stats().abandoned >= 1);
+    }
+
+    #[test]
+    fn code_the_guest_patches_while_its_module_is_compiled_never_runs_stale() {
+        let mut harness = harness_with_a_compile_worker(&PATCH_THEN_JUMP, Some(1));
+        assert_eq!(harness.run(1000), Stop::Halted);
+        assert_eq!(harness.cpu.gpr[0], 6);
+        assert!(harness.cpu.jit.as_ref().unwrap().stats().translated >= 1);
+    }
+
+    #[test]
+    fn a_flush_forgets_the_modules_being_compiled() {
+        let mut harness = harness_with_a_compile_worker(&COUNTDOWN_LOOP, None);
+        run_countdown_and_rewind(&mut harness);
+        let mut jit = harness.cpu.jit.take().unwrap();
+        assert!(!jit.pending_starts().is_empty());
+        jit.flush(&mut harness.cpu);
+        assert!(jit.pending_starts().is_empty());
+        // The modules from before the flush are done now, and must not be installed.
+        jit.finish_compiles();
+        harness.cpu.jit = Some(jit);
+        run_countdown_and_rewind(&mut harness);
+        // Nothing submitted since is done, so whatever was installed is what this thread
+        // stopped waiting for.
+        let stats = harness.cpu.jit.as_ref().unwrap().stats();
+        assert_eq!(stats.modules, stats.impatient, "{stats:?}");
+        assert!(stats.abandoned >= 1, "{stats:?}");
+        assert_eq!(harness.cpu.icount, 2 * COUNTDOWN_LOOP_INSNS);
+    }
+
+    #[test]
+    fn a_pending_block_that_keeps_running_does_not_wait_for_the_worker() {
+        // l: sub ecx, 1; jnz l; hlt
+        const SELF_LOOP: [u8; 6] = [0x83, 0xe9, 0x01, 0x75, 0xfb, 0xf4];
+        let mut harness = harness_with_a_compile_worker(&SELF_LOOP, None);
+        harness.cpu.gpr[1] = 1000;
+        assert_eq!(harness.run(10_000), Stop::Halted);
+        assert_eq!(harness.cpu.gpr[1], 0);
+        let stats = harness.cpu.jit.as_ref().unwrap().stats();
+        assert_eq!(stats.impatient, 1, "{stats:?}");
+        // sub and jnz in the interpreter until the loop's block has waited its patience out
+        assert!(stats.cold_steps <= 2 * (PATIENCE as u64 + 1), "{stats:?}");
+    }
+
+    #[test]
+    fn blocks_that_get_hot_while_a_module_is_out_share_the_next_one() {
+        // jmp $+2; jmp $+2; jmp $+2; hlt: four blocks, the first goes out alone
+        const JUMPS: [u8; 7] = [0xeb, 0x00, 0xeb, 0x00, 0xeb, 0x00, 0xf4];
+        let mut harness = harness_with_a_compile_worker(&JUMPS, None);
+        let run_again = |harness: &mut Harness| {
+            harness.cpu.jit.as_ref().unwrap().finish_compiles();
+            harness.cpu.halted = false;
+            harness.cpu.rip = CODE_BASE;
+            assert_eq!(harness.run(100), Stop::Halted);
+        };
+        assert_eq!(harness.run(100), Stop::Halted);
+        run_again(&mut harness);
+        run_again(&mut harness);
+        let stats = harness.cpu.jit.as_ref().unwrap().stats();
+        assert_eq!(stats.translated, 4, "{stats:?}");
+        assert_eq!(stats.modules, 2, "{stats:?}");
+    }
+
+    #[test]
+    fn a_compile_worker_lowers_the_compile_threshold() {
+        let mut harness = harness_with_a_compile_worker(&COUNTDOWN_LOOP, None);
+        let jit = harness.cpu.jit.as_ref().unwrap();
+        jit.set_compile_threshold(COMPILE_THRESHOLD);
+        // The loop body's 100 runs make it hot, and its module goes to the worker.
+        run_countdown_and_rewind(&mut harness);
+        let jit = harness.cpu.jit.as_ref().unwrap();
+        assert_eq!(jit.stats().submitted, 1);
+        assert_eq!(
+            jit.shared.compile_threshold.load(Ordering::Relaxed),
+            COMPILE_THRESHOLD_WITH_WORKER
+        );
+    }
+
+    #[test]
+    fn a_loop_inside_a_pending_block_installs_it_once_the_worker_is_done() {
+        // The loop body lies inside the setup block: running it must still look for the setup
+        // block's module, so the loop gets a block of its own and stops being interpreted.
+        let mut harness = harness_with_a_compile_worker(&COUNTDOWN_LOOP, Some(1));
+        assert_eq!(harness.run(10_000), Stop::Halted);
+        assert_eq!(harness.cpu.gpr[1], 0);
+        let stats = harness.cpu.jit.as_ref().unwrap().stats();
+        assert!(stats.translated >= 2, "{stats:?}");
+        assert!(stats.cold_steps < COUNTDOWN_LOOP_INSNS / 2, "{stats:?}");
+    }
+
+    #[test]
+    fn a_loop_inside_a_pending_block_does_not_wait_for_the_worker_forever() {
+        let mut harness = harness_with_a_compile_worker(&COUNTDOWN_LOOP, None);
+        assert_eq!(harness.run(10_000), Stop::Halted);
+        let stats = harness.cpu.jit.as_ref().unwrap().stats();
+        assert!(
+            stats.impatient >= 2,
+            "the setup block, then the loop's: {stats:?}"
+        );
+        assert!(stats.cold_steps < COUNTDOWN_LOOP_INSNS / 2, "{stats:?}");
+    }
+
+    #[test]
+    fn code_inside_a_block_being_compiled_does_not_get_hot_on_its_own() {
+        // The loop body (and its jnz) lie inside the setup block, which is waiting for its
+        // module: running them in the interpreter must not make blocks of their own.
+        let mut harness = harness_with_a_compile_worker(&COUNTDOWN_LOOP, None);
+        run_countdown_and_rewind(&mut harness);
+        let jit = harness.cpu.jit.as_ref().unwrap();
+        let jnz = LOOP_BODY + 3;
+        assert!(
+            !jit.pending_starts().contains(&jnz),
+            "{:x?}",
+            jit.pending_starts()
+        );
+        assert_eq!(jit.block_index(jnz), None);
     }
 
     #[test]

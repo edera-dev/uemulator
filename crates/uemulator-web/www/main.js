@@ -3,6 +3,7 @@ import {
   FRAME_READY, NET_OFFSET, NET_RING_BYTES, OPTION, RECT_WORDS, RING_BYTES, RING_OFFSET, UEFI_FIRMWARE_MAGIC,
 } from "./protocol.js";
 import { formatMac, joinSegment, randomMac, randomTab } from "./segment.js";
+import { compileWorkerHelps, createCompileQueue } from "./jit_host.js";
 
 const $ = (id) => document.getElementById(id);
 const term = window.term = new Terminal({ convertEol: false, cursorBlink: true, fontSize: 14, scrollback: 5000 });
@@ -59,6 +60,9 @@ const BZIMAGE_MAGIC_OFFSET = 0x202;
 const BZIMAGE_MAGIC = "HdrS";
 
 let worker = null;
+// Compiles the JIT's modules beside `worker` (jit_compiler.js). Started here and not by `worker`,
+// whose own workers never start in Chrome while it is busy in `uw_run`.
+let compiler = null;
 // Set from Start until the worker exists (downloads happen in between).
 let starting = false;
 let control = null;
@@ -1038,6 +1042,8 @@ function finish(text, kind) {
   clearInterval(clock);
   worker?.terminate();
   worker = null;
+  compiler?.terminate();
+  compiler = null;
   // Only now that the worker is gone: leaving hands the server role to another tab.
   segment?.leave();
   segment = null;
@@ -1097,6 +1103,12 @@ async function launch() {
     }
 
     worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
+    let compileQueue = null;
+    if (s.jit && compileWorkerHelps()) {
+      compileQueue = createCompileQueue();
+      compiler = new Worker(new URL("./jit_compiler.js", import.meta.url), { type: "module" });
+      compiler.postMessage({ queue: compileQueue });
+    }
     starting = false;
     worker.onmessage = ({ data }) => {
       if (data.type === "output") {
@@ -1149,6 +1161,7 @@ async function launch() {
       rows: term.rows,
       control: shared,
       network,
+      compileQueue,
     };
     setStatus("Starting…", "busy");
     worker.postMessage(message, [kernel, initrd, hypervisor, firmware.image].filter(Boolean));

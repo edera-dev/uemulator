@@ -1,5 +1,6 @@
 //! A minimal WebAssembly binary encoder: the function body instructions the block generator
-//! (`emit_wasm.rs`) uses and the one fixed module shape every block is wrapped in. Nothing here
+//! (`emit_wasm.rs`) uses and the one fixed module shape every block is wrapped in (one or more
+//! functions, each exported under its index). Nothing here
 //! knows about the guest. Pure `alloc`, so it also builds and is unit-tested on hosts that cannot
 //! run the modules (where nothing but those tests uses it).
 
@@ -16,7 +17,12 @@ pub(crate) const BLOCK_VOID: u8 = 0x40;
 pub(crate) const BLOCK_I64: u8 = I64;
 
 /// Opcodes (WebAssembly core spec, "Binary Format: Instructions"), named as in the text format.
+/// There is no `loop` here, and block code must not get one without a look at
+/// `www/jit_compiler.js`: the compile worker runs every block once against a memory without the
+/// `Cpu` to make the engine compile it, which only ends because block code cannot loop.
 pub(crate) mod op {
+    #[cfg(test)]
+    pub const NOP: u8 = 0x01;
     pub const BLOCK: u8 = 0x02;
     pub const IF: u8 = 0x04;
     pub const ELSE: u8 = 0x05;
@@ -231,9 +237,6 @@ const REF_FUNCREF: u8 = 0x70;
 /// import; the engine checks the real one against it.
 const LIMITS_MIN_ONLY: u8 = 0;
 
-/// The export the host takes the block from (`www/jit_host.js`).
-pub(crate) const EXPORT_NAME: &str = "block";
-
 fn name(out: &mut Vec<u8>, text: &str) {
     leb_u32(out, text.len() as u32);
     out.extend_from_slice(text.as_bytes());
@@ -245,22 +248,42 @@ fn section(module: &mut Vec<u8>, id: u8, contents: &[u8]) {
     module.extend_from_slice(contents);
 }
 
-/// A module that exports `block`, a `(cpu: i32) -> i64` function whose body is `code` (which must
-/// end with its own `end`). It imports `env.memory` and `env.table`, the emulator's linear memory
-/// and function table, so the code reads the `Cpu` directly and reaches the helpers through
-/// `call_indirect`. `i32_locals` and `i64_locals` are declared after the parameter, in that order.
+/// One function of a module: its type (one of the `FUNCTION_TYPES`), its body (which must end
+/// with its own `end`) and the locals declared after the type's parameters, i32 then i64.
+pub(crate) struct Function<'a> {
+    pub type_index: u32,
+    pub code: &'a [u8],
+    pub i32_locals: u32,
+    pub i64_locals: u32,
+}
+
+/// A module that exports `block`'s function as "0": a `(cpu: i32) -> i64` function whose body is
+/// `code`. See `module_of_functions`.
 pub(crate) fn block_module(code: &[u8], i32_locals: u32, i64_locals: u32) -> Vec<u8> {
     module_of_type(BLOCK_TYPE, code, i32_locals, i64_locals)
 }
 
-/// `block_module` for a function of another of the `FUNCTION_TYPES`; its locals follow all of
-/// that type's parameters.
+/// `block_module` for a function of another of the `FUNCTION_TYPES`.
 pub(crate) fn module_of_type(
     function_type: u32,
     code: &[u8],
     i32_locals: u32,
     i64_locals: u32,
 ) -> Vec<u8> {
+    module_of_functions(&[Function {
+        type_index: function_type,
+        code,
+        i32_locals,
+        i64_locals,
+    }])
+}
+
+/// A module of `functions`, each exported under its index in decimal ("0", "1", ...), which is
+/// how `www/jit_host.js` finds them. It imports `env.memory` and `env.table`, the emulator's
+/// linear memory and function table, so the code reads the `Cpu` directly and reaches the helpers
+/// through `call_indirect`. The functions never call each other by index, so a block's body is
+/// the same bytes whichever module it ends up in.
+pub(crate) fn module_of_functions(functions: &[Function]) -> Vec<u8> {
     let mut module = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
 
     let mut types = Vec::new();
@@ -284,34 +307,40 @@ pub(crate) fn module_of_type(
     imports.extend_from_slice(&[EXTERN_TABLE, REF_FUNCREF, LIMITS_MIN_ONLY, 0]);
     section(&mut module, SECTION_IMPORT, &imports);
 
-    let mut functions = Vec::new();
-    leb_u32(&mut functions, 1);
-    leb_u32(&mut functions, function_type);
-    section(&mut module, SECTION_FUNCTION, &functions);
+    let mut declarations = Vec::new();
+    leb_u32(&mut declarations, functions.len() as u32);
+    for function in functions {
+        leb_u32(&mut declarations, function.type_index);
+    }
+    section(&mut module, SECTION_FUNCTION, &declarations);
 
     let mut exports = Vec::new();
-    leb_u32(&mut exports, 1);
-    name(&mut exports, EXPORT_NAME);
-    exports.push(EXTERN_FUNC);
-    leb_u32(&mut exports, 0);
+    leb_u32(&mut exports, functions.len() as u32);
+    for index in 0..functions.len() as u32 {
+        name(&mut exports, &index.to_string());
+        exports.push(EXTERN_FUNC);
+        leb_u32(&mut exports, index);
+    }
     section(&mut module, SECTION_EXPORT, &exports);
 
-    let mut body = Vec::new();
-    let local_groups = [(i32_locals, I32), (i64_locals, I64)];
-    let declared: Vec<_> = local_groups
-        .iter()
-        .filter(|(count, _)| *count > 0)
-        .collect();
-    leb_u32(&mut body, declared.len() as u32);
-    for (count, ty) in declared {
-        leb_u32(&mut body, *count);
-        body.push(*ty);
-    }
-    body.extend_from_slice(code);
     let mut code_section = Vec::new();
-    leb_u32(&mut code_section, 1);
-    leb_u32(&mut code_section, body.len() as u32);
-    code_section.extend_from_slice(&body);
+    leb_u32(&mut code_section, functions.len() as u32);
+    for function in functions {
+        let mut body = Vec::new();
+        let local_groups = [(function.i32_locals, I32), (function.i64_locals, I64)];
+        let declared: Vec<_> = local_groups
+            .iter()
+            .filter(|(count, _)| *count > 0)
+            .collect();
+        leb_u32(&mut body, declared.len() as u32);
+        for (count, ty) in declared {
+            leb_u32(&mut body, *count);
+            body.push(*ty);
+        }
+        body.extend_from_slice(function.code);
+        leb_u32(&mut code_section, body.len() as u32);
+        code_section.extend_from_slice(&body);
+    }
     section(&mut module, SECTION_CODE, &code_section);
     module
 }
@@ -413,6 +442,82 @@ mod tests {
         );
         // two local groups: 2 x i32, 3 x i64, then the body
         assert!(module.ends_with(&[0x02, 0x02, I32, 0x03, I64, op::END]));
+    }
+
+    /// The sections of `module` as (id, contents), checking every length on the way.
+    fn sections(module: &[u8]) -> Vec<(u8, &[u8])> {
+        let mut out = Vec::new();
+        let mut offset = 8;
+        while offset < module.len() {
+            let id = module[offset];
+            let (length, at) = read_leb(module, offset + 1);
+            out.push((id, &module[at..at + length as usize]));
+            offset = at + length as usize;
+        }
+        assert_eq!(offset, module.len());
+        out
+    }
+
+    fn read_leb(bytes: &[u8], mut at: usize) -> (u32, usize) {
+        let (mut value, mut shift) = (0u32, 0);
+        loop {
+            let byte = bytes[at];
+            at += 1;
+            value |= ((byte & 0x7f) as u32) << shift;
+            shift += 7;
+            if byte & 0x80 == 0 {
+                return (value, at);
+            }
+        }
+    }
+
+    #[test]
+    fn a_module_of_several_functions_exports_each_under_its_index() {
+        let bodies: [&[u8]; 3] = [
+            &[op::END],
+            &[op::NOP, op::END],
+            &[op::NOP, op::NOP, op::END],
+        ];
+        let functions: Vec<Function> = bodies
+            .iter()
+            .enumerate()
+            .map(|(i, code)| Function {
+                type_index: if i == 1 { LINK_TYPE } else { BLOCK_TYPE },
+                code,
+                i32_locals: i as u32,
+                i64_locals: 0,
+            })
+            .collect();
+        let module = module_of_functions(&functions);
+        let sections = sections(&module);
+        let section = |id| sections.iter().find(|(i, _)| *i == id).unwrap().1;
+        assert_eq!(
+            section(SECTION_FUNCTION),
+            [3, BLOCK_TYPE as u8, LINK_TYPE as u8, BLOCK_TYPE as u8]
+        );
+        // three exports: the name "0" for function 0, and so on
+        assert_eq!(
+            section(SECTION_EXPORT),
+            [
+                3,
+                1,
+                b'0',
+                EXTERN_FUNC,
+                0,
+                1,
+                b'1',
+                EXTERN_FUNC,
+                1,
+                1,
+                b'2',
+                EXTERN_FUNC,
+                2
+            ]
+        );
+        let code = section(SECTION_CODE);
+        assert_eq!(code[0], 3);
+        // function 2: 2 x i32, two nops
+        assert!(code.ends_with(&[6, 1, 2, I32, op::NOP, op::NOP, op::END]));
     }
 
     #[test]

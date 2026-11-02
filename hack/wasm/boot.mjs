@@ -5,7 +5,7 @@
 //   node hack/wasm/boot.mjs [--kernel K] [--initrd I] [--disk D]... [--cdrom ISO]... [--cmdline S] [--memory MiB]
 //                           [--firmware none|uefi|bios] [--cpus N] [--iommu] [--no-acpi] [--serial]
 //                           [--hypervisor XEN [--hypervisor-cmdline S]]
-//                           [--no-jit] [--debug] [--wasm FILE] [--until TEXT] [--seconds N]
+//                           [--no-jit] [--no-compile-worker] [--debug] [--wasm FILE] [--until TEXT] [--seconds N]
 //
 // --disk is a raw or udisk image (a file, or an http(s) URL served with range requests) attached
 // the way the page attaches one: read on demand, writes kept in memory. --cdrom attaches an image
@@ -15,7 +15,9 @@
 // target/web/uemulator-firmware.bin (hack/web.sh builds it) and boots the kernel through it, or the
 // disk when there is no kernel. --debug turns on the library's debug mode: on exit the state dump,
 // with the JIT's counters and the instructions that went through the interpreter, goes to stderr
-// (it costs time; do not measure with it). --wasm boots another build of the module, for comparing
+// (it costs time; do not measure with it). --no-compile-worker compiles the JIT's modules on the
+// emulator's thread, as engines other than V8 do (www/jit_host.js); `compile=` is the time that
+// thread spent instantiating them either way. --wasm boots another build of the module, for comparing
 // two builds (with --firmware uefi the firmware image is looked for next to it). --hypervisor
 // boots Xen (xen.gz, xen or xen.efi) through the UEFI firmware with the kernel as its dom0, as the
 // page does; --cmdline is then dom0's and --hypervisor-cmdline Xen's (empty: the library's default).
@@ -24,8 +26,9 @@
 // JIT host did to stderr.
 import { closeSync, fstatSync, openSync, readFileSync, readSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { Worker } from "node:worker_threads";
 import { parseArgs } from "node:util";
-import { createJitHost } from "../../crates/uemulator-web/www/jit_host.js";
+import { createCompileQueue, createJitHost } from "../../crates/uemulator-web/www/jit_host.js";
 import { FIRMWARE, OPTION } from "../../crates/uemulator-web/www/protocol.js";
 
 const { values } = parseArgs({
@@ -45,6 +48,7 @@ const { values } = parseArgs({
     "hypervisor-cmdline": { type: "string", default: "" },
     wasm: { type: "string", default: new URL("../../target/web/uemulator_web.wasm", import.meta.url).pathname },
     "no-jit": { type: "boolean", default: false },
+    "no-compile-worker": { type: "boolean", default: false },
     debug: { type: "boolean", default: false },
     until: { type: "string" },
     seconds: { type: "string", default: "120" },
@@ -68,13 +72,13 @@ const sleeper = new Int32Array(new SharedArrayBuffer(4));
 
 const host = {
   ...jit.host,
-  host_jit_compile(ptr, len) {
+  host_jit_compile(ptr, len, slots, count) {
     const before = performance.now();
-    const slot = jit.host.host_jit_compile(ptr, len);
+    const status = jit.host.host_jit_compile(ptr, len, slots, count);
     compileMs += performance.now() - before;
     compiled++;
-    if (slot < 0) console.error("jit: module refused:", jit.host.lastError);
-    return slot;
+    if (status < 0) console.error("jit: module refused:", jit.host.lastError);
+    return status;
   },
   host_output(ptr, len) {
     const text = decoder.decode(bytes(ptr, len));
@@ -150,6 +154,11 @@ let diskBytes = 0;
 const { instance } = await WebAssembly.instantiate(readFileSync(values.wasm), { host });
 wasm = instance.exports;
 jit.attach(wasm);
+if (!values["no-jit"] && !values["no-compile-worker"]) {
+  const compileQueue = createCompileQueue();
+  new Worker(new URL("./jit_compiler.mjs", import.meta.url), { workerData: compileQueue }).unref();
+  jit.useCompileQueue(compileQueue);
+}
 
 function upload(data) {
   const ptr = wasm.uw_alloc(data.byteLength);
