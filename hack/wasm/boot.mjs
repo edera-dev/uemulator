@@ -91,6 +91,12 @@ const host = {
   host_frame_ready: () => 0,
   host_frame() {},
   host_cursor() {},
+  // No network here (hack/wasm/segment.mjs boots machines on a shared segment).
+  host_net_recv: () => 0,
+  host_net_send() {},
+  host_net_flush() {},
+  host_net_serving: () => 0,
+  host_net_status() {},
   host_should_stop: () => (found || performance.now() > deadline ? 1 : 0),
   host_idle: () => Atomics.wait(sleeper, 0, 0, 1),
   host_random(ptr, len) {

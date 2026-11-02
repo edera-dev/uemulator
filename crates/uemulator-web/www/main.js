@@ -1,7 +1,8 @@
 import {
-  CONTROL_BYTES, CTRL, CURSOR, EVENT, EVENT_OFFSET, EVENT_RECORDS, EVENT_WORDS, EXIT_NAMES, FIRMWARE, OPTION,
-  RING_BYTES, RING_OFFSET, UEFI_FIRMWARE_MAGIC,
+  CONTROL_BYTES, CTRL, CURSOR, EVENT, EVENT_OFFSET, EVENT_RECORDS, EVENT_WORDS, EXIT_NAMES, FIRMWARE, NET_OFFSET,
+  NET_RING_BYTES, OPTION, RING_BYTES, RING_OFFSET, UEFI_FIRMWARE_MAGIC,
 } from "./protocol.js";
+import { formatMac, joinSegment, randomMac, randomTab } from "./segment.js";
 
 const $ = (id) => document.getElementById(id);
 const term = window.term = new Terminal({ convertEol: false, cursorBlink: true, fontSize: 14, scrollback: 5000 });
@@ -38,7 +39,7 @@ const FIRMWARE_HINTS = {
 };
 const FIRMWARE_LABELS = { uefi: "UEFI", none: "direct kernel", bios: "BIOS", custom: "custom firmware" };
 const RADIOS = ["firmware", "console", "display"];
-const CHECKBOXES = ["shell", "replace-cmdline", "jit", "acpi", "iommu", "rng", "reboot", "input"];
+const CHECKBOXES = ["shell", "replace-cmdline", "jit", "acpi", "iommu", "rng", "reboot", "input", "network"];
 const SELECTS = ["memory", "cpus"];
 // Where the guest RAM is one allocation of the 32-bit module: Rust refuses one larger than
 // isize::MAX, so 2 GiB less a MiB is the most there is.
@@ -63,6 +64,9 @@ let starting = false;
 let control = null;
 let ring = null;
 let events = null;
+// This tab's place on the shared segment while a machine with a network runs (segment.js).
+let segment = null;
+let networkMac = null;
 let startedAt = 0;
 let clock = null;
 let hasRun = false;
@@ -221,6 +225,7 @@ function readSettings() {
     serial: radio("console") === "serial",
     display: radio("display"),
     input: $("input").checked,
+    network: $("network").checked,
     memoryMib: Number($("memory").value),
     cpus: Number($("cpus").value),
     jit: $("jit").checked,
@@ -438,6 +443,7 @@ function restoreSettings() {
   $("cmdline").value = "cmdline" in saved ? saved.cmdline : DEFAULT_CMDLINE_EXTRA;
   if (params.has("args")) $("cmdline").value = params.get("args");
   if (params.has("iommu")) $("iommu").checked = $("acpi").checked = true;
+  if (params.has("network")) $("network").checked = !["0", "off", "false"].includes(params.get("network"));
   $("hypervisor-cmdline").value = params.get("hypervisor-args") ?? saved.hypervisorCmdline ?? "";
   for (const key of ["kernel", "initrd", "hypervisor", "firmwareImage"]) {
     const url = params.get(key === "firmwareImage" ? "firmware-image" : key) ?? saved[key];
@@ -863,11 +869,32 @@ function showBanner(text, kind) {
   $("banner").hidden = false;
 }
 
+// The bar's network pill: the guest's address on the shared segment and how many other tabs'
+// machines are on it.
+function showNetwork({ address, peers, serving }) {
+  const pill = $("net-status");
+  const dotted = address ? [24, 16, 8, 0].map((shift) => (address >>> shift) & 0xff).join(".") : null;
+  const others = `${peers} other machine${peers === 1 ? "" : "s"}`;
+  pill.firstElementChild.textContent = `${dotted ?? "no address yet"} · ${others}`;
+  pill.dataset.kind = dotted ? "network" : "network-waiting";
+  pill.title = [
+    `Shared network, NIC ${formatMac(networkMac)}`,
+    dotted ? `address ${dotted}/24` : "the guest has no address yet (run DHCP on its interface, e.g. udhcpc -i eth0)",
+    `${others} in this browser's other tabs`,
+    serving ? "this tab is the segment's DHCP server (10.0.2.2)" : "another tab is the DHCP server (10.0.2.2)",
+  ].join("\n");
+  pill.hidden = false;
+}
+
 function finish(text, kind) {
   starting = false;
   clearInterval(clock);
   worker?.terminate();
   worker = null;
+  // Only now that the worker is gone: leaving hands the server role to another tab.
+  segment?.leave();
+  segment = null;
+  $("net-status").hidden = true;
   control = null;
   ring = null;
   events = null;
@@ -913,6 +940,14 @@ async function launch() {
     control[CTRL.COLS] = term.cols;
     control[CTRL.ROWS] = term.rows;
     control[CTRL.FRAME_ACK] = 1;
+    let network = null;
+    if (s.network) {
+      const tab = randomTab();
+      networkMac = randomMac();
+      network = { mac: networkMac.buffer, tab };
+      segment = joinSegment({ control, ring: new Uint8Array(shared, NET_OFFSET, NET_RING_BYTES), tab });
+      showNetwork({ address: 0, peers: 0, serving: false });
+    }
 
     worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
     starting = false;
@@ -923,6 +958,8 @@ async function launch() {
         drawFrame(data);
       } else if (data.type === "cursor") {
         setCursor(data);
+      } else if (data.type === "network") {
+        showNetwork(data);
       } else if (data.type === "log") {
         console.log("[uemulator]", data.text);
       } else if (data.type === "started") {
@@ -964,6 +1001,7 @@ async function launch() {
       cols: term.cols,
       rows: term.rows,
       control: shared,
+      network,
     };
     setStatus("Starting…", "busy");
     worker.postMessage(message, [kernel, initrd, hypervisor, firmware.image].filter(Boolean));

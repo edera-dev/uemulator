@@ -9,7 +9,9 @@
 //! and the screen's keyboard and pointer events through a second ring (`host_input_events`).
 //! Screen updates go the other way through `host_frame`, one at a time: the page acknowledges
 //! each once drawn (`host_frame_ready`), so a busy page gets fewer, larger updates rather than a
-//! backlog of messages.
+//! backlog of messages. With a network (`uw_set_network`) the guest's NIC is a port on the
+//! segment the page's tabs share: the library's `SegmentAgent` switches its frames, and the
+//! `host_net_*` imports carry them (`www/segment.js`).
 #![cfg(target_arch = "wasm32")]
 
 use std::cell::RefCell;
@@ -18,8 +20,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use uemulator::{
     BYTES_PER_PIXEL, BlockBackend, ClockMode, ConsoleKind, Cursor, Disk, DisplayHandle,
     DisplayMode, EmulatedMachine, ExitReason, FrameUpdate, InputHandle, JitMode, MachineConfig,
-    MemoryKeyValueStore, PointerButton, RawImage, Rect, RemoteImage, StopHandle, Udisk,
-    UdiskOptions, disk_io,
+    MemoryKeyValueStore, NetHandle, PointerButton, RawImage, Rect, RemoteImage, SegmentAgent,
+    SegmentDestination, SegmentStatus, StopHandle, Udisk, UdiskOptions, disk_io,
 };
 
 const NS_PER_MS: f64 = 1_000_000.0;
@@ -38,6 +40,15 @@ const FRAME_INTERVAL_MS: f64 = 16.0;
 /// arguments (`EVENT_*`, `www/protocol.js` has the same numbers).
 const EVENTS_PER_POLL: usize = 64;
 const EVENT_WORDS: usize = 3;
+/// The longest frame taken from another tab: a guest may raise its MTU to virtio-net's limit of
+/// 65535 (no MTU feature is offered), plus the Ethernet header.
+const SEGMENT_FRAME_MAX: usize = u16::MAX as usize + 14;
+const MAC_BYTES: usize = 6;
+
+// `host_net_send` destinations (`SegmentDestination`); `www/protocol.js` has the same numbers.
+const DESTINATION_EVERYONE: i32 = 0;
+const DESTINATION_TAB: i32 = 1;
+const DESTINATION_SERVER: i32 = 2;
 
 pub const EXIT_SHUTDOWN: i32 = 0;
 pub const EXIT_RESET: i32 = 1;
@@ -142,6 +153,19 @@ unsafe extern "C" {
         ptr: *const u8,
         len: usize,
     );
+    /// The next frame another tab sent this one: copies it to `ptr` (`capacity` bytes at most; a
+    /// longer one is skipped), the sending tab's number to `from`, and returns its length, or 0
+    /// when none is waiting. Never blocks.
+    fn host_net_recv(ptr: *mut u8, capacity: usize, from: *mut u32) -> usize;
+    /// Queues a frame for the other tabs: `destination` is a `DESTINATION_*`, `tab` the tab for
+    /// `DESTINATION_TAB`. Sent at the next `host_net_flush`.
+    fn host_net_send(ptr: *const u8, len: usize, destination: i32, tab: u32);
+    fn host_net_flush();
+    /// Non-zero while this tab holds the segment's server lock.
+    fn host_net_serving() -> i32;
+    /// The segment status changed: the guest's address (big-endian, 0 for none), the number of
+    /// other tabs and whether this one serves.
+    fn host_net_status(address: u32, peers: u32, serving: i32);
     /// The pointer image: `CURSOR_*` kind, and for `CURSOR_IMAGE` its size, hotspot and RGBA
     /// pixels (straight alpha).
     fn host_cursor(
@@ -172,6 +196,19 @@ thread_local! {
     static PENDING_HYPERVISOR: RefCell<Option<(Vec<u8>, String)>> = const { RefCell::new(None) };
     /// The machine's screen and input handles, for the poll hook (like `STOP`).
     static SCREEN: RefCell<Option<ScreenLink>> = const { RefCell::new(None) };
+    /// What `uw_set_network` set up for the next `uw_create`: the NIC's address and its agent.
+    static PENDING_NETWORK: RefCell<Option<([u8; MAC_BYTES], SegmentAgent)>> = const { RefCell::new(None) };
+    /// The running machine's port on the segment, for the poll hook.
+    static NETWORK: RefCell<Option<NetLink>> = const { RefCell::new(None) };
+}
+
+/// What the poll hook keeps between calls to move frames between the guest's NIC, its agent and
+/// the other tabs.
+struct NetLink {
+    net: NetHandle,
+    agent: SegmentAgent,
+    frame: Vec<u8>,
+    reported: Option<SegmentStatus>,
 }
 
 /// What the poll hook keeps between calls to feed the page the screen and the guest the input.
@@ -310,6 +347,35 @@ pub unsafe extern "C" fn uw_set_hypervisor(
     PENDING_HYPERVISOR.with(|hypervisor| *hypervisor.borrow_mut() = Some((image, cmdline)));
 }
 
+/// Gives the next `uw_create` a virtio-net NIC with address `mac` (6 bytes) on the segment the
+/// page's tabs share, as tab `tab` (`www/segment.js` picks both at random). Takes ownership of
+/// the buffer. Returns 0, or 1 with the message in `uw_error_*` for an address a tab may not use.
+///
+/// # Safety
+/// `mac` must come from `uw_alloc(len)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uw_set_network(mac: *mut u8, len: usize, tab: u32) -> i32 {
+    let mac = unsafe { take_buffer(mac, len) };
+    let Ok(mac) = <[u8; MAC_BYTES]>::try_from(mac.as_slice()) else {
+        set_error(format!("a MAC address is {MAC_BYTES} bytes, not {len}"));
+        return 1;
+    };
+    match SegmentAgent::new(mac, tab, now_ms()) {
+        Ok(agent) => {
+            PENDING_NETWORK.with(|network| *network.borrow_mut() = Some((mac, agent)));
+            0
+        }
+        Err(error) => {
+            set_error(error.to_string());
+            1
+        }
+    }
+}
+
+fn now_ms() -> u64 {
+    unsafe { host_now_ms() as u64 }
+}
+
 /// Builds the machine and loads the kernel. Returns 0, or 1 with the message in `uw_error_*`.
 /// `kernel_len == 0` means no kernel (the firmware boots a disk), `initrd_len == 0` no initramfs.
 /// The command line is appended to the library's default (which follows `OPTION_ACPI` and
@@ -385,6 +451,12 @@ pub unsafe extern "C" fn uw_create(
     if initrd_len != 0 {
         config = config.initrd(initrd);
     }
+    // No offloads are declared: the frames go to other guests, which need real checksums and
+    // MTU-sized frames.
+    let network = PENDING_NETWORK.with(|network| network.take());
+    if let Some((mac, _)) = &network {
+        config = config.net(*mac);
+    }
     for disk in PENDING_DISKS.with(|disks| disks.take()) {
         config = config.disk(disk);
     }
@@ -437,6 +509,14 @@ pub unsafe extern "C" fn uw_create(
             pixels: Vec::new(),
         });
     });
+    NETWORK.with(|slot| {
+        *slot.borrow_mut() = network.zip(machine.net()).map(|((_, agent), net)| NetLink {
+            net,
+            agent,
+            frame: vec![0; SEGMENT_FRAME_MAX],
+            reported: None,
+        });
+    });
     MACHINE.with(|slot| *slot.borrow_mut() = Some(machine));
     0
 }
@@ -468,6 +548,11 @@ fn poll(console: &uemulator::ConsoleHandle, idle: bool) {
         if let Some(link) = screen.borrow_mut().as_mut() {
             link.deliver_input();
             link.send_screen();
+        }
+    });
+    NETWORK.with(|network| {
+        if let Some(link) = network.borrow_mut().as_mut() {
+            link.pump();
         }
     });
     if unsafe { host_should_stop() } != 0 {
@@ -597,6 +682,51 @@ impl ScreenLink {
     }
 }
 
+impl NetLink {
+    /// Moves every frame waiting on either side through the agent, then sends what it produced.
+    fn pump(&mut self) {
+        let now = now_ms();
+        self.agent
+            .set_serving(unsafe { host_net_serving() } != 0, now);
+        loop {
+            let mut from = 0u32;
+            let len =
+                unsafe { host_net_recv(self.frame.as_mut_ptr(), self.frame.len(), &mut from) };
+            if len == 0 {
+                break;
+            }
+            self.agent.from_segment(from, &self.frame[..len], now);
+        }
+        while let Some(frame) = self.net.try_recv_frame() {
+            self.agent.from_guest(&frame, now);
+        }
+        self.agent.tick(now);
+        // A full receive queue (a guest whose driver is not up) drops the frame, as a NIC
+        // without receive buffers would.
+        for frame in self.agent.take_for_guest() {
+            self.net.send_frame(&frame);
+        }
+        let outgoing = self.agent.take_for_segment();
+        if !outgoing.is_empty() {
+            for (destination, frame) in &outgoing {
+                let (destination, tab) = match destination {
+                    SegmentDestination::Everyone => (DESTINATION_EVERYONE, 0),
+                    SegmentDestination::Tab(tab) => (DESTINATION_TAB, *tab),
+                    SegmentDestination::Server => (DESTINATION_SERVER, 0),
+                };
+                unsafe { host_net_send(frame.as_ptr(), frame.len(), destination, tab) };
+            }
+            unsafe { host_net_flush() };
+        }
+        let status = self.agent.status();
+        if self.reported != Some(status) {
+            self.reported = Some(status);
+            let address = status.address.map_or(0, u32::from_be_bytes);
+            unsafe { host_net_status(address, status.peers as u32, i32::from(status.serving)) };
+        }
+    }
+}
+
 /// The library's pixels (blue, green, red, unused) as `ImageData` wants them (red, green, blue,
 /// alpha), in place. Opaque, since the fourth byte of a screen pixel means nothing.
 fn bgrx_to_rgba(pixels: &mut [u8]) {
@@ -643,6 +773,7 @@ pub extern "C" fn uw_run() -> i32 {
     let reason = machine.wait();
     STOP.with(|slot| *slot.borrow_mut() = None);
     SCREEN.with(|slot| *slot.borrow_mut() = None);
+    NETWORK.with(|slot| *slot.borrow_mut() = None);
     match reason {
         ExitReason::Shutdown => EXIT_SHUTDOWN,
         ExitReason::Reset => EXIT_RESET,

@@ -59,6 +59,8 @@
   .pill[data-kind=busy]::before { background: var(--accent); animation: pulse 1s ease-in-out infinite; }
   .pill[data-kind=error] { color: var(--error); background: var(--error-soft); }
   .pill[data-kind=error]::before { background: var(--error); }
+  .pill[data-kind=network]::before { background: var(--accent); }
+  .pill[data-kind=network-waiting]::before { background: var(--faint); }
   @keyframes pulse { 50% { opacity: .3; } }
   .spacer { flex: 1; }
   .group { display: flex; align-items: center; gap: 6px; }
@@ -195,6 +197,7 @@
   <button id="toggle-sidebar" class="ghost" title="Show or hide the machine's settings" aria-expanded="true" aria-controls="sidebar"><svg class="i"><use href="#i-menu"/></svg><span class="hide-narrow">Settings</span></button>
   <div class="brand">uemulator<small>x86_64 in your browser</small></div>
   <div id="status" class="pill" role="status"><span>Stopped</span></div>
+  <div id="net-status" class="pill hide-narrow" role="status" hidden><span></span></div>
   <div class="spacer"></div>
   <div class="group" id="screen-tools" hidden>
     <div class="segmented" id="views" role="group" aria-label="View">
@@ -299,6 +302,7 @@
             </div>
           </div>
           <label class="switch"><strong>Keyboard and mouse</strong><span>virtio keyboard and tablet, fed from the Screen view.</span><input id="input" type="checkbox" checked></label>
+          <label class="switch"><strong>Network</strong><span>virtio-net on an Ethernet segment shared with the machines in this browser's other tabs of this page. DHCP gives each an address in 10.0.2.0/24 (10.0.2.15 and up); no internet.</span><input id="network" type="checkbox" checked></label>
         </section>
 
         <section class="panel">
