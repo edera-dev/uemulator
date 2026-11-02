@@ -62,7 +62,7 @@ impl Rig {
             setup_queue(&mut ram, CURSOR_DESC, CURSOR_AVAIL, CURSOR_USED, QUEUE_SIZE),
         ];
         Rig {
-            gpu: VirtioGpu::new(display.clone()),
+            gpu: VirtioGpu::new(display.clone(), None),
             display,
             queues,
             ram,
@@ -785,7 +785,7 @@ fn the_device_of_the_next_boot_takes_the_screen_and_pointer_back_without_a_reset
     assert!(rig.display.virtio_owns_screen());
     assert_eq!(rig.display.cursor().1, Cursor::Hidden);
     // A restart that skipped the driver's shutdown: no reset, just new devices.
-    let _next_boot = VirtioGpu::new(rig.display.clone());
+    let _next_boot = VirtioGpu::new(rig.display.clone(), None);
     assert!(
         !rig.display.virtio_owns_screen(),
         "the boot framebuffer is scanned again"
@@ -857,3 +857,5 @@ fn a_device_reset_frees_everything_and_hands_the_screen_back() {
     assert_eq!(rig.gpu.resource_bytes, 0);
     assert_eq!(rig.flush(RESOURCE, full()), RESP_ERR_INVALID_RESOURCE_ID);
 }
+
+mod three_d;

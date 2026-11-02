@@ -18,6 +18,7 @@ mod cpu;
 mod dev;
 mod disk;
 mod display;
+mod gpu;
 mod jit;
 mod kv;
 mod machine;
@@ -49,6 +50,7 @@ pub use display::{
     BYTES_PER_PIXEL, Cursor, CursorImage, DisplayHandle, Frame, FrameUpdate, InputHandle,
     PointerButton, Rect, ScreenMirror, linux_key_for_usb_usage,
 };
+pub use gpu::{GpuBox, GpuCapset, GpuCommand, GpuLimits, GpuLink, GpuResource};
 #[cfg(not(freestanding))]
 pub use kv::FileKeyValueStore;
 pub use kv::{KeyValueError, KeyValueStore, MemoryKeyValueStore};
@@ -198,6 +200,152 @@ mod api_tests {
             PointerButton::Extra,
         ];
         let _ = [DisplayMode::None, DisplayMode::Framebuffer];
+    }
+
+    #[test]
+    fn the_gpu_renderer_surface_has_the_documented_signatures() {
+        let _: fn(Vec<GpuCapset>, GpuLimits) -> GpuLink = GpuLink::new;
+        let _: fn(MachineConfig, GpuLink) -> MachineConfig = MachineConfig::gpu;
+        let _: fn(&GpuLink) -> &[GpuCapset] = GpuLink::capsets;
+        let _: fn(&GpuLink) -> GpuLimits = GpuLink::limits;
+        let _: fn(&GpuLink) -> Vec<GpuCommand> = GpuLink::take_commands;
+        let _: fn(&GpuLink, u64) = GpuLink::complete_fence;
+        let _: fn(&GpuLink, u64, Vec<u8>) = GpuLink::complete_read;
+        let _ = |link: &GpuLink| link.on_commands(|| {});
+        let _: [u32; 2] = [GpuCapset::VIRGL, GpuCapset::VIRGL2];
+        let capset = GpuCapset {
+            id: GpuCapset::VIRGL2,
+            max_version: 2,
+            data: Vec::new(),
+        };
+        let limits = GpuLimits {
+            max_texture_size: 1,
+            max_texture_3d_size: 1,
+            max_array_layers: 1,
+            max_buffer_bytes: 1,
+            max_resource_bytes: 1,
+        };
+        let region = GpuBox {
+            x: 0,
+            y: 0,
+            z: 0,
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+        let resource = GpuResource {
+            id: 1,
+            target: 2,
+            format: 1,
+            bind: 0,
+            width: 1,
+            height: 1,
+            depth: 1,
+            array_size: 1,
+            last_level: 0,
+            samples: 0,
+            flags: 0,
+        };
+        let rect = Rect::default();
+        let commands = [
+            GpuCommand::Reset,
+            GpuCommand::CreateContext {
+                context: 1,
+                name: Vec::new(),
+            },
+            GpuCommand::DestroyContext { context: 1 },
+            GpuCommand::AttachResource {
+                context: 1,
+                resource: 1,
+            },
+            GpuCommand::DetachResource {
+                context: 1,
+                resource: 1,
+            },
+            GpuCommand::CreateResource(resource),
+            GpuCommand::DestroyResource { resource: 1 },
+            GpuCommand::WriteResource {
+                context: 1,
+                resource: 1,
+                level: 0,
+                region,
+                data: Vec::new(),
+            },
+            GpuCommand::ReadResource {
+                context: 1,
+                resource: 1,
+                level: 0,
+                region,
+                token: 1,
+            },
+            GpuCommand::Submit {
+                context: 1,
+                commands: Vec::new(),
+            },
+            GpuCommand::SetScanout {
+                scanout: 0,
+                resource: 1,
+                rect,
+            },
+            GpuCommand::Flush { resource: 1, rect },
+            GpuCommand::Fence { sequence: 1 },
+        ];
+        assert_eq!(commands.len(), 13);
+        let _ = (capset, limits);
+    }
+
+    #[test]
+    fn gpu_types_cross_threads_and_keep_their_derives() {
+        is_send_sync::<GpuLink>();
+        is_clone::<GpuLink>();
+        is_debug::<GpuLink>();
+        is_send::<GpuCommand>();
+        is_clone::<GpuCommand>();
+        is_debug::<GpuCommand>();
+        is_clone::<GpuCapset>();
+        is_copy::<GpuLimits>();
+        is_default::<GpuLimits>();
+        is_copy::<GpuBox>();
+        is_default::<GpuBox>();
+        is_copy::<GpuResource>();
+        is_default::<GpuResource>();
+    }
+
+    #[test]
+    fn a_gpu_renderer_needs_a_display_and_capsets_the_guest_accepts() {
+        let renderer = |capsets| GpuLink::new(capsets, GpuLimits::default());
+        let capset = |id, bytes| GpuCapset {
+            id,
+            max_version: 1,
+            data: vec![0; bytes],
+        };
+        let refused = [
+            (MachineConfig::new().gpu(renderer(Vec::new())), "display"),
+            (
+                MachineConfig::new()
+                    .display(DisplayMode::Framebuffer)
+                    .gpu(renderer(vec![capset(0, 4)])),
+                "nonzero",
+            ),
+            (
+                MachineConfig::new()
+                    .display(DisplayMode::Framebuffer)
+                    .gpu(renderer(vec![capset(1, 4), capset(1, 4)])),
+                "distinct",
+            ),
+            (
+                MachineConfig::new()
+                    .display(DisplayMode::Framebuffer)
+                    .gpu(renderer(vec![capset(1, 1 << 20)])),
+                "larger",
+            ),
+        ];
+        for (config, words) in refused {
+            match EmulatedMachine::new(config) {
+                Err(Error::BadConfig(message)) => assert!(message.contains(words), "{message}"),
+                other => panic!("expected BadConfig about {words}, got {:?}", other.err()),
+            }
+        }
     }
 
     #[test]

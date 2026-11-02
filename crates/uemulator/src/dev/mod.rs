@@ -24,6 +24,7 @@ mod vrng;
 use crate::console::ConsoleHandle;
 use crate::disk::Disk;
 use crate::display::{DisplayHandle, InputDevice, InputHandle};
+use crate::gpu::GpuLink;
 use crate::netdev::NetHandle;
 use crate::sync::Arc;
 use acpi_pm::AcpiPm;
@@ -166,6 +167,8 @@ pub(crate) struct DisplayDevices {
     /// The UEFI firmware's framebuffer in RAM, shown while no virtio-gpu driver owns the screen.
     /// Only a machine booted through the firmware has one.
     pub boot_framebuffer: Option<FramebufferRegion>,
+    /// The renderer behind the GPU's 3D commands; without one the GPU is 2D only.
+    pub gpu: Option<GpuLink>,
 }
 
 /// PCI functions `DevConfig::display` adds: the GPU.
@@ -315,6 +318,7 @@ impl Devices {
         if let Some(display) = cfg.display {
             virtio_devices.push(Transport::new(Box::new(VirtioGpu::new(
                 display.display.clone(),
+                display.gpu.clone(),
             ))));
             boot_framebuffer = display
                 .boot_framebuffer

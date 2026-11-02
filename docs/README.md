@@ -29,7 +29,7 @@ The design plans in [`plans/`](plans/README.md) are the source of truth for how 
 - [16-iommu.md](plans/16-iommu.md): the AMD IOMMU, covering translation, interrupt remapping and IVRS.
 - [11-storage-net-console.md](plans/11-storage-net-console.md): configurable RAM and the virtio-pci disk, network and console.
 - [24-display-input.md](plans/24-display-input.md): the graphical console: virtio-gpu, virtio-input, the firmware's GOP framebuffer, the display and input handles and the CLI's web viewer.
-- [25-gpu-3d.md](plans/25-gpu-3d.md): proposal for guest 3D through virtio-gpu: virgl on WebGL2 (recommended) against Venus on WebGPU, the render worker and milestones.
+- [25-gpu-3d.md](plans/25-gpu-3d.md): guest 3D through virtio-gpu: the device side and `GpuLink` (done), virgl on WebGL2 (recommended) against Venus on WebGPU, the render worker and milestones.
 
 ## Firmware and boot
 

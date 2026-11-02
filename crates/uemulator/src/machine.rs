@@ -19,6 +19,7 @@ use crate::dev::{
 };
 use crate::disk::Disk;
 use crate::display::{self, DisplayHandle, InputHandle};
+use crate::gpu::{self, GpuLink};
 use crate::kv::{KeyValueStore, MemoryKeyValueStore};
 use crate::netdev::NetHandle;
 use crate::platform::{DEFAULT_CMDLINE, DEFAULT_SERIAL_CMDLINE};
@@ -193,6 +194,7 @@ pub struct MachineConfig {
     /// `None` follows the display: input devices come with a screen unless asked otherwise.
     input: Option<bool>,
     console_on_screen: bool,
+    gpu: Option<GpuLink>,
     iommu: bool,
     acpi: bool,
     jit: JitMode,
@@ -233,6 +235,7 @@ impl Default for MachineConfig {
             display_size: (display::DEFAULT_WIDTH, display::DEFAULT_HEIGHT),
             input: None,
             console_on_screen: true,
+            gpu: None,
             iommu: false,
             acpi: true,
             jit: JitMode::Auto,
@@ -394,6 +397,15 @@ impl MachineConfig {
     /// Adds a screen (`DisplayMode::Framebuffer`) or not (`None`, the default).
     pub fn display(mut self, mode: DisplayMode) -> Self {
         self.display = mode;
+        self
+    }
+
+    /// Gives the screen's virtio-gpu a renderer: the device then offers `VIRGL` and the capsets
+    /// in `link`, and forwards the guest's 3D commands to it (`docs/plans/25-gpu-3d.md`). The
+    /// embedder keeps a clone and drains it (`GpuLink::take_commands`); a guest whose fences are
+    /// never completed waits on them. Needs a display, and cannot be combined with `verify_jit`.
+    pub fn gpu(mut self, link: GpuLink) -> Self {
+        self.gpu = Some(link);
         self
     }
 
@@ -622,6 +634,7 @@ struct Vcpu {
 /// size, which is the same on every boot).
 fn display_devices(
     display: &Option<DisplayHandle>,
+    gpu: &Option<GpuLink>,
     firmware: Option<&boot::FirmwareParams>,
     ram_top: u64,
 ) -> Option<DisplayDevices> {
@@ -632,7 +645,44 @@ fn display_devices(
     Some(DisplayDevices {
         display: display.clone(),
         boot_framebuffer,
+        gpu: gpu.clone(),
     })
+}
+
+/// A renderer needs the screen's GPU to sit behind, and capsets the guest's driver accepts:
+/// Linux drops every capset when it finds an id of 0. The twin of `verify_jit` would need a
+/// renderer of its own, completing fences in step.
+fn validate_gpu(link: &GpuLink, has_display: bool, verify: bool) -> Result<(), Error> {
+    if !has_display {
+        return Err(Error::BadConfig("gpu needs a display".into()));
+    }
+    if verify {
+        return Err(Error::BadConfig(
+            "verify_jit cannot run with a gpu renderer".into(),
+        ));
+    }
+    let capsets = link.capsets();
+    if capsets.len() > gpu::MAX_CAPSETS {
+        return Err(Error::BadConfig(format!(
+            "at most {} gpu capsets",
+            gpu::MAX_CAPSETS
+        )));
+    }
+    for (index, capset) in capsets.iter().enumerate() {
+        if capset.id == 0 || capsets[..index].iter().any(|other| other.id == capset.id) {
+            return Err(Error::BadConfig(format!(
+                "gpu capset ids must be nonzero and distinct (capset {index})"
+            )));
+        }
+        if capset.data.len() > gpu::MAX_CAPSET_BYTES {
+            return Err(Error::BadConfig(format!(
+                "gpu capset {} is larger than {} bytes",
+                capset.id,
+                gpu::MAX_CAPSET_BYTES
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Everything `boot::load` needs to lay the guest out again, plus the parts of the device set
@@ -656,6 +706,7 @@ struct RebootImage {
     /// The embedder holds these; the new devices must be built around them, like the NICs.
     display: Option<DisplayHandle>,
     input: Option<InputHandle>,
+    gpu: Option<GpuLink>,
     /// Set when the machine boots UEFI firmware: that image and handoff replace the kernel.
     uefi: Option<(Vec<u8>, boot::FirmwareParams)>,
 }
@@ -860,6 +911,8 @@ fn mirrored_devices(main: &mut DevConfig, main_uart: &ConsoleHandle) -> (DevConf
             DisplayDevices {
                 display: DisplayHandle::with_size(width, height),
                 boot_framebuffer: devices.boot_framebuffer,
+                // `verify_jit` refuses a renderer.
+                gpu: None,
             }
         }),
         input: main.input.as_ref().map(|input| {
@@ -939,6 +992,7 @@ impl Vcpu {
             }
             let display = display_devices(
                 &image.display,
+                &image.gpu,
                 image.uefi.as_ref().map(|(_, params)| params),
                 ram.len() as u64,
             );
@@ -1010,6 +1064,18 @@ impl Vcpu {
         if let Some(input) = &input {
             let thread = std::thread::current();
             input.set_device_waker(Some(Arc::new(move || thread.unpark())));
+        }
+        // And for the renderer's fences, which a guest waiting in its idle loop is halted for.
+        #[cfg(not(freestanding))]
+        let gpu = self
+            .devcfg
+            .display
+            .as_ref()
+            .and_then(|devices| devices.gpu.clone());
+        #[cfg(not(freestanding))]
+        if let Some(gpu) = &gpu {
+            let thread = std::thread::current();
+            gpu.set_device_waker(Some(Arc::new(move || thread.unpark())));
         }
         let mut cpu = Cpu::new(
             ram,
@@ -1111,6 +1177,10 @@ impl Vcpu {
         #[cfg(not(freestanding))]
         if let Some(input) = &input {
             input.set_device_waker(None);
+        }
+        #[cfg(not(freestanding))]
+        if let Some(gpu) = &gpu {
+            gpu.set_device_waker(None);
         }
         let finished = Finished {
             ram_bytes,
@@ -1238,6 +1308,9 @@ impl EmulatedMachine {
                 display::MAX_WIDTH,
                 display::MAX_HEIGHT
             )));
+        }
+        if let Some(link) = &cfg.gpu {
+            validate_gpu(link, has_display, cfg.verify)?;
         }
         let functions = virtio_console_count
             + disk_count
@@ -1407,6 +1480,7 @@ impl EmulatedMachine {
             rng: rng.clone(),
             display: display_devices(
                 &display,
+                &cfg.gpu,
                 uefi.as_ref().map(|(_, params)| params),
                 ram.len() as u64,
             ),
@@ -1431,6 +1505,7 @@ impl EmulatedMachine {
                     rng: devcfg.rng.clone(),
                     display: display.clone(),
                     input: input.clone(),
+                    gpu: cfg.gpu.clone(),
                     uefi,
                 }
             });

@@ -1,9 +1,10 @@
-//! virtio-gpu, 2D only (virtio 1.2 section 5.7): the guest creates resources (host-side images),
-//! backs them with its own pages, copies pages into them (`TRANSFER_TO_HOST_2D`), points the one
+//! virtio-gpu (virtio 1.2 section 5.7): the guest creates resources (host-side images), backs
+//! them with its own pages, copies pages into them (`TRANSFER_TO_HOST_2D`), points the one
 //! scanout at a resource and says which part changed (`RESOURCE_FLUSH`), which is when the
-//! `DisplayHandle` gets the pixels. No 3D, no EDID, no blobs: Linux's `virtio_gpu` DRM driver
-//! runs its fbdev console and KMS desktops on what is left. Behaviour follows QEMU's
-//! `hw/display/virtio-gpu.c`.
+//! `DisplayHandle` gets the pixels. No EDID, no blobs: Linux's `virtio_gpu` DRM driver runs its
+//! fbdev console and KMS desktops on what is left. Behaviour follows QEMU's
+//! `hw/display/virtio-gpu.c`. With a `GpuLink` from the embedder the device also offers
+//! `VIRGL`, and the 3D commands go to the renderer behind it (`virgl.rs`).
 //!
 //! Everything the guest sends is bounded before the host allocates or copies: resource sizes
 //! against `MAX_RESOURCE_BYTES` in total, rectangles against their resource, backing entries
@@ -17,6 +18,11 @@ use crate::display::{
     BYTES_PER_PIXEL, Cursor, CursorImage, DisplayHandle, MAX_CURSOR_SIDE, MAX_HEIGHT, MAX_WIDTH,
     Rect,
 };
+use crate::gpu::GpuLink;
+use virgl::Accel;
+
+mod formats;
+mod virgl;
 #[cfg(freestanding)]
 use crate::prelude::*;
 
@@ -49,6 +55,8 @@ const RESP_ERR_OUT_OF_MEMORY: u32 = 0x1201;
 const RESP_ERR_INVALID_SCANOUT_ID: u32 = 0x1202;
 const RESP_ERR_INVALID_RESOURCE_ID: u32 = 0x1203;
 const RESP_ERR_INVALID_PARAMETER: u32 = 0x1205;
+/// `VIRTIO_GPU_F_VIRGL`: the 3D commands and capsets.
+const FEATURE_VIRGL: u64 = 1 << 0;
 
 /// `struct virtio_gpu_ctrl_hdr`: type u32, flags u32, fence_id u64, ctx_id u32, ring_idx u8,
 /// padding. Every request starts with one and every response is one plus a payload.
@@ -58,8 +66,9 @@ const HEADER_FENCE_ID: usize = 8;
 const HEADER_CONTEXT_ID: usize = 16;
 const HEADER_RING_INDEX: usize = 20;
 /// The driver waits for the response of a fenced command before it reuses what the command
-/// touched; responses echo the fence (and the ring it was meant for), and since every command
-/// completes before its response is written, that is all fencing needs here.
+/// touched; responses echo the fence (and the ring it was meant for). Without a renderer every
+/// command completes before its response is written, so that is all fencing needs; with one,
+/// fenced responses wait for the renderer (`virgl.rs`).
 const FLAG_FENCE: u32 = 1 << 0;
 const FLAG_INFO_RING_INDEX: u32 = 1 << 1;
 
@@ -204,6 +213,21 @@ impl BackingCursor {
             self.advance(backing, count as u64);
         }
     }
+
+    /// Stores `data` from here, as `read` reads; bytes past the backing's end, or for an entry
+    /// outside RAM, are dropped.
+    fn write(&mut self, backing: &[BackingEntry], mem: &mut GuestMem, data: &[u8]) {
+        let mut done = 0;
+        while done < data.len() {
+            let Some(entry) = backing.get(self.entry) else {
+                return;
+            };
+            let count = ((entry.length - self.offset) as usize).min(data.len() - done);
+            mem.write(entry.address + self.offset, &data[done..done + count]);
+            done += count;
+            self.advance(backing, count as u64);
+        }
+    }
 }
 
 /// Converts one row of `source` pixels (byte offsets of blue, green and red in `channels`) into
@@ -243,6 +267,8 @@ pub(crate) struct VirtioGpu {
     events_read: u32,
     /// A display event is waiting to be signalled as a configuration change.
     event_pending: bool,
+    /// The 3D side, when the embedder gave the machine a renderer.
+    accel: Option<Accel>,
 }
 
 /// A request header and the parts of it a response echoes.
@@ -304,10 +330,11 @@ impl Header {
     }
 }
 
-/// Bytes of a request a command can need: the header, the largest fixed part (a transfer), and
-/// for `ATTACH_BACKING` its entries.
+/// The header and the largest fixed part any command has (`CTX_CREATE`'s).
+const LARGEST_FIXED_REQUEST: usize = HEADER_BYTES + virgl::LARGEST_FIXED_BODY;
+
+/// Bytes of a request a command can need: the fixed part, and for `ATTACH_BACKING` its entries.
 fn request_limit(nr_entries: u32) -> usize {
-    const LARGEST_FIXED_REQUEST: usize = HEADER_BYTES + 32;
     LARGEST_FIXED_REQUEST + nr_entries.min(MAX_BACKING_ENTRIES) as usize * MEM_ENTRY_BYTES
 }
 
@@ -315,8 +342,9 @@ impl VirtioGpu {
     /// Built for every boot around the embedder's handle, which outlives the boot. A guest that
     /// restarts without resetting the device (Linux's emergency restart under `panic=-1` skips
     /// device shutdown) would otherwise leave its pointer image on the firmware's screen and
-    /// keep the boot framebuffer from being scanned, freezing the firmware's console.
-    pub fn new(display: DisplayHandle) -> Self {
+    /// keep the boot framebuffer from being scanned, freezing the firmware's console. The
+    /// renderer behind `gpu` is told to drop what an earlier boot left it.
+    pub fn new(display: DisplayHandle, gpu: Option<GpuLink>) -> Self {
         display.set_virtio_owns_screen(false);
         display.set_cursor(Cursor::Host);
         let preferred = display.size();
@@ -328,12 +356,13 @@ impl VirtioGpu {
             scanout: None,
             events_read: 0,
             event_pending: false,
+            accel: gpu.map(Accel::new),
         }
     }
 
     /// Runs one control command and returns the response bytes.
     fn execute(&mut self, chain: &Chain, mem: &GuestMem) -> Vec<u8> {
-        let mut fixed = [0u8; HEADER_BYTES + 32];
+        let mut fixed = [0u8; LARGEST_FIXED_REQUEST];
         let length = chain.read_from(mem, 0, &mut fixed);
         let header = Header::parse(&fixed[..length]);
         if length < HEADER_BYTES {
@@ -353,7 +382,20 @@ impl VirtioGpu {
                 self.attach_backing(&request[HEADER_BYTES.min(request.len())..], mem)
             }
             CMD_RESOURCE_DETACH_BACKING => self.detach_backing(u32_at(body, 0)),
-            // 3D, capsets, EDID and blobs are not offered; a driver that asks anyway is told.
+            virgl::CMD_GET_CAPSET_INFO | virgl::CMD_GET_CAPSET => match &self.accel {
+                Some(accel) if header.command == virgl::CMD_GET_CAPSET => {
+                    return accel.capset(&header, body);
+                }
+                Some(accel) => return accel.capset_info(&header, body),
+                None => RESP_ERR_UNSPEC,
+            },
+            command if virgl::CONTEXT_COMMANDS.contains(&command) && self.accel.is_some() => {
+                let resources = &self.resources;
+                let accel = self.accel.as_mut().unwrap();
+                accel.execute(&header, body, chain, mem, |id| resources.contains_key(&id))
+            }
+            // 3D without a renderer, EDID and blobs are not offered; a driver that asks anyway
+            // is told.
             _ => RESP_ERR_UNSPEC,
         };
         header.response(status)
@@ -379,7 +421,13 @@ impl VirtioGpu {
             u32_at(body, 8),
             u32_at(body, 12),
         );
-        if id == 0 || self.resources.contains_key(&id) {
+        if id == 0
+            || self.resources.contains_key(&id)
+            || self
+                .accel
+                .as_ref()
+                .is_some_and(|accel| accel.has_resource(id))
+        {
             return RESP_ERR_INVALID_RESOURCE_ID;
         }
         if channel_offsets(format).is_none()
@@ -414,6 +462,12 @@ impl VirtioGpu {
     }
 
     fn unref(&mut self, id: u32) -> u32 {
+        if let Some(accel) = &mut self.accel {
+            if accel.has_resource(id) {
+                return accel.unref(id);
+            }
+            accel.forget(id);
+        }
         let Some(resource) = self.resources.remove(&id) else {
             return RESP_ERR_INVALID_RESOURCE_ID;
         };
@@ -437,6 +491,16 @@ impl VirtioGpu {
         // scanout off (a blank screen, not the firmware's stale framebuffer); a device reset
         // gives it back.
         self.display.set_virtio_owns_screen(true);
+        if let Some(accel) = &mut self.accel {
+            if accel.has_resource(id) {
+                let status = accel.set_scanout(id, rect);
+                if status == RESP_OK_NODATA {
+                    self.scanout = None;
+                }
+                return status;
+            }
+            accel.leave_scanout();
+        }
         if id == 0 {
             self.scanout = None;
             self.blank();
@@ -462,6 +526,11 @@ impl VirtioGpu {
     }
 
     fn flush(&mut self, rect: Rect, id: u32) -> u32 {
+        if let Some(accel) = &mut self.accel
+            && accel.has_resource(id)
+        {
+            return accel.flush(id, rect);
+        }
         let Some(resource) = self.resources.get(&id) else {
             return RESP_ERR_INVALID_RESOURCE_ID;
         };
@@ -616,7 +685,7 @@ impl VirtioGpu {
     /// `resource_id`, `nr_entries`, then that many `virtio_gpu_mem_entry`s.
     fn attach_backing(&mut self, body: &[u8], mem: &GuestMem) -> u32 {
         let (id, count) = (u32_at(body, 0), u32_at(body, 4));
-        let Some(resource) = self.resources.get_mut(&id) else {
+        let Some(target) = self.backing_mut(id) else {
             return RESP_ERR_INVALID_RESOURCE_ID;
         };
         const ENTRIES_START: usize = 8;
@@ -640,18 +709,55 @@ impl VirtioGpu {
             }
             backing.push(entry);
         }
-        resource.backing = backing;
+        *target = backing;
         RESP_OK_NODATA
     }
 
     fn detach_backing(&mut self, id: u32) -> u32 {
-        match self.resources.get_mut(&id) {
-            Some(resource) => {
-                resource.backing.clear();
+        match self.backing_mut(id) {
+            Some(backing) => {
+                backing.clear();
                 RESP_OK_NODATA
             }
             None => RESP_ERR_INVALID_RESOURCE_ID,
         }
+    }
+
+    /// The backing of a resource of either kind; one id names one resource.
+    fn backing_mut(&mut self, id: u32) -> Option<&mut Vec<BackingEntry>> {
+        if let Some(resource) = self.resources.get_mut(&id) {
+            return Some(&mut resource.backing);
+        }
+        self.accel.as_mut()?.backing_mut(id)
+    }
+
+    /// Runs the control queue until it is empty, or until the renderer is too far behind to
+    /// queue more (`poll` comes back to it). True if a response was completed.
+    fn run_control(&mut self, queue: &mut Queue, mem: &mut GuestMem) -> bool {
+        let mut completed = false;
+        loop {
+            if self.accel.as_mut().is_some_and(Accel::is_behind) {
+                break;
+            }
+            let Some(chain) = queue.pop(mem) else {
+                break;
+            };
+            let response = self.execute(&chain, mem);
+            let (chain, response) = match &mut self.accel {
+                Some(accel) => {
+                    let fenced = u32_at(&response, HEADER_FLAGS) & FLAG_FENCE != 0;
+                    match accel.finish(chain, response, fenced) {
+                        Some(answer) => answer,
+                        None => continue,
+                    }
+                }
+                None => (chain, response),
+            };
+            let written = chain.write_at(mem, 0, &response);
+            queue.push_used(mem, chain.head, written as u32);
+            completed = true;
+        }
+        completed
     }
 }
 
@@ -660,9 +766,15 @@ impl VirtioDev for VirtioGpu {
         DEVICE_TYPE_GPU
     }
 
-    /// Neither VIRGL nor EDID nor blobs: the driver then sticks to the 2D commands.
+    /// `VIRGL` with a renderer, nothing otherwise: the driver then sticks to the 2D commands.
+    /// Never EDID or blobs (`RESOURCE_BLOB` alone would turn the driver's dumb buffers into
+    /// blobs).
     fn features(&self) -> u64 {
-        0
+        if self.accel.is_some() {
+            FEATURE_VIRGL
+        } else {
+            0
+        }
     }
 
     fn num_queues(&self) -> usize {
@@ -674,7 +786,7 @@ impl VirtioDev for VirtioGpu {
             CONFIG_EVENTS_READ => self.events_read,
             CONFIG_EVENTS_CLEAR => 0,
             CONFIG_NUM_SCANOUTS => SCANOUT_COUNT,
-            CONFIG_NUM_CAPSETS => 0,
+            CONFIG_NUM_CAPSETS => self.accel.as_ref().map_or(0, Accel::capset_count),
             _ => 0,
         };
         (word >> (8 * (offset % CONFIG_WORD_BYTES))) as u8
@@ -689,27 +801,25 @@ impl VirtioDev for VirtioGpu {
     }
 
     fn kick(&mut self, queue: usize, queues: &mut [Queue], mem: &mut GuestMem) -> bool {
+        if queue == CONTROL_QUEUE {
+            return self.run_control(&mut queues[CONTROL_QUEUE], mem);
+        }
+        // Cursor commands carry no response.
+        debug_assert_eq!(queue, CURSOR_QUEUE);
         let mut completed = false;
         while let Some(chain) = queues[queue].pop(mem) {
-            let written = if queue == CONTROL_QUEUE {
-                let response = self.execute(&chain, mem);
-                chain.write_at(mem, 0, &response)
-            } else {
-                // Cursor commands carry no response.
-                debug_assert_eq!(queue, CURSOR_QUEUE);
-                let mut request = [0u8; CURSOR_REQUEST_BYTES];
-                let length = chain.read_from(mem, 0, &mut request);
-                self.cursor_command(&request[..length]);
-                0
-            };
-            queues[queue].push_used(mem, chain.head, written as u32);
+            let mut request = [0u8; CURSOR_REQUEST_BYTES];
+            let length = chain.read_from(mem, 0, &mut request);
+            self.cursor_command(&request[..length]);
+            queues[queue].push_used(mem, chain.head, 0);
             completed = true;
         }
         completed
     }
 
-    /// Picks up a size a frontend asked for and tells the driver.
-    fn poll(&mut self, _queues: &mut [Queue], _mem: &mut GuestMem) -> bool {
+    /// Picks up a size a frontend asked for and tells the driver; completes what the renderer
+    /// has finished, and goes back to a control queue left waiting for it.
+    fn poll(&mut self, queues: &mut [Queue], mem: &mut GuestMem) -> bool {
         if let Some(size) = self.display.take_requested_size()
             && size != self.preferred
         {
@@ -717,7 +827,14 @@ impl VirtioDev for VirtioGpu {
             self.events_read |= EVENT_DISPLAY;
             self.event_pending = true;
         }
-        false
+        let Some(accel) = &mut self.accel else {
+            return false;
+        };
+        let mut completed = accel.complete(&mut queues[CONTROL_QUEUE], mem);
+        if accel.may_resume() {
+            completed |= self.run_control(&mut queues[CONTROL_QUEUE], mem);
+        }
+        completed
     }
 
     fn config_event(&mut self) -> bool {
@@ -734,6 +851,9 @@ impl VirtioDev for VirtioGpu {
         self.event_pending = false;
         self.display.set_virtio_owns_screen(false);
         self.display.set_cursor(Cursor::Host);
+        if let Some(accel) = &mut self.accel {
+            accel.reset();
+        }
     }
 }
 

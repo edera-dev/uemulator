@@ -46,6 +46,14 @@ MachineConfig::display_size(width, height)          // default 1280x800; without
 EmulatedMachine::display() -> Option<DisplayHandle> // size, generation, frame, update_since, sync_mirror (ScreenMirror), wait_for_update, on_update, request_size, cursor
 EmulatedMachine::input() -> Option<InputHandle>     // key (Linux code), key_usb, pointer_move, pointer_button, scroll, release_all, pointer_area
 
+// Guest 3D (docs/plans/25-gpu-3d.md): a renderer outside the library behind the virtio-gpu
+GpuLink::new(Vec<GpuCapset>, GpuLimits) -> GpuLink  // cloneable, Send + Sync; capsets answer GET_CAPSET*, limits bound RESOURCE_CREATE_3D
+MachineConfig::gpu(GpuLink)                         // offers VIRGL; needs a display, refused with verify_jit
+GpuLink::take_commands() -> Vec<GpuCommand>         // in order: Reset, contexts, resources, Write/ReadResource (packed boxes), Submit (virgl stream, unparsed), SetScanout, Flush, Fence
+GpuLink::on_commands(f)                             // called after the device queues commands
+GpuLink::complete_fence(sequence)                   // everything up to that Fence is done; the device releases held responses
+GpuLink::complete_read(token, bytes)                // a ReadResource's packed box, before any later fence
+
 pub struct ConsoleHandle { .. }
 impl ConsoleHandle {
     pub fn write(&self, bytes: &[u8]);                       // host → guest (serial RX)

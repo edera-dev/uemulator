@@ -294,6 +294,7 @@ mod twin_devices {
             display: Some(crate::dev::DisplayDevices {
                 display,
                 boot_framebuffer,
+                gpu: None,
             }),
             ..DevConfig::default()
         }
@@ -617,6 +618,28 @@ mod twin_devices {
                 "{jit:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_gpu_renderer_keeps_the_slots_and_is_told_to_start_over() {
+        let link = crate::gpu::GpuLink::new(Vec::new(), crate::gpu::GpuLimits::default());
+        let renderer = link.clone();
+        assert_eq!(
+            probe(
+                |config| config
+                    .console(ConsoleKind::Serial)
+                    .rng(false)
+                    .display(DisplayMode::Framebuffer)
+                    .gpu(renderer),
+                JitMode::Off
+            ),
+            expected_slots([
+                id_bytes(DEVICE_TYPE_GPU),
+                id_bytes(DEVICE_TYPE_INPUT),
+                id_bytes(DEVICE_TYPE_INPUT)
+            ])
+        );
+        assert_eq!(link.take_commands(), [crate::gpu::GpuCommand::Reset]);
     }
 
     #[test]

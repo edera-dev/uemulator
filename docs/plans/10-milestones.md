@@ -55,6 +55,8 @@
 
 - Interrupt controllers and CPU platform state for Windows done (see 07, "LAPIC and IOAPIC"): xAPIC and x2APIC local APIC with timer and TSC-deadline, 24-pin I/O APIC fed by the same device lines as the PIC, CR8/TPR priority, NMI delivery with `iret` unblocking, MTRRs, PAT validation, inert machine-check banks, AMD memory-typing MSRs, CPUID leaf 0xB. The Alpine kernel boots with the APIC advertised (virtual wire mode, TSC-deadline timer). SMP is done (below). The HPET, the ACPI PM timer and ACPI tables are done (below).
 
+- Guest 3D, device side (M1 of 25) done: `MachineConfig::gpu(GpuLink)` makes the virtio-gpu offer `VIRGL` and the embedder's capsets, and forwards contexts, 3D resources, transfers in both directions and `SUBMIT_3D` streams to the renderer as `GpuCommand`s, holding every fenced response until the renderer passes its fence. Covered by the `Rig` tests in `dev/vgpu/tests/three_d.rs` with the test as the renderer; no renderer exists yet, so no guest has drawn through it. A machine without a renderer is unchanged.
+
 Each has an observable serial-output exit criterion. Interpreter first.
 
 | # | deliverable | exit criterion |

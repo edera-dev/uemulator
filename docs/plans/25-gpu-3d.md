@@ -1,6 +1,6 @@
 # Guest 3D through virtio-gpu
 
-**Status:** proposal. Nothing here is implemented; the device is still 2D only (`docs/plans/24-display-input.md`).
+**Status:** partially implemented. M1, the device side, is in (`dev/vgpu/virgl.rs`, `gpu.rs`; "What M1 built" below). There is no renderer yet, so no guest has drawn a 3D frame; M0's web spike and everything from M2 on are still proposals.
 
 The aim is to give a Linux guest hardware-accelerated OpenGL (and perhaps Vulkan) through virtio-gpu, primarily on the web build, with the CLI as a second host. The web page can reach the host GPU only through WebGL2 (OpenGL ES 3.0) and WebGPU, so whatever the guest sends has to land on one of those.
 
@@ -156,10 +156,27 @@ A render thread owns the ANGLE context and the renderer crate and drains `GpuLin
 - Web: the render worker owns the canvas and draws the 3D scanout from its own texture, with no readback. A WebGL texture cannot be shared between contexts, so the 2D frames and the 3D scanout must either reach one context or sit on two stacked canvases. Proposal: stack them. The existing 2D canvas and its WebGL2 renderer in `main.js` stay as they are, a second canvas above it belongs to the render worker, and the page shows it while the scanout is a GPU resource (the render worker says so when it handles a `SET_SCANOUT`). The landed 2D path is untouched, and a lost 3D context falls back to the 2D canvas for free. Pointer mapping and scaling apply to both canvases. Screenshots ask the render worker (`convertToBlob` on its canvas) while it is in front. Moving the 2D renderer into the render worker (one canvas) is the alternative if stacking costs a compositor layer that matters.
 - A guest that flips scanout between a dumb buffer (fbcon, Plymouth) and a 3D resource (a compositor's GBM surface) switches canvases. fbcon after a compositor exits goes back to pixels, and the next 2D flush publishes as today.
 
+## What M1 built
+
+The interface as it landed, which differs from the sketch under "Architecture" in favour of typed values: the library hands the embedder `GpuCommand`s, not encoded bytes, and the web crate chooses the ring encoding.
+
+- `GpuLink::new(capsets, limits)`, then `MachineConfig::gpu(link)`. Needs a display; refused with `verify_jit` (the twin would need a renderer completing fences in step). Capsets: nonzero distinct ids, at most 16, 64 KiB each.
+- The renderer side: `take_commands()` drains `GpuCommand`s in order (`on_commands` to be told), `complete_fence(sequence)` and `complete_read(token, bytes)` report back. Pixel data both ways is packed rows of the box; the device resolves the guest's strides and offset.
+- Every response that carries a fence is held behind a `GpuCommand::Fence`, fenced 2D commands and errors too: Linux signals every earlier fence on an answer, so answering a 2D fence early would release a 3D one. QEMU does the same through `virgl_renderer_create_fence`. Sequences come from the link and only grow, so a completion that arrives after a reset or a reboot cannot release anything of the new device.
+- A link with 32 MiB queued and not taken stops the device popping the control queue; `poll` resumes it.
+- `RESOURCE_CREATE_3D` is checked against `GpuLimits` and a per-format block table (`dev/vgpu/formats.rs`, every non-video virgl format); transfers against the level, the strides (0 meaning the level's own) and the backing, as virglrenderer's `check_transfer_bounds` and `check_iov_bounds` do.
+- A transfer's context must have the resource attached.
+
+Left for later:
+
+- A 2D resource attached to a context is accepted but never reaches the renderer, so a context that samples a dumb buffer sees nothing. No guest path known to need it yet (Mesa's virgl driver uses 3D resources throughout).
+- `DisplayHandle` has no notion of a GPU scanout: while one is shown the 2D screen keeps its last frame, and the frontend has to learn from `SetScanout` that the renderer draws the screen.
+- Linux CLI hosts linking virglrenderer (A2) would be the quickest check of the device against a known-good renderer.
+
 ## Milestones
 
 - **M0, spike (web only, throwaway allowed):** the render worker with a transferred `OffscreenCanvas`, the two rings, `uw_set_gpu` with hand-written capset bytes, the device offering `VIRGL` and answering capsets, contexts, `RESOURCE_CREATE_3D`, fenced `SUBMIT_3D` with only `VIRGL_CCMD_CLEAR` and `SET_FRAMEBUFFER_STATE` decoded, and `SET_SCANOUT`/`RESOURCE_FLUSH` of the cleared resource. Exit: an Alpine guest with `mesa-dri-gallium` runs a program that clears to a colour through EGL on the `virtio_gpu` render node (kmscube is the next step up), the colour appears on the page, and the guest does not hang on the fence. Settles the "Verify in M0" list.
-- **M1, device:** the full route A device side in `vgpu.rs` with the `GpuRenderer`/`GpuLink` interface and a fake renderer in the tests (below). No renderer yet; every machine without `gpu_renderer` is unchanged.
+- **M1, device (done, above):** the full route A device side in `vgpu.rs` with the `GpuRenderer`/`GpuLink` interface and a fake renderer in the tests (below). No renderer yet; every machine without `gpu_renderer` is unchanged.
 - **M2, decoder:** `crates/uemulator-virgl` decodes every non-video command into typed state changes, with golden tests from captured streams. Optional A2 on Linux CLI hosts here to see real guests through the M1 device.
 - **M3, shaders:** TGSI text parser and the GLSL ES 3.00 translator for vertex and fragment shaders: arithmetic, texturing, control flow, the shader keys. Golden tests; the outputs pass a GLSL ES validator at test time if one is vendored (no network).
 - **M4, web renderer:** the `Gl` binding in the render worker, formats, transfers both ways, queries, blits, the stacked canvas. Exit: kmscube, glmark2-es2 and a compositor (weston or sway) on the page; numbers recorded in this plan.
