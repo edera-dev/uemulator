@@ -9,7 +9,9 @@
 //! and the screen's keyboard and pointer events through a second ring (`host_input_events`).
 //! Screen updates go the other way through `host_frame`, one at a time: the page acknowledges
 //! each once drawn (`host_frame_ready`), so a busy page gets fewer, larger updates rather than a
-//! backlog of messages. With a network (`uw_set_network`) the guest's NIC is a port on the
+//! backlog of messages. Only the tiles that differ from what the page shows go (a
+//! `ScreenMirror`), in the library's own pixel format: the page's WebGL shader reorders the
+//! channels, so this thread, which is also the guest's, spends nothing converting them. With a network (`uw_set_network`) the guest's NIC is a port on the
 //! segment the page's tabs share: the library's `SegmentAgent` switches its frames, and the
 //! `host_net_*` imports carry them (`www/segment.js`).
 #![cfg(target_arch = "wasm32")]
@@ -19,9 +21,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use uemulator::{
     BYTES_PER_PIXEL, BlockBackend, ClockMode, ConsoleKind, Cursor, Disk, DisplayHandle,
-    DisplayMode, EmulatedMachine, ExitReason, FrameUpdate, InputHandle, JitMode, MachineConfig,
-    MemoryKeyValueStore, NetHandle, PointerButton, RawImage, Rect, RemoteImage, SegmentAgent,
-    SegmentDestination, SegmentStatus, StopHandle, Udisk, UdiskOptions, disk_io,
+    DisplayMode, EmulatedMachine, ExitReason, InputHandle, JitMode, MachineConfig,
+    MemoryKeyValueStore, NetHandle, PointerButton, RawImage, RemoteImage, ScreenMirror,
+    SegmentAgent, SegmentDestination, SegmentStatus, StopHandle, Udisk, UdiskOptions, disk_io,
 };
 
 const NS_PER_MS: f64 = 1_000_000.0;
@@ -36,6 +38,13 @@ const SECTOR_BYTES: u64 = 512;
 /// Screen updates go out at most this often: about what a browser paints anyway, and each one
 /// is a copy out of the module plus a message to the page.
 const FRAME_INTERVAL_MS: f64 = 16.0;
+/// A rectangle as `host_frame` passes it: x, y, width, height.
+const RECT_WORDS: usize = 4;
+/// `host_frame_ready` answers (`FRAME_READY` in `www/protocol.js`): a frame is in flight; the
+/// page can take the next; or it can and has lost its picture (a WebGL context loss), so the
+/// next is the whole screen.
+const FRAME_READY_NOT: i32 = 0;
+const FRAME_READY_RESEND: i32 = 2;
 /// Input events taken from the page's ring per poll. A record is three `i32`: kind and two
 /// arguments (`EVENT_*`, `www/protocol.js` has the same numbers).
 const EVENTS_PER_POLL: usize = 64;
@@ -137,21 +146,20 @@ unsafe extern "C" {
     /// Copies up to `capacity` input event records (`EVENT_WORDS` `i32` each) to `ptr` and
     /// returns how many; never blocks.
     fn host_input_events(ptr: *mut i32, capacity: usize) -> usize;
-    /// Non-zero when the page has drawn the last frame and can take the next.
+    /// A `FRAME_READY_*`: whether the page has drawn the last frame and can take the next.
     fn host_frame_ready() -> i32;
-    /// A screen update: the screen is `screen_width` x `screen_height`, and the `width` x
-    /// `height` rectangle at (`x`, `y`) is at `ptr` as packed RGBA rows (what `ImageData`
-    /// takes). The page owes an acknowledgement before the next.
-    #[allow(clippy::too_many_arguments)]
+    /// A screen update: the screen is `screen_width` x `screen_height`; `rect_count`
+    /// rectangles of it, each four `u32` (x, y, width, height) at `rects`, changed. The whole
+    /// screen is at `pixels`, rows `stride` bytes apart, blue, green, red, unused per pixel; the
+    /// rectangles' rows must be copied out before this returns. The page owes an
+    /// acknowledgement before the next.
     fn host_frame(
         screen_width: u32,
         screen_height: u32,
-        x: u32,
-        y: u32,
-        width: u32,
-        height: u32,
-        ptr: *const u8,
-        len: usize,
+        rects: *const u32,
+        rect_count: usize,
+        pixels: *const u8,
+        stride: usize,
     );
     /// The next frame another tab sent this one: copies it to `ptr` (`capacity` bytes at most; a
     /// longer one is skipped), the sending tab's number to `from`, and returns its length, or 0
@@ -215,11 +223,12 @@ struct NetLink {
 struct ScreenLink {
     display: Option<DisplayHandle>,
     input: Option<InputHandle>,
-    /// The screen generation the page has; `None` until the first (whole-screen) frame.
-    sent_generation: Option<u64>,
+    /// What the page shows; empty until the first (whole-screen) frame.
+    mirror: ScreenMirror,
     sent_cursor: u64,
     last_frame_ms: f64,
-    pixels: Vec<u8>,
+    /// The rectangles of the frame being sent, `RECT_WORDS` `u32` each, for `host_frame`.
+    rects: Vec<u32>,
 }
 
 fn set_error(message: String) {
@@ -503,10 +512,10 @@ pub unsafe extern "C" fn uw_create(
         *screen.borrow_mut() = (display.is_some() || input.is_some()).then(|| ScreenLink {
             display,
             input,
-            sent_generation: None,
+            mirror: ScreenMirror::new(),
             sent_cursor: 0,
             last_frame_ms: f64::NEG_INFINITY,
-            pixels: Vec::new(),
+            rects: Vec::new(),
         });
     });
     NETWORK.with(|slot| {
@@ -637,46 +646,38 @@ impl ScreenLink {
             send_cursor(&cursor);
         }
         let now = unsafe { host_now_ms() };
-        if now - self.last_frame_ms < FRAME_INTERVAL_MS || unsafe { host_frame_ready() } == 0 {
+        if now - self.last_frame_ms < FRAME_INTERVAL_MS {
             return;
         }
-        let update = match self.sent_generation {
-            Some(generation) => match display.update_since(generation, &mut self.pixels) {
-                Some(update) => update,
-                None => return,
-            },
-            // The page starts with no picture at all, so the first frame is the whole screen
-            // even when the guest has not drawn anything yet.
-            None => {
-                let frame = display.frame();
-                self.pixels = frame.pixels;
-                FrameUpdate {
-                    generation: frame.generation,
-                    width: frame.width,
-                    height: frame.height,
-                    rect: Rect {
-                        x: 0,
-                        y: 0,
-                        width: frame.width,
-                        height: frame.height,
-                    },
-                }
-            }
+        match unsafe { host_frame_ready() } {
+            FRAME_READY_NOT => return,
+            FRAME_READY_RESEND => self.mirror = ScreenMirror::new(),
+            _ => {}
+        }
+        // A new mirror syncs as the whole screen: the page starts with no picture at all, even
+        // when the guest has not drawn anything yet.
+        let Some(rects) = display.sync_mirror(&mut self.mirror) else {
+            return;
         };
-        self.sent_generation = Some(update.generation);
+        if rects.is_empty() {
+            // Flushed, but every pixel is what the page already has.
+            return;
+        }
         self.last_frame_ms = now;
-        bgrx_to_rgba(&mut self.pixels);
-        let rect = update.rect;
+        self.rects.clear();
+        for rect in rects {
+            self.rects
+                .extend_from_slice(&[rect.x, rect.y, rect.width, rect.height]);
+        }
+        let (width, height) = self.mirror.size();
         unsafe {
             host_frame(
-                update.width,
-                update.height,
-                rect.x,
-                rect.y,
-                rect.width,
-                rect.height,
-                self.pixels.as_ptr(),
-                self.pixels.len(),
+                width,
+                height,
+                self.rects.as_ptr(),
+                self.rects.len() / RECT_WORDS,
+                self.mirror.pixels().as_ptr(),
+                self.mirror.stride(),
             )
         };
     }
@@ -724,15 +725,6 @@ impl NetLink {
             let address = status.address.map_or(0, u32::from_be_bytes);
             unsafe { host_net_status(address, status.peers as u32, i32::from(status.serving)) };
         }
-    }
-}
-
-/// The library's pixels (blue, green, red, unused) as `ImageData` wants them (red, green, blue,
-/// alpha), in place. Opaque, since the fourth byte of a screen pixel means nothing.
-fn bgrx_to_rgba(pixels: &mut [u8]) {
-    for pixel in pixels.as_chunks_mut::<BYTES_PER_PIXEL>().0 {
-        pixel.swap(0, 2);
-        pixel[3] = u8::MAX;
     }
 }
 

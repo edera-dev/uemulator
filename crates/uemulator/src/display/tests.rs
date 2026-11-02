@@ -117,6 +117,124 @@ fn damage_is_clipped_to_the_screen() {
     assert_eq!(update.rect, rect(6, 2, 2, 2));
 }
 
+/// A screen big enough for several tiles each way, with a ragged right and bottom edge.
+const MIRROR_WIDTH: u32 = 3 * MIRROR_TILE + 10;
+const MIRROR_HEIGHT: u32 = 2 * MIRROR_TILE + 5;
+
+fn tile(column: u32, row: u32) -> Rect {
+    rect(
+        column * MIRROR_TILE,
+        row * MIRROR_TILE,
+        MIRROR_TILE,
+        MIRROR_TILE,
+    )
+}
+
+#[test]
+fn a_new_mirror_gets_the_whole_screen_and_then_nothing_until_a_change() {
+    let display = DisplayHandle::with_size(MIRROR_WIDTH, MIRROR_HEIGHT);
+    paint(&display, rect(5, 5, 3, 3), 4);
+    let mut mirror = ScreenMirror::new();
+    assert_eq!(mirror.size(), (0, 0));
+    assert_eq!(
+        display.sync_mirror(&mut mirror),
+        Some(vec![rect(0, 0, MIRROR_WIDTH, MIRROR_HEIGHT)])
+    );
+    assert_eq!(mirror.size(), (MIRROR_WIDTH, MIRROR_HEIGHT));
+    assert_eq!(mirror.generation(), Some(display.generation()));
+    assert_eq!(mirror.pixels(), display.frame().pixels);
+    assert_eq!(display.sync_mirror(&mut mirror), None);
+}
+
+#[test]
+fn distant_changes_come_back_as_their_own_tiles_not_their_union() {
+    let display = DisplayHandle::with_size(MIRROR_WIDTH, MIRROR_HEIGHT);
+    let mut mirror = ScreenMirror::new();
+    display.sync_mirror(&mut mirror);
+    paint(&display, rect(1, 1, 2, 2), 1);
+    paint(
+        &display,
+        rect(2 * MIRROR_TILE + 3, MIRROR_TILE + 3, 2, 2),
+        2,
+    );
+    let mut rects = display.sync_mirror(&mut mirror).unwrap();
+    rects.sort_by_key(|rect| (rect.y, rect.x));
+    assert_eq!(rects, vec![tile(0, 0), tile(2, 1)]);
+    assert_eq!(mirror.pixels(), display.frame().pixels);
+    let mut pixels = Vec::new();
+    mirror.copy_rect(tile(2, 1), &mut pixels);
+    assert_eq!(
+        pixels.len(),
+        (MIRROR_TILE * MIRROR_TILE) as usize * BYTES_PER_PIXEL
+    );
+    let corner = ((3 * MIRROR_TILE + 3) as usize) * BYTES_PER_PIXEL;
+    assert_eq!(pixels[corner], 2);
+}
+
+#[test]
+fn a_change_that_puts_back_the_same_pixels_is_no_rectangle() {
+    let display = DisplayHandle::with_size(MIRROR_WIDTH, MIRROR_HEIGHT);
+    let mut mirror = ScreenMirror::new();
+    display.sync_mirror(&mut mirror);
+    // A flush of the whole screen that changed nothing, as compositors send.
+    paint(&display, rect(0, 0, MIRROR_WIDTH, MIRROR_HEIGHT), 0);
+    assert_eq!(display.sync_mirror(&mut mirror), Some(Vec::new()));
+}
+
+#[test]
+fn runs_of_tiles_grow_down_into_the_rows_below_and_are_clipped_to_the_screen() {
+    let display = DisplayHandle::with_size(MIRROR_WIDTH, MIRROR_HEIGHT);
+    let mut mirror = ScreenMirror::new();
+    display.sync_mirror(&mut mirror);
+    // Columns 1 to the ragged edge in every tile row, ragged bottom included: one rectangle.
+    paint(
+        &display,
+        rect(MIRROR_TILE + 1, 0, 2 * MIRROR_TILE + 9, MIRROR_HEIGHT),
+        5,
+    );
+    assert_eq!(
+        display.sync_mirror(&mut mirror),
+        Some(vec![rect(
+            MIRROR_TILE,
+            0,
+            2 * MIRROR_TILE + 10,
+            MIRROR_HEIGHT
+        )])
+    );
+    // A run whose columns differ from the one above stays apart.
+    paint(&display, rect(0, 0, 1, 1), 6);
+    paint(&display, rect(0, MIRROR_TILE, MIRROR_TILE + 1, 1), 6);
+    let mut rects = display.sync_mirror(&mut mirror).unwrap();
+    rects.sort_by_key(|rect| (rect.y, rect.x));
+    assert_eq!(
+        rects,
+        vec![
+            tile(0, 0),
+            rect(0, MIRROR_TILE, 2 * MIRROR_TILE, MIRROR_TILE)
+        ]
+    );
+    assert_eq!(mirror.pixels(), display.frame().pixels);
+}
+
+#[test]
+fn a_size_change_or_a_mirror_far_behind_is_synced_in_full() {
+    let display = DisplayHandle::with_size(MIRROR_WIDTH, MIRROR_HEIGHT);
+    let mut mirror = ScreenMirror::new();
+    display.sync_mirror(&mut mirror);
+    // Further behind than the damage history: compared everywhere, sent where it differs.
+    for _ in 0..DAMAGE_HISTORY + 5 {
+        paint(&display, rect(MIRROR_TILE, 0, 1, 1), 3);
+    }
+    assert_eq!(display.sync_mirror(&mut mirror), Some(vec![tile(1, 0)]));
+    display.publish(MIRROR_WIDTH / 2, MIRROR_HEIGHT / 2, |_, _| None);
+    assert_eq!(
+        display.sync_mirror(&mut mirror),
+        Some(vec![rect(0, 0, MIRROR_WIDTH / 2, MIRROR_HEIGHT / 2)])
+    );
+    assert_eq!(mirror.size(), (MIRROR_WIDTH / 2, MIRROR_HEIGHT / 2));
+    assert_eq!(mirror.pixels(), display.frame().pixels);
+}
+
 #[test]
 fn rect_union_ignores_empty_rectangles() {
     let a = rect(1, 1, 2, 2);

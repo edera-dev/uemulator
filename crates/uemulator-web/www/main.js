@@ -1,6 +1,6 @@
 import {
-  CONTROL_BYTES, CTRL, CURSOR, EVENT, EVENT_OFFSET, EVENT_RECORDS, EVENT_WORDS, EXIT_NAMES, FIRMWARE, NET_OFFSET,
-  NET_RING_BYTES, OPTION, RING_BYTES, RING_OFFSET, UEFI_FIRMWARE_MAGIC,
+  BYTES_PER_PIXEL, CONTROL_BYTES, CTRL, CURSOR, EVENT, EVENT_OFFSET, EVENT_RECORDS, EVENT_WORDS, EXIT_NAMES, FIRMWARE,
+  FRAME_READY, NET_OFFSET, NET_RING_BYTES, OPTION, RECT_WORDS, RING_BYTES, RING_OFFSET, UEFI_FIRMWARE_MAGIC,
 } from "./protocol.js";
 import { formatMac, joinSegment, randomMac, randomTab } from "./segment.js";
 
@@ -595,7 +595,154 @@ window.addEventListener("resize", relayout);
 // through the event ring. "terminal" or "screen" is in front.
 let view = "terminal";
 const canvas = $("screen");
-const screenContext = canvas.getContext("2d", { alpha: false });
+
+// The screen as a WebGL2 texture the size of the screen. Frames arrive as rectangles of the
+// library's pixels (blue, green, red, unused), uploaded as they are into an RGBA texture; the
+// fragment shader reads its pixel with texelFetch and swaps red and blue, so no thread converts
+// pixels and the upload is the GPU's (a quarter of what putImageData costs a 1280x800 frame).
+// The canvas is exactly the texture's size: CSS scales it, as before.
+const SCREEN_VERTEX_SHADER = `#version 300 es
+void main() {
+  // One triangle that covers the viewport: (-1,-1), (3,-1), (-1,3).
+  vec2 corner = vec2(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0);
+  gl_Position = vec4(corner, 0.0, 1.0);
+}`;
+const SCREEN_FRAGMENT_SHADER = `#version 300 es
+// highp: mediump may not tell gl_FragCoord.y 1599.5 from 1598.5.
+precision highp float;
+uniform highp sampler2D screen;
+out vec4 color;
+void main() {
+  // Texture row 0 is the screen's top row; the framebuffer's row 0 is its bottom.
+  ivec2 size = textureSize(screen, 0);
+  vec4 pixel = texelFetch(screen, ivec2(gl_FragCoord.x, float(size.y) - gl_FragCoord.y), 0);
+  color = vec4(pixel.b, pixel.g, pixel.r, 1.0);
+}`;
+
+const GL_OPTIONS = { alpha: false, antialias: false, depth: false, stencil: false };
+
+// Returns whether the screen's program links: false on a lost context.
+function buildScreenProgram(gl) {
+  const compile = (kind, source) => {
+    const shader = gl.createShader(kind);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    return shader;
+  };
+  const program = gl.createProgram();
+  gl.attachShader(program, compile(gl.VERTEX_SHADER, SCREEN_VERTEX_SHADER));
+  gl.attachShader(program, compile(gl.FRAGMENT_SHADER, SCREEN_FRAGMENT_SHADER));
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) return false;
+  gl.useProgram(program);
+  // An empty vertex array: the vertex shader makes its corners from gl_VertexID.
+  gl.bindVertexArray(gl.createVertexArray());
+  return true;
+}
+
+function createGlRenderer() {
+  // Tried on a canvas of its own first: once the screen's canvas has a WebGL context it can
+  // never have a 2D one, so it must not get one that turns out unusable.
+  const probe = document.createElement("canvas").getContext("webgl2", GL_OPTIONS);
+  if (!probe || !buildScreenProgram(probe)) return null;
+  probe.getExtension("WEBGL_lose_context")?.loseContext();
+  const gl = canvas.getContext("webgl2", GL_OPTIONS);
+  if (!gl) return null;
+  let texture = null;
+  let lost = false;
+  function setUp() {
+    buildScreenProgram(gl);
+    texture = null;
+    resize();
+  }
+  // WebGL zeroes a new texture: a black screen until the first frame.
+  function resize() {
+    if (texture) gl.deleteTexture(texture);
+    texture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, canvas.width, canvas.height);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+  }
+  function present() {
+    if (!lost) gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+  // A lost context (a GPU reset, too many contexts) takes the texture with it: once it is back,
+  // the worker is asked for the whole screen again.
+  canvas.addEventListener("webglcontextlost", (event) => {
+    event.preventDefault();
+    lost = true;
+  });
+  canvas.addEventListener("webglcontextrestored", () => {
+    lost = false;
+    setUp();
+    present();
+    requestWholeScreen();
+  });
+  setUp();
+  return {
+    resize() {
+      resize();
+      present();
+    },
+    draw(rects, pixels) {
+      if (lost) return;
+      let at = 0;
+      for (let i = 0; i < rects.length; i += RECT_WORDS) {
+        const [x, y, width, height] = rects.subarray(i, i + RECT_WORDS);
+        const bytes = width * height * BYTES_PER_PIXEL;
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, x, y, width, height, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(pixels, at, bytes));
+        at += bytes;
+      }
+      present();
+    },
+    // The drawing buffer is cleared once composited; drawing again in the same task as
+    // `toBlob` gives it the picture.
+    present,
+  };
+}
+
+// Without WebGL2: a 2D canvas, the channels reordered here (on the page, still not on the
+// emulator's thread).
+function create2dRenderer() {
+  const context = canvas.getContext("2d", { alpha: false });
+  const clear = () => {
+    context.fillStyle = "#000";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+  };
+  return {
+    resize: clear,
+    draw(rects, pixels) {
+      const source = new Uint8Array(pixels);
+      let at = 0;
+      for (let i = 0; i < rects.length; i += RECT_WORDS) {
+        const [x, y, width, height] = rects.subarray(i, i + RECT_WORDS);
+        const image = new ImageData(width, height);
+        const target = image.data;
+        for (let byte = 0; byte < target.length; byte += BYTES_PER_PIXEL) {
+          target[byte] = source[at + byte + 2];
+          target[byte + 1] = source[at + byte + 1];
+          target[byte + 2] = source[at + byte];
+          target[byte + 3] = 255;
+        }
+        context.putImageData(image, x, y);
+        at += target.length;
+      }
+    },
+    present() {},
+  };
+}
+
+// The next frame is the whole screen, not what changed since the last one: the page lost its
+// picture. When a frame is in flight, its acknowledgement asks instead.
+let resendWanted = false;
+function requestWholeScreen() {
+  if (!control) return;
+  if (Atomics.compareExchange(control, CTRL.FRAME_ACK, FRAME_READY.YES, FRAME_READY.RESEND) !== FRAME_READY.YES) {
+    resendWanted = true;
+  }
+}
+
+const renderer = createGlRenderer() ?? create2dRenderer();
 // KeyboardEvent.code to USB HID keyboard usage (UI Events code values are named after the USB
 // usage they come from); the same table as the CLI's viewer (crates/uemulator-cli/src/frontend/web/viewer.html).
 const USAGES = (() => {
@@ -701,8 +848,8 @@ function layoutScreen() {
 
 function resetScreen(s) {
   [canvas.width, canvas.height] = DEFAULT_SCREEN;
-  screenContext.fillStyle = "#000";
-  screenContext.fillRect(0, 0, canvas.width, canvas.height);
+  renderer.resize();
+  resendWanted = false;
   canvas.style.cursor = "";
   const note = s.display === "none" ? "No screen: keys and the pointer go to the guest's virtio keyboard and tablet." : "";
   $("screen-note").textContent = note;
@@ -719,13 +866,12 @@ function drawFrame(frame) {
   if (canvas.width !== frame.screenWidth || canvas.height !== frame.screenHeight) {
     canvas.width = frame.screenWidth;
     canvas.height = frame.screenHeight;
+    renderer.resize();
     layoutScreen();
   }
-  if (frame.width > 0 && frame.height > 0) {
-    const image = new ImageData(new Uint8ClampedArray(frame.pixels), frame.width, frame.height);
-    screenContext.putImageData(image, frame.x, frame.y);
-  }
-  if (control) Atomics.store(control, CTRL.FRAME_ACK, 1);
+  renderer.draw(frame.rects, frame.pixels);
+  if (control) Atomics.store(control, CTRL.FRAME_ACK, resendWanted ? FRAME_READY.RESEND : FRAME_READY.YES);
+  resendWanted = false;
 }
 
 // The guest's pointer image becomes the canvas's CSS cursor: the tablet puts the guest's pointer
@@ -837,6 +983,7 @@ $("ctrl-alt-del").onclick = () => {
   focusView();
 };
 $("screenshot").onclick = () => {
+  renderer.present();
   canvas.toBlob((blob) => {
     if (!blob) return;
     const link = Object.assign(document.createElement("a"), {
@@ -939,7 +1086,7 @@ async function launch() {
     events = new Int32Array(shared, EVENT_OFFSET, EVENT_RECORDS * EVENT_WORDS);
     control[CTRL.COLS] = term.cols;
     control[CTRL.ROWS] = term.rows;
-    control[CTRL.FRAME_ACK] = 1;
+    control[CTRL.FRAME_ACK] = FRAME_READY.YES;
     let network = null;
     if (s.network) {
       const tab = randomTab();

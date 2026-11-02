@@ -159,25 +159,70 @@ impl Resource {
                 .checked_add(rect.height)
                 .is_some_and(|bottom| bottom <= self.height)
     }
+}
 
-    /// Fills `out` from byte `offset` of the backing, as if the entries were one buffer. Bytes
-    /// past the backing's end, or in an entry outside RAM, read as zero.
-    fn read_backing(&self, mem: &GuestMem, mut offset: u64, out: &mut [u8]) {
-        out.fill(0);
-        let mut done = 0;
-        for entry in &self.backing {
-            if done == out.len() {
-                break;
+/// A position in a resource's backing: an entry and the offset into it. A transfer carries it
+/// from row to row, so each row continues where the last stopped; walking the entries from the
+/// first for every row costs rows x entries, and a dumb buffer is backed by one entry per page
+/// (a thousand for 1280x800).
+#[derive(Clone, Copy, Default)]
+struct BackingCursor {
+    entry: usize,
+    offset: u64,
+}
+
+impl BackingCursor {
+    /// Moves `bytes` further; past the last entry it stays at the end.
+    fn advance(&mut self, backing: &[BackingEntry], mut bytes: u64) {
+        while let Some(entry) = backing.get(self.entry) {
+            let left = entry.length - self.offset;
+            if bytes < left {
+                self.offset += bytes;
+                return;
             }
-            if offset >= entry.length {
-                offset -= entry.length;
-                continue;
-            }
-            let count = ((entry.length - offset) as usize).min(out.len() - done);
-            mem.read(entry.address + offset, &mut out[done..done + count]);
-            done += count;
-            offset = 0;
+            bytes -= left;
+            self.entry += 1;
+            self.offset = 0;
         }
+    }
+
+    /// Fills `out` from here, as if the entries were one buffer, and moves past it. Bytes past
+    /// the backing's end, or in an entry outside RAM, read as zero.
+    fn read(&mut self, backing: &[BackingEntry], mem: &GuestMem, out: &mut [u8]) {
+        let mut done = 0;
+        while done < out.len() {
+            let Some(entry) = backing.get(self.entry) else {
+                out[done..].fill(0);
+                return;
+            };
+            let count = ((entry.length - self.offset) as usize).min(out.len() - done);
+            let piece = &mut out[done..done + count];
+            if !mem.read(entry.address + self.offset, piece) {
+                piece.fill(0);
+            }
+            done += count;
+            self.advance(backing, count as u64);
+        }
+    }
+}
+
+/// Converts one row of `source` pixels (byte offsets of blue, green and red in `channels`) into
+/// the screen's blue, green, red, unused, with the unused byte 0. The format Linux gives its
+/// dumb buffers is the screen's own, a copy and a mask; it is the case worth keeping fast, as
+/// every flush of the guest's console or desktop goes through here under the device lock.
+fn convert_row(source: &[u8], target: &mut [u8], channels: [usize; 3]) {
+    const COLOUR_MASK: u32 = 0x00ff_ffff;
+    let source = source.as_chunks::<BYTES_PER_PIXEL>().0;
+    let target = target.as_chunks_mut::<BYTES_PER_PIXEL>().0;
+    if channels == [0, 1, 2] {
+        for (to, from) in target.iter_mut().zip(source) {
+            *to = (u32::from_le_bytes(*from) & COLOUR_MASK).to_le_bytes();
+        }
+        return;
+    }
+    let [blue, green, red] = channels;
+    for (to, from) in target.iter_mut().zip(source) {
+        *to = [from[blue], from[green], from[red], 0];
     }
 }
 
@@ -456,20 +501,19 @@ impl VirtioGpu {
             height: bottom - top,
         };
         let source_stride = resource.stride();
+        let row_bytes = damage.width as usize * BYTES_PER_PIXEL;
         self.display
             .publish(shown.width, shown.height, |screen, stride| {
                 for row in 0..damage.height {
-                    let source_row = (top + row) as usize * source_stride;
-                    let target_row = (damage.y + row) as usize * stride;
-                    for column in 0..damage.width {
-                        let source = source_row + (left + column) as usize * BYTES_PER_PIXEL;
-                        let target = target_row + (damage.x + column) as usize * BYTES_PER_PIXEL;
-                        let pixel = &resource.pixels[source..source + BYTES_PER_PIXEL];
-                        screen[target] = pixel[blue];
-                        screen[target + 1] = pixel[green];
-                        screen[target + 2] = pixel[red];
-                        screen[target + 3] = 0;
-                    }
+                    let source =
+                        (top + row) as usize * source_stride + left as usize * BYTES_PER_PIXEL;
+                    let target =
+                        (damage.y + row) as usize * stride + damage.x as usize * BYTES_PER_PIXEL;
+                    convert_row(
+                        &resource.pixels[source..source + row_bytes],
+                        &mut screen[target..target + row_bytes],
+                        [blue, green, red],
+                    );
                 }
                 Some(damage)
             });
@@ -546,14 +590,25 @@ impl VirtioGpu {
         }
         let stride = resource.stride();
         let row_bytes = rect.width as usize * BYTES_PER_PIXEL;
-        let mut row = vec![0u8; row_bytes];
+        if rect.is_empty() {
+            return RESP_OK_NODATA;
+        }
+        let last_row = (rect.height as u64 - 1) * stride as u64;
+        if offset.checked_add(last_row + row_bytes as u64).is_none() {
+            return RESP_ERR_INVALID_PARAMETER;
+        }
+        let mut cursor = BackingCursor::default();
+        cursor.advance(&resource.backing, offset);
         for line in 0..rect.height as usize {
-            let Some(source) = offset.checked_add((line * stride) as u64) else {
-                return RESP_ERR_INVALID_PARAMETER;
-            };
-            resource.read_backing(mem, source, &mut row);
+            if line > 0 {
+                cursor.advance(&resource.backing, (stride - row_bytes) as u64);
+            }
             let target = (rect.y as usize + line) * stride + rect.x as usize * BYTES_PER_PIXEL;
-            resource.pixels[target..target + row_bytes].copy_from_slice(&row);
+            cursor.read(
+                &resource.backing,
+                mem,
+                &mut resource.pixels[target..target + row_bytes],
+            );
         }
         RESP_OK_NODATA
     }

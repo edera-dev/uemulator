@@ -524,6 +524,59 @@ fn transfers_are_checked_against_the_resource() {
 }
 
 #[test]
+fn a_transfer_carries_rows_across_many_small_out_of_order_entries() {
+    // Entries of 20 bytes, so pixels straddle them, laid out in RAM in reverse: a row of the
+    // rectangle starts part way into one entry and ends in another, as a dumb buffer's rows
+    // cross its pages. Each image byte is its own index, so a misplaced byte shows.
+    const ENTRY_BYTES: u32 = 20;
+    let mut rig = Rig::new();
+    let length = WIDTH * HEIGHT * 4;
+    let count = length.div_ceil(ENTRY_BYTES);
+    let entry_address = |index: u32| BACKING_A + u64::from((count - 1 - index) * 32);
+    for byte in 0..length {
+        let at = entry_address(byte / ENTRY_BYTES) + u64::from(byte % ENTRY_BYTES);
+        rig.ram[at as usize] = byte as u8;
+    }
+    assert_eq!(
+        rig.create(RESOURCE, FORMAT_B8G8R8X8, WIDTH, HEIGHT),
+        RESP_OK_NODATA
+    );
+    let mut request = header(CMD_RESOURCE_ATTACH_BACKING);
+    request.extend(words(&[RESOURCE, count]));
+    let split = request.len();
+    for index in 0..count {
+        request.extend(entry_address(index).to_le_bytes());
+        request.extend(words(&[ENTRY_BYTES, 0]));
+    }
+    assert_eq!(
+        response_type(&rig.command_split(&request, split)),
+        RESP_OK_NODATA
+    );
+    let rect = Rect {
+        x: 3,
+        y: 2,
+        width: 5,
+        height: 4,
+    };
+    let offset = u64::from((rect.y * WIDTH + rect.x) * 4);
+    assert_eq!(rig.transfer(RESOURCE, rect, offset), RESP_OK_NODATA);
+    let pixels = &rig.gpu.resources[&RESOURCE].pixels;
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let at = ((y * WIDTH + x) * 4) as usize;
+            let inside = (rect.x..rect.x + rect.width).contains(&x)
+                && (rect.y..rect.y + rect.height).contains(&y);
+            let expected: [u8; 4] = if inside {
+                core::array::from_fn(|byte| (at + byte) as u8)
+            } else {
+                [0; 4]
+            };
+            assert_eq!(pixels[at..at + 4], expected, "pixel {x},{y}");
+        }
+    }
+}
+
+#[test]
 fn set_scanout_checks_the_scanout_the_resource_and_the_rectangle() {
     let mut rig = Rig::new();
     assert_eq!(

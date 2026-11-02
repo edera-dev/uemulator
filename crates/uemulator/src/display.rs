@@ -36,6 +36,11 @@ pub(crate) const MAX_HEIGHT: u32 = 1600;
 /// this gets the whole screen, which is always correct, just bigger.
 const DAMAGE_HISTORY: usize = 64;
 
+/// Side of the square tiles `DisplayHandle::sync_mirror` compares. A change as small as a text
+/// cursor costs one tile on the wire; smaller tiles would cut that further but give frontends
+/// more, smaller rectangles to encode and draw, each with its own overhead.
+const MIRROR_TILE: u32 = 64;
+
 /// Range of the tablet's absolute axes as the guest sees them (`ABS_X`, `ABS_Y`), the one QEMU's
 /// virtio tablet uses. Fixed, so a mode change needs no new device configuration: pointer
 /// positions are scaled from screen pixels into it.
@@ -135,6 +140,149 @@ pub struct FrameUpdate {
     pub width: u32,
     pub height: u32,
     pub rect: Rect,
+}
+
+/// A frontend's copy of the screen as it last showed it. `DisplayHandle::sync_mirror` brings it
+/// up to date and returns only the parts whose pixels really differ, by comparing tiles: the
+/// damage history is a union of what the guest flushed (a blinking cursor and a clock in
+/// opposite corners are the whole screen), and guests flush more than they change. Everything a
+/// frontend then encodes, transfers and uploads is only what is new to it.
+#[derive(Clone, Debug, Default)]
+pub struct ScreenMirror {
+    width: u32,
+    height: u32,
+    /// The screen generation copied; `None` before the first sync.
+    generation: Option<u64>,
+    pixels: Vec<u8>,
+}
+
+impl ScreenMirror {
+    /// An empty mirror: its first sync copies, and returns, the whole screen.
+    pub fn new() -> ScreenMirror {
+        ScreenMirror::default()
+    }
+
+    /// The size of the screen copied, (0, 0) before the first sync.
+    pub fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    pub fn generation(&self) -> Option<u64> {
+        self.generation
+    }
+
+    /// The copy: `height` rows of `width` pixels in `Frame`'s format, with no padding.
+    pub fn pixels(&self) -> &[u8] {
+        &self.pixels
+    }
+
+    /// Bytes from one row of `pixels` to the next.
+    pub fn stride(&self) -> usize {
+        self.width as usize * BYTES_PER_PIXEL
+    }
+
+    /// Writes the pixels of `rect` (inside the copy) into `out`, replacing what was there:
+    /// `rect.height` rows of `rect.width` pixels, packed, as `update_since` gives them.
+    pub fn copy_rect(&self, rect: Rect, out: &mut Vec<u8>) {
+        let rect = rect.clipped(self.width, self.height);
+        let row_bytes = rect.width as usize * BYTES_PER_PIXEL;
+        out.clear();
+        out.reserve(row_bytes * rect.height as usize);
+        for row in rect.y..rect.y + rect.height {
+            let start = row as usize * self.stride() + rect.x as usize * BYTES_PER_PIXEL;
+            out.extend_from_slice(&self.pixels[start..start + row_bytes]);
+        }
+    }
+}
+
+/// `left == right`, eight bytes at a time. Slice equality is a `memcmp` call, which on wasm32 is
+/// compiler-builtins' byte loop: five times slower for a whole screen (1.4 ms against 0.27 ms
+/// for 1280x800 under Node), and on the web the comparison runs on the guest's only thread.
+/// Natively the two are within 0.05 ms of each other.
+fn same_bytes(left: &[u8], right: &[u8]) -> bool {
+    const WORD: usize = core::mem::size_of::<u64>();
+    let (left_words, left_tail) = left.as_chunks::<WORD>();
+    let (right_words, right_tail) = right.as_chunks::<WORD>();
+    left.len() == right.len()
+        && left_tail == right_tail
+        && left_words
+            .iter()
+            .zip(right_words)
+            .all(|(a, b)| u64::from_ne_bytes(*a) == u64::from_ne_bytes(*b))
+}
+
+/// Compares the tiles of `screen` that meet `damage` with `mirror` (both `width` x `height`),
+/// copies the ones that differ into `mirror`, and returns them as rectangles: each run of changed
+/// tiles in a row of tiles, grown down through the rows below that have a run with the same
+/// columns. Rectangles never overlap and are clipped to the screen.
+fn sync_tiles(
+    screen: &[u8],
+    mirror: &mut [u8],
+    width: u32,
+    height: u32,
+    damage: Rect,
+) -> Vec<Rect> {
+    let stride = width as usize * BYTES_PER_PIXEL;
+    let first_column = damage.x / MIRROR_TILE;
+    let last_column = (damage.x + damage.width - 1) / MIRROR_TILE;
+    let mut done = Vec::new();
+    // Rectangles that reach the bottom of the previous row of tiles and may grow into this one.
+    let mut growing: Vec<Rect> = Vec::new();
+    for tile_row in damage.y / MIRROR_TILE..=(damage.y + damage.height - 1) / MIRROR_TILE {
+        let top = tile_row * MIRROR_TILE;
+        let bottom = (top + MIRROR_TILE).min(height);
+        let mut runs = Vec::new();
+        let mut run_start = None;
+        // One past the last column ends a run still open at the right edge.
+        for column in first_column..=last_column + 1 {
+            let changed = column <= last_column && {
+                let left = (column * MIRROR_TILE) as usize * BYTES_PER_PIXEL;
+                let right = ((column + 1) * MIRROR_TILE).min(width) as usize * BYTES_PER_PIXEL;
+                // Rows above the first that differs are equal; from there on they are copied.
+                let mut differs = false;
+                for row in top as usize..bottom as usize {
+                    let span = row * stride + left..row * stride + right;
+                    differs = differs || !same_bytes(&screen[span.clone()], &mirror[span.clone()]);
+                    if differs {
+                        mirror[span.clone()].copy_from_slice(&screen[span]);
+                    }
+                }
+                differs
+            };
+            match (changed, run_start) {
+                (true, None) => run_start = Some(column),
+                (false, Some(start)) => {
+                    let x = start * MIRROR_TILE;
+                    runs.push(Rect {
+                        x,
+                        y: top,
+                        width: (column * MIRROR_TILE).min(width) - x,
+                        height: bottom - top,
+                    });
+                    run_start = None;
+                }
+                _ => {}
+            }
+        }
+        let mut next = Vec::with_capacity(runs.len());
+        for run in runs {
+            match growing
+                .iter()
+                .position(|above| (above.x, above.width) == (run.x, run.width))
+            {
+                Some(index) => {
+                    let mut above = growing.swap_remove(index);
+                    above.height += run.height;
+                    next.push(above);
+                }
+                None => next.push(run),
+            }
+        }
+        done.append(&mut growing);
+        growing = next;
+    }
+    done.append(&mut growing);
+    done
 }
 
 /// Called with the new generation after each change, see `DisplayHandle::on_update`.
@@ -313,6 +461,44 @@ impl DisplayHandle {
             height: screen.height,
             rect,
         })
+    }
+
+    /// Brings `mirror` up to date with the screen and returns the parts that differ from what it
+    /// held (see `ScreenMirror`): `None` when the screen has not changed since the mirror's
+    /// generation, no rectangles when it changed back to what the mirror holds. A new mirror,
+    /// or one of another size, gets the whole screen as one rectangle. The comparison runs
+    /// under the handle's lock, as `update_since`'s copy does; it reads only the damaged tiles.
+    pub fn sync_mirror(&self, mirror: &mut ScreenMirror) -> Option<Vec<Rect>> {
+        let screen = self.shared.screen.lock().unwrap();
+        let full = Rect {
+            x: 0,
+            y: 0,
+            width: screen.width,
+            height: screen.height,
+        };
+        let same_size = (mirror.width, mirror.height) == (screen.width, screen.height);
+        let damage = match mirror.generation {
+            Some(generation) if same_size => screen.damage_since(generation)?,
+            _ => {
+                mirror.width = screen.width;
+                mirror.height = screen.height;
+                mirror.generation = Some(screen.generation);
+                mirror.pixels.clear();
+                mirror.pixels.extend_from_slice(&screen.pixels);
+                return Some(vec![full]);
+            }
+        };
+        mirror.generation = Some(screen.generation);
+        if damage.is_empty() {
+            return Some(Vec::new());
+        }
+        Some(sync_tiles(
+            &screen.pixels,
+            &mut mirror.pixels,
+            screen.width,
+            screen.height,
+            damage,
+        ))
     }
 
     /// Waits until the generation is past `generation` or `timeout` passes, and returns the

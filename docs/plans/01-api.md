@@ -43,7 +43,7 @@ MachineConfig::display(DisplayMode::Framebuffer)    // None (default) | Framebuf
 MachineConfig::input(bool)                          // virtio keyboard + tablet; default: exactly when there is a screen
 MachineConfig::console_on_screen(bool)              // default true: the screen is /dev/console (console=tty0 last)
 MachineConfig::display_size(width, height)          // default 1280x800; without a screen, the pointer area
-EmulatedMachine::display() -> Option<DisplayHandle> // size, generation, frame, update_since, wait_for_update, on_update, request_size, cursor
+EmulatedMachine::display() -> Option<DisplayHandle> // size, generation, frame, update_since, sync_mirror (ScreenMirror), wait_for_update, on_update, request_size, cursor
 EmulatedMachine::input() -> Option<InputHandle>     // key (Linux code), key_usb, pointer_move, pointer_button, scroll, release_all, pointer_area
 
 pub struct ConsoleHandle { .. }

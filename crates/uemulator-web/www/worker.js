@@ -3,7 +3,8 @@
 // acknowledgements, the stop request and the frames from other tabs come through the
 // SharedArrayBuffer `control` that main.js shares with us (layout in protocol.js).
 import {
-  CTRL, EVENT_OFFSET, EVENT_RECORDS, EVENT_WORDS, NET_OFFSET, NET_RING_BYTES, RING_BYTES, RING_OFFSET,
+  BYTES_PER_PIXEL, CTRL, EVENT_OFFSET, EVENT_RECORDS, EVENT_WORDS, FRAME_READY, NET_OFFSET, NET_RING_BYTES,
+  RECT_WORDS, RING_BYTES, RING_OFFSET,
 } from "./protocol.js";
 import { createJitHost } from "./jit_host.js";
 import { createSegmentSender, netRingHasFrames, takeFrame } from "./segment.js";
@@ -131,12 +132,28 @@ const host = {
   host_frame_ready() {
     return Atomics.load(control, CTRL.FRAME_ACK);
   },
-  host_frame(screenWidth, screenHeight, x, y, width, height, ptr, len) {
-    Atomics.store(control, CTRL.FRAME_ACK, 0);
-    // A copy into a buffer of its own: ImageData refuses views on shared memory, and the
-    // module's memory moves on as soon as this returns.
-    const pixels = memoryBytes(ptr, len).slice();
-    postMessage({ type: "frame", screenWidth, screenHeight, x, y, width, height, pixels: pixels.buffer }, [pixels.buffer]);
+  host_frame(screenWidth, screenHeight, rectsPtr, rectCount, pixelsPtr, stride) {
+    Atomics.store(control, CTRL.FRAME_ACK, FRAME_READY.NOT);
+    // The rectangles' rows, packed one rectangle after another, into a buffer of their own:
+    // WebGL refuses views on shared memory, and the module's memory moves on as soon as this
+    // returns. This is the one copy a frame costs this thread; the page reorders the channels.
+    const rects = new Uint32Array(wasm.memory.buffer, address(rectsPtr), rectCount * RECT_WORDS).slice();
+    let total = 0;
+    for (let i = 0; i < rects.length; i += RECT_WORDS) total += rects[i + 2] * rects[i + 3] * BYTES_PER_PIXEL;
+    const pixels = new Uint8Array(total);
+    const screen = new Uint8Array(wasm.memory.buffer);
+    const base = address(pixelsPtr);
+    let at = 0;
+    for (let i = 0; i < rects.length; i += RECT_WORDS) {
+      const [x, y, width, height] = rects.subarray(i, i + RECT_WORDS);
+      const rowBytes = width * BYTES_PER_PIXEL;
+      for (let row = y; row < y + height; row++) {
+        const start = base + row * stride + x * BYTES_PER_PIXEL;
+        pixels.set(screen.subarray(start, start + rowBytes), at);
+        at += rowBytes;
+      }
+    }
+    postMessage({ type: "frame", screenWidth, screenHeight, rects, pixels: pixels.buffer }, [rects.buffer, pixels.buffer]);
   },
   host_cursor(kind, width, height, hotX, hotY, ptr, len) {
     const pixels = memoryBytes(ptr, len).slice();

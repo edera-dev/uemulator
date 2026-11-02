@@ -37,10 +37,10 @@
 "use strict";
 // Protocol (crates/uemulator-cli/src/frontend/web.rs): the server sends binary messages that
 // start with a kind byte. 3 (first): flags (1 screen, 2 input), then the pointer area's width and
-// height as little-endian u16. 1: screen width, screen height, x, y, width, height as u16, then a
-// PNG of that rectangle; the page answers "a" once it is drawn (only these are answered). 2: the
-// guest's pointer, a state byte (0 the host's, 1 hidden, 2 image), hot spot x and y as u16, then
-// for an image its PNG. The page sends text commands: "k USAGE 0|1" (key by USB HID usage),
+// height as little-endian u16. 4: screen width, screen height and a count as u16, then per
+// rectangle x, y, width, height as u16, its PNG's length as u32 and the PNG; the page answers
+// "a" once all of them are drawn (only these are answered). 2: the guest's pointer, a state byte
+// (0 the host's, 1 hidden, 2 image), hot spot x and y as u16, then for an image its PNG. The page sends text commands: "k USAGE 0|1" (key by USB HID usage),
 // "m X Y" (pointer in screen pixels), "b INDEX 0|1" (0 left, 1 right, 2 middle, 3 back,
 // 4 forward), "w CLICKS" (wheel, positive up), "r" (release everything), "s WIDTH HEIGHT" (ask
 // the guest for that screen size).
@@ -75,8 +75,9 @@ const USAGES = (() => {
 // MouseEvent.button to the server's button index.
 const BUTTONS = { 0: 0, 1: 2, 2: 1, 3: 3, 4: 4 };
 const RECONNECT_MS = 1000;
-const HEADER_BYTES = 13;
-const KIND_RECT = 1;
+const RECTS_HEADER_BYTES = 7;
+const RECT_HEADER_BYTES = 12;
+const KIND_RECTS = 4;
 const KIND_CURSOR = 2;
 const KIND_HELLO = 3;
 const HELLO_HAS_DISPLAY = 1;
@@ -182,19 +183,31 @@ async function draw(buffer) {
   const kind = view.getUint8(0);
   if (kind === KIND_HELLO) hello(view);
   if (kind === KIND_CURSOR) setCursor(view, buffer);
-  if (kind !== KIND_RECT) return false;
-  const word = (i) => view.getUint16(1 + 2 * i, true);
-  const [width, height, x, y] = [word(0), word(1), word(2), word(3)];
+  if (kind !== KIND_RECTS) return false;
+  const word = (at) => view.getUint16(at, true);
+  const [width, height, count] = [word(1), word(3), word(5)];
+  // Every band is decoded at once (off the main thread), then all are drawn together: the
+  // canvas never shows half an update.
+  const pending = [];
+  let at = RECTS_HEADER_BYTES;
+  for (let i = 0; i < count; i++) {
+    const length = view.getUint32(at + 8, true);
+    const png = new Blob([new Uint8Array(buffer, at + RECT_HEADER_BYTES, length)], { type: "image/png" });
+    const [x, y] = [word(at), word(at + 2)];
+    pending.push(createImageBitmap(png).then((image) => ({ image, x, y })));
+    at += RECT_HEADER_BYTES + length;
+  }
+  const images = await Promise.all(pending);
   if (canvas.width !== width || canvas.height !== height) {
     canvas.width = width;
     canvas.height = height;
     sizeLabel.textContent = width + "×" + height;
     fit();
   }
-  const image = await createImageBitmap(new Blob([buffer.slice(HEADER_BYTES)],
-    { type: "image/png" }));
-  context.drawImage(image, x, y);
-  image.close();
+  for (const { image, x, y } of images) {
+    context.drawImage(image, x, y);
+    image.close();
+  }
   drawn++;
   return true;
 }
@@ -209,7 +222,7 @@ function connect() {
   socket.onopen = () => setState("connected", true);
   socket.onmessage = (event) => {
     // A rectangle that failed to decode is still answered, or the server would wait forever.
-    const isRect = new DataView(event.data).getUint8(0) === KIND_RECT;
+    const isRect = new DataView(event.data).getUint8(0) === KIND_RECTS;
     chain = chain.then(() => draw(event.data)).catch(() => isRect).then((answer) => {
       if (answer) send("a");
     });

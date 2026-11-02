@@ -7,7 +7,7 @@ use std::io::Write;
 
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
-use uemulator::BYTES_PER_PIXEL;
+use uemulator::{BYTES_PER_PIXEL, Rect};
 
 const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
 const BIT_DEPTH: u8 = 8;
@@ -25,23 +25,39 @@ const RGBA_BYTES: usize = 4;
 /// Encodes `width` x `height` pixels in the library's frame format (blue, green, red, unused;
 /// rows packed) as a PNG.
 pub fn encode_bgrx(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
-    encode(width, height, pixels, false)
+    let row_bytes = width as usize * BYTES_PER_PIXEL;
+    encode(width, height, pixels.chunks_exact(row_bytes), false)
+}
+
+/// Encodes the `rect` of a screen whose rows are `stride` bytes apart (a `ScreenMirror`) as a
+/// PNG, without copying it out first.
+pub fn encode_bgrx_rect(pixels: &[u8], stride: usize, rect: Rect) -> Vec<u8> {
+    let left = rect.x as usize * BYTES_PER_PIXEL;
+    let row_bytes = rect.width as usize * BYTES_PER_PIXEL;
+    let rows = (rect.y..rect.y + rect.height).map(|row| {
+        let start = row as usize * stride + left;
+        &pixels[start..start + row_bytes]
+    });
+    encode(rect.width, rect.height, rows, false)
 }
 
 /// Encodes `width` x `height` pixels of blue, green, red, alpha (a `CursorImage`) as a PNG with
 /// alpha.
 pub fn encode_bgra(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
-    encode(width, height, pixels, true)
+    let row_bytes = width as usize * BYTES_PER_PIXEL;
+    encode(width, height, pixels.chunks_exact(row_bytes), true)
 }
 
-fn encode(width: u32, height: u32, pixels: &[u8], alpha: bool) -> Vec<u8> {
+fn encode<'a>(
+    width: u32,
+    height: u32,
+    rows: impl Iterator<Item = &'a [u8]>,
+    alpha: bool,
+) -> Vec<u8> {
     let channels = if alpha { RGBA_BYTES } else { RGB_BYTES };
     let row_pixels = width as usize;
     let mut filtered = Vec::with_capacity((1 + row_pixels * channels) * height as usize);
-    for row in pixels
-        .chunks_exact(row_pixels * BYTES_PER_PIXEL)
-        .take(height as usize)
-    {
+    for row in rows.take(height as usize) {
         filtered.push(FILTER_SUB);
         let mut left = [0u8; RGBA_BYTES];
         for pixel in row.as_chunks::<BYTES_PER_PIXEL>().0 {
@@ -151,6 +167,29 @@ mod tests {
                 left = rgb;
             }
         }
+    }
+
+    #[test]
+    fn a_rectangle_of_a_larger_screen_encodes_as_its_own_image() {
+        let (width, height) = (4u32, 3u32);
+        let pixels: Vec<u8> = (0..width * height)
+            .flat_map(|i| [i as u8, i as u8 + 100, i as u8 + 200, 0])
+            .collect();
+        let rect = Rect {
+            x: 1,
+            y: 1,
+            width: 2,
+            height: 2,
+        };
+        let mut packed = Vec::new();
+        for row in 1..3 {
+            let start = (row * width as usize + 1) * BYTES_PER_PIXEL;
+            packed.extend_from_slice(&pixels[start..start + 2 * BYTES_PER_PIXEL]);
+        }
+        assert_eq!(
+            encode_bgrx_rect(&pixels, width as usize * BYTES_PER_PIXEL, rect),
+            encode_bgrx(2, 2, &packed)
+        );
     }
 
     #[test]

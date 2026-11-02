@@ -1,21 +1,23 @@
 //! The built-in web viewer: a small HTTP server that serves one page (`web/viewer.html`), a
 //! WebSocket at `/ws` and the whole screen as `/screenshot.png`. Over the socket the server sends
 //! screen updates as PNG rectangles and the guest's pointer image, and the page sends keyboard
-//! and mouse events and size requests as short text commands. One update is in flight per viewer
-//! at a time (the page acknowledges each after drawing it), so a slow browser or link gets
-//! fewer, larger updates instead of a growing backlog. Protocol in
-//! `docs/plans/24-display-input.md`.
+//! and mouse events and size requests as short text commands. Each viewer has a `ScreenMirror`
+//! of what its page shows, so only tiles whose pixels changed are encoded, in bands on every
+//! core. One update is in flight per viewer at a time (the page acknowledges each after drawing
+//! it), so a slow browser or link gets fewer, larger updates instead of a growing backlog.
+//! Protocol in `docs/plans/24-display-input.md`.
 
 mod png;
 mod websocket;
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use uemulator::{BYTES_PER_PIXEL, Cursor, DisplayHandle, FrameUpdate, PointerButton, Rect};
+use uemulator::{Cursor, PointerButton, Rect, ScreenMirror};
 
 use super::{Frontend, Screen};
 use websocket::{
@@ -34,10 +36,21 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const UPDATE_WAIT: Duration = Duration::from_millis(500);
 /// At most this many updates per second per viewer: what a browser shows anyway.
 const MIN_UPDATE_INTERVAL: Duration = Duration::from_millis(16);
-/// Update message: kind u8, then screen width, screen height, x, y, width, height as u16 little
-/// endian, then the PNG of the rectangle.
-const UPDATE_KIND_RECT: u8 = 1;
-const UPDATE_HEADER_BYTES: usize = 13;
+/// Rectangles are encoded in bands of at most this many rows, the bands on as many threads as
+/// the host has: deflate is nine tenths of an encode, and a full 1280x800 screen of photo-like
+/// content takes 21 ms on one core, 3 ms in bands on fourteen.
+const BAND_ROWS: u32 = 64;
+/// An update smaller than this many pixels is encoded on the session's own thread: starting
+/// threads would cost more than they save.
+const PARALLEL_MIN_PIXELS: usize = 256 * 256;
+/// Screen update: kind u8, then screen width, screen height and the number of rectangles as u16
+/// little endian, then for each rectangle x, y, width and height as u16, the length of its PNG
+/// as u32 and the PNG. The page draws all of them before it acknowledges, so it never shows half
+/// an update. Kind 1, a single rectangle, is retired: a page left open across an upgrade must
+/// not misread this as one (it stops updating until reloaded).
+const UPDATE_KIND_RECTS: u8 = 4;
+const RECTS_HEADER_BYTES: usize = 7;
+const RECT_HEADER_BYTES: usize = 12;
 /// Pointer message: kind u8, state u8 (`CURSOR_*`), hot spot x and y as u16 little endian, then
 /// for an image its PNG with alpha.
 const UPDATE_KIND_CURSOR: u8 = 2;
@@ -499,44 +512,87 @@ fn cursor_message(cursor: &Cursor) -> Vec<u8> {
     message
 }
 
-/// The binary message for one update.
-fn update_message(update: &FrameUpdate, pixels: &[u8]) -> Vec<u8> {
-    let png = png::encode_bgrx(update.rect.width, update.rect.height, pixels);
-    let mut message = Vec::with_capacity(UPDATE_HEADER_BYTES + png.len());
-    message.push(UPDATE_KIND_RECT);
-    for value in [
-        update.width,
-        update.height,
-        update.rect.x,
-        update.rect.y,
-        update.rect.width,
-        update.rect.height,
-    ] {
-        message.extend_from_slice(&(value as u16).to_le_bytes());
+/// `rects` cut into bands of at most `BAND_ROWS` rows, the units that are encoded in parallel.
+fn bands(rects: &[Rect]) -> Vec<Rect> {
+    let mut bands = Vec::new();
+    for rect in rects {
+        let mut top = rect.y;
+        while top < rect.y + rect.height {
+            let height = BAND_ROWS.min(rect.y + rect.height - top);
+            bands.push(Rect {
+                y: top,
+                height,
+                ..*rect
+            });
+            top += height;
+        }
     }
-    message.extend_from_slice(&png);
-    message
+    bands
 }
 
-/// The whole screen as one update, for a viewer that just connected.
-fn full_update(display: &DisplayHandle) -> (FrameUpdate, Vec<u8>) {
-    let frame = display.frame();
-    let update = FrameUpdate {
-        generation: frame.generation,
-        width: frame.width,
-        height: frame.height,
-        rect: Rect {
-            x: 0,
-            y: 0,
-            width: frame.width,
-            height: frame.height,
-        },
-    };
-    debug_assert_eq!(
-        frame.pixels.len(),
-        frame.width as usize * frame.height as usize * BYTES_PER_PIXEL
-    );
-    (update, frame.pixels)
+/// Each band of a screen (`pixels`, rows `stride` bytes apart) as a PNG, in order; on several
+/// threads when there is enough to do.
+fn encode_bands(pixels: &[u8], stride: usize, bands: &[Rect]) -> Vec<Vec<u8>> {
+    let encode = |band: &Rect| png::encode_bgrx_rect(pixels, stride, *band);
+    let area: usize = bands
+        .iter()
+        .map(|band| band.width as usize * band.height as usize)
+        .sum();
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |count| count.get())
+        .min(bands.len());
+    if threads <= 1 || area < PARALLEL_MIN_PIXELS {
+        return bands.iter().map(encode).collect();
+    }
+    let (encode, next) = (&encode, &AtomicUsize::new(0));
+    let mut pngs = vec![Vec::new(); bands.len()];
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(move || {
+                    let mut done = Vec::new();
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(band) = bands.get(index) else {
+                            return done;
+                        };
+                        done.push((index, encode(band)));
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            for (index, png) in worker.join().expect("encoding cannot panic") {
+                pngs[index] = png;
+            }
+        }
+    });
+    pngs
+}
+
+/// The message (`UPDATE_KIND_RECTS`) that shows the page `rects` of `mirror`.
+fn update_message(mirror: &ScreenMirror, rects: &[Rect]) -> Vec<u8> {
+    let bands = bands(rects);
+    let pngs = encode_bands(mirror.pixels(), mirror.stride(), &bands);
+    let (width, height) = mirror.size();
+    let length = RECTS_HEADER_BYTES
+        + pngs
+            .iter()
+            .map(|png| RECT_HEADER_BYTES + png.len())
+            .sum::<usize>();
+    let mut message = Vec::with_capacity(length);
+    message.push(UPDATE_KIND_RECTS);
+    for value in [width, height, bands.len() as u32] {
+        message.extend_from_slice(&(value as u16).to_le_bytes());
+    }
+    for (band, png) in bands.iter().zip(&pngs) {
+        for value in [band.x, band.y, band.width, band.height] {
+            message.extend_from_slice(&(value as u16).to_le_bytes());
+        }
+        message.extend_from_slice(&(png.len() as u32).to_le_bytes());
+        message.extend_from_slice(png);
+    }
+    message
 }
 
 /// Runs one viewer: input on a thread of its own, updates on this one.
@@ -597,11 +653,11 @@ fn run_session(
     };
     let (mut cursor_generation, cursor) = display.cursor();
     send(&writer, &cursor_message(&cursor))?;
-    let (update, pixels) = full_update(display);
-    let mut generation = update.generation;
-    send(&writer, &update_message(&update, &pixels))?;
+    // What the page shows; a new one syncs as the whole screen.
+    let mut mirror = ScreenMirror::new();
+    let whole = display.sync_mirror(&mut mirror).unwrap_or_default();
+    send(&writer, &update_message(&mirror, &whole))?;
     let mut last_sent = Instant::now();
-    let mut pixels = Vec::new();
     loop {
         // One update in flight: wait until the page has drawn the last one.
         match acknowledged.recv_timeout(UPDATE_WAIT) {
@@ -609,36 +665,41 @@ fn run_session(
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
         }
-        // A pointer change ends the wait too; it goes out at once, outside the one-in-flight
-        // rule (it is a few hundred bytes and the page draws nothing for it).
+        // Then until the screen differs from what the page shows. A pointer change ends the
+        // wait too; it goes out at once, outside the one-in-flight rule (it is a few hundred
+        // bytes and the page draws nothing for it).
         loop {
-            let now = display.wait_for_update(generation, UPDATE_WAIT);
-            let (current, cursor) = display.cursor();
-            if current != cursor_generation {
-                cursor_generation = current;
-                send(&writer, &cursor_message(&cursor))?;
-            }
-            if now > generation {
-                break;
-            }
             if matches!(
                 acknowledged.try_recv(),
                 Err(mpsc::TryRecvError::Disconnected)
             ) {
                 return Ok(());
             }
+            let shown = mirror.generation().unwrap_or(0);
+            let now = display.wait_for_update(shown, UPDATE_WAIT);
+            let (current, cursor) = display.cursor();
+            if current != cursor_generation {
+                cursor_generation = current;
+                send(&writer, &cursor_message(&cursor))?;
+            }
+            if now <= shown {
+                continue;
+            }
+            // Let changes that come right after each other go out as one update.
+            let since = last_sent.elapsed();
+            if since < MIN_UPDATE_INTERVAL {
+                std::thread::sleep(MIN_UPDATE_INTERVAL - since);
+            }
+            // A flush that left every pixel as it was has nothing for the page.
+            match display.sync_mirror(&mut mirror) {
+                Some(rects) if !rects.is_empty() => {
+                    send(&writer, &update_message(&mirror, &rects))?;
+                    last_sent = Instant::now();
+                    break;
+                }
+                _ => {}
+            }
         }
-        // Let changes that come right after each other go out as one update.
-        let since = last_sent.elapsed();
-        if since < MIN_UPDATE_INTERVAL {
-            std::thread::sleep(MIN_UPDATE_INTERVAL - since);
-        }
-        let Some(update) = display.update_since(generation, &mut pixels) else {
-            continue;
-        };
-        generation = update.generation;
-        send(&writer, &update_message(&update, &pixels))?;
-        last_sent = Instant::now();
     }
 }
 

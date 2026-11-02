@@ -1,6 +1,6 @@
 use super::*;
 use std::io::{Cursor, Read};
-use uemulator::InputHandle;
+use uemulator::{DisplayHandle, InputHandle};
 
 const KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
 const ACCEPT: &str = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
@@ -267,30 +267,74 @@ fn commands_parse_and_nonsense_is_ignored() {
     }
 }
 
+/// (x, y, width, height, PNG) of each rectangle of an update message, after checking its
+/// header says `screen` and its lengths add up.
+fn parse_update(message: &[u8], screen: (u16, u16)) -> Vec<(u16, u16, u16, u16, Vec<u8>)> {
+    let word = |at: usize| u16::from_le_bytes([message[at], message[at + 1]]);
+    assert_eq!(message[0], UPDATE_KIND_RECTS);
+    assert_eq!((word(1), word(3)), screen);
+    let mut at = RECTS_HEADER_BYTES;
+    let mut rects = Vec::new();
+    for _ in 0..word(5) {
+        let length = u32::from_le_bytes(message[at + 8..at + 12].try_into().unwrap()) as usize;
+        let png = message[at + RECT_HEADER_BYTES..at + RECT_HEADER_BYTES + length].to_vec();
+        assert_eq!(png[..4], *b"\x89PNG");
+        rects.push((word(at), word(at + 2), word(at + 4), word(at + 6), png));
+        at += RECT_HEADER_BYTES + length;
+    }
+    assert_eq!(at, message.len(), "nothing after the last rectangle");
+    rects
+}
+
 #[test]
-fn an_update_message_is_the_header_then_a_png() {
-    let update = FrameUpdate {
-        generation: 3,
-        width: 1280,
-        height: 800,
-        rect: Rect {
-            x: 16,
-            y: 32,
-            width: 2,
-            height: 1,
-        },
+fn rectangles_are_cut_into_bands_of_at_most_band_rows() {
+    let tall = Rect {
+        x: 8,
+        y: 3,
+        width: 5,
+        height: 2 * BAND_ROWS + 1,
     };
-    let message = update_message(&update, &[1, 2, 3, 0, 4, 5, 6, 0]);
-    assert_eq!(message[0], UPDATE_KIND_RECT);
-    let word = |index: usize| u16::from_le_bytes([message[1 + 2 * index], message[2 + 2 * index]]);
+    let small = Rect {
+        x: 0,
+        y: 0,
+        width: 2,
+        height: 2,
+    };
+    let rows = |y, height| Rect { y, height, ..tall };
     assert_eq!(
-        [word(0), word(1), word(2), word(3), word(4), word(5)],
-        [1280, 800, 16, 32, 2, 1]
+        bands(&[tall, small]),
+        [
+            rows(3, BAND_ROWS),
+            rows(3 + BAND_ROWS, BAND_ROWS),
+            rows(3 + 2 * BAND_ROWS, 1),
+            small
+        ]
     );
-    assert_eq!(
-        &message[UPDATE_HEADER_BYTES..UPDATE_HEADER_BYTES + 4],
-        b"\x89PNG"
-    );
+}
+
+#[test]
+fn an_update_message_carries_every_band_in_order_as_its_own_png() {
+    let display = DisplayHandle::default();
+    let mut mirror = ScreenMirror::new();
+    let whole = display.sync_mirror(&mut mirror).unwrap();
+    // The whole screen is big enough to be encoded on several threads; the order must hold.
+    let rects = parse_update(&update_message(&mirror, &whole), (1280, 800));
+    let expected: Vec<_> = bands(&whole)
+        .iter()
+        .map(|band| (0, band.y as u16, 1280, band.height as u16))
+        .collect();
+    let got: Vec<_> = rects
+        .iter()
+        .map(|(x, y, w, h, _)| (*x, *y, *w, *h))
+        .collect();
+    assert_eq!(got, expected);
+    for ((_, _, width, height, png), band) in rects.iter().zip(bands(&whole)) {
+        assert_eq!(
+            *png,
+            png::encode_bgrx_rect(mirror.pixels(), mirror.stride(), band)
+        );
+        assert_eq!((*width as u32, *height as u32), (band.width, band.height));
+    }
 }
 
 #[test]
@@ -444,14 +488,15 @@ fn a_socket_gets_the_hello_the_cursor_and_the_whole_screen_first_and_answers_pin
     assert_eq!(cursor.payload[..2], [UPDATE_KIND_CURSOR, CURSOR_HOST]);
     let first = messages.read(&mut stream).unwrap();
     assert_eq!(first.opcode, OPCODE_BINARY);
-    assert_eq!(first.payload[0], UPDATE_KIND_RECT);
-    let word = |index: usize| {
-        u16::from_le_bytes([first.payload[1 + 2 * index], first.payload[2 + 2 * index]])
-    };
-    assert_eq!(
-        [word(0), word(1), word(2), word(3), word(4), word(5)],
-        [1280, 800, 0, 0, 1280, 800]
-    );
+    let rects = parse_update(&first.payload, (1280, 800));
+    let covered: u32 = rects
+        .iter()
+        .map(|(x, _, width, height, _)| {
+            assert_eq!((*x, *width), (0, 1280), "full-width bands");
+            u32::from(*height)
+        })
+        .sum();
+    assert_eq!(covered, 800, "the whole screen");
     // Input and acks are accepted without an answer; a ping gets its pong.
     stream.write_all(&client_text("k 4 1")).unwrap();
     stream.write_all(&client_text("a")).unwrap();

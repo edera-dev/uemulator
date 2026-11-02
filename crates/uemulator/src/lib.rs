@@ -47,7 +47,7 @@ pub use disk::{
 };
 pub use display::{
     BYTES_PER_PIXEL, Cursor, CursorImage, DisplayHandle, Frame, FrameUpdate, InputHandle,
-    PointerButton, Rect, linux_key_for_usb_usage,
+    PointerButton, Rect, ScreenMirror, linux_key_for_usb_usage,
 };
 #[cfg(not(freestanding))]
 pub use kv::FileKeyValueStore;
@@ -153,6 +153,14 @@ mod api_tests {
         let _: fn(&DisplayHandle) -> Frame = DisplayHandle::frame;
         let _: fn(&DisplayHandle, u64, &mut Vec<u8>) -> Option<FrameUpdate> =
             DisplayHandle::update_since;
+        let _: fn(&DisplayHandle, &mut ScreenMirror) -> Option<Vec<Rect>> =
+            DisplayHandle::sync_mirror;
+        let _: fn() -> ScreenMirror = ScreenMirror::new;
+        let _: fn(&ScreenMirror) -> (u32, u32) = ScreenMirror::size;
+        let _: fn(&ScreenMirror) -> Option<u64> = ScreenMirror::generation;
+        let _: fn(&ScreenMirror) -> &[u8] = ScreenMirror::pixels;
+        let _: fn(&ScreenMirror) -> usize = ScreenMirror::stride;
+        let _: fn(&ScreenMirror, Rect, &mut Vec<u8>) = ScreenMirror::copy_rect;
         let _: fn(&DisplayHandle, u64, std::time::Duration) -> u64 = DisplayHandle::wait_for_update;
         let _: fn(&DisplayHandle, u32, u32) = DisplayHandle::request_size;
         let _ = |display: &DisplayHandle| display.on_update(|_generation: u64| {});
@@ -207,6 +215,8 @@ mod api_tests {
         is_default::<DisplayMode>();
         is_default::<Rect>();
         is_default::<Frame>();
+        is_default::<ScreenMirror>();
+        is_clone::<ScreenMirror>();
         is_debug::<Frame>();
         is_debug::<DisplayMode>();
         is_default::<Cursor>();

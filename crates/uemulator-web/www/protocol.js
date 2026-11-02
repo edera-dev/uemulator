@@ -11,8 +11,9 @@ export const CTRL = {
   RESIZE_GENERATION: 3,
   COLS: 4,
   ROWS: 5,
-  // 1 while the page can take a screen update: the worker clears it as it sends one, the page
-  // sets it again once that one is on the canvas. One update in flight, never a backlog.
+  // Non-zero while the page can take a screen update (FRAME_READY): the worker clears it as it
+  // sends one, the page sets it again once that one is on the canvas. One update in flight,
+  // never a backlog.
   FRAME_ACK: 6,
   EVENT_HEAD: 7,
   EVENT_TAIL: 8,
@@ -30,6 +31,14 @@ export const NET_OFFSET = EVENT_OFFSET + EVENT_RECORDS * EVENT_WORDS * 4;
 // About 350 full-size frames: what can pile up while the worker is stuck in a disk read.
 export const NET_RING_BYTES = 1 << 19;
 export const CONTROL_BYTES = NET_OFFSET + NET_RING_BYTES;
+// FRAME_ACK values: the FRAME_READY_* constants in src/lib.rs. RESEND asks for the whole screen
+// rather than what changed since the last frame: the page lost its picture (a WebGL context
+// loss).
+export const FRAME_READY = { NOT: 0, YES: 1, RESEND: 2 };
+// A frame's rectangles are RECT_WORDS Uint32 each (x, y, width, height); its pixels are
+// BYTES_PER_PIXEL bytes each, blue, green, red, unused (the library's format).
+export const RECT_WORDS = 4;
+export const BYTES_PER_PIXEL = 4;
 // Screen input event kinds: the EVENT_* constants in src/lib.rs.
 export const EVENT = {
   KEY: 1, // USB HID usage, pressed
