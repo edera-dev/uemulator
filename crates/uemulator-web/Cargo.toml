@@ -12,3 +12,4 @@ crate-type = ["cdylib"]
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # `jit` is the WebAssembly JIT: blocks become modules the page instantiates (www/jit_host.js).
 uemulator = { path = "../uemulator", default-features = false, features = ["jit"] }
+uemulator-virgl = { path = "../uemulator-virgl" }

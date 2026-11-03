@@ -13,15 +13,18 @@
 //! `ScreenMirror`), in the library's own pixel format: the page's WebGL shader reorders the
 //! channels, so this thread, which is also the guest's, spends nothing converting them. With a network (`uw_set_network`) the guest's NIC is a port on the
 //! segment the page's tabs share: the library's `SegmentAgent` switches its frames, and the
-//! `host_net_*` imports carry them (`www/segment.js`).
+//! `host_net_*` imports carry them (`www/segment.js`). With a GPU (`uw_set_gpu`) the guest's
+//! virgl commands go to the page's render worker through `host_gpu_*` (`gpu.rs`).
 #![cfg(target_arch = "wasm32")]
+
+mod gpu;
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use uemulator::{
     BYTES_PER_PIXEL, BlockBackend, ClockMode, ConsoleKind, Cursor, Disk, DisplayHandle,
-    DisplayMode, EmulatedMachine, ExitReason, InputHandle, JitMode, MachineConfig,
+    DisplayMode, EmulatedMachine, ExitReason, GpuLink, InputHandle, JitMode, MachineConfig,
     MemoryKeyValueStore, NetHandle, PointerButton, RawImage, RemoteImage, ScreenMirror,
     SegmentAgent, SegmentDestination, SegmentStatus, StopHandle, Udisk, UdiskOptions, disk_io,
 };
@@ -208,6 +211,10 @@ thread_local! {
     static PENDING_NETWORK: RefCell<Option<([u8; MAC_BYTES], SegmentAgent)>> = const { RefCell::new(None) };
     /// The running machine's port on the segment, for the poll hook.
     static NETWORK: RefCell<Option<NetLink>> = const { RefCell::new(None) };
+    /// What `uw_set_gpu` made for the next `uw_create`.
+    static PENDING_GPU: RefCell<Option<GpuLink>> = const { RefCell::new(None) };
+    /// The running machine's link to the render worker, for the poll hook.
+    static GPU: RefCell<Option<gpu::GpuPump>> = const { RefCell::new(None) };
 }
 
 /// What the poll hook keeps between calls to move frames between the guest's NIC, its agent and
@@ -381,6 +388,36 @@ pub unsafe extern "C" fn uw_set_network(mac: *mut u8, len: usize, tab: u32) -> i
     }
 }
 
+/// Gives the next `uw_create` a 3D-capable GPU (`VIRTIO_GPU_F_VIRGL`) whose commands go to the
+/// page's render worker. `limits` is `gpu::LIMIT_WORDS` little-endian `u32`, what the render
+/// worker's WebGL2 context reported (`www/render.js` lists them); `renderer` names it in the
+/// capset (`uemulator_virgl::caps::capset_v2`). Needs `OPTION_DISPLAY`. Takes ownership of both buffers. Returns 0, or 1
+/// with the message in `uw_error_*`.
+///
+/// # Safety
+/// Both pointers must come from `uw_alloc` with the matching length.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uw_set_gpu(
+    limits: *mut u8,
+    len: usize,
+    renderer: *mut u8,
+    renderer_len: usize,
+) -> i32 {
+    let limits = unsafe { take_buffer(limits, len) };
+    let renderer = unsafe { take_buffer(renderer, renderer_len) };
+    let Ok(words) = <[[u8; 4]; gpu::LIMIT_WORDS]>::try_from(limits.as_chunks::<4>().0) else {
+        set_error(format!(
+            "the GPU limits are {} bytes, not {len}",
+            gpu::LIMIT_WORDS * 4
+        ));
+        return 1;
+    };
+    let words = words.map(u32::from_le_bytes);
+    let link = gpu::link(&words, &String::from_utf8_lossy(&renderer));
+    PENDING_GPU.with(|pending| *pending.borrow_mut() = Some(link));
+    0
+}
+
 fn now_ms() -> u64 {
     unsafe { host_now_ms() as u64 }
 }
@@ -462,6 +499,10 @@ pub unsafe extern "C" fn uw_create(
     }
     // No offloads are declared: the frames go to other guests, which need real checksums and
     // MTU-sized frames.
+    let gpu = PENDING_GPU.with(|gpu| gpu.take());
+    if let Some(link) = &gpu {
+        config = config.gpu(link.clone());
+    }
     let network = PENDING_NETWORK.with(|network| network.take());
     if let Some((mac, _)) = &network {
         config = config.net(*mac);
@@ -526,6 +567,7 @@ pub unsafe extern "C" fn uw_create(
             reported: None,
         });
     });
+    GPU.with(|slot| *slot.borrow_mut() = gpu.map(gpu::GpuPump::new));
     MACHINE.with(|slot| *slot.borrow_mut() = Some(machine));
     0
 }
@@ -562,6 +604,11 @@ fn poll(console: &uemulator::ConsoleHandle, idle: bool) {
     NETWORK.with(|network| {
         if let Some(link) = network.borrow_mut().as_mut() {
             link.pump();
+        }
+    });
+    GPU.with(|gpu| {
+        if let Some(pump) = gpu.borrow_mut().as_mut() {
+            pump.pump();
         }
     });
     if unsafe { host_should_stop() } != 0 {
@@ -766,6 +813,7 @@ pub extern "C" fn uw_run() -> i32 {
     STOP.with(|slot| *slot.borrow_mut() = None);
     SCREEN.with(|slot| *slot.borrow_mut() = None);
     NETWORK.with(|slot| *slot.borrow_mut() = None);
+    GPU.with(|slot| *slot.borrow_mut() = None);
     match reason {
         ExitReason::Shutdown => EXIT_SHUTDOWN,
         ExitReason::Reset => EXIT_RESET,

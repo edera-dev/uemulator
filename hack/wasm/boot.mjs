@@ -5,7 +5,7 @@
 //   node hack/wasm/boot.mjs [--kernel K] [--initrd I] [--disk D]... [--cdrom ISO]... [--cmdline S] [--memory MiB]
 //                           [--firmware none|uefi|bios] [--cpus N] [--iommu] [--no-acpi] [--serial]
 //                           [--hypervisor XEN [--hypervisor-cmdline S]]
-//                           [--no-jit] [--debug] [--wasm FILE] [--until TEXT] [--seconds N]
+//                           [--gpu] [--no-jit] [--debug] [--wasm FILE] [--until TEXT] [--seconds N]
 //
 // --disk is a raw or udisk image (a file, or an http(s) URL served with range requests) attached
 // the way the page attaches one: read on demand, writes kept in memory. --cdrom attaches an image
@@ -20,6 +20,11 @@
 // boots Xen (xen.gz, xen or xen.efi) through the UEFI firmware with the kernel as its dom0, as the
 // page does; --cmdline is then dom0's and --hypervisor-cmdline Xen's (empty: the library's default).
 //
+// --gpu gives the machine a screen and a 3D GPU (uw_set_gpu, with GLES 3.0's minimum limits)
+// whose commands go to www/gpu.js's renderer here, with a backend that draws nothing and logs
+// each clear, scanout and flush to stderr: a guest's virgl traffic and its fences without a
+// browser (docs/plans/25-gpu-3d.md).
+//
 // Stops when TEXT shows up on the console or after N seconds, and prints the wall time and what the
 // JIT host did to stderr.
 import { closeSync, fstatSync, openSync, readFileSync, readSync } from "node:fs";
@@ -27,6 +32,9 @@ import { execFileSync } from "node:child_process";
 import { parseArgs } from "node:util";
 import { createJitHost } from "../../crates/uemulator-web/www/jit_host.js";
 import { FIRMWARE, OPTION } from "../../crates/uemulator-web/www/protocol.js";
+import {
+  COMPLETION, LIMIT_PARAMETERS, MINIMUM_LIMITS, Renderer, encodeRecord, splitRecords,
+} from "../../crates/uemulator-web/www/gpu.js";
 
 const { values } = parseArgs({
   options: {
@@ -44,6 +52,7 @@ const { values } = parseArgs({
     hypervisor: { type: "string" },
     "hypervisor-cmdline": { type: "string", default: "" },
     wasm: { type: "string", default: new URL("../../target/web/uemulator_web.wasm", import.meta.url).pathname },
+    gpu: { type: "boolean", default: false },
     "no-jit": { type: "boolean", default: false },
     debug: { type: "boolean", default: false },
     until: { type: "string" },
@@ -65,6 +74,27 @@ const jit = createJitHost();
 // Pointers arrive as signed i32: `>>> 0` makes the ones past 2 GiB of module memory positive.
 const bytes = (ptr, len) => new Uint8Array(wasm.memory.buffer, ptr >>> 0, len);
 const sleeper = new Int32Array(new SharedArrayBuffer(4));
+
+// Completions the renderer queued, as records, until the module asks for them.
+let gpuCompletions = [];
+const gpuLog = (text) => console.error(`gpu: ${text}`);
+const describe = (resource) => `resource ${resource.id} ${resource.width}x${resource.height} format ${resource.format} bind 0x${resource.bind.toString(16)}`;
+const gpuRenderer = new Renderer(
+  {
+    resource: () => {},
+    destroyResource: () => {},
+    clear: (resource, rgba) => gpuLog(`clear ${describe(resource)} to ${rgba.map((c) => c.toFixed(3)).join(",")}`),
+    scanout: (resource, rect) => gpuLog(`scanout ${resource ? describe(resource) : "off"} ${rect.width}x${rect.height}`),
+    flush: (resource) => gpuLog(`flush resource ${resource.id}`),
+    reset: () => gpuLog("reset"),
+  },
+  (kind, words, data) => {
+    gpuCompletions.push(encodeRecord(kind, words, data));
+    if (kind === COMPLETION.FENCE) gpuFences++;
+  },
+  gpuLog,
+);
+let gpuFences = 0;
 
 const host = {
   ...jit.host,
@@ -91,6 +121,21 @@ const host = {
   host_frame_ready: () => 0,
   host_frame() {},
   host_cursor() {},
+  host_gpu_send(ptr, len) {
+    for (const { kind, payload } of splitRecords(bytes(ptr, len))) gpuRenderer.handle(kind, payload);
+    return len;
+  },
+  host_gpu_receive(ptr, capacity) {
+    let copied = 0;
+    while (gpuCompletions.length) {
+      const record = gpuCompletions[0];
+      if (copied + record.length > capacity) return copied || -record.length;
+      bytes(ptr + copied, record.length).set(record);
+      copied += record.length;
+      gpuCompletions.shift();
+    }
+    return copied;
+  },
   // No network here (hack/wasm/segment.mjs boots machines on a shared segment).
   host_net_recv: () => 0,
   host_net_send() {},
@@ -180,8 +225,17 @@ if (values.hypervisor) {
   const hypervisorCmdline = new TextEncoder().encode(values["hypervisor-cmdline"]);
   wasm.uw_set_hypervisor(upload(hypervisor), hypervisor.length, upload(hypervisorCmdline), hypervisorCmdline.length);
 }
+if (values.gpu) {
+  const limits = new Uint8Array(new Int32Array(MINIMUM_LIMITS).buffer);
+  if (limits.length !== LIMIT_PARAMETERS.length * 4) throw new Error("gpu.js: one limit per parameter");
+  const name = new TextEncoder().encode("uemulator boot.mjs");
+  if (wasm.uw_set_gpu(upload(limits), limits.length, upload(name), name.length)) {
+    console.error("gpu:", decoder.decode(bytes(wasm.uw_error_ptr(), wasm.uw_error_len())));
+    process.exit(2);
+  }
+}
 const options =
-  (values["no-jit"] ? 0 : OPTION.JIT) | (values["no-acpi"] ? 0 : OPTION.ACPI) |
+  (values.gpu ? OPTION.DISPLAY : 0) | (values["no-jit"] ? 0 : OPTION.JIT) | (values["no-acpi"] ? 0 : OPTION.ACPI) |
   (values.iommu ? OPTION.IOMMU : 0) | (values.serial ? OPTION.SERIAL_CONSOLE : 0) | OPTION.RNG |
   (values.debug ? OPTION.DEBUG : 0);
 const failed = wasm.uw_create(
@@ -200,4 +254,8 @@ console.error(
     `modules=${compiled} compile=${compileMs.toFixed(0)}ms` +
     (diskSources.length ? ` disk-reads=${diskReads} disk-bytes=${diskBytes}` : ""),
 );
+if (values.gpu) {
+  console.error(`gpu: ${gpuFences} fences completed, ${gpuRenderer.clears} clears; ` +
+    [...gpuRenderer.counts].map(([name, count]) => `${name} ${count}`).join(", "));
+}
 if (code === 4) console.error(decoder.decode(bytes(wasm.uw_error_ptr(), wasm.uw_error_len())));

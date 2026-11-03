@@ -266,20 +266,22 @@ def newc_members(archive):
         offset = data_at + file_size + (-(data_at + file_size) % CPIO_ALIGN)
 
 
-def net_modules(netboot_initramfs_gz):
-    """{file name: bytes} of NET_MODULES from the netboot initramfs."""
+def net_modules(netboot_initramfs_gz, wanted=NET_MODULES):
+    """{file name: bytes} of `wanted` (paths below usr/lib/modules/VERSION/) from the netboot
+    initramfs."""
     found = {}
     for name, data in newc_members(gzip.decompress(netboot_initramfs_gz)):
-        for module in NET_MODULES:
+        for module in wanted:
             if re.fullmatch(rf"usr/lib/modules/[^/]+/{re.escape(module)}", name):
                 found[os.path.basename(module)] = data
-    missing = [m for m in NET_MODULES if os.path.basename(m) not in found]
+    missing = [m for m in wanted if os.path.basename(m) not in found]
     if missing:
         sys.exit(f"demo: the netboot initramfs has no {', '.join(missing)}")
     return found
 
 
-def initramfs(rootfs_tar_gz, modules):
+def initramfs(rootfs_tar_gz, modules, init=INIT, module_dir=NET_MODULE_DIR):
+    """The minirootfs, `modules` ({file name: bytes}) in `module_dir` and `init` as /init."""
     archive = Newc()
     with tarfile.open(fileobj=io.BytesIO(rootfs_tar_gz), mode="r:gz") as tar:
         for member in tar:
@@ -297,14 +299,14 @@ def initramfs(rootfs_tar_gz, modules):
                 sys.exit(f"demo: {member.name} in the minirootfs is neither a file, directory nor symlink")
     # The kernel creates no missing parent directories while it unpacks.
     parent = ""
-    for part in NET_MODULE_DIR.split("/"):
+    for part in module_dir.split("/"):
         parent = f"{parent}/{part}" if parent else part
         archive.add(parent, stat.S_IFDIR | 0o755)
     for name, data in modules.items():
-        archive.add(f"{NET_MODULE_DIR}/{name}", stat.S_IFREG | 0o644, data)
+        archive.add(f"{module_dir}/{name}", stat.S_IFREG | 0o644, data)
     # Where the kernel opens PID 1's first stdin/stdout, before devtmpfs is mounted over /dev.
     archive.add("dev/console", stat.S_IFCHR | 0o600, rdev=(CONSOLE_MAJOR, CONSOLE_MINOR))
-    archive.add("init", stat.S_IFREG | 0o755, INIT.encode())
+    archive.add("init", stat.S_IFREG | 0o755, init.encode())
     return gzip.compress(archive.finish(), compresslevel=9, mtime=0)
 
 

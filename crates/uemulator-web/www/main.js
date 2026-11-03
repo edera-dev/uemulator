@@ -2,6 +2,7 @@ import {
   BYTES_PER_PIXEL, CONTROL_BYTES, CTRL, CURSOR, EVENT, EVENT_OFFSET, EVENT_RECORDS, EVENT_WORDS, EXIT_NAMES, FIRMWARE,
   FRAME_READY, NET_OFFSET, NET_RING_BYTES, OPTION, RECT_WORDS, RING_BYTES, RING_OFFSET, UEFI_FIRMWARE_MAGIC,
 } from "./protocol.js";
+import { COMMAND_RING_BYTES, COMPLETION_RING_BYTES, createRing } from "./gpu.js";
 import { formatMac, joinSegment, randomMac, randomTab } from "./segment.js";
 
 const $ = (id) => document.getElementById(id);
@@ -595,6 +596,38 @@ window.addEventListener("resize", relayout);
 // through the event ring. "terminal" or "screen" is in front.
 let view = "terminal";
 const canvas = $("screen");
+// ?gpu gives the guest a 3D GPU (virgl, docs/plans/25-gpu-3d.md) drawn by a render worker of its
+// own onto the canvas over the screen. M0: only clears are drawn.
+const GPU_REQUESTED = new URLSearchParams(location.search).has("gpu");
+let renderWorker = null;
+
+// Starts the render worker on a fresh canvas (one can hand its control to a worker only once)
+// and resolves to what the emulator's worker needs for uw_set_gpu, once its WebGL2 context is up.
+function startRenderer(shared) {
+  const old = $("screen-3d");
+  const screen3d = old.cloneNode(false);
+  old.replaceWith(screen3d);
+  screen3d.hidden = true;
+  const offscreen = screen3d.transferControlToOffscreen();
+  const commands = createRing(COMMAND_RING_BYTES);
+  const completions = createRing(COMPLETION_RING_BYTES);
+  renderWorker = new Worker(new URL("./render.js", import.meta.url), { type: "module" });
+  return new Promise((resolve, reject) => {
+    renderWorker.onerror = (event) => reject(new Error(`render worker failed: ${event.message}`));
+    renderWorker.onmessage = ({ data }) => {
+      if (data.type === "ready") {
+        resolve({ limits: data.limits, renderer: data.renderer, commands, completions });
+      } else if (data.type === "failed") {
+        reject(new Error(`gpu: ${data.message}`));
+      } else if (data.type === "scanout") {
+        screen3d.hidden = !data.active;
+      } else if (data.type === "log") {
+        console.log("[gpu]", data.text);
+      }
+    };
+    renderWorker.postMessage({ type: "start", canvas: offscreen, commands, completions, control: shared }, [offscreen]);
+  });
+}
 
 // The screen as a WebGL2 texture the size of the screen. Frames arrive as rectangles of the
 // library's pixels (blue, green, red, unused), uploaded as they are into an RGBA texture; the
@@ -1038,6 +1071,9 @@ function finish(text, kind) {
   clearInterval(clock);
   worker?.terminate();
   worker = null;
+  renderWorker?.terminate();
+  renderWorker = null;
+  $("screen-3d").hidden = true;
   // Only now that the worker is gone: leaving hands the server role to another tab.
   segment?.leave();
   segment = null;
@@ -1096,6 +1132,7 @@ async function launch() {
       showNetwork({ address: 0, peers: 0, serving: false });
     }
 
+    const gpu = GPU_REQUESTED && s.display !== "none" ? await startRenderer(shared) : null;
     worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
     starting = false;
     worker.onmessage = ({ data }) => {
@@ -1149,6 +1186,7 @@ async function launch() {
       rows: term.rows,
       control: shared,
       network,
+      gpu,
     };
     setStatus("Starting…", "busy");
     worker.postMessage(message, [kernel, initrd, hypervisor, firmware.image].filter(Boolean));

@@ -6,6 +6,7 @@ import {
   BYTES_PER_PIXEL, CTRL, EVENT_OFFSET, EVENT_RECORDS, EVENT_WORDS, FRAME_READY, NET_OFFSET, NET_RING_BYTES,
   RECT_WORDS, RING_BYTES, RING_OFFSET,
 } from "./protocol.js";
+import { openRing, readRecords, writeRecords } from "./gpu.js";
 import { createJitHost } from "./jit_host.js";
 import { createSegmentSender, netRingHasFrames, takeFrame } from "./segment.js";
 
@@ -23,6 +24,9 @@ let events;
 let netRing;
 // Posts the guest's frames to the other tabs; only with a network (`uw_set_network`).
 let segment = null;
+// The rings to and from the render worker (render.js); only with a GPU (`uw_set_gpu`).
+let gpuCommands = null;
+let gpuCompletions = null;
 let outputChunks = [];
 let outputBytes = 0;
 let lastFlush = 0;
@@ -159,6 +163,14 @@ const host = {
     const pixels = memoryBytes(ptr, len).slice();
     postMessage({ type: "cursor", kind, width, height, hotX, hotY, pixels: pixels.buffer }, [pixels.buffer]);
   },
+  host_gpu_send(ptr, len) {
+    return writeRecords(gpuCommands, memoryBytes(ptr, len), (kind, bytes) => {
+      postMessage({ type: "log", text: `gpu: dropped a ${bytes}-byte record of kind ${kind}, larger than the ring` });
+    });
+  },
+  host_gpu_receive(ptr, capacity) {
+    return readRecords(gpuCompletions, memoryBytes(ptr, capacity));
+  },
   host_random(ptr, len) {
     // getRandomValues takes at most 65536 bytes per call and refuses a view on shared memory.
     const MAX_BYTES = 65536;
@@ -263,6 +275,16 @@ async function boot(message) {
       return;
     }
     segment = createSegmentSender(message.network.tab);
+  }
+  if (message.gpu) {
+    gpuCommands = openRing(message.gpu.commands);
+    gpuCompletions = openRing(message.gpu.completions);
+    const limits = new Uint8Array(new Int32Array(message.gpu.limits).buffer);
+    const name = new TextEncoder().encode(message.gpu.renderer);
+    if (wasm.uw_set_gpu(upload(limits), limits.length, upload(name), name.length)) {
+      postMessage({ type: "exit", code: -2, message: `gpu: ${lastError()}` });
+      return;
+    }
   }
   const kernelPtr = upload(kernel);
   const initrdPtr = upload(initrd);

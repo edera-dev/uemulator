@@ -1,6 +1,6 @@
 # Guest 3D through virtio-gpu
 
-**Status:** partially implemented. M1, the device side, is in (`dev/vgpu/virgl.rs`, `gpu.rs`; "What M1 built" below). There is no renderer yet, so no guest has drawn a 3D frame; M0's web spike and everything from M2 on are still proposals.
+**Status:** partially implemented. M1, the device side (`dev/vgpu/virgl.rs`, `gpu.rs`), and M0, the web spike, are in ("What M1 built" and "What M0 built" below): on the page with `?gpu`, Mesa's virgl driver in an Alpine guest clears the screen through EGL and KMS, and the colours reach the render worker's canvas. Only clears are drawn. M2 and everything after it are still proposals.
 
 The aim is to give a Linux guest hardware-accelerated OpenGL (and perhaps Vulkan) through virtio-gpu, primarily on the web build, with the CLI as a second host. The web page can reach the host GPU only through WebGL2 (OpenGL ES 3.0) and WebGPU, so whatever the guest sends has to land on one of those.
 
@@ -24,7 +24,7 @@ From Linux's `drivers/gpu/drm/virtio` (`virtgpu_kms.c`, `virtgpu_gem.c`, `virtgp
 - `CONTEXT_INIT` is honoured only together with `VIRGL` (the `CONTEXT_INIT` ioctl refuses without both).
 - Fences: a fence response signals that fence and every earlier fence of the same dma-fence context (`virtio_gpu_fence_event_process`). Without context-init, all fences are on one global timeline; with it, there is one timeline per context and ring (`FLAG_INFO_RING_IDX`). Responses may come back out of order: each buffer carries its own completion, and QEMU holds fenced commands on a list while later ones complete.
 - `TRANSFER_FROM_HOST_3D` is always fenced by the ioctl (`virtio_gpu_transfer_from_host_ioctl` allocates a fence unconditionally), so a readback can be asynchronous: the guest waits for the fence before it reads the backing.
-- Guest userspace: Mesa's Gallium virgl driver (`virtio_gpu_dri.so`) for route A, and Mesa's Venus Vulkan driver (`libvulkan_virtio.so`) for route B. Venus refuses to start unless the kernel reports all of `3D_FEATURES` (VIRGL), `CAPSET_QUERY_FIX`, `RESOURCE_BLOB`, `HOST_VISIBLE` (a shared-memory region), `CROSS_DEVICE` (`VIRTIO_GPU_F_RESOURCE_UUID`) and `CONTEXT_INIT` (`required_params` in Mesa's `src/virtio/vulkan/vn_renderer_virtgpu.c`). Packaging (to check in M0): Alpine has `mesa-vulkan-virtio` in v3.24; Debian trixie's `mesa-vulkan-drivers` lists `libvulkan_virtio.so` and `virtio_icd.json`; the virgl Gallium driver is in Alpine's `mesa-dri-gallium` and Debian's `libgl1-mesa-dri`.
+- Guest userspace: Mesa's Gallium virgl driver (`virtio_gpu_dri.so`) for route A, and Mesa's Venus Vulkan driver (`libvulkan_virtio.so`) for route B. Venus refuses to start unless the kernel reports all of `3D_FEATURES` (VIRGL), `CAPSET_QUERY_FIX`, `RESOURCE_BLOB`, `HOST_VISIBLE` (a shared-memory region), `CROSS_DEVICE` (`VIRTIO_GPU_F_RESOURCE_UUID`) and `CONTEXT_INIT` (`required_params` in Mesa's `src/virtio/vulkan/vn_renderer_virtgpu.c`). Packaging (to check in M0): Alpine has `mesa-vulkan-virtio` in v3.24; Debian trixie's `mesa-vulkan-drivers` lists `libvulkan_virtio.so` and `virtio_icd.json`; the virgl Gallium driver is in Alpine's `mesa-dri-gallium` only from edge on (M0 found 3.24's Mesa built without it) and in Debian's `libgl1-mesa-dri` (not checked).
 
 ## Route A: virgl on WebGL2
 
@@ -64,7 +64,7 @@ WebGL2 against what virgl expects:
 - No geometry or tessellation shaders, compute, shader storage buffers, images or atomics (all GLES 3.1+), no texture buffers, no fp64, no logic ops. Clip distances, polygon mode and depth clamp only through extensions (`WEBGL_clip_cull_distance`, `WEBGL_polygon_mode`, `EXT_depth_clamp`). Primitive restart is always on with the fixed index; desktop GL lets it be set.
 - `clientWaitSync` with a timeout of zero only; fences are polled, which suits a worker running its own event loop.
 
-Level it can honestly advertise: virglrenderer gives a GLES 3.0 host `glsl_level` 130 (`vrend_fill_caps_glsl_version`: 120, or 130 at GLES 3.0, 310 at 3.1) and sets `HOST_IS_GLES`. With GLSL 1.30 and none of GL 3.1's texture buffers, Mesa's virgl driver should report about desktop GL 3.0 (compatibility contexts at 2.1 or 3.0) and GLES 3.0. Enough for compositors (GNOME, KDE and sway need GLES 2.0 or 3.0), glmark2-es2, Firefox and Chromium WebGL1, and most older games. Not enough for anything needing GL 3.2+ (geometry shaders) or compute. The exact version Mesa computes is to be checked in M0.
+Level it can honestly advertise: virglrenderer gives a GLES 3.0 host `glsl_level` 130 (`vrend_fill_caps_glsl_version`: 120, or 130 at GLES 3.0, 310 at 3.1) and sets `HOST_IS_GLES`. With GLSL 1.30 and none of GL 3.1's texture buffers, Mesa's virgl driver should report about desktop GL 3.0 (compatibility contexts at 2.1 or 3.0) and GLES 3.0. Enough for compositors (GNOME, KDE and sway need GLES 2.0 or 3.0), glmark2-es2, Firefox and Chromium WebGL1, and most older games. Not enough for anything needing GL 3.2+ (geometry shaders) or compute. M0 found less: with the capset `uemulator-virgl` builds today Mesa reports desktop GL 2.1 and GLES 2.0 (under "Verify in M0").
 
 Size, three ways to get a renderer:
 
@@ -173,9 +173,37 @@ Left for later:
 - `DisplayHandle` has no notion of a GPU scanout: while one is shown the 2D screen keeps its last frame, and the frontend has to learn from `SetScanout` that the renderer draws the screen.
 - Linux CLI hosts linking virglrenderer (A2) would be the quickest check of the device against a known-good renderer.
 
+## What M0 built
+
+The spike as it landed, kept as the base for M4 rather than thrown away:
+
+- `crates/uemulator-virgl` (`no_std` + `alloc`, no dependencies), the renderer crate of "The renderer crate", with only `caps.rs` so far: `virgl_caps_v1` and `virgl_caps_v2` bytes from `HostLimits` (what WebGL2's `getParameter` reports). Every offset was measured from virglrenderer's `virgl_hw.h` with `offsetof` and is pinned by the tests. It advertises `glsl_level` 130, `HOST_IS_GLES`, the formats WebGL2 can render and sample, and Mesa's own defaults for the point and line ranges.
+- `uw_set_gpu(limits, renderer)` before `uw_create`. `src/gpu.rs` in the web crate encodes each `GpuCommand` as a record (a kind, a length, little-endian words, then the bytes) and the poll hook hands them to `host_gpu_send`. While the ring has no room it takes nothing more from the link, so the device's 32 MiB limit is what stops the guest. Completions come back through `host_gpu_receive`.
+- `www/gpu.js`: the two `SharedArrayBuffer` rings (48 MiB of commands, so one batch of the device's 32 MiB always fits; 1 MiB of completions) and the M0 renderer. It decodes surfaces, `SET_FRAMEBUFFER_STATE` and `CLEAR`, skips every other virgl command by its length, completes each fence once everything before it has been handed to GL, and answers reads with no bytes.
+- `www/render.js`, the render worker: a WebGL2 context on the `OffscreenCanvas` of `#screen-3d`, one RGBA8 texture and framebuffer per 2D resource it clears, a blit to the canvas on `RESOURCE_FLUSH` of the scanout, and a message to the page, which shows the canvas over the 2D screen while the scanout is a 3D resource. It notifies `CTRL.HEAD` after writing completions, so a halted guest waiting on a fence wakes at once.
+- `hack/wasm/boot.mjs --gpu` runs the same renderer under Node with a backend that only logs, and `hack/gpu/image.py` builds the guest (Alpine edge's Mesa and kmscube on a squashfs disk, plus `hack/gpu/eglclear.c`).
+
+What it showed:
+
+- Under Node, `eglclear` prints `GL_RENDERER: virgl`. The renderer decodes four clears, red, green, blue and red, on two 1280x800 `B8G8R8X8` resources that Mesa swaps between with `SET_SCANOUT` and `RESOURCE_FLUSH`. All six fences complete and the guest never waits on one. `kmscube` (`gpu.run=kmscube`) page-flips 19,275 frames in 70 seconds (275 a second; virtio-gpu has no vblank to pace it), each a `SUBMIT_3D` and a fenced `RESOURCE_FLUSH`, and all 19,527 fences complete. With its draws skipped, it shows its grey clear.
+- In the page (Chromium, the desktop app's browser pane), the render worker's canvas takes the same colours in the same order, read back from the page.
+- A blit into the canvas in a later task than the frame before it left the canvas black, while the source texture held the colour. Clearing the canvas's drawing buffer first fixes it (`flush` in `render.js`); why is a guess (the browser's implicit clear of a buffer it has shown).
+- Mesa's virgl stream for this program: sub-contexts, shaders, constant buffers, sampler states and the framebuffer state, all skipped without harm.
+
+Left for later:
+
+- Everything but clears (M2 to M4). The decoder moves to Rust in `uemulator-virgl` (M2); `www/gpu.js` keeps the rings.
+- Readbacks are answered with no bytes, so the guest's backing keeps what it had.
+- Context loss: nothing handles `webglcontextlost` yet.
+- The guest's `GL_RENDERER` is plain "virgl": Mesa shows the host's name only from `host_feature_check_version` 5 on, and the capset claims 0, because higher versions make Mesa read fields it leaves zero (`caps.rs`).
+- When the completion ring is full, `render.js` keeps the rest and sends it only after the next command, and a guest waiting on that fence sends none: a deadlock once readbacks are real (M4). The completion ring is 1 MiB, smaller than one 1280x800 readback, and a completion record that never fits is lost without a word; a command record larger than the 48 MiB command ring is dropped with a log line.
+- Y orientation is untested: a uniform clear looks the same either way up.
+- A screenshot while the 3D canvas is in front still saves the 2D screen.
+- The capset is minimal: GL 2.1 and GLES 2.0 (above). M4 advertises what it implements.
+
 ## Milestones
 
-- **M0, spike (web only, throwaway allowed):** the render worker with a transferred `OffscreenCanvas`, the two rings, `uw_set_gpu` with hand-written capset bytes, the device offering `VIRGL` and answering capsets, contexts, `RESOURCE_CREATE_3D`, fenced `SUBMIT_3D` with only `VIRGL_CCMD_CLEAR` and `SET_FRAMEBUFFER_STATE` decoded, and `SET_SCANOUT`/`RESOURCE_FLUSH` of the cleared resource. Exit: an Alpine guest with `mesa-dri-gallium` runs a program that clears to a colour through EGL on the `virtio_gpu` render node (kmscube is the next step up), the colour appears on the page, and the guest does not hang on the fence. Settles the "Verify in M0" list.
+- **M0, spike (web only, throwaway allowed; done, above, with Alpine edge's Mesa because 3.24's has no virgl):** the render worker with a transferred `OffscreenCanvas`, the two rings, `uw_set_gpu` with hand-written capset bytes, the device offering `VIRGL` and answering capsets, contexts, `RESOURCE_CREATE_3D`, fenced `SUBMIT_3D` with only `VIRGL_CCMD_CLEAR` and `SET_FRAMEBUFFER_STATE` decoded, and `SET_SCANOUT`/`RESOURCE_FLUSH` of the cleared resource. Exit: an Alpine guest with `mesa-dri-gallium` runs a program that clears to a colour through EGL on the `virtio_gpu` render node (kmscube is the next step up), the colour appears on the page, and the guest does not hang on the fence. Settles the "Verify in M0" list.
 - **M1, device (done, above):** the full route A device side in `vgpu.rs` with the `GpuRenderer`/`GpuLink` interface and a fake renderer in the tests (below). No renderer yet; every machine without `gpu_renderer` is unchanged.
 - **M2, decoder:** `crates/uemulator-virgl` decodes every non-video command into typed state changes, with golden tests from captured streams. Optional A2 on Linux CLI hosts here to see real guests through the M1 device.
 - **M3, shaders:** TGSI text parser and the GLSL ES 3.00 translator for vertex and fragment shaders: arithmetic, texturing, control flow, the shader keys. Golden tests; the outputs pass a GLSL ES validator at test time if one is vendored (no network).
@@ -204,13 +232,13 @@ Rules from `CLAUDE.md`: tests next to the code, no network, nothing under `~/.ue
 
 ## Verify in M0
 
-Not checked while writing this, and the plan depends on them:
+Not checked while writing this, and the plan depends on them. What M0 found:
 
-- The GL and GLES versions Mesa's virgl driver reports for `glsl_level` 130 with `HOST_IS_GLES` (expected: desktop 3.0 or 2.1, GLES 3.0).
-- Package names: Alpine `mesa-dri-gallium` (virgl), `mesa-vulkan-virtio`; Debian `libgl1-mesa-dri`, `mesa-vulkan-drivers`.
-- Whether a worker that never yields can present WebGL frames (`transferToImageBitmap` and a post). If it can, a simpler variant renders on the emulator's worker with no rings; it still pays GL calls on the guest's thread.
-- `Atomics.waitAsync` support in the target browsers.
-- Whether Mesa's virgl driver needs `VIRGL2` or works with `VIRGL` alone, and which `virgl_caps_v2` fields it requires non-zero.
+- The GL and GLES versions Mesa's virgl driver reports for `glsl_level` 130 with `HOST_IS_GLES`. Expected: desktop 3.0 or 2.1, GLES 3.0. **Found:** with M0's capset, Mesa 26.2 reports desktop GL 2.1 (GLSL 1.20) and GLES 2.0 (GLSL ES 1.00), so the GLSL level alone does not decide it. Which missing features hold it back is not yet pinned down. The guess is the ones M0's capset leaves off and GLES 3.0 and GL 3.0 require: integer and float render formats, occlusion queries, multisampling, transform feedback. M4 sets them as it implements them, and should check the version against Mesa's computation (`compute_version` in `src/mesa/main/version.c`).
+- Package names: Alpine `mesa-dri-gallium` (virgl), `mesa-vulkan-virtio`; Debian `libgl1-mesa-dri`, `mesa-vulkan-drivers`. **Found:** the package name is right, but Alpine 3.24 builds Mesa without virgl. `_gallium_drivers` in aports' `main/mesa/APKBUILD` has no `virgl` on x86_64, so Mesa prints `virtio_gpu: driver missing` and falls back to llvmpipe, drawing through the 2D path. Edge has it, so `hack/gpu/image.py` takes edge's packages. Debian not checked.
+- Whether a worker that never yields can present WebGL frames (`transferToImageBitmap` and a post). If it can, a simpler variant renders on the emulator's worker with no rings; it still pays GL calls on the guest's thread. **Not tried:** M0 built the render worker the plan proposes.
+- `Atomics.waitAsync` support in the target browsers. **Found:** it works in Chromium. Firefox and Safari not checked; without it `render.js` polls every 2 ms.
+- Whether Mesa's virgl driver needs `VIRGL2` or works with `VIRGL` alone, and which `virgl_caps_v2` fields it requires non-zero. **Found:** Mesa runs on the fields `caps.rs` fills, with every v2 field it leaves at zero. That it reads capset 2 is inferred, not seen: Linux 6.18 has `CAPSET_QUERY_FIX`, and with it Mesa's `virgl_drm_get_caps` asks for 2. `VIRGL` alone not tried.
 
 ## References
 

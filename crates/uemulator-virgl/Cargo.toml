@@ -1,0 +1,7 @@
+[package]
+name = "uemulator-virgl"
+description = "The host side of virgl for uemulator's virtio-gpu: capsets now, the stream decoder and shader translator later"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

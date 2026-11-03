@@ -44,6 +44,11 @@ if [ -n "$WEB_DEMO" ]; then
     python3 hack/web/demo.py "$out/demo"
 fi
 
+# hack/gpu/image.py's guest, for ?gpu (docs/plans/25-gpu-3d.md), when it has been built.
+if [ -d target/gpu ]; then
+    ln -s "$(pwd)/target/gpu" "$out/gpu"
+fi
+
 if [ -n "$WEB_DISK" ]; then
     mkdir -p "$out/assets"
     ln -s "$(cd "$(dirname "$WEB_DISK")" && pwd)/$(basename "$WEB_DISK")" "$out/assets/disk"

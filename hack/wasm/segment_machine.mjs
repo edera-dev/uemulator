@@ -47,6 +47,9 @@ const host = {
   host_frame_ready: () => 0,
   host_frame() {},
   host_cursor() {},
+  // No GPU here: nothing calls these without `uw_set_gpu`.
+  host_gpu_send: (_ptr, len) => len,
+  host_gpu_receive: () => 0,
   host_net_recv(ptr, capacity, fromPtr) {
     const frame = takeFrame(control, netRing, bytes(ptr, capacity));
     if (!frame) return 0;

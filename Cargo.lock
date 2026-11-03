@@ -589,10 +589,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "uemulator-virgl"
+version = "0.1.0"
+
+[[package]]
 name = "uemulator-web"
 version = "0.1.0"
 dependencies = [
  "uemulator",
+ "uemulator-virgl",
 ]
 
 [[package]]
