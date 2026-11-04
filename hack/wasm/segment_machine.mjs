@@ -4,8 +4,8 @@
 // through the shared control block (www/protocol.js), which segment.mjs fills; console output
 // goes back to it as messages.
 import { readFileSync } from "node:fs";
-import { parentPort, workerData } from "node:worker_threads";
-import { createJitHost } from "../../crates/uemulator-web/www/jit_host.js";
+import { Worker, parentPort, workerData } from "node:worker_threads";
+import { createCompileQueue, createJitHost } from "../../crates/uemulator-web/www/jit_host.js";
 import {
   CTRL, FIRMWARE, NET_OFFSET, NET_RING_BYTES, OPTION, RING_BYTES, RING_OFFSET,
 } from "../../crates/uemulator-web/www/protocol.js";
@@ -86,6 +86,11 @@ const host = {
 const { instance } = await WebAssembly.instantiate(readFileSync(wasmPath), { host });
 wasm = instance.exports;
 jit.attach(wasm);
+if (useJit) {
+  const compileQueue = createCompileQueue();
+  new Worker(new URL("./jit_compiler.mjs", import.meta.url), { workerData: compileQueue }).unref();
+  jit.useCompileQueue(compileQueue);
+}
 
 function upload(data) {
   const ptr = wasm.uw_alloc(data.byteLength);

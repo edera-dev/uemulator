@@ -33,8 +33,8 @@ use core::mem::{offset_of, size_of};
 use super::blocks::{SLOT_BLOCK_BITS, SLOT_BLOCK_MASK, STRADDLER_TAG};
 use super::helpers::*;
 use super::wasm_encode::{
-    BLOCK_I64, BLOCK_TYPE, BLOCK_VOID, COND_TYPE, Code, EXEC_TYPE, LINK_TYPE, LOAD_TYPE,
-    STORE_TYPE, block_module, module_of_type, op,
+    BLOCK_I64, BLOCK_TYPE, BLOCK_VOID, COND_TYPE, Code, EXEC_TYPE, Function, LINK_TYPE, LOAD_TYPE,
+    STORE_TYPE, module_of_type, op,
 };
 use crate::cpu::decode::{Insn, NO_REG};
 use crate::cpu::flags::LazyFlagsOp;
@@ -191,8 +191,9 @@ const PAGE_SIZE: u64 = 1 << PAGE_SHIFT;
 
 /// What `compile_block` produces.
 pub(crate) struct CompiledBlock {
-    /// The module the host instantiates; its `block` export is the block's function.
-    pub module: Vec<u8>,
+    /// The block's function body, a `BLOCK_TYPE` function with `I32_LOCALS` and `I64_LOCALS`
+    /// (`function`); `wasm_encode::module_of_functions` wraps one or several in a module.
+    pub code: Vec<u8>,
     /// Guest instructions lowered inline.
     pub inlined: u32,
     /// Flag records the block leaves out because a later instruction overwrites them.
@@ -1960,7 +1961,18 @@ impl<'a> Gen<'a> {
     }
 }
 
-/// Generates the module for one block. `insns` must outlive the code, which points into it, and
+impl CompiledBlock {
+    pub fn function(&self) -> Function<'_> {
+        Function {
+            type_index: BLOCK_TYPE,
+            code: &self.code,
+            i32_locals: I32_LOCALS,
+            i64_locals: I64_LOCALS,
+        }
+    }
+}
+
+/// Generates the function for one block. `insns` must outlive the code, which points into it, and
 /// so must the `LINKS_PER_BLOCK` cells at `link_cells` (0: the exits are not linked).
 pub(crate) fn compile_block(
     addrs: &Addrs,
@@ -1972,7 +1984,7 @@ pub(crate) fn compile_block(
     let mut generator = Gen::new(addrs, insns, link_cells);
     generator.compile(rips, end_rip);
     CompiledBlock {
-        module: block_module(&generator.c.bytes, I32_LOCALS, I64_LOCALS),
+        code: generator.c.bytes,
         inlined: generator.inlined,
         flag_records_skipped: generator.flag_records_skipped,
     }
