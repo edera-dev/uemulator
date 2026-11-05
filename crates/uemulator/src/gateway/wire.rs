@@ -65,6 +65,10 @@ pub(super) const ICMP_ECHO_REPLY: u8 = 0;
 pub(super) const ICMP_ECHO_REQUEST: u8 = 8;
 /// Type, code, checksum, identifier, sequence.
 pub(super) const ICMP_ECHO_HEADER_LEN: usize = 8;
+pub(super) const ICMP_DEST_UNREACHABLE: u8 = 3;
+pub(super) const ICMP_CODE_PORT_UNREACHABLE: u8 = 3;
+/// Type, code, checksum and four unused bytes, then the quoted packet (RFC 792).
+pub(super) const ICMP_ERROR_HEADER_LEN: usize = 8;
 pub(super) const ICMP_CHECKSUM: Range<usize> = 2..4;
 
 pub(super) const UDP_HEADER_LEN: usize = 8;
@@ -297,6 +301,8 @@ pub(super) fn tcp_segment_unchecked(header: &TcpHeader, data: &[u8]) -> Vec<u8> 
 }
 
 pub(super) struct Ipv4Packet<'a> {
+    /// The IPv4 header including options, for quoting in ICMP errors.
+    pub(super) header: &'a [u8],
     pub(super) src: [u8; 4],
     pub(super) dst: [u8; 4],
     pub(super) proto: u8,
@@ -326,6 +332,7 @@ pub(super) fn parse_ipv4(frame: &[u8]) -> Option<Ipv4Packet<'_>> {
         return None;
     }
     Some(Ipv4Packet {
+        header: &ip[..header_len],
         src: ip[IPV4_SRC].try_into().ok()?,
         dst: ip[IPV4_DST].try_into().ok()?,
         proto: ip[IPV4_PROTOCOL],

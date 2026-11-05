@@ -5,6 +5,8 @@ fn a_new_gateway_starts_empty_and_expects_the_default_guest_mac() {
     let mut un = user_net();
     assert!(un.pop_for_guest().is_none());
     assert_eq!(un.guest_mac, GUEST_MAC);
+    assert_eq!(un.udp.limit, MAX_UDP_FLOWS);
+    assert!(un.udp.flows.is_empty() && un.take_requests().is_empty());
 }
 
 #[test]
@@ -174,6 +176,7 @@ fn unsupported_ip_protocols_are_ignored() {
     un.from_guest(&guest_ip_frame(GATEWAY_IP, IP_PROTO_GRE, &[0; 16]), NOW_MS);
     un.from_guest(&guest_ip_frame(GATEWAY_IP, 2, &[0; 8]), NOW_MS);
     assert!(drain(&mut un).is_empty());
+    assert!(un.udp.flows.is_empty() && un.take_requests().is_empty());
 }
 
 #[test]
@@ -212,6 +215,10 @@ fn echo_to_any_address_is_answered_locally() {
         let ip = parse_ipv4(&out[0]).unwrap();
         assert_eq!((ip.src, ip.dst, ip.proto), (dst, GUEST_IP, IP_PROTO_ICMP));
         assert_eq!(ip.payload[0], ICMP_ECHO_REPLY);
+        assert!(
+            un.udp.flows.is_empty() && un.take_requests().is_empty(),
+            "nothing left the host"
+        );
     }
 }
 

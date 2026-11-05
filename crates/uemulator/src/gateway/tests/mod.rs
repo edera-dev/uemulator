@@ -3,12 +3,15 @@
 //! through `use super::*`.
 
 use super::dhcp::*;
+use super::udp::MAX_UDP_FLOWS;
 use super::wire::*;
 use super::*;
+use alloc::collections::BTreeMap;
 
 mod dhcp;
 mod link;
 mod parsing;
+mod udp;
 mod wire;
 
 const FUZZ_SEED: u64 = 0x5eed_0002;
@@ -16,7 +19,6 @@ const NOW_MS: u64 = 0;
 const GUEST_MAC: [u8; 6] = DEFAULT_GUEST_MAC;
 const OTHER_GUEST_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x99];
 const ARP_REQUEST_FRAME_LEN: usize = ETH_HEADER_LEN + ARP_PACKET_LEN;
-const ICMP_DEST_UNREACHABLE: u8 = 3;
 const IP_PROTO_GRE: u8 = 47;
 const RESOLVER: Endpoint = Endpoint {
     address: [1, 1, 1, 1],
@@ -97,6 +99,129 @@ fn echo_request_payload(identifier: u16, sequence: u16, data: &[u8]) -> Vec<u8> 
     let checksum = reference_checksum(&echo);
     echo[ICMP_CHECKSUM].copy_from_slice(&checksum.to_be_bytes());
     echo
+}
+
+/// The driver side of the stream API, recording what the gateway asked for per stream so tests
+/// can assert on it without sockets.
+#[derive(Default)]
+struct FakeRemote {
+    streams: BTreeMap<StreamId, FakeStream>,
+}
+
+struct FakeStream {
+    kind: StreamKind,
+    target: Endpoint,
+    /// Received and not yet drained.
+    datagrams: Vec<Vec<u8>>,
+    write_shutdown: bool,
+    closed: bool,
+}
+
+impl FakeRemote {
+    /// Takes the gateway's pending requests, records them and returns them.
+    fn requests(&mut self, gateway: &mut Gateway) -> Vec<GatewayRequest> {
+        let requests = gateway.take_requests();
+        for request in &requests {
+            match request {
+                GatewayRequest::Open {
+                    stream,
+                    kind,
+                    target,
+                } => {
+                    let fresh = FakeStream {
+                        kind: *kind,
+                        target: *target,
+                        datagrams: Vec::new(),
+                        write_shutdown: false,
+                        closed: false,
+                    };
+                    assert!(
+                        self.streams.insert(*stream, fresh).is_none(),
+                        "stream {stream} opened twice"
+                    );
+                }
+                GatewayRequest::Datagram { stream, data } => {
+                    self.live(*stream).datagrams.push(data.clone());
+                }
+                GatewayRequest::ShutdownWrite { stream } => {
+                    self.live(*stream).write_shutdown = true
+                }
+                GatewayRequest::Close { stream } => self.live(*stream).closed = true,
+            }
+        }
+        requests
+    }
+
+    fn live(&mut self, stream: StreamId) -> &mut FakeStream {
+        let entry = self
+            .streams
+            .get_mut(&stream)
+            .unwrap_or_else(|| panic!("request for unopened stream {stream}"));
+        assert!(!entry.closed, "request for closed stream {stream}");
+        entry
+    }
+
+    /// Asserts the gateway asked for exactly one new stream and returns it with what it is for.
+    fn single_open_detail(&mut self, gateway: &mut Gateway) -> (StreamId, StreamKind, Endpoint) {
+        let opens: Vec<_> = self
+            .requests(gateway)
+            .into_iter()
+            .filter_map(|request| match request {
+                GatewayRequest::Open {
+                    stream,
+                    kind,
+                    target,
+                } => Some((stream, kind, target)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(opens.len(), 1, "expected exactly one Open: {opens:?}");
+        opens[0]
+    }
+
+    fn single_open(&mut self, gateway: &mut Gateway) -> StreamId {
+        self.single_open_detail(gateway).0
+    }
+
+    /// Datagrams recorded for `stream` and not drained yet; takes no new requests.
+    fn datagrams(&self, stream: StreamId) -> &[Vec<u8>] {
+        &self.streams[&stream].datagrams
+    }
+
+    /// Takes new requests, then returns and forgets the datagrams recorded for `stream`.
+    fn drain_datagrams(&mut self, gateway: &mut Gateway, stream: StreamId) -> Vec<Vec<u8>> {
+        self.requests(gateway);
+        core::mem::take(&mut self.live(stream).datagrams)
+    }
+
+    fn kind(&self, stream: StreamId) -> StreamKind {
+        self.streams[&stream].kind
+    }
+
+    fn target(&self, stream: StreamId) -> Endpoint {
+        self.streams[&stream].target
+    }
+
+    fn is_closed(&self, stream: StreamId) -> bool {
+        self.streams[&stream].closed
+    }
+
+    /// Streams that were opened and not closed.
+    fn live_streams(&self) -> Vec<StreamId> {
+        self.streams
+            .iter()
+            .filter(|(_, stream)| !stream.closed)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+}
+
+fn user_net_with_remote() -> (Gateway, FakeRemote) {
+    (user_net(), FakeRemote::default())
+}
+
+fn segment_with_remote() -> (Gateway, FakeRemote) {
+    (segment_gateway(), FakeRemote::default())
 }
 
 fn drain(un: &mut Gateway) -> Vec<Vec<u8>> {

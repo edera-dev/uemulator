@@ -18,7 +18,8 @@
 mod dhcp;
 #[cfg(test)]
 mod tests;
-// The TCP codecs and UDP ports wait for the flows that use them.
+mod udp;
+// The TCP codecs wait for the TCP flows.
 #[allow(dead_code)]
 mod wire;
 
@@ -27,13 +28,13 @@ use crate::prelude::*;
 use alloc::collections::VecDeque;
 
 use dhcp::{DHCP_CLIENT_PORT, DHCP_SERVER_PORT, dhcp_reply, dhcp_reply_type, parse_dhcp_request};
+use udp::UdpFlows;
 use wire::{
     ARP_ETHERNET_IPV4, ARP_OP_REPLY, ARP_OP_REQUEST, ARP_OPCODE, ARP_PACKET_LEN, ARP_SENDER_IP,
     ARP_SENDER_MAC, ARP_TARGET_IP, ETH_HEADER_LEN, ETH_SRC_MAC, ETH_TYPE, ETHERTYPE_ARP,
     ETHERTYPE_IPV4, ICMP_CHECKSUM, ICMP_ECHO_HEADER_LEN, ICMP_ECHO_REPLY, ICMP_ECHO_REQUEST,
-    IP_PROTO_ICMP, IP_PROTO_TCP, IP_PROTO_UDP, Ipv4Packet, UDP_DST_PORT, UDP_HEADER_LEN,
-    UDP_LENGTH, be_u16, ethernet_frame, internet_checksum, ipv4_packet, ipv4_packets, parse_ipv4,
-    udp_segment,
+    IP_PROTO_ICMP, IP_PROTO_TCP, IP_PROTO_UDP, Ipv4Packet, UDP_DST_PORT, be_u16, ethernet_frame,
+    internet_checksum, ipv4_packet, ipv4_packets, parse_ipv4, udp_segment,
 };
 
 /// 52:55 followed by the gateway IP, the way QEMU's slirp derives its MAC.
@@ -41,6 +42,8 @@ pub(crate) const GATEWAY_MAC: [u8; 6] = [0x52, 0x55, 0x0a, 0x00, 0x02, 0x02];
 /// Also the DHCP server and default router.
 pub(crate) const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
 const DNS_IP: [u8; 4] = [10, 0, 2, 3];
+/// What the gateway address stands for under `UserNet`: the host itself.
+const LOOPBACK_IP: [u8; 4] = [127, 0, 0, 1];
 /// The only address DHCP hands out.
 const GUEST_IP: [u8; 4] = [10, 0, 2, 15];
 const SUBNET_PREFIX: [u8; 3] = [10, 0, 2];
@@ -54,12 +57,47 @@ const DNS_PORT: u16 = 53;
 const DEFAULT_GUEST_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 /// Where the first IPv4 identification number comes from; any value does.
 const FIRST_IP_ID: u16 = 1;
+const FIRST_STREAM_ID: StreamId = 1;
 
 /// An IPv4 address and port.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Endpoint {
     pub address: [u8; 4],
     pub port: u16,
+}
+
+/// Names one byte stream (a TCP connection or a UDP flow) between the gateway and its driver.
+/// Allocated by the gateway: never 0, increasing, never reused while the stream is live.
+pub type StreamId = u32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamKind {
+    Tcp,
+    Udp,
+}
+
+/// What the gateway asks of its driver; the driver answers with `Gateway::opened`, `failed`,
+/// `remote_data`, `remote_closed` and `reset`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GatewayRequest {
+    /// Connect to `target` (already mapped: 10.0.2.2 is 127.0.0.1 under `UserNet`, DNS goes to
+    /// the configured server).
+    Open {
+        stream: StreamId,
+        kind: StreamKind,
+        target: Endpoint,
+    },
+    /// One UDP datagram. Only sent once the stream is open.
+    Datagram {
+        stream: StreamId,
+        data: Vec<u8>,
+    },
+    ShutdownWrite {
+        stream: StreamId,
+    },
+    Close {
+        stream: StreamId,
+    },
 }
 
 /// Which network the gateway is for.
@@ -111,6 +149,14 @@ pub struct Gateway {
     #[allow(dead_code, reason = "read by the TCP flows")]
     large_segments: bool,
     ip_id: u16,
+    /// Requests for the driver, oldest first.
+    requests: Vec<GatewayRequest>,
+    udp: UdpFlows,
+    /// The next `StreamId` to try; shared by every kind of stream.
+    next_stream: StreamId,
+    /// The last time the driver told us (`from_guest`, `poll`), for events that carry none, such
+    /// as `remote_data` refreshing a flow's idle timer.
+    now_ms: u64,
     /// Initial sequence number of the most recent connection.
     #[allow(dead_code, reason = "read by the TCP flows")]
     isn: u32,
@@ -124,6 +170,10 @@ impl Gateway {
             out: VecDeque::new(),
             large_segments: false,
             ip_id: FIRST_IP_ID,
+            requests: Vec::new(),
+            udp: UdpFlows::new(),
+            next_stream: FIRST_STREAM_ID,
+            now_ms: 0,
             isn: config.isn_seed,
         }
     }
@@ -153,7 +203,8 @@ impl Gateway {
         }
     }
 
-    pub fn from_guest(&mut self, frame: &[u8], _now_ms: u64) {
+    pub fn from_guest(&mut self, frame: &[u8], now_ms: u64) {
+        self.now_ms = now_ms;
         if frame.len() < ETH_HEADER_LEN || !self.takes_frame(frame) {
             return;
         }
@@ -165,12 +216,63 @@ impl Gateway {
                     match ip.proto {
                         IP_PROTO_ICMP => self.icmp(&ip),
                         IP_PROTO_UDP => self.udp_in(&ip),
-                        // TCP flows and the rest of UDP arrive with the flow tables.
+                        // TCP flows arrive with their flow table.
                         _ => {}
                     }
                 }
             }
             _ => {}
+        }
+    }
+
+    /// What the driver should do next, oldest first.
+    pub fn take_requests(&mut self) -> Vec<GatewayRequest> {
+        core::mem::take(&mut self.requests)
+    }
+
+    /// The driver connected `stream`; datagrams waiting for it are released.
+    pub fn opened(&mut self, stream: StreamId) {
+        self.udp_opened(stream);
+    }
+
+    /// The driver could not connect `stream`. The flow is gone; a UDP guest gets ICMP port
+    /// unreachable.
+    pub fn failed(&mut self, stream: StreamId) {
+        self.udp_failed(stream);
+    }
+
+    /// Bytes (TCP) or one datagram (UDP) from the remote end.
+    pub fn remote_data(&mut self, stream: StreamId, data: &[u8]) {
+        self.udp_remote_data(stream, data);
+    }
+
+    /// The remote end closed `stream` in an orderly way.
+    pub fn remote_closed(&mut self, stream: StreamId) {
+        self.udp_drop(stream);
+    }
+
+    /// `stream` broke. A UDP flow is dropped without telling the guest.
+    pub fn reset(&mut self, stream: StreamId) {
+        self.udp_drop(stream);
+    }
+
+    /// Lets time pass: idle UDP flows expire here, yielding `Close`.
+    pub fn poll(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+        self.expire_udp(now_ms);
+    }
+
+    /// The next free stream id. Skips 0 and live ids when the counter wraps.
+    fn allocate_stream(&mut self) -> StreamId {
+        loop {
+            let candidate = self.next_stream;
+            self.next_stream = match candidate.wrapping_add(1) {
+                0 => FIRST_STREAM_ID,
+                next => next,
+            };
+            if candidate != 0 && !self.udp.has_stream(candidate) {
+                return candidate;
+            }
         }
     }
 
@@ -231,23 +333,9 @@ impl Gateway {
         self.emit_ip(ip.dst, ip.src, IP_PROTO_ICMP, &reply);
     }
 
-    fn udp_in(&mut self, ip: &Ipv4Packet) {
-        let datagram = ip.payload;
-        if datagram.len() < UDP_HEADER_LEN {
-            return;
-        }
-        let dport = be_u16(&datagram[UDP_DST_PORT]);
-        let len = (be_u16(&datagram[UDP_LENGTH]) as usize).clamp(UDP_HEADER_LEN, datagram.len());
-        let data = &datagram[UDP_HEADER_LEN..len];
-        // Datagrams to the DHCP port are never NAT-ed: when UDP flows arrive they go in an else.
-        if dport == DHCP_SERVER_PORT {
-            self.dhcp(data);
-        }
-    }
-
     /// Serves `GUEST_IP` (see `dhcp_reply_type` for which messages are answered). Replies are
     /// always broadcast because the client may not have an address yet.
-    fn dhcp(&mut self, request: &[u8]) {
+    pub(super) fn dhcp(&mut self, request: &[u8]) {
         if !matches!(self.policy, GatewayPolicy::UserNet { .. }) {
             return;
         }

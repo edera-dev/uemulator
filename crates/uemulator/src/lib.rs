@@ -51,7 +51,10 @@ pub use display::{
     BYTES_PER_PIXEL, Cursor, CursorImage, DisplayHandle, Frame, FrameUpdate, InputHandle,
     PointerButton, Rect, ScreenMirror, linux_key_for_usb_usage,
 };
-pub use gateway::{Endpoint, Gateway, GatewayConfig, GatewayPolicy, GuestFrame};
+pub use gateway::{
+    Endpoint, Gateway, GatewayConfig, GatewayPolicy, GatewayRequest, GuestFrame, StreamId,
+    StreamKind,
+};
 pub use gpu::{GpuBox, GpuCapset, GpuCommand, GpuLimits, GpuLink, GpuResource};
 #[cfg(not(freestanding))]
 pub use kv::FileKeyValueStore;
@@ -131,6 +134,13 @@ mod api_tests {
         let _: fn(&mut Gateway, GuestFrame) = Gateway::requeue_for_guest;
         let _: fn(&Gateway, &[u8]) -> bool = Gateway::takes_frame;
         let _: fn(&mut Gateway, bool) = Gateway::set_large_segments;
+        let _: fn(&mut Gateway) -> Vec<GatewayRequest> = Gateway::take_requests;
+        let _: fn(&mut Gateway, StreamId) = Gateway::opened;
+        let _: fn(&mut Gateway, StreamId) = Gateway::failed;
+        let _: fn(&mut Gateway, StreamId, &[u8]) = Gateway::remote_data;
+        let _: fn(&mut Gateway, StreamId) = Gateway::remote_closed;
+        let _: fn(&mut Gateway, StreamId) = Gateway::reset;
+        let _: fn(&mut Gateway, u64) = Gateway::poll;
         let resolver = Endpoint {
             address: [1, 1, 1, 1],
             port: 53,
