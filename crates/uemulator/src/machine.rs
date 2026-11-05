@@ -13,6 +13,7 @@ use crate::cpu::vcpus::ThreadSpawner;
 use crate::cpu::{Cpu, DEFAULT_RANDOM_SEED};
 use crate::dev::host_entropy;
 use crate::dev::kv::SharedKeyValueStore;
+use crate::dev::tpm::{STORE_PREFIX, TpmConfig};
 use crate::dev::{
     DISPLAY_FUNCTIONS, DevConfig, DisplayDevices, EntropyFn, INPUT_FUNCTIONS, MAX_VIRTIO_FUNCTIONS,
     RngSource,
@@ -399,8 +400,10 @@ impl MachineConfig {
     /// `ConsoleHandle`, in call order (`EmulatedMachine::consoles()`).
     /// Gives the machine a TPM 2.0 (off by default): a CRB interface at 0xFED40000 that the ACPI
     /// tables describe (`TPM2`, `MSFT0101`). The UEFI firmware starts it and measures the boot
-    /// into its PCRs, with an event log for the OS. It implements the measured-boot commands
-    /// (PCRs, hashing, random numbers, capabilities) and no keys; its state lasts until the
+    /// into its PCRs, with an event log for the OS. Besides the measured-boot commands it has
+    /// RSA 2048 and ECC P-256 keys, sealed data, HMAC and policy sessions, NV indices and
+    /// persistent objects; its seeds, NV indices and persistent objects live in the
+    /// `key_value_store` (in memory for the machine's lifetime without one), the rest until the
     /// guest resets (`docs/plans/26-tpm-secure-boot.md`).
     pub fn tpm(mut self, on: bool) -> Self {
         self.tpm = on;
@@ -732,7 +735,7 @@ struct RebootImage {
     acpi: Option<AcpiConfig>,
     key_value_store: Option<SharedKeyValueStore>,
     rng: Option<RngSource>,
-    tpm: Option<RngSource>,
+    tpm: Option<TpmConfig>,
     /// The embedder holds these; the new devices must be built around them, like the NICs.
     display: Option<DisplayHandle>,
     input: Option<InputHandle>,
@@ -935,7 +938,22 @@ fn mirrored_devices(main: &mut DevConfig, main_uart: &ConsoleHandle) -> (DevConf
         // Verification always runs on a seeded stream, so cloning gives the twin the same bytes.
         rng: main.rng.clone(),
         // Seeded under verify, like the rng: the twin's TPM answers GetRandom with the same bytes.
-        tpm: main.tpm.clone(),
+        // It gets a copy of what the TPM keeps in the store, so both start from the same seeds,
+        // NV and persistent objects without the twin writing to the real store.
+        tpm: main.tpm.as_ref().map(|config| {
+            let mut copy = MemoryKeyValueStore::new();
+            let mut store = config.store.lock().unwrap();
+            for key in store.list(STORE_PREFIX) {
+                if let Some(value) = store.get(&key) {
+                    let _ = copy.set(&key, &value);
+                }
+            }
+            let copy: Box<dyn KeyValueStore> = Box::new(copy);
+            TpmConfig {
+                random: config.random.clone(),
+                store: Arc::new(Mutex::new(copy)),
+            }
+        }),
         // Same functions and the same boot framebuffer region; host input reaches the main CPU
         // only, and the twin's screen is never looked at.
         display: main.display.as_ref().map(|devices| {
@@ -1333,14 +1351,21 @@ impl EmulatedMachine {
             let seeded = RngSource::Seeded(
                 cfg.random_seed.unwrap_or(DEFAULT_RANDOM_SEED) ^ TPM_RANDOM_SEED_SALT,
             );
-            if cfg.verify {
+            let random = if cfg.verify {
                 seeded
             } else {
                 cfg.entropy
                     .clone()
                     .or_else(host_entropy)
                     .map_or(seeded, RngSource::Host)
-            }
+            };
+            // Without the embedder's store the TPM still keeps its seeds and NV across guest
+            // resets, in a store of its own that lives as long as the machine.
+            let store = cfg.key_value_store.clone().unwrap_or_else(|| {
+                let store: Box<dyn KeyValueStore> = Box::new(MemoryKeyValueStore::new());
+                Arc::new(Mutex::new(store))
+            });
+            TpmConfig { random, store }
         });
         if cfg.secure_boot && cfg.uefi_firmware.is_none() {
             return Err(Error::BadConfig(

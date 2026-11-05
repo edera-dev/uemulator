@@ -59,3 +59,102 @@ pub(crate) fn digest(id: u16, parts: &[&[u8]]) -> Option<Vec<u8>> {
     }
     Some(hash.finish())
 }
+
+pub(super) fn hash_algorithm(id: u16) -> Option<HashAlgorithm> {
+    algorithm(id)
+}
+
+pub(super) fn hmac(id: u16, key: &[u8], parts: &[&[u8]]) -> Option<Vec<u8>> {
+    Some(uemulator_crypto::hmac::hmac(algorithm(id)?, key, parts))
+}
+
+/// KDFa (Part 1, "KDFa()"): SP800-108 counter mode over HMAC. `label` is given without its
+/// terminating NUL.
+pub(super) fn kdfa(
+    id: u16,
+    key: &[u8],
+    label: &[u8],
+    context_u: &[u8],
+    context_v: &[u8],
+    bits: u32,
+) -> Option<Vec<u8>> {
+    Some(uemulator_crypto::kdf::kdfa(
+        algorithm(id)?,
+        key,
+        label,
+        context_u,
+        context_v,
+        bits,
+    ))
+}
+
+/// KDFe (Part 1, "KDFe()"): the SP800-56A concatenation KDF ECDH salts go through.
+pub(super) fn kdfe(
+    id: u16,
+    z: &[u8],
+    label: &[u8],
+    party_u: &[u8],
+    party_v: &[u8],
+    bits: u32,
+) -> Option<Vec<u8>> {
+    Some(uemulator_crypto::kdf::kdfe(
+        algorithm(id)?,
+        z,
+        label,
+        party_u,
+        party_v,
+        bits,
+    ))
+}
+
+/// The deterministic bit stream a primary object is made from: KDFa's construction, block
+/// after block, without the length field (which a stream does not know up front). The same
+/// seed, label and contexts give the same key, which is what lets `TPM2_CreatePrimary` give back
+/// the same primary for the same template every time. The reference implementation's DRBG
+/// differs, so keys are not those another TPM would derive from the same seed; nothing can tell,
+/// since seeds never leave a TPM.
+pub(super) struct KdfStream {
+    algorithm: HashAlgorithm,
+    key: Vec<u8>,
+    context: Vec<u8>,
+    counter: u32,
+    pending: Vec<u8>,
+}
+
+impl KdfStream {
+    pub fn new(
+        id: u16,
+        key: &[u8],
+        label: &[u8],
+        context_u: &[u8],
+        context_v: &[u8],
+    ) -> Option<Self> {
+        let mut context = label.to_vec();
+        context.push(0);
+        context.extend_from_slice(context_u);
+        context.extend_from_slice(context_v);
+        Some(KdfStream {
+            algorithm: algorithm(id)?,
+            key: key.to_vec(),
+            context,
+            counter: 0,
+            pending: Vec::new(),
+        })
+    }
+
+    pub fn fill(&mut self, bytes: &mut [u8]) {
+        for byte in bytes {
+            if self.pending.is_empty() {
+                self.counter = self.counter.wrapping_add(1);
+                let mut block = uemulator_crypto::hmac::hmac(
+                    self.algorithm,
+                    &self.key,
+                    &[&self.counter.to_be_bytes(), &self.context],
+                );
+                block.reverse();
+                self.pending = block;
+            }
+            *byte = self.pending.pop().unwrap_or(0);
+        }
+    }
+}

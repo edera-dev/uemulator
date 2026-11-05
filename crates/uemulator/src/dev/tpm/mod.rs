@@ -10,14 +10,35 @@
 #[cfg(freestanding)]
 use crate::prelude::*;
 
+mod capability;
+mod context;
 mod engine;
 mod hash;
+mod hierarchy;
+#[cfg(test)]
+mod key_tests;
+mod nv;
+mod object;
+mod session;
+mod spec;
 #[cfg(test)]
 mod tests;
 mod wire;
 
+use crate::dev::RngSource;
+use crate::dev::kv::SharedKeyValueStore;
 pub(crate) use engine::Random;
 use engine::Tpm;
+pub(crate) use hierarchy::STORE_PREFIX;
+
+/// What a machine's TPM is made from: where its randomness comes from, and the store that holds
+/// what it keeps across resets (the machine's key-value store, or one of its own that lives as
+/// long as the machine when the embedder gave none).
+#[derive(Clone)]
+pub(crate) struct TpmConfig {
+    pub random: RngSource,
+    pub store: SharedKeyValueStore,
+}
 
 pub(crate) const TPM_CRB_BASE: u64 = 0xfed4_0000;
 /// One 4 KiB page: locality 0's registers, the control area and the data buffer.
@@ -90,9 +111,9 @@ pub(crate) struct TpmCrb {
 }
 
 impl TpmCrb {
-    pub fn new(random: Random, now_ns: u64) -> Self {
+    pub fn new(config: TpmConfig, now_ns: u64) -> Self {
         TpmCrb {
-            tpm: Tpm::new(random, now_ns),
+            tpm: Tpm::new(Random::new(config.random), now_ns, config.store),
             locality_assigned: false,
             idle: true,
             cancel: 0,

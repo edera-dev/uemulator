@@ -3,6 +3,8 @@ use super::hash::{self, ALG_SHA1, ALG_SHA256, ALG_SHA384, ALG_SHA512};
 use super::wire::{Reader, Writer};
 use super::*;
 use crate::dev::RngSource;
+use crate::kv::{KeyValueStore, MemoryKeyValueStore};
+use crate::sync::{Arc, Mutex};
 
 const ST_NO_SESSIONS: u16 = 0x8001;
 const ST_SESSIONS: u16 = 0x8002;
@@ -24,7 +26,8 @@ const CC_SEQUENCE_COMPLETE: u32 = 0x13e;
 const CC_EVENT_SEQUENCE_COMPLETE: u32 = 0x185;
 const CC_FLUSH_CONTEXT: u32 = 0x165;
 const CC_READ_CLOCK: u32 = 0x181;
-const CC_CREATE_PRIMARY: u32 = 0x131;
+/// TPM2_Sign, which this TPM does not implement.
+const CC_SIGN: u32 = 0x15d;
 
 const RC_INITIALIZE: u32 = 0x100;
 const RC_COMMAND_CODE: u32 = 0x143;
@@ -34,8 +37,7 @@ const RC_AUTH_MISSING: u32 = 0x125;
 const RC_LOCALITY: u32 = 0x907;
 /// TPM_RC_AUTH_FAIL for session 1.
 const RC_AUTH_FAIL_SESSION_1: u32 = 0x08e | 0x800 | 0x100;
-/// TPM_RC_HANDLE for handle 1.
-const RC_HANDLE_HANDLE_1: u32 = 0x08b | 0x100;
+const RC_REFERENCE_H0: u32 = 0x910;
 /// TPM_RC_HANDLE for parameter 1.
 const RC_HANDLE_PARAMETER_1: u32 = 0x08b | 0x040 | 0x100;
 
@@ -46,8 +48,20 @@ const CAP_TPM_PROPERTIES: u32 = 6;
 const PT_TOTAL_COMMANDS: u32 = 0x129;
 const TRANSIENT_FIRST: u32 = 0x8000_0000;
 
+fn memory_store() -> SharedKeyValueStore {
+    let store: Box<dyn KeyValueStore> = Box::new(MemoryKeyValueStore::new());
+    Arc::new(Mutex::new(store))
+}
+
 fn tpm() -> Tpm {
-    Tpm::new(Random::new(RngSource::Seeded(7)), 0)
+    Tpm::new(Random::new(RngSource::Seeded(7)), 0, memory_store())
+}
+
+fn config(seed: u64) -> TpmConfig {
+    TpmConfig {
+        random: RngSource::Seeded(seed),
+        store: memory_store(),
+    }
 }
 
 fn started() -> Tpm {
@@ -174,7 +188,7 @@ fn startup_state_has_nothing_to_resume() {
 fn malformed_commands_get_the_matching_codes() {
     let mut tpm = started();
     assert_eq!(
-        code(&tpm.execute(&command(CC_CREATE_PRIMARY, &[], &[]), 0)),
+        code(&tpm.execute(&command(CC_SIGN, &[], &[]), 0)),
         RC_COMMAND_CODE
     );
     let mut bad_tag = command(CC_GET_RANDOM, &[], &8u16.to_be_bytes());
@@ -328,8 +342,8 @@ fn a_hash_sequence_checks_its_password_and_hashes_every_piece() {
     let response = tpm.execute(&complete, 0);
     let mut reader = Reader::new(parameters(&response, 0));
     assert_eq!(reader.sized().unwrap(), sha256(&[b"hello world"]));
-    // Completing flushed it.
-    assert_eq!(code(&tpm.execute(&right, 0)), RC_HANDLE_HANDLE_1);
+    // Completing flushed it: a transient handle that is not loaded.
+    assert_eq!(code(&tpm.execute(&right, 0)), RC_REFERENCE_H0);
 }
 
 #[test]
@@ -420,7 +434,7 @@ fn the_seeded_random_stream_is_repeatable() {
 
 #[test]
 fn read_clock_counts_milliseconds_since_init() {
-    let mut tpm = Tpm::new(Random::new(RngSource::Seeded(1)), 5_000_000);
+    let mut tpm = Tpm::new(Random::new(RngSource::Seeded(1)), 5_000_000, memory_store());
     tpm.execute(&command(CC_STARTUP, &[], &0u16.to_be_bytes()), 5_000_000);
     let response = tpm.execute(&command(CC_READ_CLOCK, &[], &[]), 1_005_000_000);
     let mut reader = Reader::new(parameters(&response, 0));
@@ -449,7 +463,7 @@ fn read_buffer(crb: &TpmCrb, length: usize) -> Vec<u8> {
 
 #[test]
 fn the_crb_interface_runs_a_command_the_way_linux_drives_it() {
-    let mut crb = TpmCrb::new(Random::new(RngSource::Seeded(3)), 0);
+    let mut crb = TpmCrb::new(config(3), 0);
     let interface = crb.mmio_read(TPM_CRB_BASE + INTF_ID, 8);
     assert_eq!(interface & 0xf, 1, "CRB interface type");
     assert_eq!(
@@ -520,7 +534,7 @@ fn the_crb_interface_runs_a_command_the_way_linux_drives_it() {
 
 #[test]
 fn a_size_past_the_buffer_is_refused_not_overrun() {
-    let mut crb = TpmCrb::new(Random::new(RngSource::Seeded(3)), 0);
+    let mut crb = TpmCrb::new(config(3), 0);
     let mut header = command(CC_STARTUP, &[], &0u16.to_be_bytes());
     header[2..6].copy_from_slice(&0xffff_ffffu32.to_be_bytes());
     write_buffer(&mut crb, &header);

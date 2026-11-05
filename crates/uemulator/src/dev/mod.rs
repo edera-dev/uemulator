@@ -201,9 +201,8 @@ pub(crate) struct DevConfig {
     pub rng: Option<RngSource>,
     /// Adds the screen (`DISPLAY_FUNCTIONS` functions) after the NICs.
     pub display: Option<DisplayDevices>,
-    /// Adds the TPM (not a PCI function: CRB MMIO at `tpm::TPM_CRB_BASE`), whose
-    /// `TPM2_GetRandom` draws from this source.
-    pub tpm: Option<RngSource>,
+    /// Adds the TPM (not a PCI function: CRB MMIO at `tpm::TPM_CRB_BASE`).
+    pub tpm: Option<tpm::TpmConfig>,
     /// Adds the keyboard and tablet (`INPUT_FUNCTIONS` functions) after the GPU.
     pub input: Option<InputHandle>,
 }
@@ -364,9 +363,7 @@ impl Devices {
             reset_control: 0,
             pci: PciHost::new(virtio_devices).with_iommu(cfg.iommu),
             kv: cfg.key_value_store.map(KvDevice::new),
-            tpm: cfg
-                .tpm
-                .map(|source| TpmCrb::new(tpm::Random::new(source), 0)),
+            tpm: cfg.tpm.map(|config| TpmCrb::new(config, 0)),
             lapics: (0..cfg.cpus.max(1) as u32).map(Lapic::new).collect(),
             current_cpu: 0,
             lowest_priority_cursor: 0,

@@ -44,10 +44,22 @@ impl<'a> Reader<'a> {
         Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
+    pub fn u64(&mut self) -> Result<u64, Truncated> {
+        let bytes = self.take(8)?;
+        Ok(u64::from_be_bytes(bytes.try_into().unwrap()))
+    }
+
     /// A `TPM2B_*`: the u16 size, then the bytes.
     pub fn sized(&mut self) -> Result<&'a [u8], Truncated> {
         let size = self.u16()? as usize;
         self.take(size)
+    }
+
+    /// What is left, all of it.
+    pub fn rest(&mut self) -> &'a [u8] {
+        let rest = self.bytes;
+        self.bytes = &[];
+        rest
     }
 }
 
@@ -86,4 +98,21 @@ impl Writer {
         self.u16(value.len() as u16);
         self.bytes.extend_from_slice(value);
     }
+
+    /// A `TPM2B_*` around a structure (`TPM2B_PUBLIC`, `TPM2B_CREATION_DATA`, ...): `write`
+    /// marshals it and the size goes in front.
+    pub fn sized_with(&mut self, write: impl FnOnce(&mut Writer)) {
+        let start = self.bytes.len();
+        self.u16(0);
+        write(self);
+        let size = (self.bytes.len() - start - 2) as u16;
+        self.bytes[start..start + 2].copy_from_slice(&size.to_be_bytes());
+    }
+}
+
+/// Marshals with a fresh writer and hands back the bytes.
+pub(crate) fn marshal(write: impl FnOnce(&mut Writer)) -> Vec<u8> {
+    let mut writer = Writer::new();
+    write(&mut writer);
+    writer.bytes
 }

@@ -2,6 +2,7 @@
 //! drives with a handful of `in`/`out` instructions. Protocol and port numbers are in
 //! `docs/plans/19-uefi-firmware.md`; `crates/uemulator-firmware/src/kv.rs` is the guest side.
 
+use crate::dev::tpm::STORE_PREFIX as TPM_STORE_PREFIX;
 use crate::kv::{KeyValueStore, MAX_KEY_BYTES, MAX_VALUE_BYTES};
 #[cfg(freestanding)]
 use crate::prelude::*;
@@ -107,6 +108,17 @@ impl KvDevice {
         self.output.clear();
         self.read_position = 0;
         self.status = STATUS_OK;
+        // The TPM keeps its seeds and NV in the same store; the guest must not read or forge
+        // them, so those keys do not exist as far as the port is concerned.
+        let reserved = self.key.starts_with(TPM_STORE_PREFIX);
+        if reserved && matches!(command, COMMAND_GET | COMMAND_SET | COMMAND_DELETE) {
+            self.status = if command == COMMAND_GET {
+                STATUS_NOT_FOUND
+            } else {
+                STATUS_BAD_COMMAND
+            };
+            return;
+        }
         match command {
             COMMAND_SELECT_KEY | COMMAND_SELECT_AUX => {
                 self.selected = if command == COMMAND_SELECT_KEY {
@@ -144,7 +156,9 @@ impl KvDevice {
             // variables never notice.
             COMMAND_NEXT => {
                 let keys = self.store.lock().unwrap().list(&self.aux);
-                match keys.into_iter().find(|candidate| *candidate > self.key) {
+                match keys.into_iter().find(|candidate| {
+                    *candidate > self.key && !candidate.starts_with(TPM_STORE_PREFIX)
+                }) {
                     Some(next) => self.output = next,
                     None => self.status = STATUS_NOT_FOUND,
                 }
@@ -205,6 +219,30 @@ mod tests {
             STATUS_OK => Ok(take_output(device)),
             status => Err(status),
         }
+    }
+
+    #[test]
+    fn the_tpm_keys_are_out_of_the_guests_reach() {
+        let store: SharedKeyValueStore = Arc::new(Mutex::new(Box::new(MemoryKeyValueStore::new())));
+        store.lock().unwrap().set(b"tpm/state", b"seeds").unwrap();
+        store.lock().unwrap().set(b"var", b"value").unwrap();
+        let mut device = KvDevice::new(store.clone());
+        assert_eq!(get(&mut device, b"tpm/state"), Err(STATUS_NOT_FOUND));
+        assert_eq!(
+            set(&mut device, b"tpm/state", b"forged"),
+            STATUS_BAD_COMMAND
+        );
+        put(&mut device, COMMAND_SELECT_KEY, b"tpm/state");
+        assert_eq!(run(&mut device, COMMAND_DELETE), STATUS_BAD_COMMAND);
+        assert_eq!(store.lock().unwrap().get(b"tpm/state").unwrap(), b"seeds");
+        // A walk of every key skips them.
+        put(&mut device, COMMAND_SELECT_KEY, b"");
+        put(&mut device, COMMAND_SELECT_AUX, b"");
+        assert_eq!(run(&mut device, COMMAND_NEXT), STATUS_OK);
+        assert_eq!(take_output(&mut device), b"var");
+        put(&mut device, COMMAND_SELECT_KEY, b"tpm/");
+        assert_eq!(run(&mut device, COMMAND_NEXT), STATUS_OK);
+        assert_eq!(take_output(&mut device), b"var");
     }
 
     #[test]
