@@ -204,6 +204,58 @@ impl Keyboard {
     }
 }
 
+/// How long a key is held before it repeats, and the time between repeats: EDK2's USB keyboard
+/// driver's `USBKBD_REPEAT_DELAY` and `USBKBD_REPEAT_RATE` (`MdeModulePkg/Bus/Usb/UsbKbDxe`).
+const REPEAT_DELAY_NS: u64 = 500_000_000;
+const REPEAT_PERIOD_NS: u64 = 32_000_000;
+
+struct HeldKey {
+    code: u16,
+    /// As typed when it went down: shift pressed or let go meanwhile does not change it.
+    key: InputKey,
+    due_ns: u64,
+}
+
+/// Repeats the last key pressed for as long as it is held. The virtio keyboard sends one press
+/// and one release and leaves repeating to whoever reads it (it advertises `EV_REP`, so Linux's
+/// input core repeats on its own), and the web pages drop the browser's repeats so Linux does
+/// not see them twice; without this a held arrow key moves a boot menu or GRUB by one line.
+#[derive(Default)]
+pub struct Typematic {
+    held: Option<HeldKey>,
+}
+
+impl Typematic {
+    /// Takes a key event and the keystroke `Keyboard::event` made of it. Only a key that types
+    /// something starts repeating; a modifier pressed meanwhile leaves the repeat going, as on a
+    /// USB keyboard under EDK2.
+    pub fn event(&mut self, code: u16, pressed: bool, typed: Option<InputKey>, now_ns: u64) {
+        if pressed {
+            if let Some(key) = typed {
+                self.held = Some(HeldKey {
+                    code,
+                    key,
+                    due_ns: now_ns.saturating_add(REPEAT_DELAY_NS),
+                });
+            }
+        } else if self.held.as_ref().is_some_and(|held| held.code == code) {
+            self.held = None;
+        }
+    }
+
+    /// The repeat due by `now_ns`, if any. The next one is a period from now, not from when this
+    /// one was due: a reader that comes back late gets one keystroke, not a burst for every
+    /// period it missed.
+    pub fn due(&mut self, now_ns: u64) -> Option<InputKey> {
+        let held = self.held.as_mut()?;
+        if now_ns < held.due_ns {
+            return None;
+        }
+        held.due_ns = now_ns.saturating_add(REPEAT_PERIOD_NS);
+        Some(held.key)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,6 +339,68 @@ mod tests {
     fn the_keypad_types_digits() {
         let mut keyboard = Keyboard::default();
         assert_eq!(text(&mut keyboard, &[KEY_KP7, 82, KEY_KPDOT]), "70.");
+    }
+
+    const MS: u64 = 1_000_000;
+
+    fn press(typematic: &mut Typematic, keyboard: &mut Keyboard, code: u16, now_ns: u64) {
+        let typed = keyboard.event(code, true);
+        typematic.event(code, true, typed, now_ns);
+    }
+
+    fn release(typematic: &mut Typematic, keyboard: &mut Keyboard, code: u16) {
+        let typed = keyboard.event(code, false);
+        typematic.event(code, false, typed, 0);
+    }
+
+    fn unicode(key: Option<InputKey>) -> Option<u16> {
+        key.map(|key| key.unicode_char)
+    }
+
+    #[test]
+    fn a_held_key_repeats_after_the_delay_at_the_period() {
+        let (mut keyboard, mut typematic) = (Keyboard::default(), Typematic::default());
+        press(&mut typematic, &mut keyboard, 30, 1000 * MS);
+        assert!(typematic.due(1000 * MS + REPEAT_DELAY_NS - 1).is_none());
+        assert_eq!(
+            unicode(typematic.due(1000 * MS + REPEAT_DELAY_NS)),
+            Some('a' as u16)
+        );
+        let first = 1000 * MS + REPEAT_DELAY_NS;
+        assert!(typematic.due(first + REPEAT_PERIOD_NS - 1).is_none());
+        assert_eq!(
+            unicode(typematic.due(first + REPEAT_PERIOD_NS)),
+            Some('a' as u16)
+        );
+        release(&mut typematic, &mut keyboard, 30);
+        assert!(typematic.due(first + 100 * REPEAT_PERIOD_NS).is_none());
+    }
+
+    #[test]
+    fn a_late_reader_gets_one_repeat_not_a_burst() {
+        let (mut keyboard, mut typematic) = (Keyboard::default(), Typematic::default());
+        press(&mut typematic, &mut keyboard, KEY_DOWN, 0);
+        let late = REPEAT_DELAY_NS + 50 * REPEAT_PERIOD_NS;
+        assert!(typematic.due(late).is_some());
+        assert!(typematic.due(late).is_none());
+        assert!(typematic.due(late + REPEAT_PERIOD_NS).is_some());
+    }
+
+    #[test]
+    fn the_last_key_pressed_repeats_and_modifiers_do_not_stop_it() {
+        let (mut keyboard, mut typematic) = (Keyboard::default(), Typematic::default());
+        press(&mut typematic, &mut keyboard, 30, 0);
+        press(&mut typematic, &mut keyboard, 48, 10 * MS);
+        // Letting go of the first key does not stop the second, which is the one repeating.
+        release(&mut typematic, &mut keyboard, 30);
+        press(&mut typematic, &mut keyboard, KEY_LEFTSHIFT, 20 * MS);
+        assert_eq!(
+            unicode(typematic.due(10 * MS + REPEAT_DELAY_NS)),
+            Some('b' as u16),
+            "the keystroke as typed when pressed"
+        );
+        release(&mut typematic, &mut keyboard, 48);
+        assert!(typematic.due(10 * MS + 2 * REPEAT_DELAY_NS).is_none());
     }
 
     #[test]

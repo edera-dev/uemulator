@@ -7,10 +7,11 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
 
-use crate::keymap::Keyboard;
+use crate::keymap::{Keyboard, Typematic};
 use crate::memory;
 use crate::pci;
 use crate::sync::Global;
+use crate::time;
 use crate::uefi::InputKey;
 use crate::uefi::memory_type::BOOT_SERVICES_DATA;
 use crate::virtio_pci::{DEVICE_ID_BASE, Transport, VENDOR_VIRTIO, write16};
@@ -54,6 +55,7 @@ struct VirtioKeyboard {
     /// Free-running available index.
     available: u16,
     keyboard: Keyboard,
+    typematic: Typematic,
 }
 
 static KEYBOARDS: Global<Vec<VirtioKeyboard>> = Global::new(Vec::new());
@@ -91,6 +93,7 @@ impl VirtioKeyboard {
             last_used: 0,
             available: 0,
             keyboard: Keyboard::default(),
+            typematic: Typematic::default(),
         };
         unsafe {
             for index in 0..QUEUE_SIZE {
@@ -140,11 +143,15 @@ impl VirtioKeyboard {
                 let code = event.add(2).cast::<u16>().read();
                 let value = event.add(4).cast::<u32>().read();
                 self.last_used = self.last_used.wrapping_add(1);
-                if kind == EV_KEY
-                    && let Some(key) = self.keyboard.event(code, value != KEY_RELEASED)
-                    && pending.len() < MAX_PENDING_KEYS
-                {
-                    pending.push_back(key);
+                if kind == EV_KEY {
+                    let pressed = value != KEY_RELEASED;
+                    let typed = self.keyboard.event(code, pressed);
+                    self.typematic.event(code, pressed, typed, time::now_ns());
+                    if let Some(key) = typed
+                        && pending.len() < MAX_PENDING_KEYS
+                    {
+                        pending.push_back(key);
+                    }
                 }
                 self.post(index);
                 reposted = true;
@@ -169,12 +176,22 @@ pub fn init() {
     }
 }
 
-/// The next keystroke typed on any virtio keyboard.
+/// The next keystroke typed on any virtio keyboard, or repeated by one held down. Repeats come
+/// only once everything typed has been read, so they never get ahead of real keystrokes.
 pub fn read_key() -> Option<InputKey> {
     let pending = PENDING.get();
     if pending.is_empty() {
-        for keyboard in KEYBOARDS.get().iter_mut() {
+        let keyboards = KEYBOARDS.get();
+        for keyboard in keyboards.iter_mut() {
             keyboard.drain(pending);
+        }
+        if pending.is_empty() {
+            let now = time::now_ns();
+            pending.extend(
+                keyboards
+                    .iter_mut()
+                    .filter_map(|keyboard| keyboard.typematic.due(now)),
+            );
         }
     }
     pending.pop_front()
