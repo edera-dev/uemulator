@@ -312,6 +312,8 @@ pub(crate) struct Addrs {
     pub ld_stack: u64,
     pub st_stack: u64,
     pub cond: u64,
+    /// `helper_whole_vector(cpu, packed, source low, source high)`.
+    pub whole_vector: u64,
     pub exit_ok: u64,
     pub exit_fail: u64,
     /// The block-to-block transfer stub (see `arch_x64::chain_stub`), or 0 when chaining is off
@@ -2075,6 +2077,14 @@ impl<'a> Gen<'a> {
                 }
                 store = self.vector_alu(&insn, form, next, insn_index, rip);
             }
+            // The SHA extensions (no prefix), pshufd, palignr and pshufb (66 prefix): see
+            // `whole_vector`
+            0x170 | 0x200 | 0x30f | 0x2c8..=0x2cd | 0x3cc if plain => {
+                let Some(form) = whole_vector(&insn) else {
+                    return false;
+                };
+                store = self.whole_vector(&insn, form, next, insn_index, rip);
+            }
             // AVX-512 data movement, integer logic and arithmetic, byte compares into an opmask
             // register, and kmov of an opmask register (see `evex_form`)
             _ if insn.evex || insn.vex => {
@@ -2581,6 +2591,61 @@ impl<'a> Gen<'a> {
         false
     }
 
+    /// A `WholeVector` instruction (the SHA extensions, pshufd, palignr, pshufb), the source being
+    /// a register or a 16-byte aligned memory operand with the fallbacks of `vector_alu`. pshufd
+    /// is the host's own (SSE2, which every x86-64 has); palignr and pshufb need SSSE3 and the
+    /// rest SHA-NI, which the host may lack, so those load the source into the last two argument
+    /// registers and call `helper_whole_vector`, which skips the interpreter's decode and dispatch.
+    fn whole_vector(
+        &mut self,
+        insn: &Insn,
+        form: WholeVector,
+        next: u64,
+        insn_index: u32,
+        rip: u64,
+    ) -> bool {
+        let (slow, resume) = self.sse_entry(insn_index, rip);
+        let xmm = |reg: u8| XMM + XMM_SIZE * reg as i32;
+        let half = XMM_SIZE / 2;
+        // Where the source is: in `Cpu::xmm`, or at the operand's host address.
+        let source = if insn.md == MODRM_MOD_REGISTER {
+            mem(CPU, xmm(insn.rm))
+        } else {
+            self.ea(insn, next);
+            // Every one of these needs a 16-byte aligned memory operand (legacy SSE).
+            self.a.mov_rr(SCRATCH_A, ADDR, true);
+            self.a.alu_ri(AND, SCRATCH_A, VECTOR_ALIGNMENT - 1, true);
+            self.a.jcc(NE, slow);
+            self.tlb_probe(XMM_SIZE as u8, TLB_TAG_READ, slow);
+            self.a.ld(SCRATCH_B, mem(SCRATCH_A, TLB_ADDEND));
+            mem_idx(ADDR, SCRATCH_B, 0, 0)
+        };
+        let source_high = source.plus(half);
+        if form.op == WholeVectorOp::ShuffleDwords {
+            self.a.xmm_ld(HOST_XMM_SRC, source);
+            self.a.pshufd(HOST_XMM_DST, HOST_XMM_SRC, form.imm);
+            self.a.xmm_st(mem(CPU, xmm(insn.reg)), HOST_XMM_DST);
+        } else {
+            // Loaded into registers that are not the first two arguments on either ABI, then
+            // moved into the last two (on SysV those are rdx, the guest address, and rcx).
+            self.a.ld(SCRATCH_C, source);
+            self.a.ld(VALUE, source_high);
+            if ARGS[2] != SCRATCH_C {
+                self.a.mov_rr(ARGS[2], SCRATCH_C, true);
+            }
+            if ARGS[3] != VALUE {
+                self.a.mov_rr(ARGS[3], VALUE, true);
+            }
+            self.a.mov_rr(ARGS[0], CPU, true);
+            self.a.mov_imm(ARGS[1], form.packed(insn.reg));
+            self.call(self.addrs.whole_vector);
+        }
+        self.a.bind(resume);
+        // The probe, and the call when there is one, clobbered the host flags.
+        self.live = false;
+        false
+    }
+
     /// `rips[k]` is the guest rip of instruction `k`; `end_rip` is the rip after the last one.
     pub fn compile(&mut self, rips: &[u64], end_rip: u64) {
         let count = self.insns.len();
@@ -2629,6 +2694,7 @@ mod tests {
         ld_stack: 0,
         st_stack: 0,
         cond: 0,
+        whole_vector: 0,
         exit_ok: 0,
         exit_fail: 0,
         chain: 0,
@@ -2787,6 +2853,7 @@ mod tests {
         ld_stack: 0,
         st_stack: 0,
         cond: 0,
+        whole_vector: 0,
         exit_ok: 0,
         exit_fail: 0,
         chain: 1,

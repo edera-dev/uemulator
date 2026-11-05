@@ -158,6 +158,8 @@ mod diff_registers;
 mod diff_smc;
 #[cfg(test)]
 mod diff_tests;
+#[cfg(test)]
+mod diff_whole_vector;
 
 #[cfg(not(all(
     feature = "jit",

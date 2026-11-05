@@ -779,6 +779,50 @@ impl Asm {
         );
     }
 
+    /// `sha256su0 vd.4s, vn.4s`: the first half of SHA-256's message schedule, which is exactly
+    /// x86's sha256msg1 with the destination in `vd` and the source in `vn` (both lane 0 low).
+    pub fn sha256su0(&mut self, vd: u32, vn: u32) {
+        self.emit(0x5e28_2800 | vn << RN_SHIFT | vd);
+    }
+    /// `sha256su1 vd.4s, vn.4s, vm.4s`: `vd + sigma1(...)` like x86's sha256msg2, plus the
+    /// `W[t-7]` words taken from `vn` and lane 0 of `vm`, which a caller wanting sha256msg2 zeroes.
+    pub fn sha256su1(&mut self, vd: u32, vn: u32, vm: u32) {
+        self.emit(0x5e00_6000 | vm << RM_SHIFT | vn << RN_SHIFT | vd);
+    }
+    /// `ext vd.16b, vn.16b, vm.16b, #index`: bytes `index..16` of `vn` followed by bytes
+    /// `0..index` of `vm`, the 32-byte `vm:vn` shifted right by `index` bytes.
+    pub fn ext_16b(&mut self, vd: u32, vn: u32, vm: u32, index: u32) {
+        const EXT_INDEX_SHIFT: u32 = 11;
+        assert!(index < VECTOR_BYTES);
+        self.emit(0x6e00_0000 | vm << RM_SHIFT | index << EXT_INDEX_SHIFT | vn << RN_SHIFT | vd);
+    }
+    /// `movi vd.2d, #0`.
+    pub fn vec_zero(&mut self, vd: u32) {
+        self.emit(0x6f00_e400 | vd);
+    }
+    /// `mov vd.s[0], wzr`: clears the low dword of `vd` and keeps the rest.
+    pub fn clear_low_dword(&mut self, vd: u32) {
+        const ZERO_REGISTER: u32 = 31;
+        self.emit(0x4e04_1c00 | ZERO_REGISTER << RN_SHIFT | vd);
+    }
+    /// `movi vd.16b, #imm`: `imm` in every byte.
+    pub fn vec_splat_byte(&mut self, vd: u32, imm: u8) {
+        const ABC_SHIFT: u32 = 16;
+        const DEFGH_SHIFT: u32 = 5;
+        const DEFGH_BITS: u32 = 5;
+        let imm = imm as u32;
+        self.emit(
+            0x4f00_e400
+                | (imm >> DEFGH_BITS) << ABC_SHIFT
+                | (imm & ((1 << DEFGH_BITS) - 1)) << DEFGH_SHIFT
+                | vd,
+        );
+    }
+    /// `tbl vd.16b, {vn.16b}, vm.16b`: byte `k` of `vd` is byte `vm[k]` of `vn` (0 past 15).
+    pub fn tbl(&mut self, vd: u32, vn: u32, vm: u32) {
+        self.emit(0x4e00_0000 | vm << RM_SHIFT | vn << RN_SHIFT | vd);
+    }
+
     /// `dmb ishld`: loads before it complete before any later load or store. A plain vector
     /// load plus this is an acquire, which `ldar` cannot give a 128-bit access.
     pub fn dmb_ishld(&mut self) {
@@ -1376,6 +1420,23 @@ fn bitfield_moves_and_insert_match_the_assembler() {
         ("bfi w0, w1, #8, #8", |a| { a.bfi(0, 1, 8, 8, false); }, &[0x33181c20]),
         ("bfi w2, w3, #0, #16", |a| { a.bfi(2, 3, 0, 16, false); }, &[0x33003c62]),
         ("bfi w4, w5, #16, #1", |a| { a.bfi(4, 5, 16, 1, false); }, &[0x331000a4]),
+    ];
+    check_encodings(cases);
+}
+
+    /// The SHA-256 schedule instructions and the byte permutes behind the inline sha256msg1/2,
+    /// palignr and pshufd.
+#[rustfmt::skip]
+#[test]
+fn whole_vector_encodings_match_the_assembler() {
+    let cases: &[EncodeCase] = &[
+        ("sha256su0 v0.4s, v1.4s", |a| { a.sha256su0(0, 1); }, &[0x5e282820]),
+        ("sha256su1 v0.4s, v2.4s, v1.4s", |a| { a.sha256su1(0, 2, 1); }, &[0x5e016040]),
+        ("ext v0.16b, v1.16b, v2.16b, #5", |a| { a.ext_16b(0, 1, 2, 5); }, &[0x6e022820]),
+        ("movi v2.2d, #0", |a| { a.vec_zero(2); }, &[0x6f00e402]),
+        ("movi v2.16b, #0x8f", |a| { a.vec_splat_byte(2, 0x8f); }, &[0x4f04e5e2]),
+        ("mov v1.s[0], wzr", |a| { a.clear_low_dword(1); }, &[0x4e041fe1]),
+        ("tbl v0.16b, {v1.16b}, v2.16b", |a| { a.tbl(0, 1, 2); }, &[0x4e020020]),
     ];
     check_encodings(cases);
 }

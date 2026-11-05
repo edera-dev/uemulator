@@ -15,7 +15,7 @@
 use super::*;
 
 #[path = "crypto.rs"]
-pub(super) mod crypto;
+pub(in crate::cpu) mod crypto;
 #[path = "string_compare.rs"]
 mod string_compare;
 
@@ -353,7 +353,7 @@ fn decode_sse42_op(map: u16, opcode: u8) -> Option<Op> {
 
 /// pshufb: each result byte is the destination byte selected by the low four bits of the
 /// source byte, or zero when the source byte's top bit is set.
-fn pshufb(dst: u128, selector: u128) -> u128 {
+pub(crate) fn pshufb(dst: u128, selector: u128) -> u128 {
     const ZEROING_BIT: u8 = 0x80;
     const INDEX_MASK: u8 = 0x0f;
     zip_lanes::<u8>(dst, selector, |_, select| {
@@ -413,7 +413,7 @@ fn apply_sign(value: i32, sign_source: i32) -> i32 {
 }
 
 /// palignr: the 32-byte value `dst:src` shifted right by `count` bytes, low 16 bytes kept.
-fn palignr(dst: u128, src: u128, count: u8) -> u128 {
+pub(crate) fn palignr(dst: u128, src: u128, count: u8) -> u128 {
     const REGISTER_BYTES: u32 = 16;
     let count = count as u32;
     if count == 0 {

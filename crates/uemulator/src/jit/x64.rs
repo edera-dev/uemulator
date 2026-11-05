@@ -67,6 +67,7 @@ const TWO_BYTE_OPCODE: u8 = 0x0f;
 const OPCODE_MOVDQU_LOAD: u8 = 0x6f;
 const OPCODE_MOVDQU_STORE: u8 = 0x7f;
 const OPCODE_PMOVMSKB: u8 = 0xd7;
+const OPCODE_PSHUFD: u8 = 0x70;
 const OPCODE_MOVQ_XMM_GPR: u8 = 0x6e;
 /// `66 0f xx` integer SSE2 opcodes for `xmm_op`.
 pub const OPCODE_PCMPEQB: u8 = 0x74;
@@ -120,6 +121,16 @@ pub struct Mem {
     /// `(register, log2 scale)`.
     index: Option<(u8, u8)>,
     disp: i32,
+}
+
+impl Mem {
+    /// The same operand `bytes` further on.
+    pub fn plus(self, bytes: i32) -> Mem {
+        Mem {
+            disp: self.disp + bytes,
+            ..self
+        }
+    }
 }
 
 pub fn mem(base: u8, disp: i32) -> Mem {
@@ -380,6 +391,12 @@ impl Asm {
     /// `pmovmskb r32, xmm`.
     pub fn pmovmskb(&mut self, d: u8, x: u8) {
         self.sse_rr(OPERAND_SIZE_PREFIX, OPCODE_PMOVMSKB, d, x);
+    }
+
+    /// `pshufd d, s, order`: result dword `k` is dword `order[2k+1:2k]` of `s`.
+    pub fn pshufd(&mut self, d: u8, s: u8, order: u8) {
+        self.sse_rr(OPERAND_SIZE_PREFIX, OPCODE_PSHUFD, d, s);
+        self.code.push(order);
     }
 
     /// The mandatory prefix comes before REX.
@@ -3924,6 +3941,8 @@ fn sse_forms_match_the_assembler() {
         ("psubq xmm0, xmm1", |a| { a.xmm_op(0xfb, 0, 1); }, &[0x66, 0x0f, 0xfb, 0xc1]),
         ("pmovmskb r9d, xmm1", |a| { a.pmovmskb(R9, 1); }, &[0x66, 0x44, 0x0f, 0xd7, 0xc9]),
         ("pmovmskb eax, xmm1", |a| { a.pmovmskb(RAX, 1); }, &[0x66, 0x0f, 0xd7, 0xc1]),
+        ("pshufd xmm0, xmm1, 0x1b", |a| { a.pshufd(0, 1, 0x1b); }, &[0x66, 0x0f, 0x70, 0xc1, 0x1b]),
+        ("pshufd xmm9, xmm12, 0xe4", |a| { a.pshufd(9, 12, 0xe4); }, &[0x66, 0x45, 0x0f, 0x70, 0xcc, 0xe4]),
     ];
     check_encodings(cases);
 }

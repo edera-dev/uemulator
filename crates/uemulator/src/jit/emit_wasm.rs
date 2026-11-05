@@ -38,6 +38,7 @@ use super::wasm_encode::{
 };
 use crate::cpu::decode::{Insn, NO_REG};
 use crate::cpu::flags::LazyFlagsOp;
+use crate::cpu::{CR0_EM, CR0_TS, CR4_OSFXSR};
 use crate::cpu::{Cpu, SEG_FS, SEG_GS, Seg, TLB_ENTRIES_PER_MODE, TlbEntry};
 
 // Offsets into `Cpu` baked into generated code; see the same list in `emit_x64.rs`. They come from
@@ -60,6 +61,13 @@ const LAZY_SRC: u32 = offset_of!(Cpu, lazy_src) as u32;
 /// The carry-in of an adc or sbb record.
 const LAZY_SRC2: u32 = offset_of!(Cpu, lazy_src2) as u32;
 const SEG_BASE: u32 = (offset_of!(Cpu, seg) + offset_of!(Seg, base)) as u32;
+const CR0: u32 = offset_of!(Cpu, cr0) as u32;
+const CR4: u32 = offset_of!(Cpu, cr4) as u32;
+const XMM: u32 = offset_of!(Cpu, xmm) as u32;
+const XMM_SIZE: u32 = size_of::<u128>() as u32;
+const XMM_HALF: u32 = XMM_SIZE / 2;
+/// Legacy-SSE 128-bit memory operands must be aligned to this.
+const VECTOR_ALIGNMENT: i64 = XMM_SIZE as i64;
 const SEG_SIZE: u32 = size_of::<Seg>() as u32;
 
 const _: () = assert!(size_of::<LazyFlagsOp>() == 1);
@@ -163,6 +171,8 @@ pub(crate) struct Addrs {
     pub cond: u32,
     /// `helper_set_rotate_flags`, called through `COND_TYPE` (its result is dropped).
     pub rotate_flags: u32,
+    /// `helper_whole_vector`, called through `STORE_TYPE` (its result is dropped).
+    pub whole_vector: u32,
     pub out: u32,
     /// Table slot of the chain stub, or 0 when blocks return to the run loop between each other.
     pub chain: u32,
@@ -322,6 +332,10 @@ pub(crate) struct Gen<'a> {
     /// Address of the block's `LINKS_PER_BLOCK` link cells, or 0 when its exits are not linked.
     link_cells: u32,
     links_used: u32,
+    /// An inline SSE instruction of this block already checked CR0.EM/TS and CR4.OSFXSR.
+    /// Everything that changes them ends a block, so one check at the first such instruction
+    /// covers the rest (as in the native generators).
+    sse_gated: bool,
 }
 
 impl<'a> Gen<'a> {
@@ -339,6 +353,7 @@ impl<'a> Gen<'a> {
             flag_records_skipped: 0,
             link_cells,
             links_used: 0,
+            sse_gated: false,
         }
     }
 
@@ -1912,6 +1927,14 @@ impl<'a> Gen<'a> {
                 self.inlined += 1;
                 return true;
             }
+            // The SHA extensions (no prefix), pshufd, palignr and pshufb (66 prefix): see
+            // `whole_vector`
+            0x170 | 0x200 | 0x30f | 0x2c8..=0x2cd | 0x3cc if plain => {
+                let Some(form) = whole_vector(&insn) else {
+                    return false;
+                };
+                self.whole_vector(&insn, form, next, k, rip);
+            }
             _ => return false,
         }
         if store {
@@ -1919,6 +1942,85 @@ impl<'a> Gen<'a> {
         }
         self.inlined += 1;
         true
+    }
+
+    /// A `WholeVector` instruction (the SHA extensions, pshufd, palignr, pshufb) through
+    /// `helper_whole_vector`, with the source loaded from its register or, 16-byte aligned, from
+    /// memory. The SSE gate failing (checked at the block's first SSE instruction), a misaligned
+    /// operand or a TLB miss runs the instruction in the interpreter instead, which raises the
+    /// fault or does the slow access. Neither path touches the flags.
+    fn whole_vector(&mut self, insn: &Insn, form: WholeVector, next: u64, k: u32, rip: u64) {
+        let is_register = insn.md == MODRM_MOD_REGISTER;
+        // Pushes the fast path's i32 condition, each part `and`ed onto the ones before.
+        let mut conditions = 0;
+        if !self.sse_gated {
+            self.sse_gated = true;
+            self.c
+                .local_get(CPU)
+                .mem(op::I64_LOAD, CR0)
+                .i64_const((CR0_EM | CR0_TS) as i64)
+                .op(op::I64_AND)
+                .op(op::I64_EQZ);
+            self.c
+                .local_get(CPU)
+                .mem(op::I64_LOAD, CR4)
+                .i64_const(CR4_OSFXSR as i64)
+                .op(op::I64_AND)
+                .i64_const(0)
+                .op(op::I64_NE)
+                .op(op::I32_AND);
+            conditions += 1;
+        }
+        if !is_register {
+            self.ea(insn, next);
+            self.c
+                .local_get(ADDR)
+                .i64_const(VECTOR_ALIGNMENT - 1)
+                .op(op::I64_AND)
+                .op(op::I64_EQZ);
+            // An aligned 16-byte access never crosses a page, so the probe's one entry covers it.
+            self.tlb_probe(XMM_SIZE as u8, TLB_TAG_READ);
+            self.c.op(op::I32_AND);
+            if conditions > 0 {
+                self.c.op(op::I32_AND);
+            }
+            conditions += 1;
+        }
+        if conditions > 0 {
+            self.c.begin_if(BLOCK_VOID);
+        }
+        self.c
+            .local_get(CPU)
+            .i64_const(form.packed(insn.reg) as i64);
+        for half in [0, XMM_HALF] {
+            if is_register {
+                self.c
+                    .local_get(CPU)
+                    .mem(op::I64_LOAD, XMM + XMM_SIZE * insn.rm as u32 + half);
+            } else {
+                self.host_address();
+                self.c.mem(op::I64_LOAD, half);
+            }
+        }
+        self.c
+            .i32_const(self.addrs.whole_vector as i32)
+            .call_indirect(STORE_TYPE)
+            .op(op::DROP);
+        if conditions > 0 {
+            // Not `helper`: that pays for the instructions before this one at translation time,
+            // which a path that is only sometimes taken cannot do (the native generators' slow
+            // paths are the same).
+            self.c.op(op::ELSE);
+            self.c
+                .local_get(CPU)
+                .i32_const(&self.insns[k as usize] as *const Insn as usize as i32);
+            self.rip_to(rip);
+            self.c
+                .i32_const(self.addrs.exec as i32)
+                .call_indirect(EXEC_TYPE);
+            self.check_status(k, true);
+            self.end();
+        }
     }
 
     /// `rips[k]` is the guest rip of instruction `k`; `end_rip` is the rip after the last one.
