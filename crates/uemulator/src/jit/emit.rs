@@ -107,6 +107,8 @@ const VECTOR_ALIGNMENT: u64 = XMM_SIZE as u64;
 /// and the source operand.
 const VECTOR_DST: u32 = 0;
 const VECTOR_SRC: u32 = 1;
+/// A third host vector register for the sequences that need a zero or an index vector.
+const VECTOR_TEMPORARY: u32 = 2;
 const RCX_INDEX: u32 = 1;
 const SEG_BASE_OFFSET: u32 = (offset_of!(Cpu, seg) + offset_of!(Seg, base)) as u32;
 const SEG_STRIDE: u32 = size_of::<Seg>() as u32;
@@ -423,6 +425,8 @@ pub(crate) struct Addrs {
     pub cond: u64,
     /// Tail-call stub for `helper_set_rotate_flags(cpu, packed CF/OF)`.
     pub rotate_flags: u64,
+    /// Tail-call stub for `helper_whole_vector(cpu, packed, source low, source high)`.
+    pub whole_vector: u64,
     pub exit_ok: u64,
     pub exit_fail: u64,
     /// The block-to-block transfer stub (see `arch_a64::chain_stub`), or 0 when chaining is off
@@ -2591,6 +2595,14 @@ impl<'a> Gen<'a> {
                 }
                 is_store = self.vector_alu(&insn, form, next_rip, insn_index, rip);
             }
+            // The SHA extensions (no prefix), pshufd, palignr and pshufb (66 prefix): see
+            // `whole_vector`
+            0x170 | 0x200 | 0x30f | 0x2c8..=0x2cd | 0x3cc if plain => {
+                let Some(form) = whole_vector(&insn) else {
+                    return false;
+                };
+                is_store = self.whole_vector(&insn, form, next_rip, insn_index, rip);
+            }
             // AVX-512 data movement, integer logic and arithmetic, byte compares into an opmask
             // register, and kmov of an opmask register (see `evex_form`)
             _ if insn.evex || insn.vex => {
@@ -3136,6 +3148,131 @@ impl<'a> Gen<'a> {
         false
     }
 
+    /// A `WholeVector` instruction (the SHA extensions, pshufd, palignr, pshufb), the source being
+    /// a register or a 16-byte aligned memory operand with the fallbacks of `vector_alu`. palignr,
+    /// pshufd and pshufb are one NEON permute; sha256msg1 and sha256msg2 are the host's own SHA-256
+    /// schedule instructions where the build targets them (`sha2`, which every Apple Silicon has).
+    /// The round instructions have no NEON equivalent (`sha256h` does four rounds in another
+    /// register layout, not two), so the rest load the source into argument registers and call
+    /// `helper_whole_vector`, which skips the interpreter's decode and dispatch.
+    fn whole_vector(
+        &mut self,
+        insn: &Insn,
+        form: WholeVector,
+        next_rip: u64,
+        insn_index: u32,
+        rip: u64,
+    ) -> bool {
+        const PACKED_ARGUMENT: u32 = 1;
+        const SOURCE_LOW_ARGUMENT: u32 = 2;
+        const SOURCE_HIGH_ARGUMENT: u32 = 3;
+        const REGISTER_BYTES: u32 = XMM_SIZE;
+        let (slow, resume) = self.sse_entry(insn_index, rip);
+        let xmm = |reg: u8| XMM_OFFSET + XMM_SIZE * reg as u32;
+        let is_register = insn.md == MODRM_MOD_REGISTER;
+        if !is_register {
+            // Leaves the host address of the operand in SCRATCH_B.
+            self.effective_address(insn, next_rip, ADDRESS);
+            // Every one of these needs a 16-byte aligned memory operand (legacy SSE).
+            self.and_constant(SCRATCH_A, ADDRESS, VECTOR_ALIGNMENT - 1);
+            self.asm.cbnz(SCRATCH_A, slow, true);
+            self.tlb_probe(XMM_SIZE as u8, TLB_TAG_READ_OFFSET, slow);
+            self.asm.ldr(SCRATCH_B, SCRATCH_A, TLB_ADDEND_OFFSET);
+            self.asm.add(SCRATCH_B, ADDRESS, SCRATCH_B, true);
+        }
+        let native = matches!(
+            form.op,
+            WholeVectorOp::ShuffleDwords | WholeVectorOp::AlignRight | WholeVectorOp::ShuffleBytes
+        ) || (cfg!(target_feature = "sha2")
+            && matches!(
+                form.op,
+                WholeVectorOp::Sha256Message1 | WholeVectorOp::Sha256Message2
+            ));
+        if !native {
+            if is_register {
+                self.asm.ldr(SOURCE_LOW_ARGUMENT, CPU, xmm(insn.rm));
+                self.asm
+                    .ldr(SOURCE_HIGH_ARGUMENT, CPU, xmm(insn.rm) + XMM_HALF);
+            } else if self.ordered_memory {
+                // Acquires, as for `vector_move`.
+                self.asm.ldar(SOURCE_LOW_ARGUMENT, SCRATCH_B, 8);
+                self.asm.add_imm(SCRATCH_B, SCRATCH_B, XMM_HALF, true);
+                self.asm.ldar(SOURCE_HIGH_ARGUMENT, SCRATCH_B, 8);
+            } else {
+                self.asm
+                    .ldp_off(SOURCE_LOW_ARGUMENT, SOURCE_HIGH_ARGUMENT, SCRATCH_B, 0);
+            }
+            self.asm.mov_imm(PACKED_ARGUMENT, form.packed(insn.reg));
+            self.asm.mov(0, CPU);
+            self.call(self.addrs.whole_vector);
+            self.asm.bind(resume);
+            self.live = None;
+            return false;
+        }
+        self.asm.ldr_q(VECTOR_DST, CPU, xmm(insn.reg));
+        if is_register {
+            self.asm.ldr_q(VECTOR_SRC, CPU, xmm(insn.rm));
+        } else {
+            self.asm.ldr_q(VECTOR_SRC, SCRATCH_B, 0);
+            if self.ordered_memory {
+                self.asm.dmb_ishld();
+            }
+        }
+        match form.op {
+            WholeVectorOp::AlignRight => {
+                // `dst:src` shifted right by `count` bytes: ext's `vm:vn` with vn the low half.
+                let count = form.imm as u32;
+                if count < REGISTER_BYTES {
+                    self.asm.ext_16b(VECTOR_DST, VECTOR_SRC, VECTOR_DST, count);
+                } else if count < 2 * REGISTER_BYTES {
+                    self.asm.vec_zero(VECTOR_TEMPORARY);
+                    self.asm.ext_16b(
+                        VECTOR_DST,
+                        VECTOR_DST,
+                        VECTOR_TEMPORARY,
+                        count - REGISTER_BYTES,
+                    );
+                } else {
+                    self.asm.vec_zero(VECTOR_DST);
+                }
+            }
+            WholeVectorOp::ShuffleDwords => {
+                // A tbl index vector picking the four bytes of each selected dword.
+                let indices = shuffle_dwords_byte_indices(form.imm);
+                self.asm.mov_imm(SOURCE_LOW_ARGUMENT, indices as u64);
+                self.asm
+                    .mov_imm(SOURCE_HIGH_ARGUMENT, (indices >> u64::BITS) as u64);
+                self.asm.fmov_d_x(VECTOR_TEMPORARY, SOURCE_LOW_ARGUMENT);
+                self.asm.ins_d1(VECTOR_TEMPORARY, SOURCE_HIGH_ARGUMENT);
+                self.asm.tbl(VECTOR_DST, VECTOR_SRC, VECTOR_TEMPORARY);
+            }
+            WholeVectorOp::ShuffleBytes => {
+                // tbl gives 0 for an index past 15, so keeping the top bit (pshufb's zeroing bit)
+                // and the low four makes it pshufb.
+                const ZEROING_AND_INDEX_BITS: u8 = 0x8f;
+                self.asm
+                    .vec_splat_byte(VECTOR_TEMPORARY, ZEROING_AND_INDEX_BITS);
+                self.asm
+                    .vec_op(VEC_AND, 0, VECTOR_SRC, VECTOR_SRC, VECTOR_TEMPORARY);
+                self.asm.tbl(VECTOR_DST, VECTOR_DST, VECTOR_SRC);
+            }
+            WholeVectorOp::Sha256Message1 => self.asm.sha256su0(VECTOR_DST, VECTOR_SRC),
+            WholeVectorOp::Sha256Message2 => {
+                // sha256su1 also adds W[t-7] from its middle operand and lane 0 of its last one;
+                // sha256msg2 leaves that to software, so both are zero.
+                self.asm.clear_low_dword(VECTOR_SRC);
+
+                self.asm.vec_zero(VECTOR_TEMPORARY);
+                self.asm.sha256su1(VECTOR_DST, VECTOR_TEMPORARY, VECTOR_SRC);
+            }
+            _ => unreachable!("only the native forms get here"),
+        }
+        self.asm.str_q(VECTOR_DST, CPU, xmm(insn.reg));
+        self.asm.bind(resume);
+        self.live = None;
+        false
+    }
+
     /// Compiles the whole block. `rips[k]` is the offset in the block's page of instruction `k`
     /// and `end_rip` the offset after the last one (past 4096 for an instruction that straddles
     /// the page end). A block ends after a terminator (see
@@ -3582,6 +3719,7 @@ mod tests {
         exec: 0,
         cond: 0,
         rotate_flags: 0,
+        whole_vector: 0,
         exit_ok: 0,
         exit_fail: 0,
         chain: 0,

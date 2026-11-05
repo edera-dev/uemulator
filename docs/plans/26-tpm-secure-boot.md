@@ -43,7 +43,7 @@ The firmware starts the TPM (`TPM2_Startup(CLEAR)`; `TPM_RC_INITIALIZE` is accep
 
 Nothing on the `ExitBootServices` path allocates (commands and digests on the stack, the log preallocated): the OS owns the memory map by then. The Linux stub measures its load options and initramfs into PCR 9 itself.
 
-Cost: the firmware hashes what it measures in guest code. Debian's 12 MB kernel and 39 MB initramfs add about 2 s to a boot on an M5 Max (portable SHA-256 2.6 s; the SHA extensions 2.0 s, because the JIT does not compile them and the interpreter runs those blocks). Compiling `sha256rnds2`/`sha256msg1`/`sha256msg2` in the JIT is the next lever.
+Cost: the firmware hashes what it measures in guest code. Debian's 12 MB kernel and 39 MB initramfs added about 2 s to a boot on an M5 Max with the portable SHA-256 (2.6 s), and 1.4 to 1.5 s with the SHA extensions while the JIT sent them through `helper_exec` (95% of that time was the interpreter's decode and dispatch, not the hashing). With the SHA extensions, pshufd, palignr and pshufb compiled (`docs/plans/20-jit-perf.md`, round 4) it is about 0.5 s: `advanced boot --console serial --append rdinit=/bin/sh` with Debian's netboot kernel and initrd reaches "Linux version" at 0.55 s without `--tpm` and 1.05 s with it (2.05 s before), "as init process" at 2.95 s and 3.48 s (4.55 s before), medians of four interleaved runs on a loaded host.
 
 ## Secure Boot (`secure_boot.rs`, `variable_store.rs`, `variables.rs`, `images.rs`)
 
@@ -70,5 +70,5 @@ Cost: the firmware hashes what it measures in guest code. Debian's 12 MB kernel 
 
 - TPM: signing (`TPM2_Sign`, restricted signing keys, `Quote`, `Certify`), an EK certificate in NV for Windows' attestation, `ObjectChangeAuth`, `PolicySecret`/`PolicyOR`/`PolicyAuthorize`/`PolicyAuthorizeNV` (systemd-pcrlock and signed PCR policies), counter and extend NV indices, `CreateLoaded`, saving hash sequences, dictionary-attack lockout. BitLocker has not been tried.
 - A way back to setup mode (a CLI option that clears PK) and custom keys (sbctl).
-- JIT-compiled SHA instructions for the measurement cost.
+- The rest of the measurement cost (about 0.5 s): see what is left in `docs/plans/20-jit-perf.md`, round 4.
 - Private time-based authenticated variables, GPT measurement into PCR 5, `EV_EFI_HANDOFF_TABLES2`.

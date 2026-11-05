@@ -550,6 +550,168 @@ pub(crate) fn vector_alu(insn: &Insn) -> Option<VectorAlu> {
     Some(VectorAlu { op, lane_log2 })
 }
 
+/// A legacy-encoded instruction that computes a whole xmm register from the destination, a
+/// register or 16-byte aligned memory source and, for `Sha256Rounds2`, the implicit xmm0: the SHA
+/// extensions plus pshufd, palignr and pshufb, which the SHA-256 loops of firmware and kernels
+/// interleave with them. The generators load the source and call `helper_whole_vector` (or emit
+/// a host instruction where one computes exactly the same thing), so these never pay for the
+/// interpreter's decode and dispatch. `Cpu::sse_ext` and `Cpu::sse` are the definition.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(u8)]
+pub(crate) enum WholeVectorOp {
+    /// sha1rnds4; the immediate's low two bits pick the round function.
+    Sha1Rounds4,
+    Sha1NextE,
+    Sha1Message1,
+    Sha1Message2,
+    /// sha256rnds2: also reads xmm0.
+    Sha256Rounds2,
+    Sha256Message1,
+    Sha256Message2,
+    /// pshufd (66 prefix): each result dword picked by two bits of the immediate.
+    ShuffleDwords,
+    /// palignr (66 prefix): `dst:src` shifted right by the immediate in bytes.
+    AlignRight,
+    /// pshufb (66 prefix): each result byte is the destination byte the source byte selects, or
+    /// zero where the source byte has its top bit set.
+    ShuffleBytes,
+}
+
+impl WholeVectorOp {
+    /// Indexed by the discriminant, which is how `helper_whole_vector` gets the operation back.
+    const ALL: [WholeVectorOp; 10] = [
+        WholeVectorOp::Sha1Rounds4,
+        WholeVectorOp::Sha1NextE,
+        WholeVectorOp::Sha1Message1,
+        WholeVectorOp::Sha1Message2,
+        WholeVectorOp::Sha256Rounds2,
+        WholeVectorOp::Sha256Message1,
+        WholeVectorOp::Sha256Message2,
+        WholeVectorOp::ShuffleDwords,
+        WholeVectorOp::AlignRight,
+        WholeVectorOp::ShuffleBytes,
+    ];
+}
+
+/// An instruction `whole_vector` accepts: the operation and its immediate (0 where it has none).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct WholeVector {
+    pub op: WholeVectorOp,
+    pub imm: u8,
+}
+
+/// Bit positions of `helper_whole_vector`'s `packed` argument: the operation in bits 7:0, the
+/// immediate in 15:8, the destination xmm register in 19:16.
+const PACKED_OPERATION_MASK: u64 = 0xff;
+const PACKED_IMM_SHIFT: u32 = 8;
+const PACKED_DESTINATION_SHIFT: u32 = 16;
+const XMM_INDEX_MASK: u64 = 0xf;
+
+impl WholeVector {
+    /// `helper_whole_vector`'s `packed` argument for this instruction writing xmm `destination`.
+    pub fn packed(self, destination: u8) -> u64 {
+        self.op as u64
+            | (self.imm as u64) << PACKED_IMM_SHIFT
+            | (destination as u64 & XMM_INDEX_MASK) << PACKED_DESTINATION_SHIFT
+    }
+
+    /// The new destination, as the interpreter computes it.
+    pub fn apply(self, destination: u128, source: u128, xmm0: u128) -> u128 {
+        use crate::cpu::{
+            palignr, pshufb, sha1_four_rounds, sha1_message_1, sha1_message_2, sha1_next_e,
+            sha256_message_1, sha256_message_2, sha256_two_rounds, shuffle_dwords,
+        };
+        match self.op {
+            WholeVectorOp::Sha1Rounds4 => sha1_four_rounds(destination, source, self.imm),
+            WholeVectorOp::Sha1NextE => sha1_next_e(destination, source),
+            WholeVectorOp::Sha1Message1 => sha1_message_1(destination, source),
+            WholeVectorOp::Sha1Message2 => sha1_message_2(destination, source),
+            WholeVectorOp::Sha256Rounds2 => sha256_two_rounds(destination, source, xmm0),
+            WholeVectorOp::Sha256Message1 => sha256_message_1(destination, source),
+            WholeVectorOp::Sha256Message2 => sha256_message_2(destination, source),
+            WholeVectorOp::ShuffleDwords => shuffle_dwords(source, self.imm),
+            WholeVectorOp::AlignRight => palignr(destination, source, self.imm),
+            WholeVectorOp::ShuffleBytes => pshufb(destination, source),
+        }
+    }
+}
+
+/// `Some` for the instructions `WholeVectorOp` lists, legacy-encoded with exactly the prefix the
+/// interpreter decodes them with: none for the SHA extensions (with 66 they are #UD), 66 for
+/// pshufd, palignr and pshufb (unprefixed they are the MMX pshufw, palignr and pshufb, with f3/f2
+/// pshufhw, pshuflw or #UD). VEX and EVEX forms carry a flag in `Insn::op`, so they never match.
+pub(crate) fn whole_vector(insn: &Insn) -> Option<WholeVector> {
+    const OPCODE_MAP_0F: u16 = 1 << 8;
+    const OPCODE_MAP_0F38: u16 = 2 << 8;
+    const OPCODE_MAP_0F3A: u16 = 3 << 8;
+    const OPCODE_MASK: u16 = 0xff;
+    const SHA1_ROUND_FUNCTION_MASK: i64 = 3;
+    if insn.rep != 0 {
+        return None;
+    }
+    let imm = insn.imm as u8;
+    // The map is the high byte; a VEX or EVEX flag there makes it match none of these.
+    let (map, opcode) = (insn.op & !OPCODE_MASK, (insn.op & OPCODE_MASK) as u8);
+    let (op, imm) = match (map, opcode, insn.p66) {
+        (OPCODE_MAP_0F3A, 0xcc, false) => (
+            WholeVectorOp::Sha1Rounds4,
+            (insn.imm & SHA1_ROUND_FUNCTION_MASK) as u8,
+        ),
+        (OPCODE_MAP_0F38, 0xc8, false) => (WholeVectorOp::Sha1NextE, 0),
+        (OPCODE_MAP_0F38, 0xc9, false) => (WholeVectorOp::Sha1Message1, 0),
+        (OPCODE_MAP_0F38, 0xca, false) => (WholeVectorOp::Sha1Message2, 0),
+        (OPCODE_MAP_0F38, 0xcb, false) => (WholeVectorOp::Sha256Rounds2, 0),
+        (OPCODE_MAP_0F38, 0xcc, false) => (WholeVectorOp::Sha256Message1, 0),
+        (OPCODE_MAP_0F38, 0xcd, false) => (WholeVectorOp::Sha256Message2, 0),
+        (OPCODE_MAP_0F, 0x70, true) => (WholeVectorOp::ShuffleDwords, imm),
+        (OPCODE_MAP_0F3A, 0x0f, true) => (WholeVectorOp::AlignRight, imm),
+        (OPCODE_MAP_0F38, 0x00, true) => (WholeVectorOp::ShuffleBytes, 0),
+        _ => return None,
+    };
+    Some(WholeVector { op, imm })
+}
+
+/// The byte permutation pshufd with immediate `order` applies, as a byte-shuffle index vector
+/// (`tbl` on aarch64): result byte `4k + j` is source byte `4 * order[2k+1:2k] + j`.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn shuffle_dwords_byte_indices(order: u8) -> u128 {
+    const DWORD_BYTES: u32 = 4;
+    const SELECTOR_MASK: u8 = 3;
+    let mut indices = 0u128;
+    for byte in 0..16u32 {
+        let dword = byte / DWORD_BYTES;
+        let selected = ((order >> (2 * dword)) & SELECTOR_MASK) as u32;
+        let index = selected * DWORD_BYTES + byte % DWORD_BYTES;
+        indices |= (index as u128) << (8 * byte);
+    }
+    indices
+}
+
+/// Runs a `WholeVector` instruction for generated code that has already passed the SSE gate and
+/// loaded the source (`source_low`, `source_high`) from its register or from guest memory, so
+/// nothing here can fault. `packed` is `WholeVector::packed`. Returns 0, so the WebAssembly blocks
+/// can call it through the store helpers' function type (`wasm_encode::STORE_TYPE`).
+pub(crate) extern "C" fn helper_whole_vector(
+    cpu: &mut Cpu,
+    packed: u64,
+    source_low: u64,
+    source_high: u64,
+) -> u64 {
+    // The generators only pack valid operations; an unknown one leaves the register alone rather
+    // than panicking.
+    let Some(&op) = WholeVectorOp::ALL.get((packed & PACKED_OPERATION_MASK) as usize) else {
+        return STATUS_OK;
+    };
+    let instruction = WholeVector {
+        op,
+        imm: (packed >> PACKED_IMM_SHIFT) as u8,
+    };
+    let destination = ((packed >> PACKED_DESTINATION_SHIFT) & XMM_INDEX_MASK) as usize;
+    let source = (source_high as u128) << 64 | source_low as u128;
+    cpu.xmm[destination] = instruction.apply(cpu.xmm[destination], source, cpu.xmm[0]);
+    STATUS_OK
+}
+
 /// What an inline AVX-512 instruction does. Whole-vector data movement and integer logic and
 /// arithmetic (the shapes of glibc's EVEX string and copy loops, with merge or zero masking
 /// except for stores to memory), byte compares into an opmask register, and `kmov` of an opmask

@@ -172,6 +172,7 @@ pub(crate) fn addrs(prologue: &Prologue, chaining: bool) -> Addrs {
         ld_stack: helpers::helper_load_stack_via_out as *const () as usize as u64,
         st_stack: helpers::helper_store_stack_x64 as *const () as usize as u64,
         cond: helpers::helper_cond as *const () as usize as u64,
+        whole_vector: helpers::helper_whole_vector as *const () as usize as u64,
         exit_ok: prologue.exit_ok,
         exit_fail: prologue.exit_fail,
         chain: if chaining { prologue.chain } else { 0 },

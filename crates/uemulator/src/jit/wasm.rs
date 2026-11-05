@@ -169,6 +169,7 @@ fn addrs(out: *mut u64, chain: u32, chain_link: u32, valid: &[AtomicU8]) -> Addr
         st_stack: helpers::helper_store_stack_x64 as *const () as usize as u32,
         cond: helpers::helper_cond as *const () as usize as u32,
         rotate_flags: helpers::helper_set_rotate_flags as *const () as usize as u32,
+        whole_vector: helpers::helper_whole_vector as *const () as usize as u32,
         out: out as usize as u32,
         chain,
         chain_link,

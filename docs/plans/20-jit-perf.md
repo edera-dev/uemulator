@@ -273,3 +273,25 @@ What is left, in order of size:
 - Native PV start-up measured about 0.05 to 0.1 s (3 to 5%) slower after the nested-leaf-cache commit, in interleaved runs on the loaded host (1.78 s before, 1.80 to 1.91 s after; the nested-rights commit alone is 1.77 to 1.80 s). A PV dom0 never enters SVM, so the cache's code does not run; inlining the walker's no-nested-paging path did not change it, and what is left (the `Cpu` layout shifting with the new `Svm` field) was not pursued. The PV boot is still 0.1 s faster overall natively (the RTC).
 - **The wasm block cache flushes once in a PV boot** (76k blocks against `MAX_BLOCKS` = 65536); raising it costs engine memory per instance (the boot peaks at 1.8 GB RSS under Node already).
 - The IOMMU: per-access cost is now within 2 ns of no IOMMU (`docs/plans/16-iommu.md`); the device lock around every DMA was left alone (nothing here measures it, and the threading rules make it the riskiest part).
+
+## Round 4: SHA extensions for measured boot (2026-11-04)
+
+Workload: with `--tpm` the UEFI firmware measures the kernel and initramfs it boots, hashing them with SHA-256 in guest code (`uemulator-crypto`'s SHA-extensions loop: per 64-byte block 32 sha256rnds2, 12 sha256msg1 on memory, 12 sha256msg2, 16 pshufd, 12 palignr, 4 pshufb). Debian 13's netboot kernel and initrd (51 MB together) with `advanced boot --console serial --append rdinit=/bin/sh`, with and without `--tpm`, timed to "Linux version" (the end of the firmware) and to "as init process", on an M5 Max at a load average of 9 to 18 from other sessions, so only interleaved runs compare.
+
+| session | build | no `--tpm`: Linux version / init | `--tpm`: Linux version / init | `--tpm` overhead to Linux version |
+|---|---|---:|---:|---:|
+| A, 3 runs | before (SHA through `helper_exec`) | 0.51 / 2.86 | 2.03 / 4.39 | 1.52 |
+| A | SHA, pshufd, palignr compiled | 0.51 / 2.89 | 1.06 / 3.53 | 0.55 |
+| B, 4 runs | before | 0.54 / 3.02 | 2.05 / 4.55 | 1.51 |
+| B | plus pshufb | 0.55 / 2.95 | 1.05 / 3.48 | 0.50 |
+
+Seconds, medians of the interleaved runs of one session. On an idle host the overhead before was 1.4 s.
+
+Before, `sample` put 95% of the hashing in the interpreter (`Cpu::exec`, `exec_two_byte`, `sse_ext`, `decode_op`, `mem_read`, `helper_exec_pair`) and 3% in `sha256_two_rounds` itself: the SHA instructions were never the cost, reaching them was. `helpers::whole_vector` now classifies the SHA extensions plus pshufd, palignr and pshufb (the instructions the loop interleaves with them); the generators load the source (register, or aligned memory through the TLB probe, with `vector_alu`'s interpreter fallback for a misaligned operand, a miss or a failing SSE gate) and either emit a host instruction that computes the same thing (aarch64: `tbl`, `ext`, `sha256su0`, `sha256su1`; x86-64: pshufd) or call `helper_whole_vector`, which applies the interpreter's own function. `jit/diff_whole_vector.rs` runs every form, every immediate, the faults and both hash loops against the interpreter on all three backends.
+
+What is left, in order of size:
+
+- **sha256rnds2 in the helper**: the largest single item of the remaining hashing (`helper_whole_vector` about 20% of it), 4 ns a call for 26M calls. On aarch64 a pair `sha256rnds2 X, Y; pshufd xmm0, xmm0, 0x0e; sha256rnds2 Y, X` is four rounds, which `sha256h`/`sha256h2` compute in one go after a lane shuffle into ABCD/EFGH; fusing the pair in the generator is the next step if measured boot matters more.
+- **x86-64 hosts** call the helper for palignr and pshufb (SSSE3) and the SHA extensions (SHA-NI) because the host may lack them; a runtime check (`is_x86_feature_detected!`, as `carry_less_multiply` does) could emit them directly. Not measured: no x86-64 host here.
+- **The web build** goes through the helper for every one of these forms; its `--tpm` boot under Node was not timed.
+- pblendw (once per block) still goes through `helper_exec`.

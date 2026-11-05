@@ -1566,13 +1566,7 @@ impl Cpu {
                 let s = src!(16);
                 let imm8 = i.imm as u8;
                 Some(match prefix {
-                    Prefix::P66 => {
-                        let mut r = 0;
-                        for k in 0..4 {
-                            u32::put(&mut r, k, u32::get(s, ((imm8 >> (2 * k)) & 3) as usize));
-                        }
-                        r
-                    }
+                    Prefix::P66 => shuffle_dwords(s, imm8),
                     Prefix::F2 => {
                         let mut r = s & !LOW_64;
                         for k in 0..4 {
@@ -2032,6 +2026,18 @@ fn put_u64<T: Lane>(r: &mut u128, k: usize, v: u64, width: u32) {
         (1u64 << width) - 1
     };
     *r |= ((v & m) as u128) << (k * width as usize);
+}
+
+/// pshufd: result dword `k` is source dword `order[2k+1:2k]`.
+pub(crate) fn shuffle_dwords(source: u128, order: u8) -> u128 {
+    const DWORDS: usize = 4;
+    const SELECTOR_MASK: u8 = 3;
+    let mut result = 0;
+    for k in 0..DWORDS {
+        let selected = (order >> (2 * k)) & SELECTOR_MASK;
+        u32::put(&mut result, k, u32::get(source, selected as usize));
+    }
+    result
 }
 
 #[path = "evex.rs"]

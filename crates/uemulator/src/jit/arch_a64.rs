@@ -105,6 +105,10 @@ pub(crate) fn prologue(base: u64) -> Prologue {
             &mut asm,
             helpers::helper_set_rotate_flags as *const () as usize as u64,
         ),
+        whole_vector: tail_call_stub(
+            &mut asm,
+            helpers::helper_whole_vector as *const () as usize as u64,
+        ),
         exit_ok,
         exit_fail,
         chain,
