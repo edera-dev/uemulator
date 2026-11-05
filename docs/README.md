@@ -42,6 +42,7 @@ The design plans in [`plans/`](plans/README.md) are the source of truth for how 
 ## Storage and network
 
 - [11-storage-net-console.md](plans/11-storage-net-console.md): virtio-blk, virtio-net and user-mode NAT.
+- [27-wisp.md](plans/27-wisp.md): internet for web guests through a Wisp relay, and the user-mode gateway shared with the CLI (design).
 - [spec/uemulator-disk-format.md](spec/uemulator-disk-format.md): the udisk image format (sparse, copy-on-write, servable over HTTP).
 
 ## Other hosts
