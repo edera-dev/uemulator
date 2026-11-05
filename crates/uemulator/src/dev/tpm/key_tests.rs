@@ -553,6 +553,18 @@ fn templates_the_tpm_cannot_make_are_refused() {
             .err(),
         Some(parameter_error(RC_KEY_SIZE, 1))
     );
+    // systemd's check that sessions can use AES-128-CFB.
+    let aes_cfb = marshal(|writer| {
+        writer.u16(ALG_SYMCIPHER);
+        writer.u16(ALG_AES);
+        writer.u16(AES_128_BITS);
+        writer.u16(ALG_CFB);
+    });
+    assert!(
+        client
+            .call(CC_TEST_PARMS, &[], &mut [], &aes_cfb, 0)
+            .is_ok()
+    );
 }
 
 #[test]

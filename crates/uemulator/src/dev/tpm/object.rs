@@ -243,7 +243,13 @@ impl Parameters {
                     return Err(RC_SCHEME);
                 }
             }
-            Parameters::SymCipher { .. } => return Err(RC_TYPE),
+            // AES-CFB is implemented (sessions use it), so systemd's probe for it passes;
+            // `check_template` still refuses to make a symmetric-cipher object.
+            Parameters::SymCipher { symmetric } => {
+                if symmetric.algorithm == hash::ALG_NULL {
+                    return Err(RC_SYMMETRIC);
+                }
+            }
             Parameters::Rsa {
                 scheme,
                 key_bits,
