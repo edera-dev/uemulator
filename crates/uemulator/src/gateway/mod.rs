@@ -16,11 +16,10 @@
 //! REQUEST naming another server gets no answer (RFC 2131 section 3.1: it declines our offer).
 
 mod dhcp;
+mod tcp;
 #[cfg(test)]
 mod tests;
 mod udp;
-// The TCP codecs wait for the TCP flows.
-#[allow(dead_code)]
 mod wire;
 
 #[cfg(freestanding)]
@@ -28,6 +27,7 @@ use crate::prelude::*;
 use alloc::collections::VecDeque;
 
 use dhcp::{DHCP_CLIENT_PORT, DHCP_SERVER_PORT, dhcp_reply, dhcp_reply_type, parse_dhcp_request};
+use tcp::TcpFlows;
 use udp::UdpFlows;
 use wire::{
     ARP_ETHERNET_IPV4, ARP_OP_REPLY, ARP_OP_REQUEST, ARP_OPCODE, ARP_PACKET_LEN, ARP_SENDER_IP,
@@ -58,6 +58,17 @@ const DEFAULT_GUEST_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 /// Where the first IPv4 identification number comes from; any value does.
 const FIRST_IP_ID: u16 = 1;
 const FIRST_STREAM_ID: StreamId = 1;
+/// `poll` stops moving remote data once this many frames are already queued for the guest, so a
+/// fast remote end cannot grow the queue without bound while the guest is slow to take frames.
+const OUT_QUEUE_LIMIT: usize = 512;
+
+/// Flow identity from the guest's point of view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct FlowKey {
+    guest_port: u16,
+    remote_ip: [u8; 4],
+    remote_port: u16,
+}
 
 /// An IPv4 address and port.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,7 +88,8 @@ pub enum StreamKind {
 }
 
 /// What the gateway asks of its driver; the driver answers with `Gateway::opened`, `failed`,
-/// `remote_data`, `remote_closed` and `reset`.
+/// `remote_data`, `remote_closed` and `reset`. A TCP stream's bytes towards the remote end are
+/// pulled with `Gateway::to_remote` and `consumed` rather than asked for here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GatewayRequest {
     /// Connect to `target` (already mapped: 10.0.2.2 is 127.0.0.1 under `UserNet`, DNS goes to
@@ -88,16 +100,12 @@ pub enum GatewayRequest {
         target: Endpoint,
     },
     /// One UDP datagram. Only sent once the stream is open.
-    Datagram {
-        stream: StreamId,
-        data: Vec<u8>,
-    },
-    ShutdownWrite {
-        stream: StreamId,
-    },
-    Close {
-        stream: StreamId,
-    },
+    Datagram { stream: StreamId, data: Vec<u8> },
+    /// The guest finished sending on a TCP stream and everything before its FIN was taken: shut
+    /// down the write side and keep reading.
+    ShutdownWrite { stream: StreamId },
+    /// The stream is over (both TCP directions done, a guest RST, or an idle UDP flow): drop it.
+    Close { stream: StreamId },
 }
 
 /// Which network the gateway is for.
@@ -109,6 +117,16 @@ pub enum GatewayPolicy {
     /// One machine on a shared segment whose server (`SegmentAgent`) does ARP and DHCP: no ARP,
     /// no DHCP, and only off-subnet destinations and `10.0.2.2:53` (to `resolver`) are ours.
     Segment { resolver: Endpoint },
+}
+
+/// What the driver should wait for on a stream (`Gateway::interest`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamInterest {
+    /// The gateway can take remote data now: a TCP stream has `room` and the guest's queue is
+    /// under its limit; an open UDP stream has no window, so only the queue counts.
+    pub read: bool,
+    /// Guest bytes wait in `to_remote`.
+    pub write: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,19 +164,18 @@ pub struct Gateway {
     /// The guest takes TCP segments longer than the MSS with an unfinished checksum
     /// (`NetHandle::guest_takes_tcp_segments`), so remote data goes out in segments as large as
     /// its window. The driver can renegotiate at any time.
-    #[allow(dead_code, reason = "read by the TCP flows")]
     large_segments: bool,
     ip_id: u16,
     /// Requests for the driver, oldest first.
     requests: Vec<GatewayRequest>,
     udp: UdpFlows,
+    tcp: TcpFlows,
     /// The next `StreamId` to try; shared by every kind of stream.
     next_stream: StreamId,
     /// The last time the driver told us (`from_guest`, `poll`), for events that carry none, such
     /// as `remote_data` refreshing a flow's idle timer.
     now_ms: u64,
     /// Initial sequence number of the most recent connection.
-    #[allow(dead_code, reason = "read by the TCP flows")]
     isn: u32,
 }
 
@@ -172,6 +189,7 @@ impl Gateway {
             ip_id: FIRST_IP_ID,
             requests: Vec::new(),
             udp: UdpFlows::new(),
+            tcp: TcpFlows::new(),
             next_stream: FIRST_STREAM_ID,
             now_ms: 0,
             isn: config.isn_seed,
@@ -203,6 +221,8 @@ impl Gateway {
         }
     }
 
+    /// Takes one frame from the guest. An ACK for TCP data it carries waits for the next `poll`,
+    /// so call `poll` after a batch of frames (and after taking `to_remote`).
     pub fn from_guest(&mut self, frame: &[u8], now_ms: u64) {
         self.now_ms = now_ms;
         if frame.len() < ETH_HEADER_LEN || !self.takes_frame(frame) {
@@ -215,8 +235,8 @@ impl Gateway {
                 if let Some(ip) = parse_ipv4(frame) {
                     match ip.proto {
                         IP_PROTO_ICMP => self.icmp(&ip),
+                        IP_PROTO_TCP => self.tcp_in(&ip),
                         IP_PROTO_UDP => self.udp_in(&ip),
-                        // TCP flows arrive with their flow table.
                         _ => {}
                     }
                 }
@@ -230,36 +250,78 @@ impl Gateway {
         core::mem::take(&mut self.requests)
     }
 
-    /// The driver connected `stream`; datagrams waiting for it are released.
+    /// The driver connected `stream`: a TCP guest gets its SYN-ACK, datagrams waiting for a UDP
+    /// stream are released.
     pub fn opened(&mut self, stream: StreamId) {
+        self.tcp_opened(stream);
         self.udp_opened(stream);
     }
 
-    /// The driver could not connect `stream`. The flow is gone; a UDP guest gets ICMP port
-    /// unreachable.
+    /// The driver could not connect `stream`. The flow is gone without a `Close`; a TCP guest gets
+    /// a RST for its SYN, a UDP guest ICMP port unreachable.
     pub fn failed(&mut self, stream: StreamId) {
+        self.tcp_failed(stream);
         self.udp_failed(stream);
     }
 
-    /// Bytes (TCP) or one datagram (UDP) from the remote end.
+    /// Bytes (TCP) or one datagram (UDP) from the remote end. TCP bytes beyond `room` are kept
+    /// too, and go to the guest as its window allows at each `poll`.
     pub fn remote_data(&mut self, stream: StreamId, data: &[u8]) {
+        self.tcp_remote_data(stream, data);
         self.udp_remote_data(stream, data);
     }
 
-    /// The remote end closed `stream` in an orderly way.
+    /// The remote end closed `stream` in an orderly way. A TCP guest gets our FIN after the data
+    /// still buffered; a UDP flow is dropped.
     pub fn remote_closed(&mut self, stream: StreamId) {
+        self.tcp_remote_closed(stream);
         self.udp_drop(stream);
     }
 
-    /// `stream` broke. A UDP flow is dropped without telling the guest.
+    /// `stream` broke. A TCP guest gets a RST; a UDP flow is dropped without telling the guest.
+    /// Either way the flow is gone without a `Close`.
     pub fn reset(&mut self, stream: StreamId) {
+        self.tcp_reset(stream);
         self.udp_drop(stream);
     }
 
-    /// Lets time pass: idle UDP flows expire here, yielding `Close`.
+    /// Moves buffered TCP data to the guest (round-robin, at most `OUT_QUEUE_LIMIT` frames
+    /// queued), sends owed ACKs and window updates, and lets time pass: idle UDP flows expire
+    /// here, yielding `Close`.
     pub fn poll(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
+        self.poll_tcp();
         self.expire_udp(now_ms);
+    }
+
+    /// The open streams the driver should watch and for what; streams wanting neither are left
+    /// out.
+    pub fn interest(&self) -> Vec<(StreamId, StreamInterest)> {
+        let queue_has_room = self.out.len() < OUT_QUEUE_LIMIT;
+        let mut interest: Vec<(StreamId, StreamInterest)> = self
+            .tcp
+            .flows
+            .values()
+            .filter(|flow| flow.opened)
+            .map(|flow| {
+                let wants = StreamInterest {
+                    read: queue_has_room && flow.room() > 0,
+                    write: !flow.to_remote.is_empty(),
+                };
+                (flow.stream, wants)
+            })
+            .filter(|(_, wants)| wants.read || wants.write)
+            .collect();
+        if queue_has_room {
+            interest.extend(self.udp.open_streams().map(|stream| {
+                let wants = StreamInterest {
+                    read: true,
+                    write: false,
+                };
+                (stream, wants)
+            }));
+        }
+        interest
     }
 
     /// The next free stream id. Skips 0 and live ids when the counter wraps.
@@ -270,7 +332,8 @@ impl Gateway {
                 0 => FIRST_STREAM_ID,
                 next => next,
             };
-            if candidate != 0 && !self.udp.has_stream(candidate) {
+            if candidate != 0 && !self.udp.has_stream(candidate) && !self.tcp.has_stream(candidate)
+            {
                 return candidate;
             }
         }

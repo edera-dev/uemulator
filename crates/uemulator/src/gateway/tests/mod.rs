@@ -11,6 +11,7 @@ use alloc::collections::BTreeMap;
 mod dhcp;
 mod link;
 mod parsing;
+mod tcp;
 mod udp;
 mod wire;
 
@@ -144,7 +145,9 @@ impl FakeRemote {
                     self.live(*stream).datagrams.push(data.clone());
                 }
                 GatewayRequest::ShutdownWrite { stream } => {
-                    self.live(*stream).write_shutdown = true
+                    let entry = self.live(*stream);
+                    assert!(!entry.write_shutdown, "stream {stream} shut down twice");
+                    entry.write_shutdown = true;
                 }
                 GatewayRequest::Close { stream } => self.live(*stream).closed = true,
             }
@@ -204,6 +207,25 @@ impl FakeRemote {
 
     fn is_closed(&self, stream: StreamId) -> bool {
         self.streams[&stream].closed
+    }
+
+    fn is_write_shutdown(&self, stream: StreamId) -> bool {
+        self.streams[&stream].write_shutdown
+    }
+
+    /// Plays a remote end that takes everything the guest sent: drains `to_remote` and returns
+    /// the bytes.
+    fn take_written(&mut self, gateway: &mut Gateway, stream: StreamId) -> Vec<u8> {
+        let mut taken = Vec::new();
+        loop {
+            let waiting = gateway.to_remote(stream);
+            if waiting.is_empty() {
+                return taken;
+            }
+            taken.extend_from_slice(waiting);
+            let len = waiting.len();
+            gateway.consumed(stream, len);
+        }
     }
 
     /// Streams that were opened and not closed.

@@ -154,6 +154,32 @@ pub(super) fn ethernet_frame(
     frame
 }
 
+/// Appends the header of an IPv4 packet carrying `payload_len` bytes, which must fit the 16-bit
+/// total length.
+fn push_ipv4_header(
+    packet: &mut Vec<u8>,
+    id: u16,
+    src: [u8; 4],
+    dst: [u8; 4],
+    proto: u8,
+    flags_and_offset: u16,
+    payload_len: usize,
+) {
+    let start = packet.len();
+    packet.extend_from_slice(&[IPV4_VERSION_IHL_NO_OPTIONS, 0]);
+    packet.extend_from_slice(&(IPV4_HEADER_LEN as u16 + payload_len as u16).to_be_bytes());
+    packet.extend_from_slice(&id.to_be_bytes());
+    packet.extend_from_slice(&flags_and_offset.to_be_bytes());
+    packet.push(IPV4_TTL);
+    packet.push(proto);
+    packet.extend_from_slice(&[0, 0]);
+    packet.extend_from_slice(&src);
+    packet.extend_from_slice(&dst);
+    let header = &mut packet[start..];
+    let checksum = internet_checksum(header);
+    header[IPV4_CHECKSUM].copy_from_slice(&checksum.to_be_bytes());
+}
+
 /// One IPv4 packet whose flags/fragment-offset word is `flags_and_offset`. `payload` must fit the
 /// 16-bit total length.
 pub(super) fn ipv4_datagram(
@@ -164,17 +190,16 @@ pub(super) fn ipv4_datagram(
     flags_and_offset: u16,
     payload: &[u8],
 ) -> Vec<u8> {
-    let mut packet = vec![IPV4_VERSION_IHL_NO_OPTIONS, 0];
-    packet.extend_from_slice(&(IPV4_HEADER_LEN as u16 + payload.len() as u16).to_be_bytes());
-    packet.extend_from_slice(&id.to_be_bytes());
-    packet.extend_from_slice(&flags_and_offset.to_be_bytes());
-    packet.push(IPV4_TTL);
-    packet.push(proto);
-    packet.extend_from_slice(&[0, 0]);
-    packet.extend_from_slice(&src);
-    packet.extend_from_slice(&dst);
-    let checksum = internet_checksum(&packet);
-    packet[IPV4_CHECKSUM].copy_from_slice(&checksum.to_be_bytes());
+    let mut packet = Vec::with_capacity(IPV4_HEADER_LEN + payload.len());
+    push_ipv4_header(
+        &mut packet,
+        id,
+        src,
+        dst,
+        proto,
+        flags_and_offset,
+        payload.len(),
+    );
     packet.extend_from_slice(payload);
     packet
 }
@@ -257,47 +282,101 @@ pub(super) struct TcpHeader {
     pub(super) advertise_mss: bool,
 }
 
+impl TcpHeader {
+    fn len(&self) -> usize {
+        TCP_HEADER_LEN
+            + if self.advertise_mss {
+                TCP_OPT_MSS_LEN
+            } else {
+                0
+            }
+    }
+
+    /// Appends the header with a zero checksum field.
+    fn push(&self, segment: &mut Vec<u8>) {
+        let header_len = self.len();
+        segment.extend_from_slice(&self.sport.to_be_bytes());
+        segment.extend_from_slice(&self.dport.to_be_bytes());
+        segment.extend_from_slice(&self.seq.to_be_bytes());
+        segment.extend_from_slice(&self.ack.to_be_bytes());
+        segment.push((header_len as u8 / 4) << 4);
+        segment.push(self.flags);
+        segment.extend_from_slice(&self.window.to_be_bytes());
+        // Checksum placeholder and urgent pointer.
+        segment.extend_from_slice(&[0, 0, 0, 0]);
+        if self.advertise_mss {
+            segment.extend_from_slice(&[TCP_OPT_MSS, TCP_OPT_MSS_LEN as u8]);
+            segment.extend_from_slice(&(MSS as u16).to_be_bytes());
+        }
+    }
+}
+
+/// The gateway builds whole frames with `tcp_frame`; the tests' guest side builds bare segments
+/// with this.
+#[cfg(test)]
 pub(super) fn tcp_segment(header: &TcpHeader, data: &[u8]) -> Vec<u8> {
-    let mut segment = tcp_segment_unchecked(header, data);
+    let mut segment = Vec::with_capacity(header.len() + data.len());
+    header.push(&mut segment);
+    segment.extend_from_slice(data);
     let checksum = transport_checksum(header.src, header.dst, IP_PROTO_TCP, &segment);
     segment[TCP_CHECKSUM].copy_from_slice(&checksum.to_be_bytes());
     segment
 }
 
-/// A segment whose checksum field holds only the folded pseudo-header sum, not complemented:
-/// what a NIC doing checksum offload expects, finished by whoever takes it
-/// (`NetHandle::send_tcp_segment`). Saves summing a 64 KiB payload here.
-pub(super) fn tcp_segment_partial(header: &TcpHeader, data: &[u8]) -> Vec<u8> {
-    let mut segment = tcp_segment_unchecked(header, data);
-    let sum = pseudo_header_sum(header.src, header.dst, IP_PROTO_TCP, segment.len());
-    segment[TCP_CHECKSUM].copy_from_slice(&(!checksum_finish(sum)).to_be_bytes());
-    segment
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum TcpChecksum {
+    Complete,
+    /// Only the folded pseudo-header sum, not complemented: what a NIC doing checksum offload
+    /// expects, finished by whoever takes the frame (`NetHandle::send_tcp_segment`). Saves summing
+    /// a 64 KiB payload here.
+    PseudoHeaderOnly,
 }
 
-/// The segment with a zero checksum field.
-pub(super) fn tcp_segment_unchecked(header: &TcpHeader, data: &[u8]) -> Vec<u8> {
-    let header_len = TCP_HEADER_LEN
-        + if header.advertise_mss {
-            TCP_OPT_MSS_LEN
-        } else {
-            0
-        };
-    let mut segment = Vec::with_capacity(header_len + data.len());
-    segment.extend_from_slice(&header.sport.to_be_bytes());
-    segment.extend_from_slice(&header.dport.to_be_bytes());
-    segment.extend_from_slice(&header.seq.to_be_bytes());
-    segment.extend_from_slice(&header.ack.to_be_bytes());
-    segment.push((header_len as u8 / 4) << 4);
-    segment.push(header.flags);
-    segment.extend_from_slice(&header.window.to_be_bytes());
-    // Checksum placeholder and urgent pointer.
-    segment.extend_from_slice(&[0, 0, 0, 0]);
-    if header.advertise_mss {
-        segment.extend_from_slice(&[TCP_OPT_MSS, TCP_OPT_MSS_LEN as u8]);
-        segment.extend_from_slice(&(MSS as u16).to_be_bytes());
+/// An Ethernet frame holding one TCP segment in one IPv4 packet with Don't Fragment set, however
+/// long: a large segment is split by the guest, so it must not be fragmented here. Built in one
+/// buffer so the payload is copied once, straight from wherever it waits; it comes in pieces
+/// because a ring buffer hands it out that way. The segment must fit an IPv4 packet.
+pub(super) fn tcp_frame(
+    dst_mac: [u8; 6],
+    src_mac: [u8; 6],
+    ip_id: u16,
+    header: &TcpHeader,
+    data: &[&[u8]],
+    checksum: TcpChecksum,
+) -> Vec<u8> {
+    let segment_len = header.len() + data.iter().map(|piece| piece.len()).sum::<usize>();
+    let tcp_start = ETH_HEADER_LEN + IPV4_HEADER_LEN;
+    let mut frame = Vec::with_capacity(tcp_start + segment_len);
+    frame.extend_from_slice(&dst_mac);
+    frame.extend_from_slice(&src_mac);
+    frame.extend_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
+    push_ipv4_header(
+        &mut frame,
+        ip_id,
+        header.src,
+        header.dst,
+        IP_PROTO_TCP,
+        IPV4_FLAG_DONT_FRAGMENT,
+        segment_len,
+    );
+    header.push(&mut frame);
+    for piece in data {
+        frame.extend_from_slice(piece);
     }
-    segment.extend_from_slice(data);
-    segment
+    let field = match checksum {
+        TcpChecksum::Complete => {
+            transport_checksum(header.src, header.dst, IP_PROTO_TCP, &frame[tcp_start..])
+        }
+        TcpChecksum::PseudoHeaderOnly => !checksum_finish(pseudo_header_sum(
+            header.src,
+            header.dst,
+            IP_PROTO_TCP,
+            segment_len,
+        )),
+    };
+    let checksum_at = tcp_start + TCP_CHECKSUM.start;
+    frame[checksum_at..checksum_at + TCP_CHECKSUM.len()].copy_from_slice(&field.to_be_bytes());
+    frame
 }
 
 pub(super) struct Ipv4Packet<'a> {

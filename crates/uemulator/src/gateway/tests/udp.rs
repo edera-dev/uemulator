@@ -1,5 +1,5 @@
 use super::*;
-use crate::gateway::udp::{FlowKey, UDP_IDLE_TIMEOUT_MS};
+use crate::gateway::udp::{UDP_IDLE_TIMEOUT_MS, UDP_PENDING_LIMIT};
 
 const SERVER: [u8; 4] = [93, 184, 216, 34];
 const SERVER_PORT: u16 = 9999;
@@ -536,6 +536,28 @@ fn datagrams_before_open_are_released_on_open_in_order() {
     assert_eq!(
         remote.drain_datagrams(&mut gateway, stream),
         [b"one".to_vec(), b"two".to_vec()]
+    );
+}
+
+#[test]
+fn datagrams_waiting_for_the_open_are_bounded_and_the_newest_dropped() {
+    let (mut gateway, mut remote) = user_net_with_remote();
+    for index in 0..UDP_PENDING_LIMIT + 10 {
+        let data = (index as u32).to_be_bytes();
+        send_at(
+            &mut gateway,
+            &udp_frame(4000, SERVER, SERVER_PORT, &data),
+            0,
+        );
+    }
+    let stream = remote.single_open(&mut gateway);
+    gateway.opened(stream);
+    let datagrams = remote.drain_datagrams(&mut gateway, stream);
+    assert_eq!(datagrams.len(), UDP_PENDING_LIMIT);
+    assert_eq!(
+        datagrams.last().unwrap(),
+        &((UDP_PENDING_LIMIT - 1) as u32).to_be_bytes().to_vec(),
+        "the oldest are kept"
     );
 }
 

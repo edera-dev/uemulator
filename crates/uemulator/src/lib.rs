@@ -53,7 +53,7 @@ pub use display::{
 };
 pub use gateway::{
     Endpoint, Gateway, GatewayConfig, GatewayPolicy, GatewayRequest, GuestFrame, StreamId,
-    StreamKind,
+    StreamInterest, StreamKind,
 };
 pub use gpu::{GpuBox, GpuCapset, GpuCommand, GpuLimits, GpuLink, GpuResource};
 #[cfg(not(freestanding))]
@@ -141,6 +141,14 @@ mod api_tests {
         let _: fn(&mut Gateway, StreamId) = Gateway::remote_closed;
         let _: fn(&mut Gateway, StreamId) = Gateway::reset;
         let _: fn(&mut Gateway, u64) = Gateway::poll;
+        let _: fn(&Gateway, StreamId) -> &[u8] = Gateway::to_remote;
+        let _: fn(&mut Gateway, StreamId, usize) = Gateway::consumed;
+        let _: fn(&Gateway, StreamId) -> usize = Gateway::room;
+        let _: fn(&Gateway) -> Vec<(StreamId, StreamInterest)> = Gateway::interest;
+        let _ = StreamInterest {
+            read: true,
+            write: false,
+        };
         let resolver = Endpoint {
             address: [1, 1, 1, 1],
             port: 53,

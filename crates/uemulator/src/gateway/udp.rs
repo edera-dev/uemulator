@@ -9,12 +9,12 @@ use alloc::collections::BTreeMap;
 use super::dhcp::DHCP_SERVER_PORT;
 use super::wire::{
     ICMP_CHECKSUM, ICMP_CODE_PORT_UNREACHABLE, ICMP_DEST_UNREACHABLE, ICMP_ERROR_HEADER_LEN,
-    IP_PROTO_ICMP, Ipv4Packet, UDP_DST_PORT, UDP_HEADER_LEN, UDP_LENGTH, UDP_SRC_PORT, be_u16,
-    internet_checksum, udp_segment,
+    IP_PROTO_ICMP, IP_PROTO_UDP, Ipv4Packet, UDP_DST_PORT, UDP_HEADER_LEN, UDP_LENGTH,
+    UDP_SRC_PORT, be_u16, internet_checksum, udp_segment,
 };
 use super::{
-    DNS_IP, DNS_PORT, Endpoint, GATEWAY_IP, Gateway, GatewayPolicy, GatewayRequest, LOOPBACK_IP,
-    StreamId, StreamKind,
+    DNS_IP, DNS_PORT, Endpoint, FlowKey, GATEWAY_IP, Gateway, GatewayPolicy, GatewayRequest,
+    LOOPBACK_IP, StreamId, StreamKind,
 };
 
 /// A flow with no datagram in either direction for this long is closed.
@@ -23,14 +23,9 @@ pub(super) const UDP_IDLE_TIMEOUT_MS: u64 = 60_000;
 /// least recently used flow is closed; the guest sees that as a lost datagram, which UDP
 /// applications already tolerate.
 pub(super) const MAX_UDP_FLOWS: usize = 128;
-
-/// Flow identity from the guest's point of view.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) struct FlowKey {
-    pub(super) guest_port: u16,
-    pub(super) remote_ip: [u8; 4],
-    pub(super) remote_port: u16,
-}
+/// Datagrams a flow holds while the driver opens its stream. Past this the newest are dropped,
+/// as a full socket buffer would; UDP applications already tolerate that.
+pub(super) const UDP_PENDING_LIMIT: usize = 64;
 
 pub(super) struct UdpFlow {
     stream: StreamId,
@@ -61,6 +56,13 @@ impl UdpFlows {
 
     pub(super) fn has_stream(&self, stream: StreamId) -> bool {
         self.by_stream.contains_key(&stream)
+    }
+
+    pub(super) fn open_streams(&self) -> impl Iterator<Item = StreamId> + '_ {
+        self.flows
+            .values()
+            .filter(|flow| flow.opened)
+            .map(|flow| flow.stream)
     }
 
     fn remove(&mut self, key: &FlowKey) -> Option<UdpFlow> {
@@ -167,7 +169,7 @@ impl Gateway {
                 stream: flow.stream,
                 data: data.to_vec(),
             });
-        } else {
+        } else if flow.pending.len() < UDP_PENDING_LIMIT {
             flow.pending.push(data.to_vec());
         }
     }
@@ -224,12 +226,7 @@ impl Gateway {
             key.guest_port,
             data,
         );
-        self.emit_ip(
-            key.remote_ip,
-            guest_ip,
-            super::wire::IP_PROTO_UDP,
-            &datagram,
-        );
+        self.emit_ip(key.remote_ip, guest_ip, IP_PROTO_UDP, &datagram);
     }
 
     /// A closed or reset UDP stream just ends the flow: there is no peer to tell and nothing the
