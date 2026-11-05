@@ -18,6 +18,7 @@ mod cpu;
 mod dev;
 mod disk;
 mod display;
+mod gateway;
 mod gpu;
 mod jit;
 mod kv;
@@ -50,6 +51,7 @@ pub use display::{
     BYTES_PER_PIXEL, Cursor, CursorImage, DisplayHandle, Frame, FrameUpdate, InputHandle,
     PointerButton, Rect, ScreenMirror, linux_key_for_usb_usage,
 };
+pub use gateway::{Endpoint, Gateway, GatewayConfig, GatewayPolicy, GuestFrame};
 pub use gpu::{GpuBox, GpuCapset, GpuCommand, GpuLimits, GpuLink, GpuResource};
 #[cfg(not(freestanding))]
 pub use kv::FileKeyValueStore;
@@ -123,6 +125,21 @@ mod api_tests {
         };
         let _: fn(&SegmentAgent) -> SegmentStatus = SegmentAgent::status;
         let _ = status;
+        let _: fn(GatewayConfig) -> Gateway = Gateway::new;
+        let _: fn(&mut Gateway, &[u8], u64) = Gateway::from_guest;
+        let _: fn(&mut Gateway) -> Option<GuestFrame> = Gateway::pop_for_guest;
+        let _: fn(&mut Gateway, GuestFrame) = Gateway::requeue_for_guest;
+        let _: fn(&Gateway, &[u8]) -> bool = Gateway::takes_frame;
+        let _: fn(&mut Gateway, bool) = Gateway::set_large_segments;
+        let resolver = Endpoint {
+            address: [1, 1, 1, 1],
+            port: 53,
+        };
+        let _ = GatewayConfig {
+            policy: GatewayPolicy::Segment { resolver },
+            isn_seed: 1,
+        };
+        let _ = GatewayPolicy::UserNet { dns: resolver };
         let _: fn(&StopHandle) = StopHandle::stop;
         let _: fn() -> MachineConfig = MachineConfig::new;
         let _: fn(MachineConfig, bool) -> MachineConfig = MachineConfig::reboot;
@@ -377,6 +394,7 @@ mod api_tests {
         is_send::<MachineConfig>();
         is_send::<EmulatedMachine>();
         is_send_sync::<SegmentAgent>();
+        is_send::<Gateway>();
         is_copy::<SegmentStatus>();
         is_copy::<SegmentDestination>();
         is_send_sync::<ConsoleHandle>();
