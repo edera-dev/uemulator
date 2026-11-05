@@ -392,12 +392,11 @@ pub(crate) fn assert_jit_matches_interpreter(code: &[u8], setup: impl Fn(&mut Ha
         result.interpreter.snapshot(),
         "state differs (jit vs interpreter)"
     );
-    if jit.cpu.ram[..] != result.interpreter.cpu.ram[..] {
-        let offset = jit
-            .cpu
-            .ram
+    let (jit_ram, interpreter_ram) = (&jit.cpu.ram[0..], &result.interpreter.cpu.ram[0..]);
+    if jit_ram != interpreter_ram {
+        let offset = jit_ram
             .iter()
-            .zip(result.interpreter.cpu.ram.iter())
+            .zip(interpreter_ram)
             .position(|(a, b)| a != b)
             .unwrap();
         panic!("RAM differs first at {offset:#x} (jit vs interpreter)");

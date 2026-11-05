@@ -476,14 +476,15 @@ mod placement {
 
     #[test]
     fn address_arithmetic_in_put_cannot_wrap() {
-        let mut ram = vec![0u8; 16];
+        let mut bytes = vec![0u8; 16];
+        let mut ram = RamSpan::from(&mut bytes);
         assert!(put(&mut ram, u64::MAX, &[1, 2]).is_err());
         assert!(put(&mut ram, u64::MAX - 1, &[1, 2, 3]).is_err());
         assert!(put(&mut ram, 15, &[1, 2]).is_err());
         assert!(put(&mut ram, 17, &[]).is_err());
         assert!(put(&mut ram, 16, &[]).is_ok());
         assert!(put(&mut ram, 14, &[7, 8]).is_ok());
-        assert_eq!(ram[14..], [7, 8]);
+        assert_eq!(bytes[14..], [7, 8]);
     }
 
     #[test]
@@ -1201,7 +1202,10 @@ mod gdt_and_page_tables {
         // The first read, through the identity map, returned the boot_params bytes.
         assert_eq!(
             harness.cpu.gpr[0],
-            u64_at(&harness.cpu.ram, BOOT_PARAMS as usize + SETUP_SECTS_OFFSET)
+            u64_at(
+                &harness.cpu.ram[0..],
+                BOOT_PARAMS as usize + SETUP_SECTS_OFFSET
+            )
         );
     }
 }

@@ -2,7 +2,7 @@ use crate::acpi::{self, AcpiConfig};
 use crate::machine::Error;
 #[cfg(freestanding)]
 use crate::prelude::*;
-use crate::ram;
+use crate::ram::{self, RamSpan};
 
 /// Where a relocatable kernel's protected-mode part is loaded. 16 MiB is the Debian kernel's
 /// `pref_address` and a multiple of its 2 MiB `kernel_alignment`; a non-relocatable kernel is
@@ -246,7 +246,7 @@ pub struct BootState {
     pub mode: BootMode,
 }
 
-fn put(ram: &mut [u8], addr: u64, data: &[u8]) -> Result<(), Error> {
+fn put(ram: &mut RamSpan<'_>, addr: u64, data: &[u8]) -> Result<(), Error> {
     let too_small = || Error::BadConfig("guest memory too small".into());
     let start = usize::try_from(addr).map_err(|_| too_small())?;
     let end = start.checked_add(data.len()).ok_or_else(too_small)?;
@@ -260,16 +260,17 @@ fn put(ram: &mut [u8], addr: u64, data: &[u8]) -> Result<(), Error> {
 /// `BootState` says they are: the first 4 GiB, and every GiB above it up to the end of RAM.
 /// `ram_top` is the end of the flat RAM buffer (`ram::flat_bytes`), which `ram` itself may be
 /// shorter than only in tests. Returns the GDT limit.
-fn write_gdt_and_page_tables(
-    ram: &mut [u8],
+fn write_gdt_and_page_tables<'r>(
+    ram: impl Into<RamSpan<'r>>,
     ram_top: u64,
     code_descriptor: u64,
 ) -> Result<u16, Error> {
+    let mut ram = ram.into();
     // Entries 0 and 1 stay null so the code and data descriptors land on the selectors
     // `BOOT_CS` and `BOOT_DS`.
     let gdt: [u64; 4] = [0, 0, code_descriptor, BOOT_DATA_DESCRIPTOR];
     let gdt_bytes: Vec<u8> = gdt.iter().flat_map(|entry| entry.to_le_bytes()).collect();
-    put(ram, GDT_ADDR, &gdt_bytes)?;
+    put(&mut ram, GDT_ADDR, &gdt_bytes)?;
 
     let first_pdpt = PML4 + PAGE_SIZE;
     let first_page_directory = first_pdpt + PAGE_SIZE;
@@ -313,7 +314,7 @@ fn write_gdt_and_page_tables(
             (gib << GIB_SHIFT) | PTE_PRESENT | PTE_WRITABLE | PTE_PAGE_SIZE,
         );
     }
-    put(ram, PML4, &tables)?;
+    put(&mut ram, PML4, &tables)?;
     Ok((gdt_bytes.len() - 1) as u16)
 }
 
@@ -324,8 +325,8 @@ fn write_gdt_and_page_tables(
 ///
 /// Every size and address comes from the image or the caller, so all arithmetic on them is
 /// checked and a misfit is an `Error`, never a panic.
-pub(crate) fn load(
-    ram: &mut [u8],
+pub(crate) fn load<'r>(
+    ram: impl Into<RamSpan<'r>>,
     kernel: &[u8],
     initrd: Option<&[u8]>,
     cmdline: &str,
@@ -335,13 +336,14 @@ pub(crate) fn load(
 
 /// `load`, and with `acpi` the tables are written into RAM, the memory map marks them, and
 /// `boot_params.acpi_rsdp_addr` points the kernel at them.
-pub(crate) fn load_with_acpi(
-    ram: &mut [u8],
+pub(crate) fn load_with_acpi<'r>(
+    ram: impl Into<RamSpan<'r>>,
     kernel: &[u8],
     initrd: Option<&[u8]>,
     cmdline: &str,
     acpi: Option<&AcpiConfig>,
 ) -> Result<BootState, Error> {
+    let mut ram = ram.into();
     let header = SetupHeader::parse(kernel)?;
     // +1 for the NUL; RAM is zeroed so the terminator is already there. The command line must
     // also end inside the usable low-memory range, or it would run into the reserved area (and,
@@ -372,8 +374,8 @@ pub(crate) fn load_with_acpi(
         .checked_add((header.init_size as u64).max(payload.len() as u64))
         .filter(|&end| end <= low_ram_top)
         .ok_or_else(|| Error::BadConfig("guest memory too small for kernel".into()))?;
-    put(ram, load_addr, payload)?;
-    put(ram, CMDLINE_ADDR, cmdline.as_bytes())?;
+    put(&mut ram, load_addr, payload)?;
+    put(&mut ram, CMDLINE_ADDR, cmdline.as_bytes())?;
 
     let mut boot_params = vec![0u8; BOOT_PARAMS_SIZE];
     // The header's own length byte says where it ends; boot_params has other fields past
@@ -397,7 +399,7 @@ pub(crate) fn load_with_acpi(
             .map(|unaligned| unaligned & !PAGE_MASK)
             .filter(|&addr| addr >= kernel_end)
             .ok_or_else(|| Error::BadConfig("guest memory too small for initrd".into()))?;
-        put(ram, addr, initrd)?;
+        put(&mut ram, addr, initrd)?;
         // `addr` is at most `initrd_addr_max`, so it and the length (below `limit`) fit in 32 bits.
         boot_params[RAMDISK_IMAGE_OFFSET..RAMDISK_IMAGE_OFFSET + 4]
             .copy_from_slice(&(addr as u32).to_le_bytes());
@@ -407,7 +409,7 @@ pub(crate) fn load_with_acpi(
 
     let e820 = match acpi {
         Some(config) => {
-            let rsdp = acpi::install(ram, config)?;
+            let rsdp = acpi::install(ram.reborrow(), config)?;
             boot_params[ACPI_RSDP_ADDR_OFFSET..ACPI_RSDP_ADDR_OFFSET + 8]
                 .copy_from_slice(&rsdp.to_le_bytes());
             e820_map_with_acpi(ram_top)
@@ -421,7 +423,7 @@ pub(crate) fn load_with_acpi(
         boot_params[entry + 8..entry + 16].copy_from_slice(&size.to_le_bytes());
         boot_params[entry + 16..entry + 20].copy_from_slice(&kind.to_le_bytes());
     }
-    put(ram, BOOT_PARAMS, &boot_params)?;
+    put(&mut ram, BOOT_PARAMS, &boot_params)?;
 
     let kernel_is_64_bit = header.xloadflags & XLF_KERNEL_64 != 0;
     let code_descriptor = if kernel_is_64_bit {
@@ -429,7 +431,7 @@ pub(crate) fn load_with_acpi(
     } else {
         BOOT_CODE32_DESCRIPTOR
     };
-    let gdt_limit = write_gdt_and_page_tables(ram, ram_top, code_descriptor)?;
+    let gdt_limit = write_gdt_and_page_tables(ram.reborrow(), ram_top, code_descriptor)?;
 
     Ok(BootState {
         // A 32-bit kernel starts at the first byte of its protected-mode image (`startup_32`).
@@ -467,13 +469,17 @@ const FIRMWARE_END: u64 = 0x10_0000;
 /// Places a firmware image at the top of the first mebibyte and returns the real-mode reset
 /// state. There is no ROM or chipset: the image sits in ordinary RAM, which is enough for a BIOS
 /// that does not write to its own range.
-pub(crate) fn load_firmware(ram: &mut [u8], image: &[u8]) -> Result<BootState, Error> {
+pub(crate) fn load_firmware<'r>(
+    ram: impl Into<RamSpan<'r>>,
+    image: &[u8],
+) -> Result<BootState, Error> {
+    let mut ram = ram.into();
     if image.is_empty() || image.len() > FIRMWARE_MAX_BYTES {
         return Err(Error::BadConfig(format!(
             "firmware must be between 1 byte and {FIRMWARE_MAX_BYTES} bytes"
         )));
     }
-    put(ram, FIRMWARE_END - image.len() as u64, image)?;
+    put(&mut ram, FIRMWARE_END - image.len() as u64, image)?;
     Ok(BootState {
         mode: BootMode::Real16,
         ..Default::default()

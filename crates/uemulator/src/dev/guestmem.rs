@@ -1,7 +1,7 @@
 use super::iommu::{Access, Iommu, PhysRead, PhysWrite};
 #[cfg(freestanding)]
 use crate::prelude::*;
-use crate::ram::is_ram_range;
+use crate::ram::{RamSpan, is_ram_range};
 use core::cell::RefCell;
 use core::sync::atomic::{Ordering, fence};
 
@@ -21,7 +21,7 @@ const PAGE_SHIFT: u32 = 12;
 /// IOMMU first (see `dev/iommu`); `read_raw`/`write_raw` and `PhysRead`/`PhysWrite` always mean
 /// physical addresses, which is what the IOMMU itself uses for its tables.
 pub(crate) struct GuestMem<'a> {
-    ram: &'a mut [u8],
+    ram: RamSpan<'a>,
     /// `Cpu::page_has_code`: one byte per guest page, nonzero if a translated block covers it.
     code: &'a [u8],
     /// Page numbers written while flagged in `code`, each listed once.
@@ -37,15 +37,15 @@ struct DmaPort {
 }
 
 /// A view of RAM for the IOMMU to read its tables through while `GuestMem` holds the IOMMU.
-struct RamView<'r>(&'r [u8]);
+struct RamView<'r, 'a>(&'r RamSpan<'a>);
 
-impl PhysRead for RamView<'_> {
+impl PhysRead for RamView<'_, '_> {
     fn read_phys(&self, phys_addr: u64, buf: &mut [u8]) -> bool {
         read_slice(self.0, phys_addr, buf)
     }
 }
 
-fn read_slice(ram: &[u8], phys_addr: u64, buf: &mut [u8]) -> bool {
+fn read_slice(ram: &RamSpan<'_>, phys_addr: u64, buf: &mut [u8]) -> bool {
     if !is_ram_range(ram.len() as u64, phys_addr, buf.len() as u64) {
         return false;
     }
@@ -70,9 +70,9 @@ fn chunk_len(remaining: usize, bytes_left: u64) -> usize {
 }
 
 impl<'a> GuestMem<'a> {
-    pub fn new(ram: &'a mut [u8], code: &'a [u8]) -> Self {
+    pub fn new(ram: impl Into<RamSpan<'a>>, code: &'a [u8]) -> Self {
         GuestMem {
-            ram,
+            ram: ram.into(),
             code,
             code_pages_written: Vec::new(),
             dma: None,
@@ -113,15 +113,16 @@ impl<'a> GuestMem<'a> {
         }
         let mut done = 0;
         while done < len {
-            let probe =
-                port.iommu
-                    .borrow_mut()
-                    .probe(&RamView(self.ram), port.requester, phys_addr + done);
+            let probe = port.iommu.borrow_mut().probe(
+                &RamView(&self.ram),
+                port.requester,
+                phys_addr + done,
+            );
             let Some(translation) = probe else {
                 // The device is about to be refused; let the IOMMU log why, as it would for
                 // the access itself. Permissions never fail a probe, so this is a real fault.
                 let _ = port.iommu.borrow_mut().translate(
-                    &RamView(self.ram),
+                    &RamView(&self.ram),
                     port.requester,
                     phys_addr + done,
                     Access::Read,
@@ -152,7 +153,7 @@ impl<'a> GuestMem<'a> {
                 return false;
             };
             let translated = port.iommu.borrow_mut().translate(
-                &RamView(self.ram),
+                &RamView(&self.ram),
                 port.requester,
                 address,
                 Access::Read,
@@ -183,7 +184,7 @@ impl<'a> GuestMem<'a> {
             };
             let translated = match &self.dma {
                 Some(port) => port.iommu.borrow_mut().translate(
-                    &RamView(self.ram),
+                    &RamView(&self.ram),
                     port.requester,
                     address,
                     Access::Write,
@@ -204,7 +205,7 @@ impl<'a> GuestMem<'a> {
 
     /// `read` without the IOMMU: `phys_addr` is a physical address.
     pub fn read_raw(&self, phys_addr: u64, buf: &mut [u8]) -> bool {
-        read_slice(self.ram, phys_addr, buf)
+        read_slice(&self.ram, phys_addr, buf)
     }
 
     /// `write` without the IOMMU: `phys_addr` is a physical address.

@@ -43,12 +43,15 @@ const FIRMWARE_LABELS = { uefi: "UEFI", none: "direct kernel", bios: "BIOS", cus
 const RADIOS = ["firmware", "console", "display"];
 const CHECKBOXES = ["shell", "replace-cmdline", "jit", "acpi", "iommu", "tpm", "secure-boot", "rng", "reboot", "input", "network"];
 const SELECTS = ["memory", "cpus"];
-// Where the guest RAM is one allocation of the 32-bit module: Rust refuses one larger than
-// isize::MAX, so 2 GiB less a MiB is the most there is.
-const MAX_MEMORY_MIB = 2047;
+// The guest's RAM is byte for byte its physical address space, and the PCI hole starts at
+// 3 GiB: more would put RAM above 4 GiB, past the end of a 32-bit module's memory.
+const MAX_MEMORY_MIB = 3072;
 // What live and installer ISOs need: Fedora's installer initramfs alone takes more than 1 GiB
 // to unpack, and with less the kernel ends in "VFS: Unable to mount root fs".
-const ISO_MEMORY_MIB = MAX_MEMORY_MIB;
+const ISO_MEMORY_MIB = 2048;
+// The old "2 GiB" (2 GiB less a MiB, the most one Rust allocation could have), still in saved
+// settings and links.
+const LEGACY_TWO_GIB_MIB = 2047;
 // Below this an ISO is a rescue or network-boot image (netboot.xyz is 2 MB) that needs no such
 // memory; the warning is for distribution ISOs. An ISO of unknown size gets it too.
 const BIG_ISO_BYTES = 256e6;
@@ -453,8 +456,9 @@ function restoreSettings() {
   const params = new URLSearchParams(location.search);
   for (const name of RADIOS) setRadio(name, params.get(name) ?? saved[name]);
   for (const id of CHECKBOXES) if (id in saved) $(id).checked = Boolean(saved[id]);
-  for (const id of SELECTS) if (id in saved) setSelect(id, saved[id]);
-  if (params.has("memory")) setSelect("memory", Math.min(Number(params.get("memory")), MAX_MEMORY_MIB));
+  const memoryMib = (mib) => (Number(mib) === LEGACY_TWO_GIB_MIB ? ISO_MEMORY_MIB : Math.min(Number(mib), MAX_MEMORY_MIB));
+  for (const id of SELECTS) if (id in saved) setSelect(id, id === "memory" ? memoryMib(saved[id]) : saved[id]);
+  if (params.has("memory")) setSelect("memory", memoryMib(params.get("memory")));
   $("cmdline").value = "cmdline" in saved ? saved.cmdline : DEFAULT_CMDLINE_EXTRA;
   if (params.has("args")) $("cmdline").value = params.get("args");
   if (params.has("iommu")) $("iommu").checked = $("acpi").checked = true;

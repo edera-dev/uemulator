@@ -19,6 +19,7 @@ use crate::dev::iommu::{self, IvrsTopology, SpecialDevice};
 use crate::dev::pci::{ECAM_BASE, ECAM_BYTES_PER_BUS, LEGACY_IRQS};
 use crate::dev::{HPET_REQUESTER, IOAPIC_REQUESTER, ioapic::IOAPIC_ID};
 use crate::machine::Error;
+use crate::ram::RamSpan;
 
 /// Where the tables live: inside the BIOS area (0xE0000..0xFFFFF), which the e820 map already
 /// reports as reserved. Tables, RSDP first.
@@ -144,7 +145,8 @@ pub(crate) fn build(config: &AcpiConfig) -> Result<Vec<u8>, Error> {
 }
 
 /// Writes the tables into `ram` and returns the RSDP's physical address.
-pub(crate) fn install(ram: &mut [u8], config: &AcpiConfig) -> Result<u64, Error> {
+pub(crate) fn install<'r>(ram: impl Into<RamSpan<'r>>, config: &AcpiConfig) -> Result<u64, Error> {
+    let mut ram = ram.into();
     let image = build(config)?;
     let start = REGION_BASE as usize;
     ram.get_mut(start..start + image.len())

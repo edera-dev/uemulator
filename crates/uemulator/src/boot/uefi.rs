@@ -10,7 +10,7 @@ use crate::dev::bootfb::FramebufferRegion;
 use crate::dev::kv::{KV_PORT_BASE, KV_PORT_COUNT};
 #[cfg(freestanding)]
 use crate::prelude::*;
-use crate::ram;
+use crate::ram::{self, RamSpan};
 
 /// Where the image is placed: the first MiB belongs to legacy structures.
 pub(crate) const FIRMWARE_BASE: u64 = 0x10_0000;
@@ -238,7 +238,7 @@ struct PlacedPayload {
 /// The firmware reserves exactly these ranges (`memory::init`), so they must not overlap each
 /// other or anything the library wrote.
 fn place_payload(
-    ram: &mut [u8],
+    ram: &mut RamSpan<'_>,
     payload: &UefiPayload,
     floor: u64,
     ceiling: u64,
@@ -285,16 +285,17 @@ fn place_payload(
 
 /// Places the firmware image at `FIRMWARE_BASE`, the handoff page and the boot GDT and
 /// identity-mapped page tables, and returns the 64-bit entry state (`rdi` = handoff).
-pub(crate) fn load_uefi_firmware(
-    ram: &mut [u8],
+pub(crate) fn load_uefi_firmware<'r>(
+    ram: impl Into<RamSpan<'r>>,
     image: &[u8],
     params: &FirmwareParams,
     acpi: Option<&crate::acpi::AcpiConfig>,
     payload: Option<&UefiPayload>,
 ) -> Result<BootState, Error> {
+    let mut ram = ram.into();
     let mut params = params.clone();
     if let Some(config) = acpi {
-        params.rsdp = crate::acpi::install(ram, config)?;
+        params.rsdp = crate::acpi::install(ram.reborrow(), config)?;
         params.acpi_region = (crate::acpi::REGION_BASE, crate::acpi::REGION_BYTES);
     }
     let params = &params;
@@ -321,7 +322,7 @@ pub(crate) fn load_uefi_firmware(
             "guest memory too small for firmware".into(),
         ));
     }
-    put(ram, FIRMWARE_BASE, image)?;
+    put(&mut ram, FIRMWARE_BASE, image)?;
     let framebuffer = params
         .framebuffer
         .map(|(width, height)| framebuffer_region(ram_top, width, height));
@@ -333,7 +334,7 @@ pub(crate) fn load_uefi_firmware(
     }
     let placed = match payload {
         Some(payload) => Some(place_payload(
-            ram,
+            &mut ram,
             payload,
             FIRMWARE_BASE + footprint,
             ceiling,
@@ -434,9 +435,9 @@ pub(crate) fn load_uefi_firmware(
         handoff.put_u64(at + 8, *size);
     }
     let handoff = handoff.0;
-    put(ram, HANDOFF_ADDR, &handoff)?;
+    put(&mut ram, HANDOFF_ADDR, &handoff)?;
 
-    let gdt_limit = write_gdt_and_page_tables(ram, ram_top, BOOT_CODE_DESCRIPTOR)?;
+    let gdt_limit = write_gdt_and_page_tables(ram.reborrow(), ram_top, BOOT_CODE_DESCRIPTOR)?;
     Ok(BootState {
         rip: FIRMWARE_BASE + entry,
         rdi: HANDOFF_ADDR,

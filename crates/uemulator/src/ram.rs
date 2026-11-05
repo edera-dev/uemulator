@@ -1,6 +1,6 @@
 //! Guest RAM and the per-page "translated code" flags, as handles that every vCPU of a machine
 //! clones. One allocation backs all of them, so with host threads the vCPUs see each other's
-//! stores, and with one thread nothing changes: the slice views below behave like a `Vec<u8>`.
+//! stores, and with one thread nothing changes: the ranged views below behave like a `Vec<u8>`.
 //!
 //! The views hand out `&[u8]` and `&mut [u8]` over memory other vCPU threads may be writing. That
 //! is a data race in Rust's model, and it is what the guest asked for: a racing guest sees
@@ -8,12 +8,19 @@
 //! entries, atomic read-modify-write, anything a host loop polls) goes through the raw accessors
 //! in `cpu/atomic.rs` instead, and never keeps a slice across a point where another thread could
 //! change what it depends on.
+//!
+//! There is deliberately no view of all of RAM as one slice. On wasm32 the RAM can be larger than
+//! `isize::MAX` (3 GiB on the web page), and Rust allows no slice, `pointer::add` or allocation
+//! that large: the compiler marks slice indexing as an in-bounds offset that a signed 32-bit
+//! index past 2 GiB would break. So every view is a range checked here, its address formed with
+//! `wrapping_add`, and code that walks RAM asks for the piece it needs.
 
 #[cfg(freestanding)]
 use crate::prelude::*;
 use crate::sync::Arc;
 use alloc::alloc::{Layout, alloc_zeroed};
-use core::ops::{Deref, DerefMut, Index, IndexMut};
+use core::marker::PhantomData;
+use core::ops::{Index, IndexMut, Range, RangeFrom};
 use core::sync::atomic::{AtomicU8, Ordering};
 
 /// First guest physical address of the hole below 4 GiB that holds the PCI BARs, the ECAM, the
@@ -69,12 +76,26 @@ pub(crate) fn zeroed_bytes(len: usize) -> Option<Vec<u8>> {
     Some(unsafe { Vec::from_raw_parts(pointer, len, len) })
 }
 
-/// The memory behind a `GuestRam`. `bytes` is never touched except to keep the allocation alive
-/// and to take its address, which stays valid because a `Vec` does not move its heap buffer.
+/// What keeps a `GuestRam`'s memory alive.
+enum Backing {
+    /// From the global allocator. Never touched except to free it on drop; a `Vec` does not move
+    /// its heap buffer, so the block's pointer stays valid.
+    Allocated(#[allow(dead_code)] Vec<u8>),
+    /// Pages added to the module's memory with `memory.grow`, for RAM the allocator cannot hand
+    /// out (more than `isize::MAX` bytes). WebAssembly memory never shrinks, so these are never
+    /// freed: the web page runs one machine per instance, and `GuestRam::zeroed_again` reuses
+    /// them across a guest reboot instead of growing a second copy that would not fit.
+    #[cfg(target_arch = "wasm32")]
+    Grown,
+}
+
+/// The memory behind a `GuestRam`.
 struct RamBlock {
     pointer: *mut u8,
     length: usize,
-    _bytes: Vec<u8>,
+    // Read only on wasm32, the one host with `Backing::Grown`; elsewhere it only frees the RAM.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    backing: Backing,
 }
 
 // The block is plain memory; sharing it between threads is the point.
@@ -95,13 +116,67 @@ impl GuestRam {
             block: Arc::new(RamBlock {
                 pointer,
                 length,
-                _bytes: bytes,
+                backing: Backing::Allocated(bytes),
             }),
         }
     }
 
+    /// `length` zeroed bytes, or `None` when the host refuses.
+    pub fn zeroed(length: usize) -> Option<Self> {
+        if length <= isize::MAX as usize {
+            return zeroed_bytes(length).map(GuestRam::new);
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let pointer = grow_zeroed(length)?;
+            Some(GuestRam {
+                block: Arc::new(RamBlock {
+                    pointer,
+                    length,
+                    backing: Backing::Grown,
+                }),
+            })
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        None
+    }
+
+    /// The same amount of zeroed RAM, for a reboot. Fresh pages from the allocator rather than a
+    /// fill of the old ones, which would commit every page the host had lazily left untouched;
+    /// grown pages cannot be given back, so those are zeroed in place, which needs this to be the
+    /// last handle.
+    pub fn zeroed_again(self) -> Option<Self> {
+        let length = self.len();
+        #[cfg(target_arch = "wasm32")]
+        if let Backing::Grown = self.block.backing {
+            let block = Arc::into_inner(self.block)?;
+            let mut ram = GuestRam {
+                block: Arc::new(block),
+            };
+            for range in views_covering(length) {
+                ram[range].fill(0);
+            }
+            return Some(ram);
+        }
+        drop(self);
+        GuestRam::zeroed(length)
+    }
+
+    /// A copy that shares nothing with this RAM, for `verify`'s interpreter twin.
+    pub fn duplicate(&self) -> Option<Self> {
+        let mut copy = GuestRam::zeroed(self.len())?;
+        for range in views_covering(self.len()) {
+            copy[range.clone()].copy_from_slice(&self[range]);
+        }
+        Some(copy)
+    }
+
     /// Host address of byte 0.
     pub fn base(&self) -> *mut u8 {
+        self.block.pointer
+    }
+
+    pub fn as_ptr(&self) -> *const u8 {
         self.block.pointer
     }
 
@@ -115,8 +190,48 @@ impl GuestRam {
         if !self.contains(start, len as u64) {
             return None;
         }
-        Some(&self[start as usize..][..len])
+        self.get(start as usize..start as usize + len)
     }
+
+    fn extent(&self) -> (*mut u8, usize) {
+        (self.block.pointer, self.block.length)
+    }
+}
+
+/// The longest view `GuestRam` hands out: the most a Rust slice may cover.
+const MAX_VIEW_BYTES: usize = isize::MAX as usize;
+
+/// `0..length` as ranges no longer than a view may be.
+fn views_covering(length: usize) -> impl Iterator<Item = Range<usize>> {
+    (0..length)
+        .step_by(MAX_VIEW_BYTES)
+        .map(move |start| start..length.min(start + MAX_VIEW_BYTES))
+}
+
+/// The range `ram[start..]` means: to the end, but no longer than a slice may be. Only RAM past
+/// `isize::MAX` (wasm32) is ever cut short, and the callers take a short prefix of it
+/// (`ram[start..][..len]`), so a cut view still holds what they index.
+fn capped(range: RangeFrom<usize>, length: usize) -> Range<usize> {
+    range.start..length.min(range.start.saturating_add(MAX_VIEW_BYTES))
+}
+
+/// `length` zeroed bytes grown onto the module's memory, or `None` when it cannot grow that far.
+/// New WebAssembly pages are zero, so nothing is written.
+#[cfg(target_arch = "wasm32")]
+fn grow_zeroed(length: usize) -> Option<*mut u8> {
+    const WASM_PAGE_BYTES: usize = 64 << 10;
+    const MAIN_MEMORY: u32 = 0;
+    const GROW_FAILED: usize = usize::MAX;
+    let first_page =
+        core::arch::wasm32::memory_grow::<MAIN_MEMORY>(length.div_ceil(WASM_PAGE_BYTES));
+    if first_page == GROW_FAILED {
+        return None;
+    }
+    // Memory from `memory.grow` belongs to no Rust allocation; it is addressed like memory a host
+    // mapped, by its address.
+    Some(core::ptr::with_exposed_provenance_mut(
+        first_page * WASM_PAGE_BYTES,
+    ))
 }
 
 impl Default for GuestRam {
@@ -131,18 +246,154 @@ impl From<Vec<u8>> for GuestRam {
     }
 }
 
-impl Deref for GuestRam {
-    type Target = [u8];
-    fn deref(&self) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(self.block.pointer, self.block.length) }
+/// Guest RAM borrowed for writing: what the boot loaders and device DMA (`GuestMem`) take. Made
+/// from a `GuestRam`, or from a buffer of the host's own (`load_linux`, `Platform::tick`, the
+/// device tests), which can never be larger than a slice.
+pub(crate) struct RamSpan<'a> {
+    pointer: *mut u8,
+    length: usize,
+    _borrow: PhantomData<&'a mut [u8]>,
+}
+
+impl RamSpan<'_> {
+    /// A shorter-lived span over the same bytes, to hand to a callee and keep this one.
+    pub fn reborrow(&mut self) -> RamSpan<'_> {
+        RamSpan {
+            pointer: self.pointer,
+            length: self.length,
+            _borrow: PhantomData,
+        }
+    }
+
+    fn extent(&self) -> (*mut u8, usize) {
+        (self.pointer, self.length)
     }
 }
 
-impl DerefMut for GuestRam {
-    fn deref_mut(&mut self) -> &mut [u8] {
-        unsafe { core::slice::from_raw_parts_mut(self.block.pointer, self.block.length) }
+impl<'a> From<&'a mut [u8]> for RamSpan<'a> {
+    fn from(bytes: &'a mut [u8]) -> Self {
+        RamSpan {
+            pointer: bytes.as_mut_ptr(),
+            length: bytes.len(),
+            _borrow: PhantomData,
+        }
     }
 }
+
+impl<'a> From<&'a mut Vec<u8>> for RamSpan<'a> {
+    fn from(bytes: &'a mut Vec<u8>) -> Self {
+        RamSpan::from(bytes.as_mut_slice())
+    }
+}
+
+impl<'a> From<&'a mut GuestRam> for RamSpan<'a> {
+    fn from(ram: &'a mut GuestRam) -> Self {
+        let (pointer, length) = ram.extent();
+        RamSpan {
+            pointer,
+            length,
+            _borrow: PhantomData,
+        }
+    }
+}
+
+/// Where `range` of the `length` bytes at `pointer` starts, or `None` when it is reversed, runs
+/// past the end, or is longer than a Rust slice may be. The PCI hole is not checked: it is part
+/// of the buffer, just never touched.
+fn view_start(pointer: *mut u8, length: usize, range: &Range<usize>) -> Option<*mut u8> {
+    let fits = range.start <= range.end
+        && range.end <= length
+        && range.end - range.start <= MAX_VIEW_BYTES;
+    // `wrapping_add`, not `add`: the offset may be past `isize::MAX` (see the module comment).
+    fits.then(|| pointer.wrapping_add(range.start))
+}
+
+#[track_caller]
+fn out_of_range(range: &Range<usize>, length: usize) -> ! {
+    panic!(
+        "guest RAM range {range:?} is reversed, past its {length} bytes or longer than {MAX_VIEW_BYTES}"
+    )
+}
+
+/// The ranged views of `GuestRam` and `RamSpan`, which both reduce to `extent`. Indexing panics
+/// like a slice's would; `ram[start..]` is `capped`.
+macro_rules! ram_views {
+    ($ram:ty) => {
+        impl $ram {
+            pub fn len(&self) -> usize {
+                self.extent().1
+            }
+
+            pub fn get(&self, range: Range<usize>) -> Option<&[u8]> {
+                let (pointer, length) = self.extent();
+                let start = view_start(pointer, length, &range)?;
+                Some(unsafe { core::slice::from_raw_parts(start, range.end - range.start) })
+            }
+
+            pub fn get_mut(&mut self, range: Range<usize>) -> Option<&mut [u8]> {
+                let (pointer, length) = self.extent();
+                let start = view_start(pointer, length, &range)?;
+                Some(unsafe { core::slice::from_raw_parts_mut(start, range.end - range.start) })
+            }
+        }
+
+        impl Index<Range<usize>> for $ram {
+            type Output = [u8];
+            #[track_caller]
+            fn index(&self, range: Range<usize>) -> &[u8] {
+                match self.get(range.clone()) {
+                    Some(bytes) => bytes,
+                    None => out_of_range(&range, self.len()),
+                }
+            }
+        }
+
+        impl IndexMut<Range<usize>> for $ram {
+            #[track_caller]
+            fn index_mut(&mut self, range: Range<usize>) -> &mut [u8] {
+                let length = self.len();
+                match self.get_mut(range.clone()) {
+                    Some(bytes) => bytes,
+                    None => out_of_range(&range, length),
+                }
+            }
+        }
+
+        impl Index<RangeFrom<usize>> for $ram {
+            type Output = [u8];
+            #[track_caller]
+            fn index(&self, range: RangeFrom<usize>) -> &[u8] {
+                &self[capped(range, self.len())]
+            }
+        }
+
+        impl IndexMut<RangeFrom<usize>> for $ram {
+            #[track_caller]
+            fn index_mut(&mut self, range: RangeFrom<usize>) -> &mut [u8] {
+                let length = self.len();
+                &mut self[capped(range, length)]
+            }
+        }
+
+        impl Index<usize> for $ram {
+            type Output = u8;
+            #[track_caller]
+            fn index(&self, offset: usize) -> &u8 {
+                &self[offset..offset.wrapping_add(1)][0]
+            }
+        }
+
+        impl IndexMut<usize> for $ram {
+            #[track_caller]
+            fn index_mut(&mut self, offset: usize) -> &mut u8 {
+                &mut self[offset..offset.wrapping_add(1)][0]
+            }
+        }
+    };
+}
+
+ram_views!(GuestRam);
+ram_views!(RamSpan<'_>);
 
 /// One byte per guest physical page: nonzero while some vCPU's decode cache or JIT holds code
 /// built from that page. Cloning shares the flags.
@@ -293,6 +544,91 @@ mod tests {
         assert_eq!(zeroed_bytes(0).unwrap().len(), 0);
         assert!(zeroed_bytes(4096).unwrap().iter().all(|&byte| byte == 0));
         assert!(zeroed_bytes(isize::MAX as usize).is_none());
+    }
+
+    #[test]
+    fn views_are_checked_ranges() {
+        let mut ram = GuestRam::new((0..=255).collect());
+        assert_eq!(ram.len(), 256);
+        assert_eq!(&ram[2..5], &[2, 3, 4]);
+        assert_eq!(ram[200..].len(), 56, "an open range runs to the end");
+        assert_eq!(&ram[250..][..2], &[250, 251]);
+        ram[7] = 99;
+        assert_eq!(ram.get(7..8), Some(&[99u8][..]));
+        assert_eq!(ram.get(250..257), None);
+        #[allow(clippy::reversed_empty_ranges)]
+        let reversed = ram.get(9..8);
+        assert_eq!(reversed, None);
+        assert_eq!(ram.get(256..256), Some(&[][..]));
+        assert_eq!(ram.get(256..257), None);
+    }
+
+    #[test]
+    fn a_span_over_a_host_buffer_writes_through_to_it() {
+        let mut bytes = vec![0u8; 8];
+        let mut span = RamSpan::from(&mut bytes);
+        span.reborrow()[2..4].copy_from_slice(&[5, 6]);
+        span[7] = 1;
+        assert_eq!(span.len(), 8);
+        assert_eq!(bytes, [0, 0, 5, 6, 0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn rebooted_ram_is_zeroed_and_as_long() {
+        let mut ram = GuestRam::zeroed(1 << 16).unwrap();
+        ram[100] = 1;
+        let again = ram.zeroed_again().unwrap();
+        assert_eq!(again.len(), 1 << 16);
+        assert!(again[0..1 << 16].iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn a_duplicate_shares_nothing() {
+        let mut ram = GuestRam::new(vec![3; 64]);
+        let copy = ram.duplicate().unwrap();
+        ram[0] = 4;
+        assert_eq!(copy[0], 3);
+        assert_eq!(copy.len(), 64);
+        assert_ne!(copy.base(), ram.base());
+    }
+
+    #[test]
+    fn views_covering_never_exceed_a_slice() {
+        assert!(views_covering(10).eq(core::iter::once(0..10)));
+        assert_eq!(views_covering(0).count(), 0);
+        let big = MAX_VIEW_BYTES + 3;
+        let pieces: Vec<_> = views_covering(big).collect();
+        assert_eq!(pieces, [0..MAX_VIEW_BYTES, MAX_VIEW_BYTES..big]);
+        assert_eq!(capped(5.., big), 5..big);
+        assert_eq!(capped(1.., big), 1..MAX_VIEW_BYTES + 1);
+        assert_eq!(capped(0.., big), 0..MAX_VIEW_BYTES);
+    }
+
+    /// The web page's 3 GiB guests: more than the allocator may hand out on wasm32. Leaks the
+    /// 2 GiB it grows for the rest of the test run, which is why it is the smallest size that
+    /// takes that path.
+    #[cfg(target_arch = "wasm32")]
+    #[test]
+    fn wasm32_ram_past_isize_max_is_grown_and_addressable() {
+        const LENGTH: usize = MAX_VIEW_BYTES + 1 + (64 << 10);
+        let mut ram = GuestRam::zeroed(LENGTH).expect("the module's memory can grow past 2 GiB");
+        assert_eq!(ram.len(), LENGTH);
+        let past_two_gib = MAX_VIEW_BYTES + 1;
+        ram[past_two_gib] = 0xaa;
+        ram[LENGTH - 1] = 0xbb;
+        assert_eq!(&ram[past_two_gib - 1..][..2], &[0, 0xaa]);
+        assert_eq!(ram[LENGTH - 1], 0xbb);
+        // The host address the CPU and the JIT form for it: `ram_base + physical`.
+        let host = (ram.base() as usize as u64 + past_two_gib as u64) as usize as *const u8;
+        assert_eq!(unsafe { *host }, 0xaa);
+        assert!(ram.get(0..LENGTH).is_none(), "no slice that long");
+        assert_eq!(ram[0..].len(), MAX_VIEW_BYTES);
+        let base = ram.base();
+        let again = ram
+            .zeroed_again()
+            .expect("the last handle reuses its pages");
+        assert_eq!(again.base(), base);
+        assert_eq!((again[past_two_gib], again[LENGTH - 1]), (0, 0));
     }
 
     #[test]

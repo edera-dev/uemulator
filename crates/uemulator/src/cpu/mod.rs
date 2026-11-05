@@ -647,19 +647,20 @@ impl Cpu {
     /// Starts in 64-bit long mode with paging already on, as the Linux 64-bit boot protocol
     /// leaves it (`docs/plans/02-boot.md`): there is no firmware to set any of this up.
     pub fn new(
-        ram: Vec<u8>,
+        ram: impl Into<GuestRam>,
         boot: BootState,
         console: ConsoleHandle,
         stop: Arc<AtomicBool>,
         log: Option<LogFn>,
         dev_config: DevConfig,
     ) -> Self {
+        let ram = ram.into();
         let ram_bytes = ram.len();
         let pages = ram_bytes >> PAGE_SHIFT;
         let cpu_count = dev_config.cpus.max(1) as u32;
         let devices = DevHandle::new(Devices::new(console, dev_config));
         let parts = MachineParts {
-            ram: GuestRam::new(ram),
+            ram,
             page_has_code: CodePages::new(pages),
             dev: devices,
             ram_bytes,

@@ -24,6 +24,7 @@ use crate::gpu::{self, GpuLink};
 use crate::kv::{KeyValueStore, MemoryKeyValueStore};
 use crate::netdev::NetHandle;
 use crate::platform::{DEFAULT_CMDLINE, DEFAULT_SERIAL_CMDLINE};
+use crate::ram::GuestRam;
 use crate::sync::{Arc, Mutex};
 
 #[derive(Debug)]
@@ -634,7 +635,7 @@ impl StopHandle {
 
 /// Everything the vCPU thread owns once `start` moves it off the caller's thread.
 struct Vcpu {
-    ram: Vec<u8>,
+    ram: GuestRam,
     boot: BootState,
     /// What the host poll hook receives: the first configured console.
     primary_console: ConsoleHandle,
@@ -655,7 +656,7 @@ struct Vcpu {
     unix_time: Option<u64>,
     random_seed: Option<u64>,
     /// Pristine copy of RAM for the lockstep interpreter CPU; only set when `verify` is on.
-    boot_ram: Option<Vec<u8>>,
+    boot_ram: Option<GuestRam>,
     devcfg: DevConfig,
     /// What a restart needs; `None` when a reset should end the run.
     reboot: Option<RebootImage>,
@@ -760,9 +761,12 @@ fn uefi_payload<'a>(
 }
 
 /// Guest RAM on host huge pages where the host has them (Linux, `jit` feature for `libc`).
-fn back_with_huge_pages(ram: &mut [u8]) {
+fn back_with_huge_pages(ram: &mut GuestRam) {
+    // A 64-bit host's RAM always fits one slice; only wasm32's can be longer.
     #[cfg(all(feature = "jit", target_os = "linux"))]
-    crate::sys::advise_huge_pages(ram);
+    if let Some(bytes) = ram.get_mut(0..ram.len()) {
+        crate::sys::advise_huge_pages(bytes);
+    }
     #[cfg(not(all(feature = "jit", target_os = "linux")))]
     let _ = ram;
 }
@@ -770,12 +774,12 @@ fn back_with_huge_pages(ram: &mut [u8]) {
 /// Zeroed guest RAM for `memory_mib`, laid out around the PCI hole (`ram::flat_bytes`). Fails
 /// where the host cannot reserve that much address space (a 32-bit host, or one that does not
 /// overcommit).
-fn allocate_ram(memory_mib: usize) -> Result<Vec<u8>, Error> {
+fn allocate_ram(memory_mib: usize) -> Result<GuestRam, Error> {
     let cannot = || Error::BadConfig(format!("cannot allocate {memory_mib} MiB of guest memory"));
     let flat_bytes = crate::ram::flat_bytes((memory_mib as u64) << BYTES_PER_MIB_SHIFT);
     let mut ram = usize::try_from(flat_bytes)
         .ok()
-        .and_then(crate::ram::zeroed_bytes)
+        .and_then(GuestRam::zeroed)
         .ok_or_else(cannot)?;
     back_with_huge_pages(&mut ram);
     Ok(ram)
@@ -979,7 +983,7 @@ fn mirrored_devices(main: &mut DevConfig, main_uart: &ConsoleHandle) -> (DevConf
 /// device set. Time is always virtual here (no `wall_clock`) because only instruction
 /// counts, which both CPUs share, keep the two clocks equal.
 fn interpreter_twin(
-    ram: Vec<u8>,
+    ram: GuestRam,
     boot: BootState,
     stop: Arc<AtomicBool>,
     boot_unix: u64,
@@ -993,7 +997,9 @@ fn interpreter_twin(
 
 /// What a finished run hands to the next one.
 struct Finished {
-    ram_bytes: usize,
+    /// The RAM the run ended with, every vCPU's handle to it dropped, so a reboot can reuse
+    /// memory that cannot be freed (`GuestRam::zeroed_again`).
+    ram: GuestRam,
     disks: Vec<Disk>,
 }
 
@@ -1008,9 +1014,8 @@ impl Vcpu {
             if let Some(log) = &self.log {
                 log("guest reset: rebooting");
             }
-            // Fresh zeroed RAM, not a `fill(0)` of the old one: `boot::load` relies on zeroes,
-            // and filling would commit every page the host had lazily left untouched.
-            let Some(mut ram) = crate::ram::zeroed_bytes(finished.ram_bytes) else {
+            // `boot::load` relies on zeroed RAM.
+            let Some(mut ram) = finished.ram.zeroed_again() else {
                 return ExitReason::Internal("reboot: cannot allocate guest memory".into());
             };
             back_with_huge_pages(&mut ram);
@@ -1092,7 +1097,6 @@ impl Vcpu {
             )
         });
         let ram = core::mem::take(&mut self.ram);
-        let ram_bytes = ram.len();
         // This thread runs the devices from here on: the vCPU of a one-processor machine (its
         // idle wait parks) or the device thread of a threaded one (`run_threaded`). A frame from
         // the host unparks it at once instead of waiting out the sleep.
@@ -1234,7 +1238,7 @@ impl Vcpu {
             gpu.set_device_waker(None);
         }
         let finished = Finished {
-            ram_bytes,
+            ram: core::mem::take(&mut cpu.ram),
             disks: cpu
                 .dev
                 .into_devices()
@@ -1568,7 +1572,15 @@ impl EmulatedMachine {
             ),
             input: input.clone(),
         };
-        let boot_ram = cfg.verify.then(|| ram.clone());
+        // A copy, not a clone: a clone of a `GuestRam` shares the memory.
+        let boot_ram = if cfg.verify {
+            let copy = ram.duplicate().ok_or_else(|| {
+                Error::BadConfig("cannot allocate a second copy of guest memory for verify".into())
+            })?;
+            Some(copy)
+        } else {
+            None
+        };
         // Verification cannot restart (the twin's devices cannot be rebuilt in step), so it keeps
         // no image and a reset ends the run.
         let reboot =

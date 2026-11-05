@@ -196,7 +196,7 @@ mod rtc {
         let stop = Arc::new(AtomicBool::new(false));
         match boot_unix {
             Some(boot_unix) => interpreter_twin(
-                ram,
+                ram.into(),
                 boot,
                 stop,
                 boot_unix,
@@ -247,7 +247,7 @@ mod rtc {
         let boot = boot::load(&mut ram, &fake_bzimage(&[0xf4]), None, "").unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let twin = interpreter_twin(
-            ram,
+            ram.into(),
             boot,
             stop.clone(),
             1,

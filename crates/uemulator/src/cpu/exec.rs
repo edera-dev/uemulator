@@ -953,7 +953,7 @@ impl Cpu {
         {
             return Ok(0);
         }
-        let ram = self.ram.as_mut_ptr();
+        let ram = self.ram.base();
         if let Some(src_pa) = src_pa {
             if !self.ram.contains(src_pa, bytes) || (dst_pa > src_pa && dst_pa < src_pa + bytes) {
                 return Ok(0);
