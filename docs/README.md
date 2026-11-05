@@ -37,7 +37,7 @@ The design plans in [`plans/`](plans/README.md) are the source of truth for how 
 - [19-uefi-firmware.md](plans/19-uefi-firmware.md): the built-in UEFI firmware, its handoff page and key-value store.
 - [17-bios.md](plans/17-bios.md): BIOS services as host code, and booting a disk's boot sector.
 - [18-xen-dom0.md](plans/18-xen-dom0.md): bringing up a Xen dom0 on the emulated AMD machine, step by step.
-- [26-tpm-secure-boot.md](plans/26-tpm-secure-boot.md): the TPM 2.0, measured boot and the event log, Secure Boot with Microsoft's keys.
+- [26-tpm-secure-boot.md](plans/26-tpm-secure-boot.md): the TPM 2.0 (keys, sessions, NV, persistence), measured boot and the event log, Secure Boot with Microsoft's keys.
 
 ## Storage and network
 
