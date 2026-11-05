@@ -1,6 +1,6 @@
 [package]
 name = "uemulator-crypto"
-description = "Hashes, RSA signature checks, X.509, PKCS#7 and Authenticode for uemulator's TPM and Secure Boot"
+description = "Hashes, HMAC and the TPM KDFs, AES-CFB, RSA and P-256 keys, X.509, PKCS#7 and Authenticode for uemulator's TPM and Secure Boot"
 version.workspace = true
 edition.workspace = true
 

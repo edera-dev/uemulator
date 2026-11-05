@@ -1,8 +1,9 @@
 //! The cryptography the TPM device and the firmware's Secure Boot need, written for this
-//! project: `no_std` with `alloc`, no dependencies, verification only (no private-key
-//! operations, nothing secret to protect, so no constant-time requirements). Every parser takes
-//! untrusted bytes (PE files, variables a guest writes) and returns `Error` rather than
-//! panicking.
+//! project: `no_std` with `alloc`, no dependencies. It holds private-key operations for the
+//! emulated TPM, and nothing in it is constant time: the TPM's secrets are as safe as the host
+//! process, and a guest that can time the emulator precisely could in principle learn them.
+//! Every parser takes untrusted bytes (PE files, variables a guest writes, TPM commands) and
+//! returns `Error` rather than panicking.
 //!
 //! - `sha`: `Sha1`, `Sha256`, `Sha384`, `Sha512` (`new`, `update`, `finish -> [u8; N]`), the
 //!   one-shot `sha1`/`sha256`/`sha384`/`sha512`, and `HashAlgorithm` (`digest_len`, `oid`,
@@ -10,8 +11,19 @@
 //! - `der`: `Reader` over DER (`read`, `expect(tag)`, `optional(tag)`, `unsigned_integer`,
 //!   `oid`, `bit_string`, `octet_string`, `algorithm`) yielding `Tlv { tag, contents, raw }`;
 //!   the OIDs used here in `der::oid`.
-//! - `rsa`: `RsaPublicKey::{from_subject_public_key_info, from_pkcs1, new}` and
-//!   `verify_pkcs1v15(HashAlgorithm, digest, signature) -> Result<(), Error>`.
+//! - `hmac`: `hmac(HashAlgorithm, key, parts)` over the concatenated parts.
+//! - `kdf`: the TPM's `kdfa` (SP800-108 counter mode, HMAC) and `kdfe` (SP800-56A
+//!   concatenation), both taking the label without its NUL and cutting to a bit count.
+//! - `aes`: `Aes::new(key)` with `encrypt_block`/`decrypt_block`, and the TPM's CFB128
+//!   `cfb_encrypt`/`cfb_decrypt(key, iv, data)` in place.
+//! - `rsa`: `RsaPublicKey::{from_subject_public_key_info, from_pkcs1, new}`,
+//!   `verify_pkcs1v15(HashAlgorithm, digest, signature) -> Result<(), Error>` and
+//!   `encrypt_oaep`; `RsaPrivateKey::{generate, from_prime}` (deterministic for a given random
+//!   stream; rebuilt from n, e and one prime, as a TPM stores it) with `prime`,
+//!   `private_operation`, `decrypt_oaep` and `sign_pkcs1v15`.
+//! - `ecc`: NIST P-256 as free functions: `p256_public_key`, `p256_ecdh`,
+//!   `p256_scalar_multiply`, `p256_ecdsa_sign`/`p256_ecdsa_verify`, the checks
+//!   `p256_is_valid_private`/`p256_is_on_curve`, and `EccPoint`.
 //! - `x509`: `Certificate::parse(der)` borrowing the input (`raw`, `tbs`, `serial`, `issuer`,
 //!   `subject`, `public_key`, `signature_algorithm`, `signature`), `verifies`/`issued`/
 //!   `is_self_signed`, and `tbs_digest(HashAlgorithm)` for dbx `EFI_CERT_X509_SHA*` entries.
@@ -33,8 +45,13 @@ extern crate alloc;
 #[macro_use]
 extern crate std;
 
+pub mod aes;
 pub mod authenticode;
+mod bignum;
 pub mod der;
+pub mod ecc;
+pub mod hmac;
+pub mod kdf;
 pub mod pkcs7;
 pub mod rsa;
 pub mod sha;

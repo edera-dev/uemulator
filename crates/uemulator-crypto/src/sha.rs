@@ -8,9 +8,9 @@ use alloc::vec::Vec;
 
 use crate::der::oid;
 
-const SHA1_BLOCK_BYTES: usize = 64;
-const SHA256_BLOCK_BYTES: usize = 64;
-const SHA512_BLOCK_BYTES: usize = 128;
+pub(crate) const SHA1_BLOCK_BYTES: usize = 64;
+pub(crate) const SHA256_BLOCK_BYTES: usize = 64;
+pub(crate) const SHA512_BLOCK_BYTES: usize = 128;
 
 pub const SHA1_DIGEST_BYTES: usize = 20;
 pub const SHA256_DIGEST_BYTES: usize = 32;
