@@ -6,6 +6,7 @@ use core::ffi::c_void;
 
 use crate::kv::KvPort;
 use crate::memory;
+use crate::secure_boot::{self, Verdict, signature_type};
 use crate::sync::Global;
 use crate::text;
 use crate::uefi::variable_attribute::{BOOTSERVICE_ACCESS, RUNTIME_ACCESS};
@@ -27,14 +28,89 @@ pub fn attach_store(port: KvPort) {
     VARIABLES.get().persistent = Some(port);
 }
 
-pub fn init() {
+/// Whether `LoadImage` checks images against db and dbx, decided once at start-up.
+static ENFORCING: Global<bool> = Global::new(false);
+
+/// What `SignatureSupport` lists: the signature types db and dbx entries may have here.
+const SIGNATURE_SUPPORT: [Guid; 6] = [
+    signature_type::SHA256,
+    signature_type::SHA384,
+    signature_type::SHA512,
+    signature_type::X509,
+    signature_type::X509_SHA256,
+    signature_type::X509_SHA384,
+];
+
+/// Secure Boot's state for this boot. With `secure_boot` on and no PK the default keys are
+/// enrolled first (into the persistent store, so a later boot without Secure Boot keeps them
+/// and shows `SetupMode` 0, `SecureBoot` 0). Shim and the OS read these variables to decide
+/// whether to verify what they load.
+fn init_secure_boot(variables: &mut Variables<KvPort>, secure_boot: bool) {
+    let visible = BOOTSERVICE_ACCESS | RUNTIME_ACCESS;
+    let global = guids::GLOBAL_VARIABLE;
+    let defaults = secure_boot::defaults();
+    if secure_boot && variables.platform_key().is_none() {
+        // PK last: until it is there the machine is in setup mode.
+        let enrolled = variables.enroll("KEK", &global, &defaults.kek)
+            && variables.enroll("db", &guids::IMAGE_SECURITY_DATABASE, &defaults.db)
+            && variables.enroll("dbx", &guids::IMAGE_SECURITY_DATABASE, &defaults.dbx)
+            && variables.enroll("PK", &global, &defaults.pk);
+        if !enrolled {
+            crate::serial::println!("secure boot: the variable store has no room for the keys");
+        }
+    }
+    let enforcing = secure_boot && variables.platform_key().is_some();
+    *ENFORCING.get() = enforcing;
+    variables.set_internal("SecureBoot", &global, visible, &[enforcing as u8]);
+    variables.refresh_setup_mode();
+    for (name, value) in [
+        ("PKDefault", &defaults.pk),
+        ("KEKDefault", &defaults.kek),
+        ("dbDefault", &defaults.db),
+        ("dbxDefault", &defaults.dbx),
+    ] {
+        variables.set_internal(name, &global, visible, value);
+    }
+    let support: Vec<u8> = SIGNATURE_SUPPORT
+        .iter()
+        .flat_map(|guid| guid.to_bytes())
+        .collect();
+    variables.set_internal("SignatureSupport", &global, visible, &support);
+}
+
+/// Why Secure Boot refused an image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// dbx names the image, its signer or a certificate in its chain.
+    Forbidden,
+    /// Nothing in db allows it.
+    NotAllowed,
+}
+
+/// Whether db and dbx let `file` run: `Ok` with the `EFI_SIGNATURE_DATA` of the db entry that
+/// allowed it (measured into PCR 7), or `Ok(None)` when Secure Boot is off.
+pub fn check_image(file: &[u8]) -> Result<Option<Vec<u8>>, Refusal> {
+    if !*ENFORCING.get() {
+        return Ok(None);
+    }
+    let db = read("db", &guids::IMAGE_SECURITY_DATABASE).unwrap_or_default();
+    let dbx = read("dbx", &guids::IMAGE_SECURITY_DATABASE).unwrap_or_default();
+    match secure_boot::verify_image(file, &db, &dbx) {
+        Verdict::Allowed(entry) => Ok(Some(entry.signature_data())),
+        Verdict::Forbidden => Err(Refusal::Forbidden),
+        Verdict::NotAllowed => Err(Refusal::NotAllowed),
+    }
+}
+
+pub fn enforcing() -> bool {
+    *ENFORCING.get()
+}
+
+pub fn init(secure_boot: bool) {
     let variables = VARIABLES.get();
     let visible = BOOTSERVICE_ACCESS | RUNTIME_ACCESS;
     let global = guids::GLOBAL_VARIABLE;
-    // No Secure Boot keys exist: the machine is in setup mode and boots anything. Shim reads
-    // these to decide whether to verify what it loads.
-    variables.set_internal("SecureBoot", &global, visible, &[0]);
-    variables.set_internal("SetupMode", &global, visible, &[1]);
+    init_secure_boot(variables, secure_boot);
     variables.set_internal("AuditMode", &global, visible, &[0]);
     variables.set_internal("DeployedMode", &global, visible, &[0]);
     variables.set_internal(

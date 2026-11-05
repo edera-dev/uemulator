@@ -6,17 +6,27 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use crate::secure_boot::{self, SecureVariable, Timestamp};
 use crate::uefi::variable_attribute::*;
 use crate::uefi::{Guid, guids};
 
 pub const KEY_PREFIX: &[u8] = b"var/";
+/// A secure variable's last `EFI_TIME`, kept beside it in the same store under this prefix
+/// (outside `var/`, so enumeration never sees it).
+const TIMESTAMP_PREFIX: &[u8] = b"vartime/";
+/// Present once anything changed PK, KEK, db or dbx through `SetVariable`: `VendorKeys` then
+/// reads 0 (UEFI 2.9 3.3) until the store is wiped.
+const KEYS_CHANGED_KEY: &[u8] = b"secure-boot/keys-changed";
+/// What PK, KEK, db, dbx, dbt and dbr are always stored with; `APPEND_WRITE` may come on top.
+pub const SECURE_ATTRIBUTES: u32 =
+    NON_VOLATILE | BOOTSERVICE_ACCESS | RUNTIME_ACCESS | TIME_BASED_AUTHENTICATED_WRITE_ACCESS;
 /// What `QueryVariableInfo` reports as the largest variable and the whole store.
 pub const MAX_VARIABLE_BYTES: usize = 64 * 1024;
 pub const STORAGE_BYTES: u64 = 1 << 20;
 const ARENA_BYTES: usize = 192 * 1024;
 const SLOTS: usize = 96;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VariableError {
     NotFound,
     InvalidParameter,
@@ -158,7 +168,7 @@ impl Store for RamStore {
 }
 
 /// Variables the firmware publishes and applications may not change.
-const READ_ONLY: [&str; 8] = [
+const READ_ONLY: [&str; 13] = [
     "SecureBoot",
     "SetupMode",
     "AuditMode",
@@ -167,6 +177,11 @@ const READ_ONLY: [&str; 8] = [
     "PlatformLangCodes",
     "BootOptionSupport",
     "SignatureSupport",
+    "VendorKeys",
+    "PKDefault",
+    "KEKDefault",
+    "dbDefault",
+    "dbxDefault",
 ];
 
 pub struct Variables<P: Store> {
@@ -188,6 +203,12 @@ pub fn split_key(key: &[u8]) -> Option<(Vec<u16>, Guid)> {
     let guid = Guid::parse(rest.get(..36)?)?;
     let name = core::str::from_utf8(rest.get(37..)?).ok()?;
     Some((name.encode_utf16().collect(), guid))
+}
+
+fn timestamp_key(name: &[u16], guid: &Guid) -> Vec<u8> {
+    let mut key = TIMESTAMP_PREFIX.to_vec();
+    key.extend_from_slice(&key_for(name, guid)[KEY_PREFIX.len()..]);
+    key
 }
 
 fn split_value(value: &[u8]) -> Option<(u32, &[u8])> {
@@ -259,6 +280,11 @@ impl<P: Store> Variables<P> {
         if name.is_empty() || name[0] == 0 {
             return Err(VariableError::InvalidParameter);
         }
+        if let Some(kind) = secure_boot::classify(&describe(name), guid) {
+            return self.set_secure(kind, name, guid, attributes, data);
+        }
+        // Time-based authentication of other variables (the signer-bound "private" kind) is
+        // not implemented; nothing this firmware boots relies on it.
         if attributes & (AUTHENTICATED_WRITE_ACCESS | TIME_BASED_AUTHENTICATED_WRITE_ACCESS) != 0 {
             return Err(VariableError::SecurityViolation);
         }
@@ -314,17 +340,182 @@ impl<P: Store> Variables<P> {
         }
         let mut value = attributes.to_le_bytes().to_vec();
         value.extend_from_slice(&combined);
-        let persistent = attributes & NON_VOLATILE != 0 && self.persistent.is_some();
-        let stored = if persistent {
-            self.ram.delete(&key);
-            self.persistent.as_mut().unwrap().set(&key, &value)
+        self.store(&key, &value, attributes & NON_VOLATILE != 0)
+            .then_some(())
+            .ok_or(VariableError::OutOfResources)
+    }
+
+    /// Writes `value` under `key` in the persistent store when it is non-volatile and there
+    /// is one, else in RAM, and removes it from the other.
+    fn store(&mut self, key: &[u8], value: &[u8], nonvolatile: bool) -> bool {
+        if nonvolatile && let Some(store) = self.persistent.as_mut() {
+            self.ram.delete(key);
+            store.set(key, value)
         } else {
             if let Some(store) = self.persistent.as_mut() {
-                store.delete(&key);
+                store.delete(key);
             }
-            self.ram.set(&key, &value)
+            self.ram.set(key, value)
+        }
+    }
+
+    fn data_of(&mut self, name: &str, guid: &Guid) -> Option<Vec<u8>> {
+        let units: Vec<u16> = name.encode_utf16().collect();
+        self.get(&units, guid, false).ok().map(|(_, data)| data)
+    }
+
+    /// The PK's value; absent means setup mode.
+    pub fn platform_key(&mut self) -> Option<Vec<u8>> {
+        self.data_of("PK", &guids::GLOBAL_VARIABLE)
+    }
+
+    /// Enrolls a secure variable as the firmware's own default, past the authentication an
+    /// application's write needs, with a zero timestamp so any signed update is newer.
+    pub fn enroll(&mut self, name: &str, guid: &Guid, data: &[u8]) -> bool {
+        let units: Vec<u16> = name.encode_utf16().collect();
+        let mut value = SECURE_ATTRIBUTES.to_le_bytes().to_vec();
+        value.extend_from_slice(data);
+        self.store(&key_for(&units, guid), &value, true)
+            && self.store(
+                &timestamp_key(&units, guid),
+                &[0; secure_boot::TIMESTAMP_BYTES],
+                true,
+            )
+    }
+
+    /// Whether PK, KEK, db or dbx were changed since the defaults were enrolled.
+    pub fn keys_changed(&mut self) -> bool {
+        self.load(KEYS_CHANGED_KEY).is_some()
+    }
+
+    /// Republishes `SetupMode` (and `VendorKeys`) after the PK came or went. `SecureBoot`
+    /// stays what it was at start-up: it describes the boot in progress.
+    pub fn refresh_setup_mode(&mut self) {
+        let visible = BOOTSERVICE_ACCESS | RUNTIME_ACCESS;
+        let has_platform_key = self.platform_key().is_some();
+        let vendor_keys = has_platform_key && !self.keys_changed();
+        self.set_internal(
+            "SetupMode",
+            &guids::GLOBAL_VARIABLE,
+            visible,
+            &[!has_platform_key as u8],
+        );
+        self.set_internal(
+            "VendorKeys",
+            &guids::GLOBAL_VARIABLE,
+            visible,
+            &[vendor_keys as u8],
+        );
+    }
+
+    /// A write to PK, KEK, db, dbx, dbt or dbr (UEFI 2.9 8.2.2 and 32.3, as EDK2's
+    /// `AuthVariableLib` does it): `EFI_VARIABLE_AUTHENTICATION_2` in front of the data, a
+    /// timestamp later than the stored one unless appending, and in user mode a signature by
+    /// the PK (for PK and KEK) or by a KEK or the PK (for the databases). In setup mode only a
+    /// new PK is checked, against its own certificate, as EDK2 does.
+    fn set_secure(
+        &mut self,
+        kind: SecureVariable,
+        name: &[u16],
+        guid: &Guid,
+        attributes: u32,
+        data: &[u8],
+    ) -> Result<(), VariableError> {
+        let append = attributes & APPEND_WRITE != 0;
+        if attributes & !APPEND_WRITE != SECURE_ATTRIBUTES {
+            return Err(VariableError::InvalidParameter);
+        }
+        let write = secure_boot::parse_authentication2(data)?;
+        let key = key_for(name, guid);
+        let time_key = timestamp_key(name, guid);
+        let stored_time: Option<Timestamp> = self
+            .load(&time_key)
+            .and_then(|(_, value)| value.try_into().ok());
+        if !append
+            && let Some(stored) = &stored_time
+            && !secure_boot::later(&write.timestamp, stored)
+        {
+            return Err(VariableError::SecurityViolation);
+        }
+        let platform_key = self.platform_key();
+        let anchors: Vec<Vec<u8>> = match (&platform_key, kind) {
+            (Some(platform_key), SecureVariable::Pk | SecureVariable::Kek) => {
+                secure_boot::certificates(platform_key)
+                    .into_iter()
+                    .map(<[u8]>::to_vec)
+                    .collect()
+            }
+            (Some(platform_key), SecureVariable::Database) => {
+                let kek = self
+                    .data_of("KEK", &guids::GLOBAL_VARIABLE)
+                    .unwrap_or_default();
+                secure_boot::certificates(&kek)
+                    .into_iter()
+                    .chain(secure_boot::certificates(platform_key))
+                    .map(<[u8]>::to_vec)
+                    .collect()
+            }
+            (None, SecureVariable::Pk) => secure_boot::certificates(write.payload)
+                .into_iter()
+                .map(<[u8]>::to_vec)
+                .collect(),
+            (None, _) => Vec::new(),
         };
-        stored.then_some(()).ok_or(VariableError::OutOfResources)
+        let needs_signature = platform_key.is_some() || kind == SecureVariable::Pk;
+        if needs_signature {
+            let message = secure_boot::signed_message(
+                name,
+                guid,
+                attributes,
+                &write.timestamp,
+                write.payload,
+            );
+            let anchors: Vec<&[u8]> = anchors.iter().map(Vec::as_slice).collect();
+            if anchors.is_empty() || !secure_boot::signed_by(write.signed_data, &message, &anchors)
+            {
+                return Err(VariableError::SecurityViolation);
+            }
+        }
+        if secure_boot::entries(write.payload).is_none()
+            || (kind == SecureVariable::Pk
+                && !write.payload.is_empty()
+                && !secure_boot::valid_platform_key(write.payload))
+        {
+            return Err(VariableError::InvalidParameter);
+        }
+        let existing = self
+            .load(&key)
+            .and_then(|(_, value)| split_value(&value).map(|(_, data)| data.to_vec()));
+        if !append && write.payload.is_empty() {
+            self.ram.delete(&time_key);
+            if let Some(store) = self.persistent.as_mut() {
+                store.delete(&time_key);
+            }
+            if existing.is_some() {
+                self.remove(&key, true)?;
+            }
+        } else {
+            let combined = match (&existing, append) {
+                (Some(existing), true) => secure_boot::append(existing, write.payload)
+                    .ok_or(VariableError::InvalidParameter)?,
+                _ => write.payload.to_vec(),
+            };
+            if combined.len() > MAX_VARIABLE_BYTES {
+                return Err(VariableError::OutOfResources);
+            }
+            let timestamp = match stored_time {
+                Some(stored) if append && !secure_boot::later(&write.timestamp, &stored) => stored,
+                _ => write.timestamp,
+            };
+            let mut value = SECURE_ATTRIBUTES.to_le_bytes().to_vec();
+            value.extend_from_slice(&combined);
+            if !self.store(&key, &value, true) || !self.store(&time_key, &timestamp, true) {
+                return Err(VariableError::OutOfResources);
+            }
+        }
+        self.store(KEYS_CHANGED_KEY, &[1], true);
+        self.refresh_setup_mode();
+        Ok(())
     }
 
     fn remove(&mut self, key: &[u8], existed: bool) -> Result<(), VariableError> {
@@ -698,6 +889,195 @@ mod tests {
             Some(60_000),
             "the others survive a refused write"
         );
+    }
+
+    const DBX_KEK2011: &[u8] = include_bytes!("../secure-boot/dbx-x64-kek2011.auth2");
+    const DBX_KEK2023: &[u8] = include_bytes!("../secure-boot/dbx-x64-kek2023.auth2");
+
+    fn enrolled() -> Box<Variables<Memory>> {
+        let mut variables = variables();
+        let defaults = secure_boot::defaults();
+        assert!(variables.enroll("KEK", &guids::GLOBAL_VARIABLE, &defaults.kek));
+        assert!(variables.enroll("db", &guids::IMAGE_SECURITY_DATABASE, &defaults.db));
+        assert!(variables.enroll("PK", &guids::GLOBAL_VARIABLE, &defaults.pk));
+        variables.refresh_setup_mode();
+        variables
+    }
+
+    fn mode(variables: &mut Variables<Memory>, name: &str) -> u8 {
+        variables
+            .get(&name_units(name), &guids::GLOBAL_VARIABLE, false)
+            .unwrap()
+            .1[0]
+    }
+
+    fn dbx_length(variables: &mut Variables<Memory>) -> usize {
+        variables
+            .get(&name("dbx"), &guids::IMAGE_SECURITY_DATABASE, false)
+            .map_or(0, |(_, data)| data.len())
+    }
+
+    const APPEND: u32 = SECURE_ATTRIBUTES | APPEND_WRITE;
+
+    #[test]
+    fn enrolled_keys_leave_setup_mode_and_count_as_vendor_keys() {
+        let mut variables = variables();
+        variables.refresh_setup_mode();
+        assert_eq!(mode(&mut variables, "SetupMode"), 1);
+        assert_eq!(mode(&mut variables, "VendorKeys"), 0);
+        let mut variables = enrolled();
+        assert_eq!(mode(&mut variables, "SetupMode"), 0);
+        assert_eq!(mode(&mut variables, "VendorKeys"), 1);
+        let (attributes, _) = variables
+            .get(&name("PK"), &guids::GLOBAL_VARIABLE, true)
+            .unwrap();
+        assert_eq!(attributes, SECURE_ATTRIBUTES);
+        assert!(
+            variables.persistent.as_ref().unwrap().0.len() >= 6,
+            "keys and timestamps are persistent"
+        );
+    }
+
+    #[test]
+    fn a_dbx_update_signed_by_a_microsoft_kek_appends_once() {
+        let mut variables = enrolled();
+        let dbx = name("dbx");
+        let database = guids::IMAGE_SECURITY_DATABASE;
+        variables
+            .set(&dbx, &database, APPEND, DBX_KEK2011, true)
+            .unwrap();
+        let first = dbx_length(&mut variables);
+        assert!(first > 9000, "{first}");
+        // The 2023 update lists the same hashes and a few more; only those are added.
+        variables
+            .set(&dbx, &database, APPEND, DBX_KEK2023, true)
+            .unwrap();
+        let second = dbx_length(&mut variables);
+        assert!(
+            second >= first && second < first + 200,
+            "{first} -> {second}"
+        );
+        variables
+            .set(&dbx, &database, APPEND, DBX_KEK2023, true)
+            .unwrap();
+        assert_eq!(dbx_length(&mut variables), second);
+        assert_eq!(mode(&mut variables, "VendorKeys"), 0, "the keys changed");
+    }
+
+    #[test]
+    fn a_signed_write_checks_its_signature_and_attributes() {
+        let mut variables = enrolled();
+        let dbx = name("dbx");
+        let database = guids::IMAGE_SECURITY_DATABASE;
+        // Signed with APPEND_WRITE in the message: replacing instead does not verify.
+        assert_eq!(
+            variables.set(&dbx, &database, SECURE_ATTRIBUTES, DBX_KEK2011, false),
+            Err(VariableError::SecurityViolation)
+        );
+        let mut tampered = DBX_KEK2011.to_vec();
+        *tampered.last_mut().unwrap() ^= 1;
+        assert_eq!(
+            variables.set(&dbx, &database, APPEND, &tampered, false),
+            Err(VariableError::SecurityViolation)
+        );
+        assert_eq!(
+            variables.set(&dbx, &database, NV_BS_RT | APPEND_WRITE, DBX_KEK2011, false),
+            Err(VariableError::InvalidParameter)
+        );
+        // The same payload aimed at db: the name is part of what was signed.
+        assert_eq!(
+            variables.set(&name("db"), &database, APPEND, DBX_KEK2011, false),
+            Err(VariableError::SecurityViolation)
+        );
+        // A KEK signature is not enough for KEK or PK.
+        for target in ["KEK", "PK"] {
+            assert_eq!(
+                variables.set(
+                    &name(target),
+                    &guids::GLOBAL_VARIABLE,
+                    APPEND,
+                    DBX_KEK2011,
+                    false
+                ),
+                Err(VariableError::SecurityViolation),
+                "{target}"
+            );
+        }
+        assert_eq!(dbx_length(&mut variables), 0);
+    }
+
+    #[test]
+    fn setup_mode_takes_database_writes_unsigned_but_checks_a_new_pk() {
+        let mut variables = variables();
+        variables.refresh_setup_mode();
+        let database = guids::IMAGE_SECURITY_DATABASE;
+        variables
+            .set(&name("db"), &database, APPEND, DBX_KEK2011, false)
+            .unwrap();
+        assert!(
+            variables
+                .get(&name("db"), &database, false)
+                .is_ok_and(|(_, data)| data.len() > 9000)
+        );
+        // A PK must be signed by itself even in setup mode, and this payload is no PK.
+        assert_eq!(
+            variables.set(
+                &name("PK"),
+                &guids::GLOBAL_VARIABLE,
+                APPEND,
+                DBX_KEK2011,
+                false
+            ),
+            Err(VariableError::SecurityViolation)
+        );
+        assert_eq!(mode(&mut variables, "SetupMode"), 1);
+    }
+
+    #[test]
+    fn a_stale_timestamp_is_refused_unless_appending() {
+        let mut variables = variables();
+        variables.refresh_setup_mode();
+        let database = guids::IMAGE_SECURITY_DATABASE;
+        variables
+            .set(
+                &name("dbx"),
+                &database,
+                SECURE_ATTRIBUTES,
+                DBX_KEK2011,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            variables.set(
+                &name("dbx"),
+                &database,
+                SECURE_ATTRIBUTES,
+                DBX_KEK2011,
+                false
+            ),
+            Err(VariableError::SecurityViolation),
+            "a replay"
+        );
+        variables
+            .set(&name("dbx"), &database, APPEND, DBX_KEK2023, false)
+            .unwrap();
+    }
+
+    #[test]
+    fn the_default_variables_cannot_be_written() {
+        let mut variables = variables();
+        for read_only in ["PKDefault", "dbxDefault", "VendorKeys"] {
+            assert_eq!(
+                variables.set(
+                    &name(read_only),
+                    &guids::GLOBAL_VARIABLE,
+                    NV_BS_RT,
+                    b"x",
+                    false
+                ),
+                Err(VariableError::WriteProtected)
+            );
+        }
     }
 
     #[test]

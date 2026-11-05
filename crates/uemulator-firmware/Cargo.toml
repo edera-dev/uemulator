@@ -10,6 +10,10 @@ edition.workspace = true
 name = "uemulator-firmware"
 path = "src/main.rs"
 
+[dependencies]
+# First-party, `no_std` and dependency-free: hashes, X.509, PKCS#7 and Authenticode.
+uemulator-crypto = { path = "../uemulator-crypto" }
+
 [features]
 # Progress messages on the serial port while the firmware starts up.
 trace = []

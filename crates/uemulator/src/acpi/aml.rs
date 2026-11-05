@@ -11,6 +11,7 @@ const OP_NAME: u8 = 0x08;
 const OP_BYTE_PREFIX: u8 = 0x0a;
 const OP_WORD_PREFIX: u8 = 0x0b;
 const OP_DWORD_PREFIX: u8 = 0x0c;
+const OP_STRING_PREFIX: u8 = 0x0d;
 const OP_QWORD_PREFIX: u8 = 0x0e;
 const OP_SCOPE: u8 = 0x10;
 const OP_BUFFER: u8 = 0x11;
@@ -144,6 +145,18 @@ pub(crate) fn integer(value: u64) -> Vec<u8> {
             out
         }
     }
+}
+
+/// A NUL-terminated ASCII string, for ids that are not EISA ids (`"MSFT0101"`).
+pub(crate) fn string(text: &str) -> Vec<u8> {
+    assert!(
+        text.is_ascii() && !text.contains('\0'),
+        "AML strings are ASCII without NUL"
+    );
+    let mut out = vec![OP_STRING_PREFIX];
+    out.extend_from_slice(text.as_bytes());
+    out.push(0);
+    out
 }
 
 /// A package of already encoded elements (at most 255).

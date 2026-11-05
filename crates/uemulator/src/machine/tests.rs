@@ -3395,3 +3395,51 @@ mod uefi_kernel {
         );
     }
 }
+
+mod tpm {
+    use super::*;
+
+    /// mov rax, 0xfed40030 (the CRB's TPM_CRB_INTF_ID); mov eax, [rax]; out 0x3f8, al.
+    const PRINT_INTERFACE_ID: [u8; 17] = [
+        0x48, 0xb8, 0x30, 0x00, 0xd4, 0xfe, 0x00, 0x00, 0x00, 0x00, 0x8b, 0x00, 0x66, 0xba, 0xf8,
+        0x03, 0xee,
+    ];
+    /// CRB interface type 1, version 1.
+    const CRB_INTERFACE_LOW_BYTE: u8 = 0x11;
+
+    fn probe(configure: impl FnOnce(MachineConfig) -> MachineConfig) -> crate::testkit::MachineRun {
+        let code = [&PRINT_INTERFACE_ID[..], &RESET_AND_HALT].concat();
+        run_machine(
+            fake_bzimage(&code),
+            JitMode::Auto,
+            GENEROUS_LIMIT,
+            configure,
+        )
+    }
+
+    #[test]
+    fn the_crb_page_answers_only_on_a_machine_with_a_tpm() {
+        let with = probe(|config| config.tpm(true));
+        assert_eq!(with.exit, ExitReason::Reset);
+        assert_eq!(with.console_output, [CRB_INTERFACE_LOW_BYTE]);
+        let without = probe(|config| config);
+        assert_eq!(without.exit, ExitReason::Reset);
+        assert_ne!(without.console_output, [CRB_INTERFACE_LOW_BYTE]);
+    }
+
+    #[test]
+    fn verify_builds_the_twin_a_tpm_of_its_own() {
+        let run = probe(|config| config.tpm(true).verify_jit(true));
+        assert_eq!(run.exit, ExitReason::Reset);
+        assert_eq!(run.console_output, [CRB_INTERFACE_LOW_BYTE]);
+    }
+
+    #[test]
+    fn secure_boot_needs_the_uefi_firmware() {
+        let config = MachineConfig::new()
+            .kernel(fake_bzimage(&RESET_AND_HALT))
+            .secure_boot(true);
+        let error = EmulatedMachine::new(config).err().expect("refused");
+        assert!(error.to_string().contains("uefi_firmware"), "{error}");
+    }
+}

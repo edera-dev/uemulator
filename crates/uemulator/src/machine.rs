@@ -173,6 +173,10 @@ pub(crate) type HostClockFn = Arc<dyn Fn() -> u64 + Send + Sync>;
 /// The embedder-facing poll hook of `MachineConfig::poll`, which receives the console itself.
 type HostPollFn = Arc<dyn Fn(&ConsoleHandle, bool) + Send + Sync>;
 
+/// Keeps the TPM's seeded stream apart from virtio-rng's when both come from `random_seed`: a
+/// guest that compared them would otherwise see the same bytes twice.
+const TPM_RANDOM_SEED_SALT: u64 = 0x5450_4d32_5f52_4e47;
+
 pub struct MachineConfig {
     kernel: Vec<u8>,
     firmware: Option<Vec<u8>>,
@@ -197,6 +201,8 @@ pub struct MachineConfig {
     gpu: Option<GpuLink>,
     iommu: bool,
     acpi: bool,
+    tpm: bool,
+    secure_boot: bool,
     jit: JitMode,
     clock: ClockMode,
     smp: SmpMode,
@@ -238,6 +244,8 @@ impl Default for MachineConfig {
             gpu: None,
             iommu: false,
             acpi: true,
+            tpm: false,
+            secure_boot: false,
             jit: JitMode::Auto,
             clock: ClockMode::Realtime,
             smp: SmpMode::Auto,
@@ -389,6 +397,27 @@ impl MachineConfig {
     /// default command line's `console=`). `Serial` may be added once, `Virtio` as often as
     /// wanted; with none added the machine gets one virtio console. Each console has its own
     /// `ConsoleHandle`, in call order (`EmulatedMachine::consoles()`).
+    /// Gives the machine a TPM 2.0 (off by default): a CRB interface at 0xFED40000 that the ACPI
+    /// tables describe (`TPM2`, `MSFT0101`). The UEFI firmware starts it and measures the boot
+    /// into its PCRs, with an event log for the OS. It implements the measured-boot commands
+    /// (PCRs, hashing, random numbers, capabilities) and no keys; its state lasts until the
+    /// guest resets (`docs/plans/26-tpm-secure-boot.md`).
+    pub fn tpm(mut self, on: bool) -> Self {
+        self.tpm = on;
+        self
+    }
+
+    /// Has the UEFI firmware enforce Secure Boot (off by default; needs `uefi_firmware`). On the
+    /// first boot of a key-value store without a platform key it enrolls its defaults: a
+    /// uemulator PK whose private key was discarded, Microsoft's KEKs, Microsoft's db
+    /// certificates (Windows and third-party UEFI CAs, 2011 and 2023) and the current x64 dbx.
+    /// Then it refuses any image db does not allow. Off, the enrolled keys stay in the store and
+    /// `SecureBoot` reads 0.
+    pub fn secure_boot(mut self, on: bool) -> Self {
+        self.secure_boot = on;
+        self
+    }
+
     pub fn console(mut self, kind: ConsoleKind) -> Self {
         self.consoles.push(kind);
         self
@@ -703,6 +732,7 @@ struct RebootImage {
     acpi: Option<AcpiConfig>,
     key_value_store: Option<SharedKeyValueStore>,
     rng: Option<RngSource>,
+    tpm: Option<RngSource>,
     /// The embedder holds these; the new devices must be built around them, like the NICs.
     display: Option<DisplayHandle>,
     input: Option<InputHandle>,
@@ -904,6 +934,8 @@ fn mirrored_devices(main: &mut DevConfig, main_uart: &ConsoleHandle) -> (DevConf
         cpus: main.cpus,
         // Verification always runs on a seeded stream, so cloning gives the twin the same bytes.
         rng: main.rng.clone(),
+        // Seeded under verify, like the rng: the twin's TPM answers GetRandom with the same bytes.
+        tpm: main.tpm.clone(),
         // Same functions and the same boot framebuffer region; host input reaches the main CPU
         // only, and the twin's screen is never looked at.
         display: main.display.as_ref().map(|devices| {
@@ -1005,6 +1037,7 @@ impl Vcpu {
                 key_value_store: image.key_value_store.clone(),
                 cpus: image.cpus,
                 rng: image.rng.clone(),
+                tpm: image.tpm.clone(),
                 display,
                 input: image.input.clone(),
             };
@@ -1294,6 +1327,26 @@ impl EmulatedMachine {
                 .or_else(host_entropy)
                 .map(RngSource::Host)
         };
+        // Its GetRandom follows the same rules as virtio-rng; without host entropy (a freestanding
+        // embedder that gave none) the TPM still works, on the seeded stream.
+        let tpm = cfg.tpm.then(|| {
+            let seeded = RngSource::Seeded(
+                cfg.random_seed.unwrap_or(DEFAULT_RANDOM_SEED) ^ TPM_RANDOM_SEED_SALT,
+            );
+            if cfg.verify {
+                seeded
+            } else {
+                cfg.entropy
+                    .clone()
+                    .or_else(host_entropy)
+                    .map_or(seeded, RngSource::Host)
+            }
+        });
+        if cfg.secure_boot && cfg.uefi_firmware.is_none() {
+            return Err(Error::BadConfig(
+                "secure_boot is enforced by the UEFI firmware: it needs uefi_firmware".into(),
+            ));
+        }
         let has_display = cfg.display == DisplayMode::Framebuffer;
         let has_input = cfg.input.unwrap_or(has_display);
         let (display_width, display_height) = cfg.display_size;
@@ -1409,6 +1462,7 @@ impl EmulatedMachine {
             pci_functions: functions,
             iommu: cfg.iommu,
             cpus: cfg.cpus as u32,
+            tpm: cfg.tpm,
         });
         let uefi = cfg.uefi_firmware.as_ref().map(|image| {
             let params = boot::FirmwareParams {
@@ -1418,6 +1472,8 @@ impl EmulatedMachine {
                 rsdp: 0,
                 acpi_region: (0, 0),
                 framebuffer: has_display.then_some(cfg.display_size),
+                secure_boot: cfg.secure_boot,
+                tpm: cfg.tpm,
             };
             (image.clone(), params)
         });
@@ -1478,6 +1534,7 @@ impl EmulatedMachine {
             key_value_store: cfg.key_value_store.clone(),
             cpus: cfg.cpus,
             rng: rng.clone(),
+            tpm: tpm.clone(),
             display: display_devices(
                 &display,
                 &cfg.gpu,
@@ -1503,6 +1560,7 @@ impl EmulatedMachine {
                     acpi,
                     key_value_store: cfg.key_value_store,
                     rng: devcfg.rng.clone(),
+                    tpm,
                     display: display.clone(),
                     input: input.clone(),
                     gpu: cfg.gpu.clone(),

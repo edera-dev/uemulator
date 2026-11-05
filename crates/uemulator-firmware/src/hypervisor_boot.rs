@@ -135,12 +135,33 @@ fn image_handle(base: u64, pages: u64, cmdline: &str) -> Result<Handle, &'static
     .map_err(|_| "cannot publish the hypervisor's image handle")
 }
 
+/// What GRUB's `multiboot2` and `module2` would measure: the files into PCR 9, the command
+/// lines into PCR 8.
+fn measure_multiboot2(image: &[u8], payload: &Payload, xen_cmdline: &str, dom0_cmdline: &str) {
+    use crate::tcg::{PCR_COMMAND_LINES, PCR_LOADED_FILES};
+    crate::tpm::measure_loaded(PCR_LOADED_FILES, image, XEN_IMAGE_NAME);
+    crate::tpm::measure_loaded(PCR_COMMAND_LINES, xen_cmdline.as_bytes(), xen_cmdline);
+    crate::tpm::measure_loaded(PCR_LOADED_FILES, bytes(payload.kernel), KERNEL_IMAGE_NAME);
+    crate::tpm::measure_loaded(PCR_COMMAND_LINES, dom0_cmdline.as_bytes(), dom0_cmdline);
+    if let Some(initrd) = payload.initrd {
+        crate::tpm::measure_loaded(PCR_LOADED_FILES, bytes(initrd), INITRD_IMAGE_NAME);
+    }
+}
+
 fn run_multiboot2(
     image: &[u8],
     payload: &Payload,
     xen_cmdline: &str,
     dom0_cmdline: &str,
 ) -> Result<Status, &'static str> {
+    // Secure Boot covers PE images only; an ELF has nothing db could vouch for.
+    if crate::variables::enforcing() {
+        return Err(
+            "Secure Boot is on and a Multiboot2 image cannot be verified; \
+             boot xen.efi instead, or turn Secure Boot off",
+        );
+    }
+    measure_multiboot2(image, payload, xen_cmdline, dom0_cmdline);
     let header = multiboot2::parse_header(image)?;
     let (Some(efi64_entry), true) = (header.efi64_entry, header.keep_boot_services) else {
         return Err(

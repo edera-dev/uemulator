@@ -8,6 +8,10 @@ default = ["jit"]
 # Host-native code generation; without it the crate has no dependencies and runs the interpreter only.
 jit = ["dep:libc", "dep:windows-sys"]
 
+[dependencies]
+# First-party, `no_std` and dependency-free: the TPM's hashes.
+uemulator-crypto = { path = "../uemulator-crypto" }
+
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", optional = true }
 

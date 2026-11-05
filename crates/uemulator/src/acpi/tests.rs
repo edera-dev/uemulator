@@ -8,6 +8,7 @@ fn config(cpus: u32, pci_functions: usize, iommu: bool) -> AcpiConfig {
         cpus,
         pci_functions,
         iommu,
+        tpm: false,
     }
 }
 
@@ -416,7 +417,11 @@ fn walk(bytes: &[u8], mut at: usize, end: usize, scope: &str, names: &mut Vec<St
 }
 
 fn dsdt_names(pci_functions: usize) -> Vec<String> {
-    let ram = ram_with_tables(&config(1, pci_functions, false));
+    dsdt_names_of(&config(1, pci_functions, false))
+}
+
+fn dsdt_names_of(config: &AcpiConfig) -> Vec<String> {
+    let ram = ram_with_tables(config);
     let fadt = find(&ram, "FACP");
     let dsdt = table_at(&ram, u32_at(fadt, 40) as u64);
     let mut names = Vec::new();
@@ -527,4 +532,33 @@ fn pci_root_bridge_osc_takes_four_arguments_and_grants_what_q35_grants() {
             .any(|w| w == [0x7b, 0x60, 0x0a, 0x1f, 0x60])
     );
     assert!(method.ends_with(&[0xa4, 0x6b]));
+}
+
+#[test]
+fn a_tpm_adds_the_tpm2_table_and_its_device() {
+    let without = ram_with_tables(&config(1, 0, false));
+    assert!(xsdt_tables(&without).iter().all(|(name, _)| name != "TPM2"));
+    assert!(
+        !dsdt_names(0)
+            .iter()
+            .any(|name| name.starts_with("._SB_.TPM_"))
+    );
+
+    let with_tpm = AcpiConfig {
+        tpm: true,
+        ..config(1, 0, false)
+    };
+    let ram = ram_with_tables(&with_tpm);
+    let tpm2 = find(&ram, "TPM2");
+    assert_eq!(tpm2.len(), 64, "no log area");
+    assert_eq!(tpm2[8], 4, "revision");
+    assert_eq!(u64_at(tpm2, 40), 0xfed4_0040, "control area");
+    assert_eq!(u32_at(tpm2, 48), 7, "start method: CRB");
+    let names = dsdt_names_of(&with_tpm);
+    for expected in ["._SB_.TPM_._HID", "._SB_.TPM_._CRS", "._SB_.TPM_._STA"] {
+        assert!(
+            names.iter().any(|name| name == expected),
+            "{expected} in {names:?}"
+        );
+    }
 }

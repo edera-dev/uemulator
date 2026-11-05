@@ -81,6 +81,8 @@ export const OPTION = {
   DISPLAY: 1 << 8,
   INPUT: 1 << 9,
   SCREEN_CONSOLE: 1 << 10,
+  TPM: 1 << 11,
+  SECURE_BOOT: 1 << 12,
 };
 // `host_net_send` destinations: the DESTINATION_* constants in src/lib.rs, which are the
 // library's SegmentDestination.

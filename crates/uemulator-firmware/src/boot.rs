@@ -208,6 +208,7 @@ fn try_boot(candidate: &Candidate, volumes: &[Volume]) -> Status {
     let boot = unsafe { BOOT_SERVICES.get().assume_init_ref() };
     let path = expanded(&candidate.path, volumes);
     println!("Booting {} ({})", candidate.description, path.text());
+    crate::tpm::before_boot_option();
     let mut path_bytes = path.as_bytes().to_vec();
     let mut image: Handle = ptr::null_mut();
     let status = (boot.load_image)(
@@ -219,6 +220,10 @@ fn try_boot(candidate: &Candidate, volumes: &[Volume]) -> Status {
         &mut image,
     );
     let status = if status != SUCCESS {
+        // A refused image still got a handle (UEFI 2.9 7.4).
+        if status == SECURITY_VIOLATION && !image.is_null() {
+            (boot.unload_image)(image);
+        }
         status
     } else {
         if !candidate.load_options().is_empty() {
@@ -232,7 +237,9 @@ fn try_boot(candidate: &Candidate, volumes: &[Volume]) -> Status {
                 &number.to_le_bytes(),
             );
         }
-        (boot.start_image)(image, ptr::null_mut(), ptr::null_mut())
+        let status = (boot.start_image)(image, ptr::null_mut(), ptr::null_mut());
+        crate::tpm::after_boot_option();
+        status
     };
     println!("{} returned with status {status:#x}", candidate.description);
     status
@@ -299,6 +306,7 @@ fn boot_menu(volumes: &[Volume]) {
 pub fn run(payload: Option<&Payload>) -> ! {
     println!("uemulator UEFI firmware");
     if let Some(payload) = payload {
+        crate::tpm::before_boot_option();
         // A kernel the machine was given is the whole boot: failing to start it must not turn
         // into a boot from some disk the caller did not ask for.
         if let Some(hypervisor) = &payload.hypervisor {

@@ -25,8 +25,10 @@ mod load_option;
 mod memory_map;
 mod mtrr;
 mod pe;
+mod secure_boot;
 mod smbios;
 mod sync;
+mod tcg;
 mod text;
 mod text_screen;
 mod uefi;
@@ -76,6 +78,8 @@ mod services;
 mod tables;
 #[cfg(target_os = "none")]
 mod time;
+#[cfg(target_os = "none")]
+mod tpm;
 #[cfg(target_os = "none")]
 mod variables;
 #[cfg(target_os = "none")]

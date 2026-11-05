@@ -103,6 +103,12 @@ pub const OPTION_INPUT: u32 = 1 << 9;
 /// With `OPTION_DISPLAY`: the screen is the guest's console (`console=tty0` last), not the
 /// terminal (`MachineConfig::console_on_screen`).
 pub const OPTION_SCREEN_CONSOLE: u32 = 1 << 10;
+/// A TPM 2.0 (`MachineConfig::tpm`).
+pub const OPTION_TPM: u32 = 1 << 11;
+/// Secure Boot enforced by the UEFI firmware (`MachineConfig::secure_boot`); ignored with any
+/// other firmware, which would refuse it. The keys are enrolled again on every page load: the
+/// page keeps no variables.
+pub const OPTION_SECURE_BOOT: u32 = 1 << 12;
 
 // Input event kinds in the page's event ring, as `www/protocol.js` numbers them.
 /// A key by USB HID usage; then pressed (1) or released (0).
@@ -472,6 +478,7 @@ pub unsafe extern "C" fn uw_create(
         // `EmulatedMachine::new` leaves that combination to the caller.
         .acpi(option(OPTION_ACPI))
         .iommu(option(OPTION_IOMMU))
+        .tpm(option(OPTION_TPM))
         .rng(option(OPTION_RNG))
         .reboot(option(OPTION_REBOOT))
         .debug(option(OPTION_DEBUG))
@@ -528,7 +535,8 @@ pub unsafe extern "C" fn uw_create(
         // though not the page: nothing here is kept across loads.
         FIRMWARE_UEFI => config
             .uefi_firmware(image)
-            .key_value_store(MemoryKeyValueStore::new()),
+            .key_value_store(MemoryKeyValueStore::new())
+            .secure_boot(option(OPTION_SECURE_BOOT)),
         FIRMWARE_BIOS => config.boot_disk(true),
         FIRMWARE_REAL_MODE => config.firmware(image),
         _ => config,

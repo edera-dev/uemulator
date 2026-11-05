@@ -182,7 +182,11 @@ fn build_config(
     if settings.disable_jit {
         cfg = cfg.jit(JitMode::Off);
     }
-    cfg = cfg.reboot(!settings.no_reboot).iommu(settings.iommu);
+    cfg = cfg
+        .reboot(!settings.no_reboot)
+        .iommu(settings.iommu)
+        .tpm(settings.tpm)
+        .secure_boot(settings.secure_boot);
     if let Some(cpus) = settings.cpus {
         cfg = cfg.cpus(cpus);
     }
@@ -217,14 +221,24 @@ pub fn run(
     runtime: &RuntimeArgs,
 ) -> Result<ExitReason, String> {
     let tty = std::io::stdin().is_terminal();
+    refuse_secure_boot_without_uefi(settings)?;
     let cfg = build_config(kernel, initramfs, settings, runtime)?;
     run_config(cfg, settings, runtime, tty)
+}
+
+/// Secure Boot is the UEFI firmware's: the direct boot and the BIOS check nothing.
+fn refuse_secure_boot_without_uefi(settings: &Settings) -> Result<(), String> {
+    if settings.secure_boot {
+        return Err("--secure-boot needs the UEFI firmware (--firmware uefi)".into());
+    }
+    Ok(())
 }
 
 /// Like `run`, for the machine's first disk booted through the library's BIOS: the disk's own boot
 /// loader loads the system, so there is no kernel, initramfs or command line here.
 pub fn run_disk(settings: &Settings, runtime: &RuntimeArgs) -> Result<ExitReason, String> {
     let tty = std::io::stdin().is_terminal();
+    refuse_secure_boot_without_uefi(settings)?;
     let cfg = build_config(Vec::new(), None, settings, runtime)?.boot_disk(true);
     run_config(cfg, settings, runtime, tty)
 }
@@ -236,6 +250,7 @@ pub fn run_firmware(
     runtime: &RuntimeArgs,
 ) -> Result<ExitReason, String> {
     let tty = std::io::stdin().is_terminal();
+    refuse_secure_boot_without_uefi(settings)?;
     let cfg = build_config(Vec::new(), None, settings, runtime)?.firmware(image);
     run_config(cfg, settings, runtime, tty)
 }

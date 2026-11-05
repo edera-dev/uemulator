@@ -77,6 +77,9 @@ struct Record {
     exit_data_size: usize,
     exit_data: *mut u16,
     returned: Option<Status>,
+    /// Secure Boot refused it: loaded (UEFI 2.9 7.4: `LoadImage` returns a handle with
+    /// `EFI_SECURITY_VIOLATION`) but `StartImage` will not run it.
+    refused: bool,
 }
 
 // Boxed because `StartImage` hands the saved stack pointer's address to assembly and the
@@ -150,17 +153,60 @@ fn device_of(path: &DevicePath) -> Handle {
     }
 }
 
-/// Loads an image from `file` (the bytes) into memory and publishes its handle.
+/// Loads an image from `file` (the bytes) into memory and publishes its handle. An image
+/// Secure Boot refuses is unloaded again and is `Err(SECURITY_VIOLATION)`.
 pub fn load(
     file: &[u8],
     parent: Handle,
     device_handle: Handle,
     path: Option<&DevicePath>,
 ) -> Result<Handle, Status> {
+    let (handle, status) = load_checked(file, parent, device_handle, path)?;
+    if status != SUCCESS {
+        unload(handle);
+        return Err(status);
+    }
+    Ok(handle)
+}
+
+/// Measures the image, checks it against db and dbx (in that order, as EDK2's Security2
+/// handlers run) and loads it. A refused image still gets a handle, with `SECURITY_VIOLATION`.
+fn load_checked(
+    file: &[u8],
+    parent: Handle,
+    device_handle: Handle,
+    path: Option<&DevicePath>,
+) -> Result<(Handle, Status), Status> {
     let image = Image::parse(file).map_err(|error| match error {
         pe::PeError::Unsupported => UNSUPPORTED,
         _ => LOAD_ERROR,
     })?;
+    crate::tpm::measure_image(
+        file,
+        image.subsystem,
+        image.image_base,
+        path.map_or(&[][..], |path| path.as_bytes()),
+    );
+    let refused = match crate::variables::check_image(file) {
+        Ok(authority) => {
+            if let Some(signature) = authority {
+                crate::tpm::measure_authority(&signature);
+            }
+            false
+        }
+        Err(refusal) => {
+            let name = path.map_or_else(
+                || alloc::string::String::from("an image"),
+                |path| path.text(),
+            );
+            let reason = match refusal {
+                crate::variables::Refusal::Forbidden => "it is forbidden by dbx",
+                crate::variables::Refusal::NotAllowed => "nothing in db allows it",
+            };
+            console::println!("Secure Boot refused {name}: {reason}");
+            true
+        }
+    };
     let code_type = match image.subsystem {
         pe::SUBSYSTEM_EFI_BOOT_SERVICE_DRIVER => memory_type::BOOT_SERVICES_CODE,
         pe::SUBSYSTEM_EFI_RUNTIME_DRIVER => memory_type::RUNTIME_SERVICES_CODE,
@@ -206,6 +252,7 @@ pub fn load(
         exit_data_size: 0,
         exit_data: ptr::null_mut(),
         returned: None,
+        refused,
     });
     let interface = (&mut *record.loaded as *mut LoadedImage).cast();
     let handle = protocols::install(ptr::null_mut(), guids::LOADED_IMAGE, interface)?;
@@ -218,7 +265,7 @@ pub fn load(
     }
     record.handle = handle;
     IMAGES.get().push(record);
-    Ok(handle)
+    Ok((handle, if refused { SECURITY_VIOLATION } else { SUCCESS }))
 }
 
 /// `LoadOptions` for the next `StartImage`: what the boot manager copies from a load option.
@@ -247,16 +294,17 @@ extern "efiapi" fn load_image(
         let Some(path) = &path else {
             return INVALID_PARAMETER;
         };
-        read_file_of(path).and_then(|(bytes, device)| load(&bytes, parent, device, Some(path)))
+        read_file_of(path)
+            .and_then(|(bytes, device)| load_checked(&bytes, parent, device, Some(path)))
     } else {
         let bytes = unsafe { core::slice::from_raw_parts(source.cast::<u8>(), source_size) };
         let device = path.as_ref().map_or(ptr::null_mut(), device_of);
-        load(bytes, parent, device, path.as_ref())
+        load_checked(bytes, parent, device, path.as_ref())
     };
     match result {
-        Ok(handle) => {
+        Ok((handle, status)) => {
             unsafe { image.write(handle) };
-            SUCCESS
+            status
         }
         Err(status) => status,
     }
@@ -297,6 +345,9 @@ extern "efiapi" fn start_image(
     };
     if record.started {
         return INVALID_PARAMETER;
+    }
+    if record.refused {
+        return SECURITY_VIOLATION;
     }
     record.started = true;
     let entry = record.entry;
@@ -345,6 +396,8 @@ extern "efiapi" fn exit_boot_services(_image: Handle, map_key: usize) -> Status 
     if map_key != memory::map_key() {
         return INVALID_PARAMETER;
     }
+    // Allocates nothing, so the caller's map stays current.
+    crate::tpm::exit_boot_services();
     events::signal_group(&guids::EXIT_BOOT_SERVICES_EVENT);
     // A notification function may have allocated, which makes the caller's map stale.
     if map_key != memory::map_key() {

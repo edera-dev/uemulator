@@ -3,10 +3,11 @@
 
 use alloc::vec::Vec;
 
-pub const SIZE: usize = 0x378;
+pub const SIZE: usize = 0x388;
 const MAGIC: &[u8; 8] = b"UEMUHAND";
-/// Version 2 added the framebuffer fields, version 3 the hypervisor.
-const VERSION: u32 = 3;
+/// Version 2 added the framebuffer fields, version 3 the hypervisor, version 4 the flags and
+/// the TPM.
+const VERSION: u32 = 4;
 
 const VERSION_OFFSET: usize = 0x08;
 const FIRMWARE_BASE: usize = 0x10;
@@ -46,6 +47,9 @@ const HYPERVISOR_BASE: usize = 0x358;
 const HYPERVISOR_SIZE: usize = 0x360;
 const HYPERVISOR_CMDLINE_BASE: usize = 0x368;
 const HYPERVISOR_CMDLINE_SIZE: usize = 0x370;
+const FLAGS: usize = 0x378;
+const FLAG_SECURE_BOOT: u32 = 1 << 0;
+const TPM_BASE: usize = 0x380;
 /// Every pixel is four bytes, blue, green, red, unused.
 pub const FRAMEBUFFER_BYTES_PER_PIXEL: u64 = 4;
 
@@ -112,6 +116,10 @@ pub struct Handoff {
     pub payload: Option<Payload>,
     /// Present when the machine has a display.
     pub framebuffer: Option<Framebuffer>,
+    /// Enforce Secure Boot (enrolling the default keys when there is no PK).
+    pub secure_boot: bool,
+    /// The TPM's CRB registers, when the machine has a TPM.
+    pub tpm_base: Option<u64>,
 }
 
 impl Handoff {
@@ -200,6 +208,8 @@ impl Handoff {
             tsc_hz: u64_at(TSC_HZ),
             payload,
             framebuffer: consistent.then_some(framebuffer),
+            secure_boot: u32_at(FLAGS) & FLAG_SECURE_BOOT != 0,
+            tpm_base: Some(u64_at(TPM_BASE)).filter(|base| *base != 0),
         })
     }
 }
@@ -330,6 +340,19 @@ mod tests {
         ] {
             assert_eq!(Handoff::parse(&page).unwrap().framebuffer, None);
         }
+    }
+
+    #[test]
+    fn secure_boot_and_the_tpm_come_from_the_flags_and_the_tpm_base() {
+        let plain = Handoff::parse(&page()).unwrap();
+        assert!(!plain.secure_boot);
+        assert_eq!(plain.tpm_base, None);
+        let mut both = page();
+        put32(&mut both, FLAGS, FLAG_SECURE_BOOT);
+        put(&mut both, TPM_BASE, 0xfed4_0000);
+        let both = Handoff::parse(&both).unwrap();
+        assert!(both.secure_boot);
+        assert_eq!(both.tpm_base, Some(0xfed4_0000));
     }
 
     #[test]

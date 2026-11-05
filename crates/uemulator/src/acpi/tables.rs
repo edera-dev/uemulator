@@ -11,6 +11,7 @@ use crate::dev::acpi_pm::{
 use crate::dev::apic::APIC_DEFAULT_BASE;
 use crate::dev::hpet::{CAPABILITIES_LOW_DWORD, HPET_BASE};
 use crate::dev::ioapic::{IOAPIC_DEFAULT_BASE, IOAPIC_ID};
+use crate::dev::tpm::{CTRL_REQ, TPM_CRB_BASE};
 
 pub(super) const HEADER_LENGTH: usize = 36;
 const OEM_ID: &[u8; 6] = b"UEMUL ";
@@ -338,4 +339,24 @@ pub(super) fn hpet() -> Vec<u8> {
     body.extend_from_slice(&HPET_MINIMUM_TICK.to_le_bytes());
     body.push(0); // page protection and OEM attributes
     table(b"HPET", HPET_REVISION, &body)
+}
+
+/// TCG ACPI Specification 1.3, "TPM2 table", revision 4, ending after the start method
+/// parameters, without the log area fields: the event log reaches Linux from the UEFI
+/// firmware's configuration table, Linux reads LAML/LASA only from a table long enough to
+/// have them, and an empty log area there would only make it warn.
+const TPM2_REVISION: u8 = 4;
+const TPM2_PLATFORM_CLASS_CLIENT: u16 = 0;
+/// "Uses the Command Response Buffer Interface".
+const TPM2_START_METHOD_CRB: u32 = 7;
+const TPM2_START_METHOD_PARAMETER_BYTES: usize = 12;
+
+pub(super) fn tpm2() -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&TPM2_PLATFORM_CLASS_CLIENT.to_le_bytes());
+    body.extend_from_slice(&[0; 2]); // reserved
+    body.extend_from_slice(&(TPM_CRB_BASE + CTRL_REQ).to_le_bytes());
+    body.extend_from_slice(&TPM2_START_METHOD_CRB.to_le_bytes());
+    body.extend_from_slice(&[0; TPM2_START_METHOD_PARAMETER_BYTES]);
+    table(b"TPM2", TPM2_REVISION, &body)
 }

@@ -4,7 +4,7 @@
 //! 0xE0000..0xFFFFF).
 //!
 //! The set is RSDP (rev 2), RSDT, XSDT, FACS, FADT (rev 6, full hardware, no SMI_CMD so ACPI
-//! starts enabled), DSDT, MADT, MCFG, HPET and, with the IOMMU, IVRS. `docs/plans/18-xen-dom0.md` and
+//! starts enabled), DSDT, MADT, MCFG, HPET and, with the IOMMU, IVRS, and with the TPM, TPM2. `docs/plans/18-xen-dom0.md` and
 //! `docs/plans/07-devices.md` describe the devices the tables point at.
 #[cfg(freestanding)]
 use crate::prelude::*;
@@ -43,6 +43,8 @@ pub(crate) struct AcpiConfig {
     pub pci_functions: usize,
     /// Publish the IVRS table for the AMD IOMMU.
     pub iommu: bool,
+    /// Publish the TPM2 table and the TPM's device.
+    pub tpm: bool,
 }
 
 impl Default for AcpiConfig {
@@ -51,6 +53,7 @@ impl Default for AcpiConfig {
             cpus: 1,
             pci_functions: 0,
             iommu: false,
+            tpm: false,
         }
     }
 }
@@ -110,7 +113,10 @@ pub(crate) fn build(config: &AcpiConfig) -> Result<Vec<u8>, Error> {
         image: vec![0; tables::RSDP_LENGTH],
     };
     let facs = region.place_aligned(&tables::facs(), FACS_ALIGNMENT);
-    let dsdt = region.place(&dsdt::dsdt(&pci_interrupt_gsis(config.pci_functions)));
+    let dsdt = region.place(&dsdt::dsdt(
+        &pci_interrupt_gsis(config.pci_functions),
+        config.tpm,
+    ));
     let fadt = region.place(&tables::fadt(dsdt, facs));
     // Level-triggered ISA lines: the PCI functions' and the SCI.
     let mut level_irqs = LEGACY_IRQS.to_vec();
@@ -121,6 +127,9 @@ pub(crate) fn build(config: &AcpiConfig) -> Result<Vec<u8>, Error> {
     entries.push(region.place(&tables::hpet()));
     if config.iommu {
         entries.push(region.place(&ivrs(config)));
+    }
+    if config.tpm {
+        entries.push(region.place(&tables::tpm2()));
     }
     let rsdt = region.place(&tables::rsdt(&entries));
     let xsdt = region.place(&tables::xsdt(&entries));

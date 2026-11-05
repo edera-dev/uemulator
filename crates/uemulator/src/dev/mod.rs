@@ -13,6 +13,7 @@ pub(crate) mod pci;
 mod pic;
 mod pit;
 mod serial;
+pub(crate) mod tpm;
 mod vblk;
 mod vcons;
 mod vgpu;
@@ -39,6 +40,7 @@ use pci::PciHost;
 use pic::Pics;
 use pit::Pit;
 use serial::Uart;
+use tpm::TpmCrb;
 use vblk::VirtioBlk;
 use vcons::VirtioConsole;
 use vgpu::VirtioGpu;
@@ -199,6 +201,9 @@ pub(crate) struct DevConfig {
     pub rng: Option<RngSource>,
     /// Adds the screen (`DISPLAY_FUNCTIONS` functions) after the NICs.
     pub display: Option<DisplayDevices>,
+    /// Adds the TPM (not a PCI function: CRB MMIO at `tpm::TPM_CRB_BASE`), whose
+    /// `TPM2_GetRandom` draws from this source.
+    pub tpm: Option<RngSource>,
     /// Adds the keyboard and tablet (`INPUT_FUNCTIONS` functions) after the GPU.
     pub input: Option<InputHandle>,
 }
@@ -224,6 +229,7 @@ pub(crate) struct Devices {
     reset_control: u8,
     pci: PciHost,
     kv: Option<KvDevice>,
+    tpm: Option<TpmCrb>,
     /// One local APIC per vCPU, indexed by vCPU number (which is also the APIC id it starts with).
     lapics: Vec<Lapic>,
     /// The vCPU that is executing; the CPU-facing APIC accesses (MMIO window, MSRs, CR8,
@@ -358,6 +364,9 @@ impl Devices {
             reset_control: 0,
             pci: PciHost::new(virtio_devices).with_iommu(cfg.iommu),
             kv: cfg.key_value_store.map(KvDevice::new),
+            tpm: cfg
+                .tpm
+                .map(|source| TpmCrb::new(tpm::Random::new(source), 0)),
             lapics: (0..cfg.cpus.max(1) as u32).map(Lapic::new).collect(),
             current_cpu: 0,
             lowest_priority_cursor: 0,
@@ -911,6 +920,9 @@ impl Devices {
         if PciHost::ecam_decodes(phys_addr) {
             return Some(self.pci.ecam_read(phys_addr, size) as u64);
         }
+        if let Some(tpm) = self.tpm.as_ref().filter(|_| TpmCrb::decodes(phys_addr)) {
+            return Some(tpm.mmio_read(phys_addr, size));
+        }
         let value = self.pci.mmio_read(phys_addr, size);
         // Reading the ISR register acknowledges the interrupt.
         self.update_pci_irqs();
@@ -950,6 +962,10 @@ impl Devices {
         }
         if PciHost::ecam_decodes(phys_addr) {
             self.pci.ecam_write(phys_addr, size, val as u32);
+            return true;
+        }
+        if let Some(tpm) = self.tpm.as_mut().filter(|_| TpmCrb::decodes(phys_addr)) {
+            tpm.mmio_write(phys_addr, size, val, self.now_ns);
             return true;
         }
         let mut messages = Vec::new();

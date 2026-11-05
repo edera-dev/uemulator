@@ -1,6 +1,6 @@
 # uemulator
 
-uemulator is an x86_64 PC emulator written in Rust, built to be embedded. It boots unmodified distribution kernels (Alpine, Debian, Fedora, and Xen with a Linux dom0) on an emulated AMD Zen 5 machine, through its own UEFI firmware. The design follows QEMU's TCG: guest code is translated into cached blocks and run by an interpreter or by a JIT for the host. The same library runs as a command-line tool, in a browser tab, or as a UEFI application. Its public API is small and centred on `MachineConfig` and `EmulatedMachine`, and it can be built with no dependencies at all.
+uemulator is an x86_64 PC emulator written in Rust, built to be embedded. It boots unmodified distribution kernels (Alpine, Debian, Fedora, and Xen with a Linux dom0) on an emulated AMD Zen 5 machine, through its own UEFI firmware. The design follows QEMU's TCG: guest code is translated into cached blocks and run by an interpreter or by a JIT for the host. The same library runs as a command-line tool, in a browser tab, or as a UEFI application. Its public API is small and centred on `MachineConfig` and `EmulatedMachine`, and it can be built with no third-party dependencies at all.
 
 **[Try it in the browser](https://edera-dev.github.io/uemulator/web/)**: Alpine Linux boots in a Web Worker.
 
@@ -15,7 +15,7 @@ uemulator is an x86_64 PC emulator written in Rust, built to be embedded. It boo
 - **A screen in your browser.** `--display framebuffer` gives the machine a graphical console, and the CLI serves a KVM-style viewer for its screen, keyboard and mouse.
 - **Its own disk format.** Images are sparse and copy-on-write, and can be streamed over HTTP.
 - **Three JITs.** aarch64, x86_64 and WebAssembly hosts get a JIT, and every JIT is checked against the interpreter. The interpreter runs everywhere else.
-- **Embeddable.** No global state, and no stdio or process exit inside the library. Built `no_std` for freestanding hosts. With `default-features = false` it has zero dependencies.
+- **Embeddable.** No global state, and no stdio or process exit inside the library. Built `no_std` for freestanding hosts. With `default-features = false` it has no third-party dependencies.
 
 ## Quick start
 
@@ -118,7 +118,7 @@ If no firmware is configured, the library enters the kernel directly through the
 
 ```sh
 cargo test --release --workspace
-cargo test --release -p uemulator --no-default-features   # interpreter only, no dependencies
+cargo test --release -p uemulator --no-default-features   # interpreter only, no third-party dependencies
 cargo clippy --release --all-targets                      # must print zero warnings
 ./hack/autofix.sh                                         # clippy --fix and rustfmt; run before every commit
 ```

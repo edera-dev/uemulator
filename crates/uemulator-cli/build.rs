@@ -12,10 +12,18 @@ const FIRMWARE_PACKAGE: &str = "uemulator-firmware";
 fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let firmware_dir = manifest_dir.join("../uemulator-firmware");
-    for watched in ["src", "Cargo.toml", "link.ld", "build.rs"] {
+    for watched in ["src", "Cargo.toml", "link.ld", "build.rs", "secure-boot"] {
         println!(
             "cargo:rerun-if-changed={}",
             firmware_dir.join(watched).display()
+        );
+    }
+    // The firmware's own dependency: a change there must rebuild the image too.
+    let crypto_dir = manifest_dir.join("../uemulator-crypto");
+    for watched in ["src", "Cargo.toml"] {
+        println!(
+            "cargo:rerun-if-changed={}",
+            crypto_dir.join(watched).display()
         );
     }
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());

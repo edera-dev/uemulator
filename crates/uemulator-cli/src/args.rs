@@ -198,6 +198,19 @@ pub struct HardwareArgs {
     #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = BOOL_FLAG_DEFAULT,
         value_name = "BOOL")]
     pub iommu: Option<bool>,
+    /// Add a TPM 2.0 (CRB interface, ACPI TPM2 table). The UEFI firmware measures the boot into
+    /// it and hands the event log to the OS; it does PCRs, hashing and random numbers, not keys
+    /// or sealing. `--tpm=false` takes it out again
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = BOOL_FLAG_DEFAULT,
+        value_name = "BOOL")]
+    pub tpm: Option<bool>,
+    /// Have the UEFI firmware enforce Secure Boot. The first boot with it enrolls a uemulator
+    /// PK and Microsoft's KEKs, db (Windows and third-party UEFI CAs, 2011 and 2023) and dbx into
+    /// the machine's nvram: shim-based distributions and Windows boot, unsigned kernels do not.
+    /// `--secure-boot=false` stops enforcing and keeps the keys
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = BOOL_FLAG_DEFAULT,
+        value_name = "BOOL")]
+    pub secure_boot: Option<bool>,
     /// The disks in command-line order, `--disk` and `--create-disk` interleaved. `order` fills it.
     #[arg(skip)]
     pub disk_steps: Vec<DiskStep>,
@@ -398,6 +411,8 @@ pub struct Settings {
     pub disable_jit: bool,
     pub disable_rng: bool,
     pub iommu: bool,
+    pub tpm: bool,
+    pub secure_boot: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display: Option<DisplayArg>,
     /// `None` follows the display, so a machine saved before input could be chosen keeps its
@@ -502,6 +517,12 @@ impl Settings {
         }
         if let Some(iommu) = hardware.iommu {
             self.iommu = iommu;
+        }
+        if let Some(tpm) = hardware.tpm {
+            self.tpm = tpm;
+        }
+        if let Some(secure_boot) = hardware.secure_boot {
+            self.secure_boot = secure_boot;
         }
         if hardware.display.is_some() {
             self.display = hardware.display;
@@ -815,6 +836,8 @@ mod tests {
             disable_jit: false,
             disable_rng: true,
             iommu: true,
+            tpm: true,
+            secure_boot: true,
             display: Some(DisplayArg::Both),
             input: Some(false),
             consoles: vec![ConsoleArg::Virtio, ConsoleArg::Serial],

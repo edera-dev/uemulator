@@ -1291,6 +1291,12 @@ mod tests {
         assert_eq!(hardware(&[]).iommu, None);
         assert_eq!(hardware(&["--iommu"]).iommu, Some(true));
         assert_eq!(hardware(&["--iommu=false"]).iommu, Some(false));
+        assert_eq!(hardware(&[]).tpm, None);
+        assert_eq!(hardware(&["--tpm"]).tpm, Some(true));
+        assert_eq!(hardware(&["--tpm=false"]).tpm, Some(false));
+        assert_eq!(hardware(&[]).secure_boot, None);
+        assert_eq!(hardware(&["--secure-boot"]).secure_boot, Some(true));
+        assert_eq!(hardware(&["--secure-boot=false"]).secure_boot, Some(false));
         assert_eq!(
             error_kind(&["advanced", "boot", "--kernel", "k", "--disable-jit=maybe"]),
             ErrorKind::InvalidValue

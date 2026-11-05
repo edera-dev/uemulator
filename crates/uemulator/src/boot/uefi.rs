@@ -28,9 +28,10 @@ const IMAGE_FOOTPRINT_OFFSET: usize = 16;
 const MAX_FOOTPRINT: u64 = 64 << 20;
 
 const HANDOFF_MAGIC: &[u8; 8] = b"UEMUHAND";
-/// Version 2 added the framebuffer fields at 0x338, version 3 the hypervisor at 0x358.
-const HANDOFF_VERSION: u32 = 3;
-pub(crate) const HANDOFF_SIZE: usize = 0x378;
+/// Version 2 added the framebuffer fields at 0x338, version 3 the hypervisor at 0x358, version 4
+/// the flags at 0x378 and the TPM at 0x380.
+const HANDOFF_VERSION: u32 = 4;
+pub(crate) const HANDOFF_SIZE: usize = 0x388;
 
 const HANDOFF_VERSION_OFFSET: usize = 0x08;
 const HANDOFF_SIZE_OFFSET: usize = 0x0c;
@@ -78,6 +79,12 @@ const HANDOFF_HYPERVISOR_BASE: usize = 0x358;
 const HANDOFF_HYPERVISOR_SIZE: usize = 0x360;
 const HANDOFF_HYPERVISOR_CMDLINE_BASE: usize = 0x368;
 const HANDOFF_HYPERVISOR_CMDLINE_SIZE: usize = 0x370;
+const HANDOFF_FLAGS: usize = 0x378;
+/// The firmware enforces Secure Boot: it enrolls its default keys if the store has no PK and
+/// refuses images that db does not allow.
+const HANDOFF_FLAG_SECURE_BOOT: u32 = 1 << 0;
+/// Physical address of the TPM's CRB registers, 0 when the machine has no TPM.
+const HANDOFF_TPM_BASE: usize = 0x380;
 /// The framebuffer starts on a 2 MiB boundary so that the guest can map it with large pages
 /// (Linux's `ioremap` of a firmware framebuffer, an OS's direct map) without splitting one
 /// around RAM it does own.
@@ -117,6 +124,9 @@ pub(crate) struct FirmwareParams {
     /// Width and height of the boot framebuffer the firmware publishes as its GOP, when the
     /// machine has a display (`framebuffer_region` says where it goes).
     pub framebuffer: Option<(u32, u32)>,
+    pub secure_boot: bool,
+    /// The machine has a TPM, which the firmware starts and measures the boot into.
+    pub tpm: bool,
 }
 
 /// Where a machine with `ram_top` bytes of flat RAM keeps a `width` x `height` boot framebuffer:
@@ -370,6 +380,17 @@ pub(crate) fn load_uefi_firmware(
         },
     );
     handoff.put_u64(HANDOFF_TSC_HZ, TSC_HZ);
+    handoff.put_u32(
+        HANDOFF_FLAGS,
+        if params.secure_boot {
+            HANDOFF_FLAG_SECURE_BOOT
+        } else {
+            0
+        },
+    );
+    if params.tpm {
+        handoff.put_u64(HANDOFF_TPM_BASE, crate::dev::tpm::TPM_CRB_BASE);
+    }
     if let Some(region) = &framebuffer {
         handoff.put_u64(HANDOFF_FRAMEBUFFER_BASE, region.base);
         handoff.put_u64(HANDOFF_FRAMEBUFFER_SIZE, region.pixel_bytes());
@@ -455,7 +476,29 @@ mod tests {
             rsdp: 0,
             acpi_region: (0, 0),
             framebuffer: None,
+            secure_boot: false,
+            tpm: false,
         }
+    }
+
+    #[test]
+    fn secure_boot_and_the_tpm_are_off_unless_asked_for() {
+        let field = |offset: usize| HANDOFF_ADDR + offset as u64;
+        let (_, ram) = load(&image(ENTRY, 0x2000), &params()).unwrap();
+        assert_eq!(u32_at(&ram, field(HANDOFF_VERSION_OFFSET)), 4);
+        assert_eq!(u32_at(&ram, field(HANDOFF_FLAGS)), 0);
+        assert_eq!(u64_at(&ram, field(HANDOFF_TPM_BASE)), 0);
+        let both = FirmwareParams {
+            secure_boot: true,
+            tpm: true,
+            ..params()
+        };
+        let (_, ram) = load(&image(ENTRY, 0x2000), &both).unwrap();
+        assert_eq!(u32_at(&ram, field(HANDOFF_FLAGS)), HANDOFF_FLAG_SECURE_BOOT);
+        assert_eq!(
+            u64_at(&ram, field(HANDOFF_TPM_BASE)),
+            crate::dev::tpm::TPM_CRB_BASE
+        );
     }
 
     fn u32_at(ram: &[u8], at: u64) -> u32 {

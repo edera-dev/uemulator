@@ -94,10 +94,13 @@ pub fn init(handoff: &Handoff) {
 
     kv::init(handoff);
     crate::serial::trace!("kv done");
-    variables::init();
+    variables::init(handoff.secure_boot);
     crate::serial::trace!("variables done");
     rng::init(handoff);
     crate::serial::trace!("rng done");
+    crate::tpm::init(handoff);
+    crate::tpm::measure_secure_boot_policy();
+    crate::serial::trace!("tpm done");
     console::init();
     console::attach_screen(handoff.framebuffer);
     crate::serial::trace!("console done");

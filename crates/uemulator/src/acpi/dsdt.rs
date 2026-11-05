@@ -8,6 +8,7 @@ use crate::prelude::*;
 use super::aml::{self, resource};
 use crate::dev::acpi_pm::{PM_LAST_PORT, PM1_EVENT_BASE, SLEEP_TYPE_S5};
 use crate::dev::pci::{ECAM_BASE, ECAM_BYTES_PER_BUS, MMIO_BASE, PCI_MMIO_WINDOW_BYTES};
+use crate::dev::tpm::{TPM_CRB_BASE, TPM_CRB_SIZE};
 
 const DSDT_REVISION: u8 = 2;
 /// `_ADR` of a PCI device is `device << 16 | function`; 0xFFFF as the function means all of them.
@@ -208,8 +209,30 @@ fn sleep_states() -> Vec<u8> {
     )
 }
 
+/// The TPM as Linux's `tpm_crb` and Windows look for it: `MSFT0101` with its CRB page. QEMU's
+/// `build_dsdt` names it TPM and adds `_STR`; the control area itself is in the TPM2 table.
+fn tpm() -> Vec<u8> {
+    const TPM_HID: &str = "MSFT0101";
+    const DEVICE_PRESENT_ENABLED_SHOWN_FUNCTIONING: u64 = 0xf;
+    let mut body = aml::named("_HID", &aml::string(TPM_HID));
+    body.extend(aml::named("_STR", &aml::string("TPM 2.0 Device")));
+    body.extend(aml::named("_UID", &aml::integer(1)));
+    body.extend(aml::named(
+        "_STA",
+        &aml::integer(DEVICE_PRESENT_ENABLED_SHOWN_FUNCTIONING),
+    ));
+    body.extend(aml::named(
+        "_CRS",
+        &aml::buffer(&resource::template(&[resource::memory32_fixed(
+            TPM_CRB_BASE as u32,
+            TPM_CRB_SIZE as u32,
+        )])),
+    ));
+    aml::device("TPM", &body)
+}
+
 /// `irq_of_slot[i]` is the GSI of the function in slot `i + 1`.
-pub(super) fn dsdt(irq_of_slot: &[u8]) -> Vec<u8> {
+pub(super) fn dsdt(irq_of_slot: &[u8], has_tpm: bool) -> Vec<u8> {
     let mut system_bus = pci_root_bridge(irq_of_slot);
     system_bus.extend(legacy_device(
         "COM1",
@@ -236,6 +259,9 @@ pub(super) fn dsdt(irq_of_slot: &[u8]) -> Vec<u8> {
         &[resource::io(PIT_PORT, PIT_PORTS)],
     ));
     system_bus.extend(system_resources());
+    if has_tpm {
+        system_bus.extend(tpm());
+    }
     let mut body = aml::scope("\\_SB", &system_bus);
     body.extend(sleep_states());
     super::tables::table(b"DSDT", DSDT_REVISION, &body)

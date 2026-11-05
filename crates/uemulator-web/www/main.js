@@ -41,7 +41,7 @@ const FIRMWARE_HINTS = {
 };
 const FIRMWARE_LABELS = { uefi: "UEFI", none: "direct kernel", bios: "BIOS", custom: "custom firmware" };
 const RADIOS = ["firmware", "console", "display"];
-const CHECKBOXES = ["shell", "replace-cmdline", "jit", "acpi", "iommu", "rng", "reboot", "input", "network"];
+const CHECKBOXES = ["shell", "replace-cmdline", "jit", "acpi", "iommu", "tpm", "secure-boot", "rng", "reboot", "input", "network"];
 const SELECTS = ["memory", "cpus"];
 // Where the guest RAM is one allocation of the 32-bit module: Rust refuses one larger than
 // isize::MAX, so 2 GiB less a MiB is the most there is.
@@ -236,6 +236,8 @@ function readSettings() {
     jit: $("jit").checked,
     acpi,
     iommu: $("iommu").checked,
+    tpm: $("tpm").checked,
+    secureBoot: $("secure-boot").checked,
     rng: $("rng").checked,
     reboot: $("reboot").checked,
   };
@@ -258,6 +260,9 @@ function notesFor(s) {
   if (s.replaceCmdline && s.kernel && !s.extra) error("Replacing the default command line with nothing leaves the guest without a console.");
   if (s.hypervisor && s.firmware !== "uefi") error("A hypervisor is booted by the UEFI firmware: choose UEFI.");
   if (s.hypervisor && !s.kernel) error("A hypervisor needs a kernel to boot as its dom0.");
+  if (s.secureBoot && s.kernel) {
+    warn("With Secure Boot the kernel must be signed by a key in db (Microsoft's): a distribution's kernel is signed by its own key, which only its shim accepts. Boot an ISO or disk with shim instead.");
+  }
   if (hasBigCd && s.memoryMib < ISO_MEMORY_MIB) {
     warn("Live and installer ISOs usually need 2 GiB: their initramfs is unpacked into RAM, and with less the kernel ends in “Unable to mount root fs”.");
   }
@@ -383,6 +388,11 @@ function render() {
   if (!smpAllowed) $("cpus").value = "1";
   $("iommu").disabled = !$("acpi").checked;
   if ($("iommu").disabled) $("iommu").checked = false;
+  // The OS finds the TPM through ACPI; Secure Boot is the UEFI firmware's to enforce.
+  $("tpm").disabled = !$("acpi").checked;
+  if ($("tpm").disabled) $("tpm").checked = false;
+  $("secure-boot").disabled = firmware !== "uefi";
+  if ($("secure-boot").disabled) $("secure-boot").checked = false;
 
   const s = readSettings();
   renderDrives();
@@ -448,6 +458,8 @@ function restoreSettings() {
   $("cmdline").value = "cmdline" in saved ? saved.cmdline : DEFAULT_CMDLINE_EXTRA;
   if (params.has("args")) $("cmdline").value = params.get("args");
   if (params.has("iommu")) $("iommu").checked = $("acpi").checked = true;
+  if (params.has("tpm")) $("tpm").checked = $("acpi").checked = true;
+  if (params.has("secure-boot")) $("secure-boot").checked = true;
   if (params.has("network")) $("network").checked = !["0", "off", "false"].includes(params.get("network"));
   $("hypervisor-cmdline").value = params.get("hypervisor-args") ?? saved.hypervisorCmdline ?? "";
   for (const key of ["kernel", "initrd", "hypervisor", "firmwareImage"]) {
@@ -529,6 +541,8 @@ function applyDemo(d) {
   $("cmdline").value = d.args ?? "";
   for (const id of ["jit", "acpi", "rng", "reboot"]) $(id).checked = true;
   $("iommu").checked = Boolean(d.iommu);
+  $("tpm").checked = Boolean(d.tpm);
+  $("secure-boot").checked = Boolean(d.secureBoot);
 }
 
 function setRunning(isRunning) {
@@ -1182,7 +1196,8 @@ async function launch() {
     const options = (s.jit ? OPTION.JIT : 0) | (s.acpi ? OPTION.ACPI : 0) | (s.iommu ? OPTION.IOMMU : 0) |
       (s.rng ? OPTION.RNG : 0) | (s.serial ? OPTION.SERIAL_CONSOLE : 0) | (s.reboot ? OPTION.REBOOT : 0) |
       (s.replaceCmdline ? OPTION.REPLACE_CMDLINE : 0) | (s.display !== "none" ? OPTION.DISPLAY : 0) |
-      (s.display === "screen" ? OPTION.SCREEN_CONSOLE : 0) | (s.input ? OPTION.INPUT : 0);
+      (s.display === "screen" ? OPTION.SCREEN_CONSOLE : 0) | (s.input ? OPTION.INPUT : 0) |
+      (s.tpm ? OPTION.TPM : 0) | (s.secureBoot ? OPTION.SECURE_BOOT : 0);
     const message = {
       firmware,
       kernel,

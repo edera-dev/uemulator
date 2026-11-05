@@ -318,6 +318,8 @@
               <label class="switch"><strong>JIT</strong><span>Compile hot code to WebAssembly, about 9x faster than interpreting.</span><input id="jit" type="checkbox" checked></label>
               <label class="switch"><strong>ACPI</strong><span>I/O APIC, HPET and power-off. Needed for several vCPUs and the IOMMU.</span><input id="acpi" type="checkbox" checked></label>
               <label class="switch"><strong>AMD IOMMU</strong><span>DMA and interrupt remapping (IVRS); the guest kernel needs <code>AMD_IOMMU</code>.</span><input id="iommu" type="checkbox"></label>
+              <label class="switch"><strong>TPM 2.0</strong><span>PCRs, hashing and random numbers behind ACPI's TPM2 table; the UEFI firmware measures the boot into it.</span><input id="tpm" type="checkbox"></label>
+              <label class="switch"><strong>Secure Boot</strong><span>UEFI only: Microsoft's keys, so shim-based distributions and Windows boot and unsigned kernels do not.</span><input id="secure-boot" type="checkbox"></label>
               <label class="switch"><strong>virtio-rng</strong><span>Entropy from <code>crypto.getRandomValues</code>.</span><input id="rng" type="checkbox" checked></label>
               <label class="switch"><strong>Restart on guest reset</strong><span>Off ends the run at a reset, which also stops a panicking kernel from rebooting forever.</span><input id="reboot" type="checkbox" checked></label>
               <label class="switch"><strong>Replace the default command line</strong><span>Pass only the extra arguments, not the library's console and panic defaults.</span><input id="replace-cmdline" type="checkbox"></label>

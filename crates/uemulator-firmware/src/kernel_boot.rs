@@ -47,6 +47,9 @@ pub fn run(payload: &Payload) -> Status {
     }
     start_from_buffer(kernel, KERNEL_FILE_NAME, cmdline).unwrap_or_else(|status| {
         match status {
+            SECURITY_VIOLATION => crate::serial::println!(
+                "sign the kernel with a key in db, or boot without --secure-boot"
+            ),
             UNSUPPORTED | LOAD_ERROR => crate::serial::println!(
                 "the kernel is not an EFI-stub image (status {status:#x}); boot it with --firmware none"
             ),
