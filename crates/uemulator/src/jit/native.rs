@@ -567,7 +567,7 @@ impl Jit {
                 hook(cpu);
             }
             let generation = self.shared.invalidations.load(Ordering::Acquire);
-            let decoded = decode_block(cpu, rip, phys_addr)?;
+            let decoded = decode_block(cpu, rip, phys_addr, false)?;
             #[cfg(test)]
             if let Some(hook) = BEFORE_INSTALL.with(|hook| hook.borrow_mut().take()) {
                 hook(cpu);

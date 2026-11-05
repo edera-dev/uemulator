@@ -133,10 +133,13 @@ fn a_loop_that_bounces_between_the_aliases_ends_where_the_interpreter_ends() {
         );
         assert_eq!(jitted.cpu.gpr[R8], 0);
         assert_eq!(jitted.cpu.gpr[RAX], interpreted.cpu.gpr[RAX]);
+        // The WebAssembly backend runs the block at 0x20 on past its jnz, so 0x25 is no block
+        // of its own there (`blocks::decode_block`).
+        let blocks = if cfg!(target_arch = "wasm32") { 2 } else { 3 };
         assert_eq!(
             translated(&jitted),
-            3,
-            "both aliases ran the three blocks translated for the first"
+            blocks,
+            "both aliases ran the blocks translated for the first"
         );
     }
 }

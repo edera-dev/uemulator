@@ -90,6 +90,17 @@ pub(super) fn difference_in(
     compared_ram: &[std::ops::Range<usize>],
 ) -> Option<String> {
     let (jit, jit_stop) = result.jit.as_ref()?;
+    // A module the engine refuses leaves its blocks to the interpreter, which would agree with
+    // itself here: a generator bug must not pass as a match.
+    #[cfg(target_arch = "wasm32")]
+    if let Some(compiler) = jit.cpu.jit.as_ref()
+        && compiler.stats().compile_failures != 0
+    {
+        return Some(format!(
+            "the engine refused a generated module: {:?}",
+            compiler.stats()
+        ));
+    }
     if jit_stop != &result.interpreter_stop {
         return Some(format!(
             "stop reason: jit {jit_stop:?}, interpreter {:?}",
@@ -328,12 +339,18 @@ mod translation {
         assert_eq!(stats_of(&result).translated, 1);
     }
 
+    /// The WebAssembly backend decodes past a conditional branch within the page
+    /// (`blocks::decode_block`), so its blocks there run on to the next block end.
+    const RUNS_ON_PAST_JCC: bool = cfg!(target_arch = "wasm32");
+
     #[test]
     fn alu_and_conditional_jump_are_lowered_inline_and_hlt_runs_through_the_helper() {
         let result = check(&INLINE_ALU_THEN_JCC);
         let stats = stats_of(&result);
-        assert_eq!(stats.translated, 2, "[add, cmp, jb] and [hlt]");
-        assert_eq!(stats.total, 4);
+        // [add, cmp, jb] and [hlt]; or [add, cmp, jb, hlt], whose jb to the hlt is taken with
+        // the seeded registers and lands on [hlt] as well
+        assert_eq!(stats.translated, 2, "{stats:?}");
+        assert_eq!(stats.total, if RUNS_ON_PAST_JCC { 5 } else { 4 });
         assert_eq!(stats.inlined, 3);
     }
 
@@ -349,8 +366,10 @@ mod translation {
     #[test]
     fn a_loop_is_translated_once_however_often_it_runs() {
         let result = check(&COUNTED_LOOP_1000);
-        // [mov, add, dec, jnz] on the way in, [add, dec, jnz] for every back edge, [hlt]
-        assert_eq!(stats_of(&result).translated, 3);
+        // [mov, add, dec, jnz] on the way in, [add, dec, jnz] for every back edge, [hlt]; where
+        // blocks run on past the jnz, the second ends at the hlt and there is no third
+        let blocks = if RUNS_ON_PAST_JCC { 2 } else { 3 };
+        assert_eq!(stats_of(&result).translated, blocks);
         assert!(result.interpreter.cpu.icount > 3000);
     }
 

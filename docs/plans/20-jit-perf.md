@@ -295,3 +295,32 @@ What is left, in order of size:
 - **x86-64 hosts** call the helper for palignr and pshufb (SSSE3) and the SHA extensions (SHA-NI) because the host may lack them; a runtime check (`is_x86_feature_detected!`, as `carry_less_multiply` does) could emit them directly. Not measured: no x86-64 host here.
 - **The web build** goes through the helper for every one of these forms; its `--tpm` boot under Node was not timed.
 - pblendw (once per block) still goes through `helper_exec`.
+
+## Round 5: the KDE live ISO on the WebAssembly build (2026-11-04)
+
+Workload: `debian-live-13.7.0-amd64-kde.iso` (3.9 GB) under Node 26 on the web build (`hack/wasm/boot.mjs`), 2047 MiB, one vCPU, through UEFI. Two ways in: the ISO's own kernel and initrd booted directly with the ISO as the CD (`--kernel vmlinuz --initrd initrd.img --cdrom ISO --cmdline "boot=live components"`, which gives a console log to time stages with `--mark`), and the real path through GRUB (`--keys` types `c`, then `linux`, `initrd` and `boot` at GRUB's command line once `--keys-after` sees the menu). Times are wall seconds from process start, interleaved pairs on a host with a load of 7 to 10 (other emulators running); single runs spread by about 3 s at 90 s.
+
+Where the time was, at HEAD: the kernel reached systemd in 77 s and SDDM started at 941 s. Natively (the aarch64 JIT) the same boot reached journald in 16 s against 154 s, for the same work (17.5G against 19.3G guest instructions by then): the WebAssembly build ran at 186M guest instructions a second against 1.1G. The userspace part (`live-config`, `ldconfig`, `console-setup`: shell scripts and short-lived processes from a squashfs) is most of the boot.
+
+| step | to journald | to `network.target` (just before SDDM) |
+|---|---:|---:|
+| HEAD | 153.8 | |
+| imul r64 with flags, mul r64, shlx/shrx/sarx, bzhi, 16-bit shifts, movzx from ah, bit scans, shld/shrd, bswap | 146.2 | |
+| a cache of 2^17 blocks that recycles invalidated blocks and evicts cold pages instead of flushing | 133.9 | |
+| blocks run on past conditional branches | 89.4 (from 125.8 in the same pair) | |
+| self-loops as wasm loops | 85.9 (87.0) | |
+| deferred flag records | no change (85.3 against 85.0) | 471.5 |
+| vector moves | | 440.0 |
+| SSE/AVX-512 integer instructions on wasm SIMD, kmovd/kmovq | | 389.3 (438.9) |
+
+End to end, HEAD against all of the above in one interleaved pair (before mulx, which came last): SDDM started at 875.8 s and 409.4 s (2.1 times faster); `Run /init` at 23.8 and 13.2 s, systemd at 94.4 and 47.7 s. Through GRUB (the page's way), `Run /init` at 39.3 and 23.1 s, the GRUB menu at 10.9 and 7.2 s.
+
+What each step rests on, beyond `docs/plans/13-web.md`:
+
+- The interpreter histogram (`--debug`) of the kernel phase was zstd's BMI2 loops: 437M instructions through `helper_exec` in the first 60 s, `imul r64` with live flags (106M), shrx/shlx (142M), bzhi (41M), 16-bit shifts (67M). The aarch64 backend had all of them; the wasm one now does too, except that the high half of a 64-bit product is four 32-bit multiplications.
+- The cache: `resets: 6` in 145 s at 2^16 blocks, 447k translations for a working set of about 160k blocks. Recycling dead blocks alone freed 17k (the blocks were alive, not stale); 2^17 with cold-page eviction and 2^18 with neither both stopped the flushes (133.9 and 128.5 s to journald). 2^17 is what is kept: V8 holds about 10 KB per block (Node's RSS 2.7, 3.2 and 3.8 GB at 2^16, 2^17 and 2^18 blocks, with 2 GB of guest RAM), and evicted code only gives its memory back at V8's next GC.
+- Block size: with blocks ending at every jcc, the boot's blocks averaged 4.5 instructions, and a block boundary is an indirect tail call into another module instance after a linked exit's checks. Running on past a jcc took them to 10.3 and to 16 guest instructions per block entry, the largest single step.
+- A register-only loop runs as fast under wasm as natively (0.38 against 0.36 ns per guest instruction, `jit::diff_tests`-style harness loop of 100M instructions); a loop with a load and a store per seven instructions ran at 1.25 against 0.58. Deferring the flag records took them to 0.29 and 0.86, faster than native for the first, but the boot did not move: its block time is spread over thousands of blocks (50% of it in 2,700 of them), most of them in Liftoff, not in steady loops.
+- V8's tier-up: `--wasm-tiering-budget=1000` boots 15% faster (75 against 88 s to journald), `--no-liftoff` is slower (90 s: TurboFan compile time). A page cannot set flags. Liftoff spills every local at each if/else (every memory access has one), so it reloads `cpu` from its frame for every guest register access; what would help is fewer control-flow merges per block or getting warm blocks to TurboFan sooner, neither tried.
+- What is left in the interpreter by 400 s (576M instructions, from 964M): adcx (90M), adox (81M) and mulx (78M, inline since), the masked vmovdqu8 loads of glibc's string tails (63M), vpbroadcastb from a general register (16M), div (16M), cmpxchg (12M).
+- The userspace phase sent another 964M instructions through the interpreter in its first 400 s: glibc's AVX-512 string and copy functions (vmovdqu64 loads and stores, kmovd, vpcmpub/vpcmpeqb/vptestmb into opmasks, vpxorq, vpminub) and, later, bignum code (adcx, adox, mulx; most likely host key generation). The moves need only i64 loads and stores; the compares use wasm's fixed-width SIMD, which `Jit::new` probes for.

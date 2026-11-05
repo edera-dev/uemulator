@@ -289,6 +289,12 @@ pub(crate) extern "C" fn helper_cond(cpu: &mut Cpu, cc: u64) -> u64 {
 /// call/jmp (`ff /2`, `ff /4`; a form the emitter does not lower goes to the interpreter helper,
 /// which also ends the block). All of them are also `ends_block`. Keep in step with the terminal
 /// arms of `try_inline`.
+/// jcc rel8 and rel32: the one kind of block end the WebAssembly backend can decode past
+/// (`blocks::decode_block`), making the taken branch a side exit.
+pub(crate) fn is_conditional_branch(insn: &Insn) -> bool {
+    matches!(insn.op, 0x70..=0x7f | 0x180..=0x18f)
+}
+
 pub(crate) fn is_inline_terminator(insn: &Insn) -> bool {
     matches!(
         insn.op,
@@ -375,6 +381,10 @@ pub(crate) fn ends_block(insn: &Insn) -> bool {
 /// read them). Only the register-only flag writers listed in `writes_all_flags` get `false`;
 /// the answer for every other instruction is `true`, as is the answer for a writer whose
 /// flags are still wanted.
+///
+/// The native generators ask this; the WebAssembly one defers every record it can instead
+/// (`emit_wasm::Gen::pending_record`).
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) fn flag_record_needed(insns: &[Insn]) -> Vec<bool> {
     let mut needed = vec![true; insns.len()];
     let mut live = true;
@@ -456,7 +466,11 @@ fn leaves_flags_alone(insn: &Insn) -> bool {
 
 /// The 128-bit whole-register moves the generators lower inline: movups/movupd, movaps/movapd and
 /// movdqu/movdqa, legacy-encoded, register or memory form.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "x86_64",
+    target_arch = "wasm32"
+))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct VectorMove {
     /// The destination is the xmm register `reg`; otherwise it is `rm` (register) or memory.
@@ -468,7 +482,11 @@ pub(crate) struct VectorMove {
 /// `Some` for the forms `VectorMove` describes. The scalar forms (`f3`/`f2` movss/movsd, which
 /// merge into the low lane), movlps/movhps, movntdq, MMX `movq` and every VEX/EVEX form are not
 /// included: `Insn::op` carries a flag for the VEX and EVEX ones, so they never match.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "x86_64",
+    target_arch = "wasm32"
+))]
 pub(crate) fn vector_move(insn: &Insn) -> Option<VectorMove> {
     const OPCODE_MAP_0F: u16 = 1 << 8;
     let opcode = insn
@@ -489,7 +507,11 @@ pub(crate) fn vector_move(insn: &Insn) -> Option<VectorMove> {
     Some(VectorMove { load, aligned })
 }
 
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "x86_64",
+    target_arch = "wasm32"
+))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum VectorOp {
     And,
@@ -511,7 +533,11 @@ pub(crate) enum VectorOp {
 /// A legacy-encoded `66 0f xx` integer vector instruction that works lane by lane on a full xmm
 /// register (or `MoveMask`). The `Cpu::sse` semantics are the definition; the same instruction
 /// without the 66 prefix is MMX and with f3/f2 is a different instruction, so neither matches.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "x86_64",
+    target_arch = "wasm32"
+))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct VectorAlu {
     pub op: VectorOp,
@@ -519,7 +545,11 @@ pub(crate) struct VectorAlu {
     pub lane_log2: u32,
 }
 
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "x86_64",
+    target_arch = "wasm32"
+))]
 pub(crate) fn vector_alu(insn: &Insn) -> Option<VectorAlu> {
     const OPCODE_MAP_0F: u16 = 1 << 8;
     if insn.rep != 0 || !insn.p66 {
@@ -717,7 +747,11 @@ pub(crate) extern "C" fn helper_whole_vector(
 /// except for stores to memory), byte compares into an opmask register, and `kmov` of an opmask
 /// register to a general register are lowered; broadcast, rounding and the rest stay in the
 /// interpreter, which also raises every #UD, so a form that could be one is not accepted here.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "x86_64",
+    target_arch = "wasm32"
+))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum EvexKind {
     /// vmovdqu8/16/32/64, vmovdqa32/64, vmovups/vmovupd, vmovaps/vmovapd between a register and
@@ -738,7 +772,11 @@ pub(crate) enum EvexKind {
     MaskToGeneral { wide: bool },
 }
 
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "x86_64",
+    target_arch = "wasm32"
+))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct EvexForm {
     pub kind: EvexKind,
@@ -751,7 +789,11 @@ pub(crate) struct EvexForm {
 /// `Some` for the instructions `EvexKind` lists, with the encodings the interpreter accepts as
 /// valid (see `Cpu::exec_evex`): no broadcast or rounding (EVEX.b), no reserved length, and no
 /// EVEX.z without a write mask.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "x86_64",
+    target_arch = "wasm32"
+))]
 pub(crate) fn evex_form(insn: &Insn) -> Option<EvexForm> {
     use crate::cpu::decode::{EVEX_OP_FLAG, VEX_OP_FLAG};
     const MAP_0F: u16 = 1;
@@ -921,7 +963,11 @@ pub(crate) const OPMASK_EXPANSION_ENTRIES: usize = 256;
 /// Offset in `Cpu` of 128-bit lane `lane` (0 least significant) of vector register `register`
 /// (0..=31). zmm0-15 are split across `xmm`, `ymm_hi` and `zmm_hi`, zmm16-31 sit in `zmm_extra`
 /// (`cpu/evex.rs`).
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "x86_64",
+    target_arch = "wasm32"
+))]
 pub(crate) fn vector_lane_offset(register: u8, lane: u32) -> usize {
     use core::mem::offset_of;
     const LANE_BYTES: usize = size_of::<u128>();

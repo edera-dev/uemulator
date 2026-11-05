@@ -156,3 +156,36 @@ fn andn_and_the_blsr_group_set_flags_from_the_result() {
         }
     }
 }
+
+/// mulx: rdx times r/m into two registers, high half last, leaving the flags alone. A cmp ahead
+/// of it sets CF, which a setc after it must still see (the WebAssembly generator keeps the cmp's
+/// operands in locals mulx must not touch), and pushfq takes the rest.
+#[test]
+fn mulx_leaves_the_flags_of_the_instruction_before() {
+    const CMP_RAX_RBX: [u8; 3] = [0x48, 0x39, 0xd8];
+    // setc r10b; pushfq; pop r11; hlt
+    const SETC_PUSHFQ_HLT: [u8; 8] = [0x41, 0x0f, 0x92, 0xc2, 0x9c, 0x41, 0x5b, 0xf4];
+    const FORMS: [&[u8]; 5] = [
+        &[0xc4, 0x62, 0xb3, 0xf6, 0xc1], // mulx r8, r9, rcx
+        &[0xc4, 0x62, 0x33, 0xf6, 0xc1], // mulx r8d, r9d, ecx
+        &[0xc4, 0x62, 0xb3, 0xf6, 0x06], // mulx r8, r9, qword ptr [rsi]
+        &[0xc4, 0x62, 0x33, 0xf6, 0x06], // mulx r8d, r9d, dword ptr [rsi]
+        &[0xc4, 0xe2, 0xf3, 0xf6, 0xcb], // mulx rcx, rcx, rbx: the high half wins
+    ];
+    for form in FORMS {
+        let code = [&CMP_RAX_RBX[..], form, &SETC_PUSHFQ_HLT].concat();
+        for source in SOURCES {
+            for multiplier in SOURCES {
+                check_with(&code, |harness| {
+                    seed_registers_and_memory(harness);
+                    harness.cpu.gpr[RAX] = 1;
+                    harness.cpu.gpr[RBX] = source | 2;
+                    harness.cpu.gpr[RCX] = source;
+                    harness.cpu.gpr[RDX] = multiplier;
+                    let address = harness.cpu.gpr[RSI];
+                    harness.write_u64(address, source);
+                });
+            }
+        }
+    }
+}

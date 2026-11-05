@@ -72,8 +72,6 @@ pub(crate) use sse::{
     ext::{palignr, pshufb},
     shuffle_dwords,
 };
-#[cfg(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64")))]
-pub(crate) use sys::CR4_OSXSAVE;
 #[cfg(all(
     feature = "jit",
     any(
@@ -82,7 +80,7 @@ pub(crate) use sys::CR4_OSXSAVE;
         target_arch = "wasm32"
     )
 ))]
-pub(crate) use sys::{CR0_EM, CR0_TS, CR4_OSFXSR};
+pub(crate) use sys::{CR0_EM, CR0_TS, CR4_OSFXSR, CR4_OSXSAVE};
 
 /// `Cpu::rng_state` until the machine overrides it with `MachineConfig::random_seed`.
 pub(crate) const DEFAULT_RANDOM_SEED: u64 = 0x9e37_79b9_7f4a_7c15;

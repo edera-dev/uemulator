@@ -304,6 +304,41 @@ fn a_write_to_a_read_only_page_succeeds_when_cr0_wp_is_clear() {
 
 const SEED_RAX: u64 = 0x8899_aabb_ccdd_eeff;
 
+/// The WebAssembly generator keeps the last flag writer's record pending and stores it only on
+/// the way out (`emit_wasm::Gen::pending_record`). A read-modify-write whose load succeeds and
+/// whose store faults computes its result into the locals that pending record lives in, so the
+/// exception must still see the flags from before it: the cmp's (CF and SF set, ZF clear).
+#[test]
+fn a_store_that_faults_after_its_load_leaves_the_flags_of_the_instruction_before() {
+    // mov rcx, [rsi] (warms the TLB entry the load hits); cmp rax, rbx; <op>; hlt
+    const WARM_THEN_CMP: [u8; 6] = [0x48, 0x8b, 0x0e, 0x48, 0x39, 0xd8];
+    let forms: [&[u8]; 6] = [
+        &[0x48, 0x01, 0x0e], // add [rsi], rcx
+        &[0x48, 0xff, 0x06], // inc qword ptr [rsi]
+        &[0x48, 0xf7, 0x1e], // neg qword ptr [rsi]
+        &[0x83, 0x2e, 0x05], // sub dword ptr [rsi], 5
+        &[0x08, 0x06],       // or byte ptr [rsi], al
+        &[0x48, 0x89, 0x0e], // mov [rsi], rcx: no load, the store faults straight away
+    ];
+    for form in forms {
+        let code = [&WARM_THEN_CMP[..], form, &[0xf4]].concat();
+        check_stop_with(
+            &code,
+            |harness| {
+                layout_setup(harness);
+                harness.cpu.gpr[RSI] = READ_ONLY + 0x30;
+                harness.cpu.gpr[RAX] = 1;
+                harness.cpu.gpr[RBX] = 2;
+            },
+            fault(14, Some(PF_PRESENT | PF_WRITE)),
+        );
+    }
+}
+
+/// #PF error code bits (SDM 4.7): the page was present, the access was a write.
+const PF_PRESENT: u32 = 1;
+const PF_WRITE: u32 = 2;
+
 #[test]
 fn a_read_only_page_can_be_read_and_the_data_matches_memory() {
     let code = [&PRELUDE[..], &LOAD_QWORD[..], &EPILOGUE[..]].concat();

@@ -6,7 +6,7 @@
 //                           [--firmware none|uefi|bios] [--cpus N] [--iommu] [--tpm] [--secure-boot] [--no-acpi] [--serial]
 //                           [--hypervisor XEN [--hypervisor-cmdline S]]
 //                           [--gpu] [--no-jit] [--no-compile-worker] [--debug] [--wasm FILE] [--until TEXT]
-//                           [--seconds N]
+//                           [--seconds N] [--mark TEXT]... [--keys TEXT [--keys-after TEXT]]
 //
 // --disk is a raw or udisk image (a file, or an http(s) URL served with range requests) attached
 // the way the page attaches one: read on demand, writes kept in memory. --cdrom attaches an image
@@ -29,7 +29,9 @@
 // browser (docs/plans/25-gpu-3d.md).
 //
 // Stops when TEXT shows up on the console or after N seconds, and prints the wall time and what the
-// JIT host did to stderr.
+// JIT host did to stderr. --mark prints the time since the start when its text first shows up, for
+// timing the stages of a boot. --keys types TEXT on the console (JSON string escapes: "\r" is Enter)
+// once --keys-after's text has shown up, or at once: a boot loader menu that waits for a key.
 import { closeSync, fstatSync, openSync, readFileSync, readSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { Worker } from "node:worker_threads";
@@ -65,6 +67,9 @@ const { values } = parseArgs({
     until: { type: "string" },
     seconds: { type: "string", default: "120" },
     quiet: { type: "boolean", default: false },
+    mark: { type: "string", multiple: true, default: [] },
+    keys: { type: "string" },
+    "keys-after": { type: "string" },
   },
 });
 if (!values.kernel && !values.disk.length && !values.cdrom.length) throw new Error("--kernel, --disk or --cdrom is required");
@@ -81,6 +86,9 @@ const jit = createJitHost();
 // Pointers arrive as signed i32: `>>> 0` makes the ones past 2 GiB of module memory positive.
 const bytes = (ptr, len) => new Uint8Array(wasm.memory.buffer, ptr >>> 0, len);
 const sleeper = new Int32Array(new SharedArrayBuffer(4));
+const marks = values.mark.map((text) => ({ text, at: undefined }));
+let pendingKeys = values.keys === undefined ? undefined : new TextEncoder().encode(JSON.parse(`"${values.keys}"`));
+let keysArmed = values["keys-after"] === undefined;
 
 // Completions the renderer queued, as records, until the module asks for them.
 let gpuCompletions = [];
@@ -116,12 +124,23 @@ const host = {
   host_output(ptr, len) {
     const text = decoder.decode(bytes(ptr, len));
     if (!values.quiet) process.stdout.write(text);
-    if (values.until) {
-      seen = (seen + text).slice(-4096);
-      if (seen.includes(values.until)) found = true;
+    seen = (seen + text).slice(-4096);
+    if (values.until && seen.includes(values.until)) found = true;
+    if (!keysArmed && seen.includes(values["keys-after"])) keysArmed = true;
+    for (const mark of marks) {
+      if (mark.at === undefined && seen.includes(mark.text)) {
+        mark.at = performance.now() - start;
+        console.error(`\nmark ${(mark.at / 1000).toFixed(2)}s ${JSON.stringify(mark.text)}`);
+      }
     }
   },
-  host_input: () => 0,
+  host_input(ptr, cap) {
+    if (!keysArmed || !pendingKeys?.length) return 0;
+    const count = Math.min(cap, pendingKeys.length);
+    bytes(ptr, count).set(pendingKeys.subarray(0, count));
+    pendingKeys = pendingKeys.subarray(count);
+    return count;
+  },
   host_resize: () => 0,
   // No screen here: nothing to draw and no keyboard or pointer events.
   host_input_events: () => 0,
@@ -263,7 +282,7 @@ const code = wasm.uw_run();
 const seconds = ((performance.now() - runStart) / 1000).toFixed(2);
 console.error(
   `\nexit=${code} found=${found} run=${seconds}s jit=${values["no-jit"] ? "off" : "on"} ` +
-    `modules=${compiled} compile=${compileMs.toFixed(0)}ms` +
+    `modules=${compiled} compile=${compileMs.toFixed(0)}ms rss=${(process.memoryUsage().rss / 2 ** 20).toFixed(0)}MiB` +
     (diskSources.length ? ` disk-reads=${diskReads} disk-bytes=${diskBytes}` : ""),
 );
 if (values.gpu) {

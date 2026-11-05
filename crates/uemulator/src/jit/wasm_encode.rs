@@ -24,9 +24,11 @@ pub(crate) mod op {
     #[cfg(test)]
     pub const NOP: u8 = 0x01;
     pub const BLOCK: u8 = 0x02;
+    pub const LOOP: u8 = 0x03;
     pub const IF: u8 = 0x04;
     pub const ELSE: u8 = 0x05;
     pub const END: u8 = 0x0b;
+    pub const BR: u8 = 0x0c;
     pub const BR_IF: u8 = 0x0d;
     pub const RETURN: u8 = 0x0f;
     pub const CALL_INDIRECT: u8 = 0x11;
@@ -63,6 +65,8 @@ pub(crate) mod op {
     pub const I64_LT_U: u8 = 0x54;
     pub const I64_GE_S: u8 = 0x59;
     pub const I64_LE_U: u8 = 0x58;
+    pub const I32_CLZ: u8 = 0x67;
+    pub const I32_CTZ: u8 = 0x68;
     pub const I32_ADD: u8 = 0x6a;
     pub const I32_AND: u8 = 0x71;
     pub const I32_OR: u8 = 0x72;
@@ -70,6 +74,8 @@ pub(crate) mod op {
     pub const I32_SHL: u8 = 0x74;
     pub const I32_ROTL: u8 = 0x77;
     pub const I32_ROTR: u8 = 0x78;
+    pub const I64_CLZ: u8 = 0x79;
+    pub const I64_CTZ: u8 = 0x7a;
     pub const I64_POPCNT: u8 = 0x7b;
     pub const I64_ADD: u8 = 0x7c;
     pub const I64_SUB: u8 = 0x7d;
@@ -87,6 +93,43 @@ pub(crate) mod op {
     pub const I64_EXTEND8_S: u8 = 0xc2;
     pub const I64_EXTEND16_S: u8 = 0xc3;
     pub const I64_EXTEND32_S: u8 = 0xc4;
+    /// The prefix of the fixed-width SIMD instructions; the opcodes in `simd` follow it as a
+    /// LEB128 number (WebAssembly 2.0, shipped in Chrome 91, Firefox 89 and Safari 16.4).
+    pub const SIMD_PREFIX: u8 = 0xfd;
+}
+
+/// Fixed-width SIMD opcodes (after `op::SIMD_PREFIX`).
+pub(crate) mod simd {
+    pub const V128_LOAD: u32 = 0x00;
+    pub const V128_STORE: u32 = 0x0b;
+    pub const I8X16_SPLAT: u32 = 0x0f;
+    pub const I8X16_EQ: u32 = 0x23;
+    pub const I8X16_NE: u32 = 0x24;
+    pub const I8X16_LT_S: u32 = 0x25;
+    pub const I8X16_LT_U: u32 = 0x26;
+    pub const I8X16_GT_S: u32 = 0x27;
+    pub const I8X16_GT_U: u32 = 0x28;
+    pub const I8X16_LE_S: u32 = 0x29;
+    pub const I8X16_LE_U: u32 = 0x2a;
+    pub const I8X16_GE_S: u32 = 0x2b;
+    pub const I8X16_GE_U: u32 = 0x2c;
+    pub const I16X8_EQ: u32 = 0x2d;
+    pub const I32X4_EQ: u32 = 0x37;
+    pub const V128_AND: u32 = 0x4e;
+    pub const V128_ANDNOT: u32 = 0x4f;
+    pub const V128_OR: u32 = 0x50;
+    pub const V128_XOR: u32 = 0x51;
+    pub const I8X16_BITMASK: u32 = 0x64;
+    pub const I8X16_ADD: u32 = 0x6e;
+    pub const I8X16_SUB: u32 = 0x71;
+    pub const I8X16_MIN_U: u32 = 0x77;
+    pub const I8X16_MAX_U: u32 = 0x79;
+    pub const I16X8_ADD: u32 = 0x8e;
+    pub const I16X8_SUB: u32 = 0x91;
+    pub const I32X4_ADD: u32 = 0xae;
+    pub const I32X4_SUB: u32 = 0xb1;
+    pub const I64X2_ADD: u32 = 0xce;
+    pub const I64X2_SUB: u32 = 0xd1;
 }
 
 /// Appends `value` as unsigned LEB128.
@@ -120,12 +163,25 @@ pub(crate) fn leb_i64(out: &mut Vec<u8>, mut value: i64) {
 #[derive(Default)]
 pub(crate) struct Code {
     pub bytes: Vec<u8>,
+    /// Structured constructs (`block`, `if`, `loop`) open at the end of `bytes`, for branch
+    /// label depths (`Code::depth`).
+    depth: u32,
 }
 
 impl Code {
     pub fn op(&mut self, opcode: u8) -> &mut Self {
         self.bytes.push(opcode);
+        if opcode == op::END {
+            // The function's own `end` closes nothing that was opened here.
+            self.depth = self.depth.saturating_sub(1);
+        }
         self
+    }
+
+    /// How many `block`/`if`/`loop` constructs are open: a `br` to the construct opened when
+    /// this was `d` takes the label `depth() - d`.
+    pub fn depth(&self) -> u32 {
+        self.depth
     }
 
     pub fn i32_const(&mut self, value: i32) -> &mut Self {
@@ -170,6 +226,36 @@ impl Code {
     pub fn begin_if(&mut self, block_type: u8) -> &mut Self {
         self.bytes.push(op::IF);
         self.bytes.push(block_type);
+        self.depth += 1;
+        self
+    }
+
+    /// `loop`: a `br` to it goes back to its start.
+    pub fn begin_loop(&mut self, block_type: u8) -> &mut Self {
+        self.bytes.push(op::LOOP);
+        self.bytes.push(block_type);
+        self.depth += 1;
+        self
+    }
+
+    /// A fixed-width SIMD instruction without immediates (`simd`).
+    pub fn simd(&mut self, opcode: u32) -> &mut Self {
+        self.bytes.push(op::SIMD_PREFIX);
+        leb_u32(&mut self.bytes, opcode);
+        self
+    }
+
+    /// `v128.load` or `v128.store` with its memarg (byte alignment, as for `mem`).
+    pub fn simd_mem(&mut self, opcode: u32, offset: u32) -> &mut Self {
+        self.simd(opcode);
+        leb_u32(&mut self.bytes, 0);
+        leb_u32(&mut self.bytes, offset);
+        self
+    }
+
+    pub fn br(&mut self, label: u32) -> &mut Self {
+        self.bytes.push(op::BR);
+        leb_u32(&mut self.bytes, label);
         self
     }
 
@@ -193,6 +279,7 @@ impl Code {
     pub fn begin_block(&mut self) -> &mut Self {
         self.bytes.push(op::BLOCK);
         self.bytes.push(BLOCK_VOID);
+        self.depth += 1;
         self
     }
 

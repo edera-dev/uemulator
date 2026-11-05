@@ -204,6 +204,22 @@ fn sixteen_byte_instruction_raises_general_protection() {
 }
 
 #[test]
+fn movd_and_movq_to_and_from_memory_and_general_registers() {
+    // mov rax, [rbx] (warms the TLB); movd xmm3, [rbx+4]; movq xmm4, [rbx+8] (66 REX.W 0f 6e)
+    // movd [rbx+0x40], xmm4; movq [rbx+0x48], xmm3 (66 REX.W 0f 7e); movq rax, xmm4
+    // movd ecx, xmm3; movq xmm5, rdx; movd xmm6, esi; hlt
+    check_with(
+        &[
+            0x48, 0x8b, 0x03, 0x66, 0x0f, 0x6e, 0x5b, 0x04, 0x66, 0x48, 0x0f, 0x6e, 0x63, 0x08,
+            0x66, 0x0f, 0x7e, 0x63, 0x40, 0x66, 0x48, 0x0f, 0x7e, 0x5b, 0x48, 0x66, 0x48, 0x0f,
+            0x7e, 0xe0, 0x66, 0x0f, 0x7e, 0xd9, 0x66, 0x48, 0x0f, 0x6e, 0xea, 0x66, 0x0f, 0x6e,
+            0xf6, 0xf4,
+        ],
+        sse_setup,
+    );
+}
+
+#[test]
 fn sse_integer_instructions_between_inline_instructions() {
     // add rax, rcx; movdqa xmm0, [rbx]; paddd xmm0, xmm0; movdqu [rbx + 16], xmm0
     // sub rax, rcx; pxor xmm1, xmm1; movq xmm2, rax; movd ebx, xmm0; hlt

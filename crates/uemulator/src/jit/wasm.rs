@@ -33,7 +33,7 @@
 
 #[cfg(freestanding)]
 use crate::prelude::*;
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use core::cell::UnsafeCell;
 use core::mem::{offset_of, size_of};
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
@@ -42,7 +42,7 @@ use super::blocks::{
     BlockKey, Decoded, JUMP_CACHE_BITS, NO_SECOND_PAGE, PAGE_MASK, PAGE_SHIFT, PAGE_SIZE,
     SLOT_BLOCK_BITS, SLOT_BLOCK_MASK, STRADDLER_TAG, decode_block, jump_cache_hash,
 };
-use super::emit_wasm::{self, Addrs, ChainTables, LINK_CELL_SIZE, LINKS_PER_BLOCK};
+use super::emit_wasm::{self, Addrs, ChainTables, LINK_CELL_SIZE, link_cells_for};
 use super::helpers;
 use super::wasm_encode::{self, Code, op};
 use crate::cpu::Cpu;
@@ -80,9 +80,22 @@ const COMPILE_THRESHOLD_WITH_WORKER: u32 = 10;
 const NEVER_COMPILE: u32 = u32::MAX;
 const HEAT_BITS: usize = 16;
 
-/// Most blocks one cache holds before it is flushed. Every block is a live instance in the engine,
-/// so this bounds that memory; the validity table is this long.
-const MAX_BLOCKS: usize = 1 << 16;
+/// Most blocks one cache holds. Every block is a live function in the engine (about 10 KB of V8's
+/// memory each, mostly Liftoff code), so this bounds that memory; the validity table is this
+/// long. A full cache makes room (`State::make_room`) by recycling the blocks invalidated since,
+/// then by evicting the pages that were not used lately, and is flushed whole only when neither
+/// frees enough.
+///
+/// A boot's code outgrows 2^16 blocks: the KDE live ISO's early userspace flushed a cache of that
+/// size six times in 145 s and spent the time recompiling the same code.
+const MAX_BLOCKS: usize = 1 << 17;
+/// Making room must free at least 1/`RECLAIM_MIN_FRACTION` of the cache: every way of doing it
+/// scans every block, so it must free enough of them to pay for the next scan.
+const RECLAIM_MIN_FRACTION: usize = 8;
+/// Blocks among the last 1/`RECENT_FRACTION` of the cache's translations count as recently used
+/// when cold pages are evicted (`State::evict_cold_pages`): they were hot enough to compile just
+/// now, and most were never looked up through the jump cache (linked exits skip it).
+const RECENT_FRACTION: u64 = 4;
 const _: () = assert!(MAX_BLOCKS as u64 <= 1 << SLOT_BLOCK_BITS);
 /// The block an empty link cell names (`emit_wasm::LINK_CELL_BLOCK`): one past the last real
 /// index, whose validity byte is never set, so a linked exit through an empty cell always takes
@@ -111,6 +124,13 @@ const MAX_IN_FLIGHT: usize = 1;
 /// run. Unbatched, waiting for the worker alone was no faster than compiling here; 4 to 32 measured
 /// within noise of each other.
 const PATIENCE: u32 = 8;
+
+/// The physical page numbers a block with this key decoded bytes from.
+fn block_pages(key: BlockKey) -> impl Iterator<Item = u64> {
+    let (phys_addr, second_page) = key;
+    core::iter::once(phys_addr >> PAGE_SHIFT)
+        .chain((second_page != NO_SECOND_PAGE).then_some(second_page >> PAGE_SHIFT))
+}
 
 /// The table slots of `module`'s `count` functions, or `None` if the engine refused it.
 fn compile_functions(module: &[u8], count: usize) -> Option<Vec<u32>> {
@@ -158,9 +178,29 @@ pub(crate) fn probe() -> bool {
     works
 }
 
+/// Whether the host compiles fixed-width SIMD (`v128`): a block function that does a 16-byte
+/// load, a byte compare and a bitmask. Without it the vector lowerings that need it are not
+/// generated (`Addrs::simd`), since one refused module leaves all its blocks interpreted.
+fn probe_simd() -> bool {
+    use wasm_encode::simd;
+    let mut code = Code::default();
+    code.i32_const(0)
+        .simd_mem(simd::V128_LOAD, 0)
+        .i32_const(0)
+        .simd_mem(simd::V128_LOAD, 0)
+        .simd(simd::I8X16_EQ)
+        .simd(simd::I8X16_BITMASK)
+        .op(op::I64_EXTEND_I32_U)
+        .op(op::END);
+    compile_module(&wasm_encode::block_module(&code.bytes, 0, 0)).is_some_and(|slot| {
+        release_slot(slot);
+        true
+    })
+}
+
 /// A function pointer on wasm32 is an index into the function table, which is how generated
 /// code names the helpers.
-fn addrs(out: *mut u64, chain: u32, chain_link: u32, valid: &[AtomicU8]) -> Addrs {
+fn addrs(out: *mut u64, chain: u32, chain_link: u32, valid: &[AtomicU8], simd: bool) -> Addrs {
     Addrs {
         exec: helpers::helper_exec as *const () as usize as u32,
         ld: helpers::helper_load_via_out as *const () as usize as u32,
@@ -174,6 +214,7 @@ fn addrs(out: *mut u64, chain: u32, chain_link: u32, valid: &[AtomicU8]) -> Addr
         chain,
         chain_link,
         valid: valid.as_ptr() as usize as u32,
+        simd,
     }
 }
 
@@ -238,11 +279,13 @@ struct Heat {
     count: u32,
 }
 
-/// One translated block. Blocks are only ever added; an invalidated one keeps its slot (cleared in
-/// `SharedJit::valid`) until the next flush, so indices held in `page_blocks` and the jump caches
-/// stay stable.
+/// One translated block. An invalidated one keeps its index and its table slot (cleared in
+/// `SharedJit::valid`) until the cache fills up; then `State::reclaim` releases its slot, frees
+/// what its code pointed into and hands the index to a new block (`slot` 0 marks it free).
 struct Block {
     key: BlockKey,
+    /// `JitStats::translated` when the block was registered: its age, for eviction.
+    born: u64,
     /// The function table slot the block's function occupies.
     slot: u32,
     /// Generated code calls `helper_exec` with the address of one of these, so they must outlive
@@ -321,6 +364,8 @@ struct SharedJit {
     chain_slot: u32,
     /// Table slot of the linking chain stub, or 0 when exits are not linked.
     chain_link_slot: u32,
+    /// The host compiles fixed-width SIMD (`probe_simd`).
+    simd: bool,
     /// Counts `invalidate_page` calls: a translation decodes outside the lock, so it compares this
     /// before and after to see a write to a page it read (see `native.rs`).
     invalidations: AtomicU64,
@@ -328,8 +373,17 @@ struct SharedJit {
     /// helper returns before anything else reads it.
     out: Box<AtomicU64>,
     compile_threshold: AtomicU32,
+    /// `JitStats::block_calls` and `JitStats::block_insns`, counted outside the lock because
+    /// `step_block` adds to them on every call.
+    block_calls: AtomicU64,
+    block_insns: AtomicU64,
+    /// `JitStats::cold_steps`, outside the lock for the same reason.
+    cold_steps: AtomicU64,
     #[cfg(test)]
     test_block_limit: core::sync::atomic::AtomicUsize,
+    /// Overrides the number of dead blocks `State::make_room` needs to recycle, when not 0.
+    #[cfg(test)]
+    test_reclaim_minimum: core::sync::atomic::AtomicUsize,
     #[cfg(test)]
     fake_compiler: Mutex<Option<FakeCompiler>>,
     state: Mutex<State>,
@@ -337,6 +391,8 @@ struct SharedJit {
 
 struct State {
     blocks: Vec<Block>,
+    /// Indices of `blocks` that `reclaim` freed, for `register` to reuse.
+    free: Vec<u32>,
     /// Every live block by `BlockKey`.
     block_map: BTreeMap<BlockKey, u32>,
     /// Physical page number -> blocks that decoded bytes from it.
@@ -369,6 +425,15 @@ pub(crate) struct JitStats {
     pub total: u64,
     /// Times the whole cache was flushed because it was full.
     pub resets: u64,
+    /// Invalidated blocks whose index and slot were reused (`State::reclaim`) instead of flushing.
+    pub recycled: u64,
+    /// Times a full cache evicted its cold pages (`State::evict_cold_pages`).
+    pub evicted_pages: u64,
+    /// Times `step_block` entered generated code, and the guest instructions those calls
+    /// retired (chained successors included): their ratio is how far a chain gets before it
+    /// comes back to the run loop.
+    pub block_calls: u64,
+    pub block_insns: u64,
     /// Lazy-flag records left out of compiled blocks as dead.
     pub flag_records_skipped: u64,
     /// Decodes thrown away because the page was written before the block was registered.
@@ -417,6 +482,15 @@ impl SharedJit {
         MAX_BLOCKS
     }
 
+    /// Dead blocks a full cache must have to be recycled instead of flushed.
+    fn reclaim_minimum(&self) -> usize {
+        #[cfg(test)]
+        if let minimum @ 1.. = self.test_reclaim_minimum.load(Ordering::Relaxed) {
+            return minimum;
+        }
+        self.block_limit().div_ceil(RECLAIM_MIN_FRACTION)
+    }
+
     /// The ticket of `module` at the compile worker, or `None` if it should be compiled now.
     fn submit(&self, module: &[u8]) -> Option<u32> {
         #[cfg(test)]
@@ -453,8 +527,11 @@ impl State {
     /// code may be running.
     fn flush(&mut self, shared: &SharedJit) {
         for block in self.blocks.drain(..) {
-            release_slot(block.slot);
+            if block.slot != 0 {
+                release_slot(block.slot);
+            }
         }
+        self.free.clear();
         for flag in shared.valid.iter() {
             flag.store(0, Ordering::Release);
         }
@@ -470,6 +547,120 @@ impl State {
         self.in_flight.clear();
         self.pending.clear();
         self.stats.resets += 1;
+    }
+
+    /// Whether `count` more blocks fit: in unused indices below `limit` or freed ones.
+    fn has_room(&self, count: usize, limit: usize) -> bool {
+        limit.saturating_sub(self.blocks.len()) + self.free.len() >= count
+    }
+
+    /// Frees every invalidated block for reuse: releases its table slot, drops what its code
+    /// points into and puts its index on `free`. Returns how many. No generated code may be
+    /// running.
+    ///
+    /// What still names a dead index after this: the jump cache, which is cleared here (an entry
+    /// would pass its validity check once the index is reused, and call the old, released slot);
+    /// and link cells. A valid block's cells can only name blocks in its own page (exits to other
+    /// pages are never linked, and straddlers neither link nor get linked to), and a write to a
+    /// page invalidates every block that decoded from it, so a cell naming a dead index belongs
+    /// to a dead block itself, which is never entered again and is freed here too.
+    fn reclaim(&mut self, shared: &SharedJit) -> usize {
+        let mut reclaimed = 0;
+        for (index, block) in self.blocks.iter_mut().enumerate() {
+            if block.slot == 0 || shared.valid[index].load(Ordering::Acquire) != 0 {
+                continue;
+            }
+            release_slot(block.slot);
+            block.slot = 0;
+            block._insns = Box::new([]);
+            block._links = Box::new([]);
+            self.free.push(index as u32);
+            reclaimed += 1;
+        }
+        if reclaimed > 0 {
+            shared.jump_cache.clear();
+        }
+        self.stats.recycled += reclaimed as u64;
+        reclaimed
+    }
+
+    /// Makes room in a full cache: recycles the dead blocks; when too few are dead for that to
+    /// last, evicts the pages not used lately and recycles their blocks; and when even that frees
+    /// too little (the cache is all hot), flushes everything.
+    fn make_room(&mut self, shared: &SharedJit) {
+        let minimum = shared.reclaim_minimum();
+        if self.reclaim(shared) >= minimum {
+            return;
+        }
+        self.evict_cold_pages(shared);
+        if self.reclaim(shared) < minimum {
+            self.flush(shared);
+        }
+    }
+
+    /// Invalidates the blocks of every page nothing suggests was used lately, as a guest write to
+    /// it would (so the link-cell rule `reclaim` relies on still holds: a page goes as a whole).
+    /// Used lately: a block of the page is in the jump cache (the stub and the run loop find
+    /// their targets there, so it holds the most recent of them), or was compiled among the last
+    /// 1/`RECENT_FRACTION` of the translations. The code flags stay set; a later store to an
+    /// evicted page just finds nothing to invalidate.
+    fn evict_cold_pages(&mut self, shared: &SharedJit) {
+        let mut used = BTreeSet::new();
+        for entry in shared.jump_cache.0.iter() {
+            // SAFETY: no generated code runs during `make_room`, and only this thread uses the
+            // cache (see the module docs).
+            let entry = unsafe { *entry.get() };
+            let index = (entry.block & SLOT_BLOCK_MASK) as usize;
+            if entry.slot == 0 || shared.valid[index].load(Ordering::Acquire) == 0 {
+                continue;
+            }
+            used.insert((entry.phys_addr & !STRADDLER_TAG) >> PAGE_SHIFT);
+            if entry.phys_addr & STRADDLER_TAG != 0 {
+                used.insert(entry.block >> SLOT_BLOCK_BITS);
+            }
+        }
+        let recent = self
+            .stats
+            .translated
+            .saturating_sub(shared.block_limit() as u64 / RECENT_FRACTION);
+        for (index, block) in self.blocks.iter().enumerate() {
+            if block.slot != 0
+                && block.born >= recent
+                && shared.valid[index].load(Ordering::Acquire) != 0
+            {
+                used.extend(block_pages(block.key));
+            }
+        }
+        let cold: Vec<u64> = self
+            .page_blocks
+            .keys()
+            .filter(|page| !used.contains(page))
+            .copied()
+            .collect();
+        for page in cold {
+            self.invalidate_blocks_of(shared, page);
+        }
+        self.stats.evicted_pages += 1;
+    }
+
+    /// Marks every block that decoded bytes from physical page `page` invalid and forgets it.
+    /// `page_blocks` can still list an index whose block died through its other page and was
+    /// recycled since (a straddler is listed under both); such an entry is skipped.
+    fn invalidate_blocks_of(&mut self, shared: &SharedJit, page: u64) {
+        let Some(indices) = self.page_blocks.remove(&page) else {
+            return;
+        };
+        for index in indices {
+            let block = &self.blocks[index as usize];
+            if block.slot == 0 || !block_pages(block.key).any(|p| p == page) {
+                continue;
+            }
+            shared.valid[index as usize].store(0, Ordering::Release);
+            let key = block.key;
+            if self.block_map.get(&key) == Some(&index) {
+                self.block_map.remove(&key);
+            }
+        }
     }
 
     /// Counts one more interpreted step of the pending block at `phys_addr`; its serial once it
@@ -501,14 +692,24 @@ impl State {
         self.stats.inlined += compiled.inlined as u64;
         self.stats.flag_records_skipped += compiled.flag_records_skipped as u64;
         self.stats.total += insns.len() as u64;
-        let index = self.blocks.len() as u32;
-        self.block_map.insert(key, index);
-        self.blocks.push(Block {
+        let block = Block {
             key,
+            born: self.stats.translated,
             slot,
             _insns: insns,
             _links: links,
-        });
+        };
+        let index = match self.free.pop() {
+            Some(index) => {
+                self.blocks[index as usize] = block;
+                index
+            }
+            None => {
+                self.blocks.push(block);
+                self.blocks.len() as u32 - 1
+            }
+        };
+        self.block_map.insert(key, index);
         shared.valid[index as usize].store(1, Ordering::Release);
         for page in pages {
             self.page_blocks.entry(page).or_default().push(index);
@@ -594,7 +795,7 @@ impl State {
             self.stats.abandoned += blocks.len() as u64;
             return true;
         }
-        if self.blocks.len() + live > shared.block_limit() {
+        if !self.has_room(live, shared.block_limit()) {
             self.stats.abandoned += blocks.len() as u64;
             return false;
         }
@@ -702,8 +903,12 @@ impl Jit {
             jump_cache,
             chain_slot,
             chain_link_slot,
+            simd: probe_simd(),
             invalidations: AtomicU64::new(0),
             out: Box::new(AtomicU64::new(0)),
+            block_calls: AtomicU64::new(0),
+            block_insns: AtomicU64::new(0),
+            cold_steps: AtomicU64::new(0),
             compile_threshold: AtomicU32::new(if cfg!(freestanding) {
                 COMPILE_THRESHOLD
             } else {
@@ -712,9 +917,12 @@ impl Jit {
             #[cfg(test)]
             test_block_limit: core::sync::atomic::AtomicUsize::new(usize::MAX),
             #[cfg(test)]
+            test_reclaim_minimum: core::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
             fake_compiler: Mutex::new(None),
             state: Mutex::new(State {
                 blocks: Vec::new(),
+                free: Vec::new(),
                 block_map: BTreeMap::new(),
                 page_blocks: BTreeMap::new(),
                 heat: vec![Heat::default(); 1 << HEAT_BITS].into_boxed_slice(),
@@ -739,7 +947,12 @@ impl Jit {
     pub fn set_ordered_memory(&mut self, _on: bool) {}
 
     pub fn stats(&self) -> JitStats {
-        self.shared.lock().stats
+        JitStats {
+            block_calls: self.shared.block_calls.load(Ordering::Relaxed),
+            block_insns: self.shared.block_insns.load(Ordering::Relaxed),
+            cold_steps: self.shared.cold_steps.load(Ordering::Relaxed),
+            ..self.shared.lock().stats
+        }
     }
 
     /// Compile a block the first time it is reached instead of after `COMPILE_THRESHOLD` runs.
@@ -751,6 +964,18 @@ impl Jit {
     #[cfg(test)]
     pub fn set_block_limit(&self, limit: usize) {
         self.shared.test_block_limit.store(limit, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn clear_jump_cache_for_tests(&self) {
+        self.shared.jump_cache.clear();
+    }
+
+    #[cfg(test)]
+    fn set_reclaim_minimum_for_tests(&self, minimum: usize) {
+        self.shared
+            .test_reclaim_minimum
+            .store(minimum, Ordering::Relaxed);
     }
 
     /// Only the native backend has a window between decoding and registering to widen.
@@ -841,26 +1066,25 @@ impl Jit {
         for phys_addr in stale {
             state.pending.remove(&phys_addr);
         }
-        let Some(indices) = state.page_blocks.remove(&ppn) else {
-            return;
-        };
-        for index in indices {
-            shared.valid[index as usize].store(0, Ordering::Release);
-            let key = state.blocks[index as usize].key;
-            state.block_map.remove(&key);
-        }
+        state.invalidate_blocks_of(shared, ppn);
+    }
+
+    /// The block the jump cache holds for this `rip` and physical address, if it is still valid.
+    /// Takes no lock: the run loop asks this first for every block it enters.
+    fn lookup_cached(&self, rip: u64, phys_addr: u64) -> Option<u64> {
+        let entry = self.shared.jump_cache.get(rip);
+        (entry.slot != 0
+            && entry.rip == rip
+            && entry.phys_addr == phys_addr
+            && self.shared.valid[entry.block as usize].load(Ordering::Relaxed) != 0)
+            .then_some(entry.slot as u64)
     }
 
     /// The block translated for the code at this physical address, if any; `rip` only picks the
     /// jump cache slot.
     pub fn lookup(&mut self, rip: u64, phys_addr: u64) -> Option<u64> {
-        let entry = self.shared.jump_cache.get(rip);
-        if entry.slot != 0
-            && entry.rip == rip
-            && entry.phys_addr == phys_addr
-            && self.shared.valid[entry.block as usize].load(Ordering::Relaxed) != 0
-        {
-            return Some(entry.slot as u64);
+        if let Some(slot) = self.lookup_cached(rip, phys_addr) {
+            return Some(slot);
         }
         let state = self.shared.lock();
         let index = *state.block_map.get(&(phys_addr, NO_SECOND_PAGE))?;
@@ -918,7 +1142,7 @@ impl Jit {
             return false;
         }
         heat.count += 1;
-        state.stats.cold_steps += 1;
+        self.shared.cold_steps.fetch_add(1, Ordering::Relaxed);
         true
     }
 
@@ -954,11 +1178,11 @@ impl Jit {
         }
     }
 
-    /// `State::pump`, flushing the cache when a finished module does not fit.
+    /// `State::pump`, making room in the cache when a finished module does not fit.
     fn pump(&mut self, cpu: &mut Cpu, waiting: Option<u64>) {
         let shared = self.shared.clone();
         if shared.lock().pump(&shared, waiting) {
-            self.flush(cpu);
+            self.make_room(cpu);
         }
     }
 
@@ -1014,7 +1238,7 @@ impl Jit {
             // before the bytes are read.
             cpu.mark_code(phys_addr);
             let generation = self.shared.invalidations.load(Ordering::Acquire);
-            let decoded = decode_block(cpu, rip, phys_addr)?;
+            let decoded = decode_block(cpu, rip, phys_addr, true)?;
             match self.install(decoded, rip, phys_addr, generation, &cpu.page_has_code) {
                 Install::Ready(slot) => return Ok(Some(slot as u64)),
                 Install::Queued => {
@@ -1023,7 +1247,7 @@ impl Jit {
                     return Ok(self.lookup(rip, phys_addr));
                 }
                 Install::Stale => {}
-                Install::Full => self.flush(cpu),
+                Install::Full => self.make_room(cpu),
                 Install::Refused => {
                     let mut state = self.shared.lock();
                     state.stats.compile_failures += 1;
@@ -1076,7 +1300,7 @@ impl Jit {
             self.fill_jump_cache(rip, phys_addr, decoded.second_page, slot, index);
             return Install::Ready(slot);
         }
-        if state.blocks.len() >= shared.block_limit() {
+        if !state.has_room(1, shared.block_limit()) {
             return Install::Full;
         }
         let Decoded {
@@ -1089,7 +1313,7 @@ impl Jit {
         } = decoded;
         let insns: Box<[Insn]> = insns.into_boxed_slice();
         let links: Box<[AtomicU64]> = if second_page == NO_SECOND_PAGE {
-            (0..LINKS_PER_BLOCK)
+            (0..link_cells_for(&insns))
                 .map(|_| AtomicU64::new(NO_BLOCK as u64))
                 .collect()
         } else {
@@ -1101,6 +1325,7 @@ impl Jit {
                 shared.chain_slot,
                 shared.chain_link_slot,
                 &shared.valid,
+                shared.simd,
             ),
             &insns,
             &insn_rips,
@@ -1174,8 +1399,15 @@ impl Jit {
         self.shared.jump_cache.set(rip, entry);
     }
 
-    /// Flushes the whole cache, which is full. Nothing runs generated code at this point (a block
-    /// is only entered from `step_block`, which is not on the stack).
+    /// Makes room in the cache, which is full (`State::make_room`). Nothing runs generated code
+    /// at this point (a block is only entered from `step_block`, which is not on the stack).
+    fn make_room(&mut self, cpu: &mut Cpu) {
+        let shared = self.shared.clone();
+        cpu.with_exclusive(|_| shared.lock().make_room(&shared));
+    }
+
+    /// Drops every block and every pending one, whatever is dead or alive.
+    #[cfg(test)]
     fn flush(&mut self, cpu: &mut Cpu) {
         let shared = self.shared.clone();
         cpu.with_exclusive(|_| shared.lock().flush(&shared));
@@ -1195,15 +1427,21 @@ impl Cpu {
         // `translate` needs `&mut Cpu`, hence the take. The Jit is put back before the block runs
         // because stores inside it reach `Cpu::code_written`, which needs `self.jit` to invalidate.
         let mut jit = self.jit.take().unwrap();
-        let cached = match jit.lookup_straddler(self, rip, phys_addr) {
+        // The jump cache first: entering a compiled block must not take the cache's lock, which
+        // `known_cold` does (on wasm32 the lock is an atomic swap, and this runs for every block
+        // the run loop enters).
+        let cached = match jit.lookup_cached(rip, phys_addr) {
             Some(slot) => Some(slot),
-            // Already counted as a cold step.
-            None if jit.known_cold(phys_addr) => {
-                self.jit = Some(jit);
-                self.last_block_insns = 1;
-                return self.step();
-            }
-            None => jit.lookup(rip, phys_addr),
+            None => match jit.lookup_straddler(self, rip, phys_addr) {
+                Some(slot) => Some(slot),
+                // Already counted as a cold step.
+                None if jit.known_cold(phys_addr) => {
+                    self.jit = Some(jit);
+                    self.last_block_insns = 1;
+                    return self.step();
+                }
+                None => jit.lookup(rip, phys_addr),
+            },
         };
         let slot = match cached {
             Some(slot) => Some(slot),
@@ -1216,7 +1454,7 @@ impl Cpu {
             },
         };
         if slot.is_none() {
-            jit.shared.lock().stats.cold_steps += 1;
+            jit.shared.cold_steps.fetch_add(1, Ordering::Relaxed);
         }
         self.jit = Some(jit);
         let Some(slot) = slot else {
@@ -1227,8 +1465,17 @@ impl Cpu {
         // SAFETY: the host put a function of this type in the slot (`CompiledBlock::function`).
         let run_block: extern "C" fn(*mut Cpu) -> u64 =
             unsafe { core::mem::transmute(slot as usize) };
+        let icount_before = self.icount;
         let exit_code = run_block(self as *mut Cpu);
         let done = exit_code >> helpers::EXIT_COUNT_SHIFT;
+        if let Some(jit) = &self.jit {
+            // Chained blocks added theirs to `icount` on the way; the last one reports its own.
+            let chained = self.icount.wrapping_sub(icount_before);
+            jit.shared.block_calls.fetch_add(1, Ordering::Relaxed);
+            jit.shared
+                .block_insns
+                .fetch_add(chained.wrapping_add(done), Ordering::Relaxed);
+        }
         self.last_block_insns = done;
         // Set by `helper` before an instruction at block index k > 0 that may read the clock: it
         // already added k to `icount`, which must not be added twice.
@@ -1291,8 +1538,10 @@ mod tests {
         assert_eq!(harness.run(10_000), Stop::Halted);
         assert_eq!(harness.cpu.gpr[1], 0);
         let stats = harness.cpu.jit.as_ref().unwrap().stats();
-        assert_eq!(stats.translated, 3, "setup, loop body, hlt");
-        assert_eq!(stats.inlined, stats.total - 1);
+        // [mov, sub, jnz, hlt] on the way in, then [sub, jnz, hlt] for every back edge: blocks
+        // run on past a jcc, so each ends at the hlt, which goes through the helper
+        assert_eq!(stats.translated, 2, "{stats:?}");
+        assert_eq!(stats.inlined, stats.total - 2);
     }
 
     #[test]
@@ -1369,8 +1618,10 @@ mod tests {
             "the accounting is the same"
         );
         assert_eq!(chained.gpr, unchained.gpr);
+        // the setup block's pass and 99 more through the loop's block, whose last pass falls
+        // through to the hlt inside it
         assert!(
-            unchained_calls > 100,
+            unchained_calls >= 100,
             "one call per block: {unchained_calls}"
         );
         assert!(
@@ -1407,21 +1658,23 @@ mod tests {
     fn a_same_page_exit_links_to_the_block_the_stub_entered() {
         let mut harness = Harness::new(&COUNTDOWN_LOOP);
         assert!(harness.enable_jit());
-        assert_eq!(harness.run(10_000), Stop::Halted);
+        run_countdown_and_rewind(&mut harness);
         let jit = harness.cpu.jit.as_ref().unwrap();
-        let body = jit.block_index(LOOP_BODY).unwrap();
-        // The jnz back to the body went through the stub once and is linked since; its
-        // fall-through ran once, before the hlt block existed, so it is still empty.
-        assert_eq!(
-            jit.link_cells(body),
-            [(body, jit.slot_of(body)), (NO_BLOCK, 0)]
-        );
         let setup = jit.block_index(CODE_BASE).unwrap();
+        // [mov, sub, jnz, hlt]: the jnz into the loop is a side exit, taken once a run
         assert_eq!(
             jit.link_cells(setup)[0],
             (NO_BLOCK, 0),
             "the body did not exist yet"
         );
+        run_countdown_and_rewind(&mut harness);
+        let jit = harness.cpu.jit.as_ref().unwrap();
+        let body = jit.block_index(LOOP_BODY).unwrap();
+        assert_eq!(jit.link_cells(setup)[0], (body, jit.slot_of(body)));
+        // The body, [sub, jnz, hlt], jumps back to its own start: it goes round inside its
+        // function (`Gen::back_edge`), and leaves through the hlt, so no cell was ever used.
+        let cells = jit.link_cells(body);
+        assert!(cells.iter().all(|&cell| cell == (NO_BLOCK, 0)), "{cells:?}");
     }
 
     #[test]
@@ -1429,9 +1682,14 @@ mod tests {
         let mut harness = Harness::new(&COUNTDOWN_LOOP);
         assert!(harness.enable_jit());
         run_countdown_and_rewind(&mut harness);
+        run_countdown_and_rewind(&mut harness);
         let warm = harness.cpu.jit.take().unwrap();
-        let body = warm.block_index(LOOP_BODY).unwrap();
-        assert_eq!(warm.link_cells(body)[0].0, body, "the loop is linked");
+        let (setup, body) = (
+            warm.block_index(CODE_BASE).unwrap(),
+            warm.block_index(LOOP_BODY).unwrap(),
+        );
+        assert_eq!(warm.link_cells(setup)[0].0, body, "the setup is linked");
+        // The budget runs out in the loop's back edge, mid-loop.
         let (calls, linked) = step_block_calls_for(warm.sibling(), 50);
         let (_, reference) = step_block_calls_for(Jit::new(false).unwrap(), u64::MAX);
         assert!(calls >= 2, "the budget interrupted the chain: {calls}");
@@ -1445,6 +1703,7 @@ mod tests {
         let mut harness = Harness::new(&COUNTDOWN_LOOP);
         assert!(harness.enable_jit());
         run_countdown_and_rewind(&mut harness);
+        run_countdown_and_rewind(&mut harness);
         let old_body = harness.cpu.jit.as_ref().unwrap().block_index(LOOP_BODY);
         let flags = harness.cpu.page_has_code.clone();
         harness
@@ -1454,10 +1713,14 @@ mod tests {
             .unwrap()
             .invalidate_page(CODE_BASE >> PAGE_SHIFT, &flags);
         run_countdown_and_rewind(&mut harness);
+        run_countdown_and_rewind(&mut harness);
         let jit = harness.cpu.jit.as_ref().unwrap();
-        let body = jit.block_index(LOOP_BODY).unwrap();
+        let (setup, body) = (
+            jit.block_index(CODE_BASE).unwrap(),
+            jit.block_index(LOOP_BODY).unwrap(),
+        );
         assert_ne!(Some(body), old_body);
-        assert_eq!(jit.link_cells(body)[0], (body, jit.slot_of(body)));
+        assert_eq!(jit.link_cells(setup)[0], (body, jit.slot_of(body)));
     }
 
     // mov ecx, 3; xor eax, eax; again: mov dl, cl; mov [rip + tgt + 2], dl; jmp tgt;
@@ -1478,13 +1741,80 @@ mod tests {
     }
 
     #[test]
-    fn a_flush_with_linked_blocks_starts_over_cleanly() {
+    fn a_full_cache_reuses_the_indices_of_invalidated_linked_blocks() {
         let mut harness = Harness::new(&COUNTDOWN_LOOP);
         assert!(harness.enable_jit());
         run_countdown_and_rewind(&mut harness);
         let jit = harness.cpu.jit.as_ref().unwrap();
-        // The next translation finds the cache full and flushes every block and its cells.
+        let blocks = jit.block_count();
+        // The next translation finds the cache full of dead blocks, whose cells name each other,
+        // and recycles them instead of flushing: the new blocks get the same indices.
+        jit.set_block_limit(blocks);
+        let flags = harness.cpu.page_has_code.clone();
+        jit.invalidate_page(CODE_BASE >> PAGE_SHIFT, &flags);
+        run_countdown_and_rewind(&mut harness);
+        let jit = harness.cpu.jit.as_ref().unwrap();
+        let stats = jit.stats();
+        assert_eq!(stats.resets, 0, "{stats:?}");
+        assert_eq!(stats.recycled, blocks as u64, "{stats:?}");
+        assert_eq!(jit.block_count(), blocks);
+        assert_eq!(harness.cpu.icount, 2 * COUNTDOWN_LOOP_INSNS);
+    }
+
+    /// Runs the code at `address` to its `hlt`.
+    fn run_from(harness: &mut Harness, address: u64) {
+        harness.cpu.halted = false;
+        harness.cpu.rip = address;
+        assert_eq!(harness.run(10_000), Stop::Halted);
+    }
+
+    #[test]
+    fn a_full_cache_of_live_blocks_evicts_the_pages_not_used_lately() {
+        // mov eax, 7; hlt and mov eax, 9; hlt, two pages apart from the loop and each other
+        const COLD: u64 = CODE_BASE + 2 * PAGE_SIZE;
+        const NEW: u64 = CODE_BASE + 4 * PAGE_SIZE;
+        let mut harness = Harness::new(&COUNTDOWN_LOOP);
+        harness.write(COLD, &[0xb8, 0x07, 0x00, 0x00, 0x00, 0xf4]);
+        harness.write(NEW, &[0xb8, 0x09, 0x00, 0x00, 0x00, 0xf4]);
+        assert!(harness.enable_jit());
+        // The cold page is translated first, so the loop's blocks are the recent ones; then only
+        // the loop is looked up again, so only its page is in the jump cache.
+        run_from(&mut harness, COLD);
+        run_from(&mut harness, CODE_BASE);
+        let jit = harness.cpu.jit.as_ref().unwrap();
+        jit.clear_jump_cache_for_tests();
+        run_from(&mut harness, CODE_BASE);
+        let jit = harness.cpu.jit.as_ref().unwrap();
+        assert!(jit.block_index(COLD).is_some());
+        let loop_block = jit.block_index(CODE_BASE).unwrap();
         jit.set_block_limit(jit.block_count());
+        jit.set_reclaim_minimum_for_tests(1);
+        run_from(&mut harness, NEW);
+        assert_eq!(harness.cpu.gpr[0], 9);
+        let jit = harness.cpu.jit.as_ref().unwrap();
+        let stats = jit.stats();
+        assert_eq!((stats.resets, stats.evicted_pages), (0, 1), "{stats:?}");
+        assert!(stats.recycled >= 1, "{stats:?}");
+        assert_eq!(jit.block_index(COLD), None);
+        assert_eq!(jit.block_index(CODE_BASE), Some(loop_block));
+        assert!(jit.block_is_valid(loop_block as usize));
+        let translated = stats.translated;
+        run_from(&mut harness, CODE_BASE);
+        assert_eq!(
+            harness.cpu.jit.as_ref().unwrap().stats().translated,
+            translated
+        );
+    }
+
+    #[test]
+    fn a_full_cache_of_live_blocks_is_flushed_with_their_cells() {
+        let mut harness = Harness::new(&COUNTDOWN_LOOP);
+        assert!(harness.enable_jit());
+        run_countdown_and_rewind(&mut harness);
+        let jit = harness.cpu.jit.as_ref().unwrap();
+        // Only one block dies, too few to recycle: the next translation flushes every block.
+        jit.set_block_limit(jit.block_count());
+        jit.set_reclaim_minimum_for_tests(usize::MAX);
         let flags = harness.cpu.page_has_code.clone();
         jit.invalidate_page(CODE_BASE >> PAGE_SHIFT, &flags);
         run_countdown_and_rewind(&mut harness);
@@ -1608,16 +1938,16 @@ mod tests {
     }
 
     #[test]
-    fn imul_64_is_inline_only_when_its_flags_are_overwritten_and_rotates_always_are() {
+    fn imul_64_adc_sbb_and_rotates_are_inline_whatever_their_flags() {
         // sbb eax, eax; adc rcx, 7; hlt: adc and sbb are inline whatever their flags
         assert_eq!(inlined_in(&[0x19, 0xc0, 0x48, 0x83, 0xd1, 0x07, 0xf4]), 2);
-        // imul rax, rcx; add rdx, 1; hlt
+        // imul rax, rcx; add rdx, 1; hlt: the product's high half is never computed
         assert_eq!(
             inlined_in(&[0x48, 0x0f, 0xaf, 0xc1, 0x48, 0x83, 0xc2, 0x01, 0xf4]),
             2
         );
-        // imul rax, rcx; hlt: the successor may read the flags
-        assert_eq!(inlined_in(&[0x48, 0x0f, 0xaf, 0xc1, 0xf4]), 0);
+        // imul rax, rcx; hlt: the successor may read the flags, which `mul_high` computes
+        assert_eq!(inlined_in(&[0x48, 0x0f, 0xaf, 0xc1, 0xf4]), 1);
         // rol rax, 13; ror ecx, cl; sub rdx, rax; hlt
         assert_eq!(
             inlined_in(&[0x48, 0xc1, 0xc0, 0x0d, 0xd3, 0xc9, 0x48, 0x29, 0xc2, 0xf4]),
@@ -1698,7 +2028,14 @@ mod tests {
 
     #[test]
     fn a_flush_forgets_the_modules_being_compiled() {
-        let mut harness = harness_with_a_compile_worker(&COUNTDOWN_LOOP, None);
+        // mov ecx, 100; l: sub ecx, 1; jnz l; jmp h; h: hlt. The loop runs inside the setup
+        // block, which runs out of patience and is installed; the hlt's block, reached once,
+        // is still waiting for its module at the flush.
+        const COUNTDOWN_THEN_JUMP: [u8; 13] = [
+            0xb9, 0x64, 0x00, 0x00, 0x00, 0x83, 0xe9, 0x01, 0x75, 0xfb, 0xeb, 0x00, 0xf4,
+        ];
+        const INSNS: u64 = COUNTDOWN_LOOP_INSNS + 1;
+        let mut harness = harness_with_a_compile_worker(&COUNTDOWN_THEN_JUMP, None);
         run_countdown_and_rewind(&mut harness);
         let mut jit = harness.cpu.jit.take().unwrap();
         assert!(!jit.pending_starts().is_empty());
@@ -1713,7 +2050,7 @@ mod tests {
         let stats = harness.cpu.jit.as_ref().unwrap().stats();
         assert_eq!(stats.modules, stats.impatient, "{stats:?}");
         assert!(stats.abandoned >= 1, "{stats:?}");
-        assert_eq!(harness.cpu.icount, 2 * COUNTDOWN_LOOP_INSNS);
+        assert_eq!(harness.cpu.icount, 2 * INSNS);
     }
 
     #[test]
@@ -1726,8 +2063,10 @@ mod tests {
         assert_eq!(harness.cpu.gpr[1], 0);
         let stats = harness.cpu.jit.as_ref().unwrap().stats();
         assert_eq!(stats.impatient, 1, "{stats:?}");
-        // sub and jnz in the interpreter until the loop's block has waited its patience out
-        assert!(stats.cold_steps <= 2 * (PATIENCE as u64 + 1), "{stats:?}");
+        // sub and jnz in the interpreter until the loop's block, [sub, jnz, hlt] (blocks run on
+        // past a jcc), has waited its patience out: `PATIENCE` passes' worth of its three
+        // instructions
+        assert!(stats.cold_steps <= 3 * (PATIENCE as u64 + 1), "{stats:?}");
     }
 
     #[test]
