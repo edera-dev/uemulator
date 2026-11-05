@@ -36,11 +36,13 @@ mod sys;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub(crate) mod vcpus;
+mod wall_clock;
 pub(crate) mod xsave;
 
 use core::sync::atomic::{AtomicBool, Ordering, fence};
 
 use crate::sync::Arc;
+pub(crate) use wall_clock::WallClock;
 
 use crate::boot::BootState;
 use crate::console::ConsoleHandle;
@@ -108,25 +110,6 @@ pub(crate) enum Slice {
     Exit(ExitReason),
     Yield,
     Halted,
-}
-
-/// The host clock the guest follows in realtime mode, zeroed when the machine starts so guest
-/// time begins at 0 as the virtual clock does. vCPUs share one reader (and so one timeline).
-#[derive(Clone)]
-pub(crate) struct WallClock {
-    read: HostClockFn,
-    origin_ns: u64,
-}
-
-impl WallClock {
-    pub(crate) fn new(read: HostClockFn) -> Self {
-        let origin_ns = read();
-        WallClock { read, origin_ns }
-    }
-
-    fn elapsed_ns(&self) -> u64 {
-        (self.read)().saturating_sub(self.origin_ns)
-    }
 }
 
 /// `Instant` as a host clock.
