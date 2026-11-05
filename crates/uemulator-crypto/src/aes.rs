@@ -105,8 +105,8 @@ impl Aes {
         let rounds = key_words + 6;
         let total_words = COLUMNS * (rounds + 1);
         let mut words = [[0u8; WORD_BYTES]; COLUMNS * MAX_ROUND_KEYS];
-        for (word, chunk) in words.iter_mut().zip(key.chunks_exact(WORD_BYTES)) {
-            word.copy_from_slice(chunk);
+        for (word, chunk) in words.iter_mut().zip(key.as_chunks::<WORD_BYTES>().0) {
+            *word = *chunk;
         }
         let mut round_constant = 1u8;
         for index in key_words..total_words {
@@ -126,7 +126,7 @@ impl Aes {
             words[index] = word;
         }
         let mut round_keys = [[0u8; BLOCK_BYTES]; MAX_ROUND_KEYS];
-        for (round_key, chunk) in round_keys.iter_mut().zip(words.chunks_exact(COLUMNS)) {
+        for (round_key, chunk) in round_keys.iter_mut().zip(words.as_chunks::<COLUMNS>().0) {
             for (column, word) in chunk.iter().enumerate() {
                 round_key[column * WORD_BYTES..][..WORD_BYTES].copy_from_slice(word);
             }
@@ -191,8 +191,8 @@ fn inverse_shift_rows(block: &mut [u8; BLOCK_BYTES]) {
 
 /// Multiplies each column by the circulant matrix whose first row is `coefficients`.
 fn multiply_columns(block: &mut [u8; BLOCK_BYTES], coefficients: [u8; WORD_BYTES]) {
-    for column in block.chunks_exact_mut(WORD_BYTES) {
-        let old = [column[0], column[1], column[2], column[3]];
+    for column in block.as_chunks_mut::<WORD_BYTES>().0 {
+        let old = *column;
         for (row, byte) in column.iter_mut().enumerate() {
             *byte = (0..WORD_BYTES).fold(0, |sum, index| {
                 sum ^ gf_multiply(

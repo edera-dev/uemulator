@@ -168,11 +168,10 @@ impl<const BLOCK: usize> BlockBuffer<BLOCK> {
             compress(&self.pending);
             self.pending_len = 0;
         }
-        let whole = data.len() / BLOCK * BLOCK;
-        for block in data[..whole].chunks_exact(BLOCK) {
+        let (blocks, rest) = data.as_chunks::<BLOCK>();
+        for block in blocks {
             compress(block);
         }
-        let rest = &data[whole..];
         self.pending[..rest.len()].copy_from_slice(rest);
         self.pending_len = rest.len();
     }
@@ -228,8 +227,8 @@ impl Sha1 {
         let state = &mut self.state;
         self.buffer.finish::<8>(|block| sha1_compress(state, block));
         let mut out = [0; SHA1_DIGEST_BYTES];
-        for (bytes, word) in out.chunks_exact_mut(4).zip(self.state) {
-            bytes.copy_from_slice(&word.to_be_bytes());
+        for (bytes, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(self.state) {
+            *bytes = word.to_be_bytes();
         }
         out
     }
@@ -237,8 +236,8 @@ impl Sha1 {
 
 fn sha1_compress(state: &mut [u32; 5], block: &[u8]) {
     let mut schedule = [0u32; 80];
-    for (word, bytes) in schedule.iter_mut().zip(block.chunks_exact(4)) {
-        *word = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    for (word, bytes) in schedule.iter_mut().zip(block.as_chunks::<4>().0) {
+        *word = u32::from_be_bytes(*bytes);
     }
     for index in 16..80 {
         schedule[index] = (schedule[index - 3]
@@ -319,8 +318,8 @@ impl Sha256 {
         self.buffer
             .finish::<8>(|block| sha256_compress(state, block));
         let mut out = [0; SHA256_DIGEST_BYTES];
-        for (bytes, word) in out.chunks_exact_mut(4).zip(self.state) {
-            bytes.copy_from_slice(&word.to_be_bytes());
+        for (bytes, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(self.state) {
+            *bytes = word.to_be_bytes();
         }
         out
     }
@@ -340,8 +339,8 @@ fn sha256_compress(state: &mut [u32; 8], block: &[u8]) {
 
 fn sha256_compress_portable(state: &mut [u32; 8], block: &[u8]) {
     let mut schedule = [0u32; 64];
-    for (word, bytes) in schedule.iter_mut().zip(block.chunks_exact(4)) {
-        *word = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    for (word, bytes) in schedule.iter_mut().zip(block.as_chunks::<4>().0) {
+        *word = u32::from_be_bytes(*bytes);
     }
     for index in 16..64 {
         let s0 = schedule[index - 15].rotate_right(7)
@@ -490,8 +489,8 @@ impl Sha512Core {
         self.buffer
             .finish::<16>(|block| sha512_compress(state, block));
         let mut out = [0; SHA512_DIGEST_BYTES];
-        for (bytes, word) in out.chunks_exact_mut(8).zip(self.state) {
-            bytes.copy_from_slice(&word.to_be_bytes());
+        for (bytes, word) in out.as_chunks_mut::<8>().0.iter_mut().zip(self.state) {
+            *bytes = word.to_be_bytes();
         }
         out
     }
@@ -499,10 +498,8 @@ impl Sha512Core {
 
 fn sha512_compress(state: &mut [u64; 8], block: &[u8]) {
     let mut schedule = [0u64; 80];
-    for (word, bytes) in schedule.iter_mut().zip(block.chunks_exact(8)) {
-        let mut array = [0u8; 8];
-        array.copy_from_slice(bytes);
-        *word = u64::from_be_bytes(array);
+    for (word, bytes) in schedule.iter_mut().zip(block.as_chunks::<8>().0) {
+        *word = u64::from_be_bytes(*bytes);
     }
     for index in 16..80 {
         let s0 = schedule[index - 15].rotate_right(1)
