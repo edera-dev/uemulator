@@ -152,6 +152,9 @@ impl Gateway {
         if !self.dns_tcp.has_stream(stream) {
             return;
         }
+        // Not a server refusing UDP but no uplink (not connected yet, or between reconnects):
+        // the next query tries UDP again instead of staying on TCP for good.
+        self.dns_tcp.fallen_back = false;
         for query in self.dns_tcp.reset() {
             self.emit_port_unreachable(GATEWAY_IP, query.guest_ip, &query.quote);
         }

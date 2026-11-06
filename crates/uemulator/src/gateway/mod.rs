@@ -33,10 +33,10 @@ use tcp::TcpFlows;
 use udp::UdpFlows;
 use wire::{
     ARP_ETHERNET_IPV4, ARP_OP_REPLY, ARP_OP_REQUEST, ARP_OPCODE, ARP_PACKET_LEN, ARP_SENDER_IP,
-    ARP_SENDER_MAC, ARP_TARGET_IP, ETH_HEADER_LEN, ETH_SRC_MAC, ETH_TYPE, ETHERTYPE_ARP,
-    ETHERTYPE_IPV4, ICMP_CHECKSUM, ICMP_ECHO_HEADER_LEN, ICMP_ECHO_REPLY, ICMP_ECHO_REQUEST,
-    IP_PROTO_ICMP, IP_PROTO_TCP, IP_PROTO_UDP, Ipv4Packet, UDP_DST_PORT, be_u16, ethernet_frame,
-    internet_checksum, ipv4_packet, ipv4_packets, parse_ipv4, udp_segment,
+    ARP_SENDER_MAC, ARP_TARGET_IP, ETH_DST_MAC, ETH_HEADER_LEN, ETH_SRC_MAC, ETH_TYPE,
+    ETHERTYPE_ARP, ETHERTYPE_IPV4, ICMP_CHECKSUM, ICMP_ECHO_HEADER_LEN, ICMP_ECHO_REPLY,
+    ICMP_ECHO_REQUEST, IP_PROTO_ICMP, IP_PROTO_TCP, IP_PROTO_UDP, Ipv4Packet, UDP_DST_PORT, be_u16,
+    ethernet_frame, internet_checksum, ipv4_packet, ipv4_packets, parse_ipv4, udp_segment,
 };
 
 /// 52:55 followed by the gateway IP, the way QEMU's slirp derives its MAC.
@@ -459,7 +459,7 @@ impl Gateway {
 }
 
 fn segment_takes(frame: &[u8]) -> bool {
-    if frame.len() < ETH_HEADER_LEN || frame[..6] != GATEWAY_MAC {
+    if frame.len() < ETH_HEADER_LEN || frame[ETH_DST_MAC] != GATEWAY_MAC {
         return false;
     }
     let Some(ip) = parse_ipv4(frame) else {

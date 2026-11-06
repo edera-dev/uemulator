@@ -193,7 +193,7 @@ fn once_refused_every_later_query_goes_straight_to_tcp() {
 }
 
 #[test]
-fn answers_are_matched_by_id_and_source_port() {
+fn dns_over_tcp_answers_are_matched_by_id_only() {
     let (mut gateway, _remote, tcp) = fallen_back();
     ask(&mut gateway, 6000, 7, 1);
     ask(&mut gateway, 6001, 7, 1);
@@ -367,5 +367,42 @@ fn outgoing_bytes_are_capped_when_the_stream_never_opens() {
     assert!(
         sent > DNS_TCP_OUTGOING_LIMIT / 2,
         "the cap, not a bug, stopped it"
+    );
+}
+
+#[test]
+fn a_failed_tcp_fallback_lets_the_next_query_try_udp_again() {
+    let (mut gateway, mut remote) = segment_with_remote();
+    ask(&mut gateway, QUERY_PORT, 1, 0);
+    let udp = remote.single_open(&mut gateway);
+    gateway.failed(udp);
+    let tcp = remote.single_open(&mut gateway);
+    gateway.failed(tcp);
+    drain(&mut gateway);
+    ask(&mut gateway, QUERY_PORT, 2, 1);
+    let (_, kind, _) = remote.single_open_detail(&mut gateway);
+    assert_eq!(
+        kind,
+        StreamKind::Udp,
+        "no uplink at all is not a UDP refusal"
+    );
+}
+
+#[test]
+fn a_working_tcp_fallback_keeps_later_queries_on_tcp() {
+    let (mut gateway, mut remote, _tcp) = fallen_back();
+    ask(&mut gateway, QUERY_PORT + 1, 2, 1);
+    assert!(
+        remote
+            .requests(&mut gateway)
+            .iter()
+            .all(|request| !matches!(
+                request,
+                GatewayRequest::Open {
+                    kind: StreamKind::Udp,
+                    ..
+                }
+            )),
+        "still TCP"
     );
 }

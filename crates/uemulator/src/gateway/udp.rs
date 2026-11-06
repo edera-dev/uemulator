@@ -15,7 +15,7 @@ use super::wire::{
 };
 use super::{
     DNS_IP, DNS_PORT, Endpoint, FlowKey, GATEWAY_IP, Gateway, GatewayPolicy, GatewayRequest,
-    LOOPBACK_IP, StreamId, StreamKind,
+    LOOPBACK_IP, OUT_QUEUE_LIMIT, StreamId, StreamKind,
 };
 
 /// A flow with no datagram in either direction for this long is closed.
@@ -264,8 +264,10 @@ impl Gateway {
 
     /// One datagram from the remote end. One too long for an IPv4 datagram is dropped, as a
     /// host stack would; the flow stays.
+    /// Also dropped when the guest's queue is full, as a full socket buffer would: unlike TCP
+    /// there is no window to hold the remote back, and `out` would grow without bound.
     pub(super) fn udp_remote_data(&mut self, stream: StreamId, data: &[u8]) {
-        if data.len() > UDP_PAYLOAD_MAX {
+        if data.len() > UDP_PAYLOAD_MAX || self.out.len() >= OUT_QUEUE_LIMIT {
             return;
         }
         let now_ms = self.now_ms;

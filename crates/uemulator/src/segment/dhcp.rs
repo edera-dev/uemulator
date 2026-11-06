@@ -62,8 +62,8 @@ const BOOTP_MIN_LEN: usize = 300;
 
 const OPTION_PAD: u8 = 0;
 const OPTION_SUBNET_MASK: u8 = 1;
-const DHCP_OPTION_ROUTER: u8 = 3;
-const DHCP_OPTION_DNS_SERVER: u8 = 6;
+pub(super) const OPTION_ROUTER: u8 = 3;
+pub(super) const OPTION_DNS_SERVER: u8 = 6;
 const OPTION_BROADCAST_ADDRESS: u8 = 28;
 const OPTION_REQUESTED_IP: u8 = 50;
 const OPTION_LEASE_TIME: u8 = 51;
@@ -378,8 +378,8 @@ fn reply(message: &ClientMessage, kind: u8, yiaddr: Ipv4) -> Vec<u8> {
         put(OPTION_BROADCAST_ADDRESS, &SUBNET_BROADCAST);
         // The tab's own gateway (crate::gateway) answers for this address: off-subnet traffic
         // and DNS on port 53.
-        put(DHCP_OPTION_ROUTER, &SERVER_IP);
-        put(DHCP_OPTION_DNS_SERVER, &SERVER_IP);
+        put(OPTION_ROUTER, &SERVER_IP);
+        put(OPTION_DNS_SERVER, &SERVER_IP);
     }
     bootp.push(OPTION_END);
     if bootp.len() < BOOTP_MIN_LEN {

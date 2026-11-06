@@ -3,8 +3,8 @@
 //! The guests are scripted: DHCP clients, ARP, ping and plain frames between them.
 
 use super::dhcp::{
-    DHCP_ACK, DHCP_DECLINE, DHCP_DISCOVER, DHCP_OFFER, DHCP_RELEASE, DHCP_REQUEST, client_message,
-    options,
+    DHCP_ACK, DHCP_DECLINE, DHCP_DISCOVER, DHCP_OFFER, DHCP_RELEASE, DHCP_REQUEST,
+    OPTION_DNS_SERVER, OPTION_ROUTER, client_message, options,
 };
 use super::packet::{
     UNSPECIFIED_IP, icmp_echo_request, is_icmp_echo_reply, parse_arp, udp_datagram,
@@ -315,10 +315,13 @@ mod addresses {
                 .find(|(k, _)| *k == kind)
                 .expect("the server answers");
             assert!(
-                options.contains(&(3, SERVER_IP.to_vec())),
+                options.contains(&(OPTION_ROUTER, SERVER_IP.to_vec())),
                 "router in {kind}"
             );
-            assert!(options.contains(&(6, SERVER_IP.to_vec())), "dns in {kind}");
+            assert!(
+                options.contains(&(OPTION_DNS_SERVER, SERVER_IP.to_vec())),
+                "dns in {kind}"
+            );
         }
     }
 

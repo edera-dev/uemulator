@@ -48,6 +48,15 @@ const SERVER_IP: Ipv4 = [10, 0, 2, 2];
 /// Locally administered, so no NIC a tab makes up can be told it is a real one; and a tab's NIC
 /// can never have it (`SegmentAgent::new` refuses).
 const SERVER_MAC: Mac = [0x52, 0x55, 0x0a, 0x00, 0x02, 0x02];
+// The web page's gateway takes the frames sent to this MAC (`segment_takes`); were the two to
+// differ it would silently take nothing.
+const _: () = {
+    let mut byte = 0;
+    while byte < SERVER_MAC.len() {
+        assert!(SERVER_MAC[byte] == crate::gateway::GATEWAY_MAC[byte]);
+        byte += 1;
+    }
+};
 const POOL_FIRST: u8 = 15;
 const POOL_LAST: u8 = 254;
 

@@ -14,6 +14,7 @@ pub(super) const MSS: usize = 1460;
 pub(super) const MIN_MSS: usize = 64;
 
 pub(super) const ETH_HEADER_LEN: usize = 14;
+pub(super) const ETH_DST_MAC: Range<usize> = 0..6;
 pub(super) const ETH_SRC_MAC: Range<usize> = 6..12;
 pub(super) const ETH_TYPE: Range<usize> = 12..14;
 pub(super) const ETHERTYPE_IPV4: u16 = 0x0800;

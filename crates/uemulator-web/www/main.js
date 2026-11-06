@@ -85,7 +85,7 @@ let wispInvalid = null;
 let wispSocket = null;
 let wispClient = { state: WISP_STATE.DISCONNECTED, closeReason: -1 };
 let lastNetwork = null;
-// The library's own default resolver (DEFAULT_WISP_RESOLVER): Cloudflare's 1.1.1.1.
+// The library's own default resolver (DEFAULT_RESOLVER): Cloudflare's 1.1.1.1.
 const WISP_RESOLVER = 0x01010101;
 const WISP_RESOLVER_PORT = 53;
 let startedAt = 0;
@@ -1096,7 +1096,8 @@ function showNetwork(shown) {
   const pill = $("net-status");
   const dotted = address ? [24, 16, 8, 0].map((shift) => (address >>> shift) & 0xff).join(".") : null;
   const others = `${peers} other machine${peers === 1 ? "" : "s"}`;
-  pill.firstElementChild.textContent = `${dotted ?? "no address yet"} · ${others}`;
+  const uplink = wispClient.state === WISP_STATE.READY ? "internet" : "offline";
+  pill.firstElementChild.textContent = `${dotted ?? "no address yet"} · ${others} · ${uplink}`;
   pill.dataset.kind = dotted ? "network" : "network-waiting";
   pill.title = [
     `Shared network, NIC ${formatMac(networkMac)}`,

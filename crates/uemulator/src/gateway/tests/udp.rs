@@ -934,3 +934,18 @@ fn the_fake_remote_reports_what_each_stream_is_for() {
     assert_eq!(remote.kind(stream), StreamKind::Udp);
     assert_eq!(remote.target(stream).address, LOOPBACK_IP);
 }
+
+#[test]
+fn remote_datagrams_are_dropped_while_the_guest_queue_is_full() {
+    let (mut gateway, mut remote) = user_net_with_remote();
+    let stream = open_flow(&mut gateway, &mut remote, 4000, 0);
+    for _ in 0..OUT_QUEUE_LIMIT {
+        gateway.out.push_back(GuestFrame::plain(Vec::new()));
+    }
+    gateway.remote_data(stream, b"dropped");
+    assert_eq!(gateway.out.len(), OUT_QUEUE_LIMIT, "the queue did not grow");
+    gateway.out.clear();
+    gateway.remote_data(stream, b"kept");
+    let (_, _, _, data) = udp_view(&drain(&mut gateway));
+    assert_eq!(data, b"kept", "datagrams flow again once the guest drained");
+}
