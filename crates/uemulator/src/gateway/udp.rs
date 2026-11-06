@@ -7,6 +7,7 @@ use crate::prelude::*;
 use alloc::collections::BTreeMap;
 
 use super::dhcp::DHCP_SERVER_PORT;
+use super::dns_tcp::DnsQuery;
 use super::wire::{
     ICMP_CHECKSUM, ICMP_CODE_PORT_UNREACHABLE, ICMP_DEST_UNREACHABLE, ICMP_ERROR_HEADER_LEN,
     IP_PROTO_ICMP, IP_PROTO_UDP, Ipv4Packet, UDP_DST_PORT, UDP_HEADER_LEN, UDP_LENGTH,
@@ -123,6 +124,13 @@ impl Gateway {
             remote_ip: ip.dst,
             remote_port: dport,
         };
+        if self.dns_tcp.fallen_back && key.remote_ip == GATEWAY_IP && dport == DNS_PORT {
+            let mut quote = ip.header.to_vec();
+            quote.extend_from_slice(&datagram[..UDP_HEADER_LEN]);
+            let query = DnsQuery::new(ip.src, key.guest_port, quote);
+            self.dns_tcp_query(query, data);
+            return;
+        }
         let now_ms = self.now_ms;
         if !self.udp.flows.contains_key(&key) {
             if self.udp.flows.len() >= self.udp.limit {
@@ -194,6 +202,27 @@ impl Gateway {
         let Some(flow) = self.udp.remove(&key) else {
             return;
         };
+        if self.is_segment_resolver_flow(&key) {
+            // A Wisp server refusing UDP: the queries wait for the TCP stream, which refuses them
+            // in turn when there is no uplink at all.
+            self.dns_tcp.fallen_back = true;
+            for data in flow.pending {
+                let query = DnsQuery::new(flow.guest_ip, key.guest_port, flow.quote.clone());
+                self.dns_tcp_query(query, &data);
+            }
+            return;
+        }
+        self.emit_port_unreachable(key.remote_ip, flow.guest_ip, &flow.quote);
+    }
+
+    fn is_segment_resolver_flow(&self, key: &FlowKey) -> bool {
+        matches!(self.policy, GatewayPolicy::Segment { .. })
+            && key.remote_ip == GATEWAY_IP
+            && key.remote_port == DNS_PORT
+    }
+
+    /// ICMP port unreachable from `from` to `to`, quoting the datagram it answers.
+    pub(super) fn emit_port_unreachable(&mut self, from: [u8; 4], to: [u8; 4], quote: &[u8]) {
         let mut message = vec![
             ICMP_DEST_UNREACHABLE,
             ICMP_CODE_PORT_UNREACHABLE,
@@ -205,10 +234,10 @@ impl Gateway {
             0,
         ];
         debug_assert_eq!(message.len(), ICMP_ERROR_HEADER_LEN);
-        message.extend_from_slice(&flow.quote);
+        message.extend_from_slice(quote);
         let checksum = internet_checksum(&message);
         message[ICMP_CHECKSUM].copy_from_slice(&checksum.to_be_bytes());
-        self.emit_ip(key.remote_ip, flow.guest_ip, IP_PROTO_ICMP, &message);
+        self.emit_ip(from, to, IP_PROTO_ICMP, &message);
     }
 
     /// One datagram from the remote end.

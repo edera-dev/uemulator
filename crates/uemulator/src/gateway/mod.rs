@@ -16,6 +16,7 @@
 //! REQUEST naming another server gets no answer (RFC 2131 section 3.1: it declines our offer).
 
 mod dhcp;
+mod dns_tcp;
 mod tcp;
 #[cfg(test)]
 mod tests;
@@ -27,6 +28,7 @@ use crate::prelude::*;
 use alloc::collections::VecDeque;
 
 use dhcp::{DHCP_CLIENT_PORT, DHCP_SERVER_PORT, dhcp_reply, dhcp_reply_type, parse_dhcp_request};
+use dns_tcp::DnsTcp;
 use tcp::TcpFlows;
 use udp::UdpFlows;
 use wire::{
@@ -170,6 +172,8 @@ pub struct Gateway {
     requests: Vec<GatewayRequest>,
     udp: UdpFlows,
     tcp: TcpFlows,
+    /// `Segment`'s DNS over TCP, once UDP to the resolver has been refused.
+    dns_tcp: DnsTcp,
     /// The next `StreamId` to try; shared by every kind of stream.
     next_stream: StreamId,
     /// The last time the driver told us (`from_guest`, `poll`), for events that carry none, such
@@ -190,6 +194,7 @@ impl Gateway {
             requests: Vec::new(),
             udp: UdpFlows::new(),
             tcp: TcpFlows::new(),
+            dns_tcp: DnsTcp::new(),
             next_stream: FIRST_STREAM_ID,
             now_ms: 0,
             isn: config.isn_seed,
@@ -255,6 +260,7 @@ impl Gateway {
     pub fn opened(&mut self, stream: StreamId) {
         self.tcp_opened(stream);
         self.udp_opened(stream);
+        self.dns_tcp_opened(stream);
     }
 
     /// The driver could not connect `stream`. The flow is gone without a `Close`; a TCP guest gets
@@ -262,6 +268,7 @@ impl Gateway {
     pub fn failed(&mut self, stream: StreamId) {
         self.tcp_failed(stream);
         self.udp_failed(stream);
+        self.dns_tcp_failed(stream);
     }
 
     /// Bytes (TCP) or one datagram (UDP) from the remote end. TCP bytes beyond `room` are kept
@@ -269,6 +276,7 @@ impl Gateway {
     pub fn remote_data(&mut self, stream: StreamId, data: &[u8]) {
         self.tcp_remote_data(stream, data);
         self.udp_remote_data(stream, data);
+        self.dns_tcp_remote_data(stream, data);
     }
 
     /// The remote end closed `stream` in an orderly way. A TCP guest gets our FIN after the data
@@ -276,6 +284,7 @@ impl Gateway {
     pub fn remote_closed(&mut self, stream: StreamId) {
         self.tcp_remote_closed(stream);
         self.udp_drop(stream);
+        self.dns_tcp_remote_closed(stream);
     }
 
     /// `stream` broke. A TCP guest gets a RST; a UDP flow is dropped without telling the guest.
@@ -283,6 +292,7 @@ impl Gateway {
     pub fn reset(&mut self, stream: StreamId) {
         self.tcp_reset(stream);
         self.udp_drop(stream);
+        self.dns_tcp_reset(stream);
     }
 
     /// Moves buffered TCP data to the guest (round-robin, at most `OUT_QUEUE_LIMIT` frames
@@ -292,6 +302,7 @@ impl Gateway {
         self.now_ms = now_ms;
         self.poll_tcp();
         self.expire_udp(now_ms);
+        self.poll_dns_tcp(now_ms);
     }
 
     /// The open streams the driver should watch and for what; streams wanting neither are left
@@ -312,6 +323,15 @@ impl Gateway {
             })
             .filter(|(_, wants)| wants.read || wants.write)
             .collect();
+        if let Some(stream) = self.dns_tcp.open_stream() {
+            let wants = StreamInterest {
+                read: queue_has_room,
+                write: self.dns_tcp.wants_write(),
+            };
+            if wants.read || wants.write {
+                interest.push((stream, wants));
+            }
+        }
         if queue_has_room {
             interest.extend(self.udp.open_streams().map(|stream| {
                 let wants = StreamInterest {
@@ -332,7 +352,10 @@ impl Gateway {
                 0 => FIRST_STREAM_ID,
                 next => next,
             };
-            if candidate != 0 && !self.udp.has_stream(candidate) && !self.tcp.has_stream(candidate)
+            if candidate != 0
+                && !self.udp.has_stream(candidate)
+                && !self.tcp.has_stream(candidate)
+                && !self.dns_tcp.has_stream(candidate)
             {
                 return candidate;
             }

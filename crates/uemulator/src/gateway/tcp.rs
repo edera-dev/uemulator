@@ -228,6 +228,9 @@ impl Gateway {
     /// The first contiguous run of guest bytes waiting for the remote end of `stream` (empty when
     /// none, or for an unknown stream). Report what was taken with `consumed`.
     pub fn to_remote(&self, stream: StreamId) -> &[u8] {
+        if let Some(queries) = self.dns_tcp_to_remote(stream) {
+            return queries;
+        }
         self.tcp
             .of_stream(stream)
             .map_or(&[], |flow| flow.to_remote.as_slices().0)
@@ -236,6 +239,9 @@ impl Gateway {
     /// The driver took `bytes` from the front of `to_remote`. The window this opens is announced
     /// at the next `poll`.
     pub fn consumed(&mut self, stream: StreamId, bytes: usize) {
+        if self.dns_tcp_consumed(stream, bytes) {
+            return;
+        }
         if let Some(flow) = self.tcp.of_stream_mut(stream) {
             let bytes = bytes.min(flow.to_remote.len());
             flow.to_remote.drain(..bytes);
@@ -247,6 +253,9 @@ impl Gateway {
     /// beyond it is still kept, but a driver that can hold data back (a socket) should read no
     /// more than this.
     pub fn room(&self, stream: StreamId) -> usize {
+        if let Some(room) = self.dns_tcp_room(stream) {
+            return room;
+        }
         self.tcp.of_stream(stream).map_or(0, TcpFlow::room)
     }
 

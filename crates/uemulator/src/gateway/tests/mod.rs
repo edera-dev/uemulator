@@ -11,6 +11,7 @@ use alloc::collections::BTreeMap;
 mod dhcp;
 mod link;
 mod parsing;
+mod segment_policy;
 mod tcp;
 mod udp;
 mod wire;
