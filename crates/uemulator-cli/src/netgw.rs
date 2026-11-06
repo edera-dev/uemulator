@@ -3,7 +3,10 @@
 
 use std::ops::Range;
 
-use crate::usernet::{GATEWAY_IP, GATEWAY_MAC, internet_checksum};
+/// The address usernet's gateway has too, so a guest configured for one works with the other.
+const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
+/// 52:55 followed by the gateway IP, the way QEMU's slirp derives its MAC.
+const GATEWAY_MAC: [u8; 6] = [0x52, 0x55, 0x0a, 0x00, 0x02, 0x02];
 
 const ETH_HEADER_LEN: usize = 14;
 const ETH_SRC_MAC: Range<usize> = 6..12;
@@ -36,6 +39,20 @@ const ICMP_CHECKSUM: Range<usize> = 36..38;
 const ICMP_FRAME_MIN_LEN: usize = ICMP_CHECKSUM.end;
 const ICMP_ECHO_REQUEST: u8 = 8;
 const ICMP_ECHO_REPLY: u8 = 0;
+
+/// RFC 1071: the ones-complement of the ones-complement sum of big-endian 16-bit words, a
+/// trailing odd byte padded with zero. The `u32` cannot overflow below 128 KiB of data, and a
+/// frame is far shorter.
+fn internet_checksum(data: &[u8]) -> u16 {
+    let mut sum: u32 = data
+        .chunks(2)
+        .map(|pair| u16::from_be_bytes([pair[0], *pair.get(1).unwrap_or(&0)]) as u32)
+        .sum();
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
 
 pub fn handle(frame: &[u8]) -> Option<Vec<u8>> {
     if frame.len() < ETH_HEADER_LEN {
