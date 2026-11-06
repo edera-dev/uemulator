@@ -1,6 +1,6 @@
 # Guest-visible performance: syscalls, memory, disk, network
 
-**Status:** implemented: two rounds of measurements and fixes; "What bounds the rest, and what is left" lists the open items.
+**Status:** implemented: two rounds of measurements and fixes, and a third that checks the move of usernet's protocol code into the library; "What bounds the rest, and what is left" lists the open items.
 
 Round 1 (2026-10-31). Measured from inside an Alpine guest (`quick create perf-test --install alpine`, installed to disk, logs in as root by itself) with the tools in `hack/perf/guest/`:
 
@@ -80,11 +80,27 @@ Bulk TCP was the guest kernel checksumming and walking its stack once per 1500-b
 
 Nothing in this round touches the disk path. The 4K random disk lines moved by 20% in `new` only, which is twice the noise seen in round 1; treat it as unexplained, not as a gain.
 
+## Round 3: usernet drives the library's gateway (2026-11-05)
+
+usernet's protocol code (ARP, DHCP, ICMP, UDP and TCP NAT) moved into the library as `Gateway` (`crates/uemulator/src/gateway/`, plan 27) and `usernet.rs` is now only the host-socket driver. Per wake it feeds the guest's frames to the gateway, opens and closes sockets as asked, writes each stream's `to_remote` and reads at most `room` bytes, then calls `Gateway::poll`. The ACK for guest data now goes out from `poll`, after the write, instead of from inside `tcp_in`. One remote-to-guest copy fewer per segment: socket read, `from_remote`, frame (before: read, segment, packet, frame).
+
+Measured differently from rounds 1 and 2, because the installed Alpine machine at hand stops at a password login, which `drive.py` cannot pass. The guest is Alpine's netboot live system instead: the machine's cached `vmlinuz-virt` and `initramfs-virt` with the installer's command line, through `advanced boot` with 1 vCPU, 2048 MiB, a user-mode NIC and a serial console, logging in as root without a password. It has no disk, so only `ubench net` ran, three times per boot. These used copies of `ab.py` and `drive.py` patched for that boot. 8 interleaved rounds, so 24 runs per binary; medians:
+
+| benchmark | before | after | |
+|---|---:|---:|---:|
+| net rx (host->guest), MB/s | 903 | 945 | 1.05x |
+| net tx (guest->host), MB/s | 1012 | 997 | 0.99x |
+| net TCP request/response, trans/s | 12917 | 12924 | 1.00x |
+
+Two runs before this one, on a busier host (two other processes at 100% CPU), gave 596 / 669 MB/s rx and 696 / 613 MB/s tx (5 rounds, one run each), then 711 / 629 and 738 / 632 (6 rounds of three). There every boot landed in one of two bands, about 900 and about 550 MB/s, for either binary, and the median followed how many boots of each binary fell in the slow band. Inside one band the two binaries agree within 5%. The before binary runs round 2's usernet unchanged, so the gap to round 2's 652 / 748 MB/s is the different guest (1 vCPU netboot instead of the installed `perf-test`) and host load, not usernet.
+
+`sample` during repeated `ubench net` runs: the usernet worker waits in `poll(2)` 79% of the time before and 81% after. The rest is `sendto` and `recvfrom`; the gateway's own code (`poll`, `remote_data`, frame building) is about 2% of the worker's samples.
+
 ## What bounds the rest, and what is left
 
 - **Random 4K disk I/O is guest CPU.** In `randread` the vCPU thread spends about 94% in guest code (block layer, ext4, interrupt path) and about 6% in the host `pread`. Device-side changes cannot move it; general JIT speed (plan 20's register pinning) would.
 - **Sequential writes end in the guest's FLUSH, which `sync_data` turns into `F_FULLFSYNC` on macOS** (about an eighth of the emulator thread's samples in the disk run). Durable across host power loss, and the reason write throughput is about half of read. A per-disk opt-out (like QEMU's `cache=unsafe`) would be the user's call; not done.
-- **Bulk TCP through usernet is now one 64 KiB window per round trip.** 652 MB/s down and 748 MB/s up are about 10-11K windows per second, the same rate as 1-byte request/response (9.9K/s). Each direction waits a full round trip per 16-bit window, since usernet's SYN-ACK carries no window scale option. Window scaling (RFC 7323) in usernet is the next step: advertise a scale in the SYN-ACK, accept the guest's, and let `to_host` and the in-flight data grow past 64 KiB. Not profiled this round.
+- **Bulk TCP through usernet is now one 64 KiB window per round trip.** 652 MB/s down and 748 MB/s up are about 10-11K windows per second, the same rate as 1-byte request/response (9.9K/s). Each direction waits a full round trip per 16-bit window, since the gateway's SYN-ACK carries no window scale option. Window scaling (RFC 7323) in the gateway is the next step: advertise a scale in the SYN-ACK, accept the guest's, and let `to_remote` and the in-flight data grow past 64 KiB. Not profiled this round.
 - **Supervisor accesses to user pages are never cached while SMAP is on**, so every `copy_to_user`/`copy_from_user` access walks the page tables (`Cpu::translate` is the top emulator function in the syscall profiles). A TLB half for "CPL 0 with AC set" would fix it, but every EFLAGS.AC writer (popf, iret, sysret, interrupt delivery, the inline `stac`/`clac`) would have to switch `tlb_active_base`, and a miss there silently weakens the guest's SMAP.
 - Still through the interpreter on the syscall path: `syscall`, `sysret`, `sti` and `rdtsc` (one each per syscall). `rdtsc` costs a `clock_gettime` per read.
 - With four vCPUs, random 4K disk I/O is less than half the one-vCPU rate (13K against 29K IOPS) before and after this round: the completion interrupt and the wakeup of the waiting task cross vCPU threads. Not looked into.
