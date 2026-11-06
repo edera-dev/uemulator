@@ -36,6 +36,7 @@ mod sync;
 mod sys;
 #[cfg(test)]
 mod testkit;
+mod wisp;
 
 pub use boot::{BootMode, BootState};
 pub use console::ConsoleHandle;
