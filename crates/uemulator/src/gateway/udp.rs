@@ -11,7 +11,7 @@ use super::dns_tcp::{DNS_ID_LEN, DnsQuery};
 use super::wire::{
     ICMP_CHECKSUM, ICMP_CODE_PORT_UNREACHABLE, ICMP_DEST_UNREACHABLE, ICMP_ERROR_HEADER_LEN,
     IP_PROTO_ICMP, IP_PROTO_UDP, Ipv4Packet, UDP_DST_PORT, UDP_HEADER_LEN, UDP_LENGTH,
-    UDP_SRC_PORT, be_u16, internet_checksum, udp_segment,
+    UDP_PAYLOAD_MAX, UDP_SRC_PORT, be_u16, internet_checksum, udp_segment,
 };
 use super::{
     DNS_IP, DNS_PORT, Endpoint, FlowKey, GATEWAY_IP, Gateway, GatewayPolicy, GatewayRequest,
@@ -262,8 +262,12 @@ impl Gateway {
         self.emit_ip(from, to, IP_PROTO_ICMP, &message);
     }
 
-    /// One datagram from the remote end.
+    /// One datagram from the remote end. One too long for an IPv4 datagram is dropped, as a
+    /// host stack would; the flow stays.
     pub(super) fn udp_remote_data(&mut self, stream: StreamId, data: &[u8]) {
+        if data.len() > UDP_PAYLOAD_MAX {
+            return;
+        }
         let now_ms = self.now_ms;
         let Some((key, flow)) = self.udp.flow_of_stream(stream) else {
             return;

@@ -690,3 +690,24 @@ fn a_refused_udp_resolver_stream_falls_back_to_dns_over_tcp() {
     );
     assert_eq!(reply.data, dns_answer(QUERY_ID));
 }
+
+#[test]
+fn udp_data_too_long_for_a_datagram_is_dropped() {
+    let mut rig = Rig::ready(PLENTY_OF_CREDIT);
+    rig.gateway
+        .from_guest(&udp_frame(GUEST_PORT, SERVER, DNS_PORT, b"query"), NOW_MS);
+    let sent = rig.pump();
+    let Some(&WispPacket::Connect { stream, .. }) = sent.first() else {
+        panic!("expected a UDP CONNECT: {sent:?}");
+    };
+    rig.server(WispPacket::Data {
+        stream,
+        payload: vec![0; u16::MAX as usize],
+    });
+    assert!(drain(&mut rig.gateway).is_empty());
+    rig.server(WispPacket::Data {
+        stream,
+        payload: b"answer".to_vec(),
+    });
+    assert_eq!(drain(&mut rig.gateway).len(), 1, "the stream still works");
+}

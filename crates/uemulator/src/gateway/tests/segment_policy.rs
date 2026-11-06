@@ -224,6 +224,17 @@ fn junk_from_the_resolver_is_ignored() {
 }
 
 #[test]
+fn an_answer_longer_than_a_datagram_is_dropped() {
+    let (mut gateway, _remote, tcp) = fallen_back();
+    ask(&mut gateway, QUERY_PORT, 2, 0);
+    let mut answer = dns_answer(2);
+    answer.resize(u16::MAX as usize, 0);
+    gateway.remote_data(tcp, &length_prefixed(&answer));
+    gateway.poll(0);
+    assert!(drain(&mut gateway).is_empty());
+}
+
+#[test]
 fn a_closed_stream_drops_its_queries_and_is_reopened_on_demand() {
     let (mut gateway, mut remote, tcp) = fallen_back();
     ask(&mut gateway, QUERY_PORT, 2, 1);

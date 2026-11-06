@@ -575,6 +575,26 @@ fn datagrams_waiting_for_the_open_are_bounded_and_the_newest_dropped() {
     );
 }
 
+/// A Wisp server can send a DATA of any length; only what fits one IPv4 datagram reaches the
+/// guest, and nothing longer may overflow the UDP length field.
+#[test]
+fn remote_datagrams_longer_than_ipv4_can_carry_are_dropped() {
+    const LARGEST: usize = u16::MAX as usize - IPV4_HEADER_LEN - UDP_HEADER_LEN;
+    let (mut gateway, mut remote) = segment_with_remote();
+    let stream = open_flow(&mut gateway, &mut remote, 4000, 0);
+    gateway.remote_data(stream, &vec![7; LARGEST]);
+    let (_, _, _, data) = udp_view(&drain(&mut gateway));
+    assert_eq!(data.len(), LARGEST);
+    for len in [
+        LARGEST + 1,
+        u16::MAX as usize - UDP_HEADER_LEN + 1,
+        u16::MAX as usize,
+    ] {
+        gateway.remote_data(stream, &vec![7; len]);
+        assert!(drain(&mut gateway).is_empty(), "{len} bytes");
+    }
+}
+
 #[test]
 fn datagrams_after_open_are_forwarded_at_once() {
     let (mut gateway, mut remote) = user_net_with_remote();

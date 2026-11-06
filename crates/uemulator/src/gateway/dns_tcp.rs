@@ -11,7 +11,7 @@
 #[cfg(freestanding)]
 use crate::prelude::*;
 
-use super::wire::{IP_PROTO_UDP, be_u16, udp_segment};
+use super::wire::{IP_PROTO_UDP, UDP_PAYLOAD_MAX, be_u16, udp_segment};
 use super::{DNS_PORT, GATEWAY_IP, Gateway, GatewayPolicy, GatewayRequest, StreamId, StreamKind};
 
 /// Queries waiting for an answer, sent or not. Past this the newest are dropped; the guest's
@@ -201,7 +201,9 @@ impl Gateway {
 
     /// Turns one answer into a datagram for the query it matches; unmatched ones are dropped.
     fn dns_tcp_answer(&mut self, message: &[u8]) {
-        if message.len() < DNS_ID_LEN {
+        // A TCP answer may be up to 65 535 bytes, more than a datagram carries; the guest's
+        // resolver retries, as it would over UDP with the answer truncated away.
+        if message.len() < DNS_ID_LEN || message.len() > UDP_PAYLOAD_MAX {
             return;
         }
         let id = be_u16(&message[..DNS_ID_LEN]);

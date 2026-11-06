@@ -76,6 +76,9 @@ pub(super) const UDP_SRC_PORT: Range<usize> = 0..2;
 pub(super) const UDP_DST_PORT: Range<usize> = 2..4;
 pub(super) const UDP_LENGTH: Range<usize> = 4..6;
 pub(super) const UDP_CHECKSUM: Range<usize> = 6..8;
+/// The most a UDP datagram can carry in one IPv4 packet (65 507). A Wisp server's DATA has no
+/// such bound, so remote data is checked against it before it becomes a datagram.
+pub(super) const UDP_PAYLOAD_MAX: usize = IPV4_PAYLOAD_LEN_MAX - UDP_HEADER_LEN;
 
 pub(super) const TCP_HEADER_LEN: usize = 20;
 pub(super) const TCP_SRC_PORT: Range<usize> = 0..2;
@@ -256,7 +259,10 @@ pub(super) fn udp_segment(
     let mut segment = Vec::with_capacity(UDP_HEADER_LEN + data.len());
     segment.extend_from_slice(&sport.to_be_bytes());
     segment.extend_from_slice(&dport.to_be_bytes());
-    segment.extend_from_slice(&(UDP_HEADER_LEN as u16 + data.len() as u16).to_be_bytes());
+    // Callers keep `data` within `UDP_PAYLOAD_MAX`. Past it the length saturates instead of
+    // overflowing, and `ipv4_packets` refuses the segment anyway.
+    let length = u16::try_from(UDP_HEADER_LEN + data.len()).unwrap_or(u16::MAX);
+    segment.extend_from_slice(&length.to_be_bytes());
     segment.extend_from_slice(&[0, 0]);
     segment.extend_from_slice(data);
     // A computed checksum of 0 is sent as 0xffff because 0 means "no checksum" in UDP (RFC 768).
