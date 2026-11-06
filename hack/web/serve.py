@@ -126,6 +126,10 @@ class WispStream:
         self.lock = threading.Lock()  # guards sock and closed
         self.sock = None  # None until connected
         self.closed = False
+        # Set by a client CLOSE, under the connection's send_lock. A retired stream is still
+        # draining its queue into the destination but must put nothing more on the WebSocket:
+        # its id may already belong to a new stream.
+        self.retired = False
 
     def attach(self, sock):
         """False if the stream was closed while connecting; the caller then owns closing sock."""
@@ -155,6 +159,7 @@ class WispConnection:
         self.rfile = rfile
         self.send_lock = threading.Lock()
         self.streams = {}
+        self.draining = set()  # retired streams whose writer has not finished; hard-closed on exit
         self.streams_lock = threading.Lock()
 
     def run(self):
@@ -165,7 +170,8 @@ class WispConnection:
             pass
         finally:
             with self.streams_lock:
-                streams, self.streams = list(self.streams.values()), {}
+                streams = list(self.streams.values()) + list(self.draining)
+                self.streams, self.draining = {}, set()
             for stream in streams:
                 stream.close()
 
@@ -214,6 +220,10 @@ class WispConnection:
                 return self.send_close(CLOSE_PROTOCOL_ERROR)
 
     def send_frame(self, opcode, payload):
+        with self.send_lock:
+            self.write_frame(opcode, payload)
+
+    def write_frame(self, opcode, payload):
         length = len(payload)
         if length < LENGTH_16_BIT:
             header = bytes([FIN_BIT | opcode, length])
@@ -221,14 +231,20 @@ class WispConnection:
             header = bytes([FIN_BIT | opcode, LENGTH_16_BIT]) + struct.pack(">H", length)
         else:
             header = bytes([FIN_BIT | opcode, LENGTH_64_BIT]) + struct.pack(">Q", length)
-        with self.send_lock:
-            self.sock.sendall(header + payload)
+        self.sock.sendall(header + payload)
 
     def send_close(self, code):
         self.send_frame(OPCODE_CLOSE, struct.pack(">H", code))
 
     def send_packet(self, kind, stream_id, payload=b""):
         self.send_frame(OPCODE_BINARY, bytes([kind]) + struct.pack("<I", stream_id) + payload)
+
+    def send_stream_packet(self, stream, kind, stream_id, payload=b""):
+        """Sends for a stream's own threads, unless the client has closed it meanwhile. The check
+        and the write share the lock `drop` retires under, so nothing slips out after the drop."""
+        with self.send_lock:
+            if not stream.retired:
+                self.write_frame(OPCODE_BINARY, bytes([kind]) + struct.pack("<I", stream_id) + payload)
 
     @staticmethod
     def shutdown(sock):
@@ -258,7 +274,11 @@ class WispConnection:
         writer blocked in sendall."""
         with self.streams_lock:
             stream = self.streams.pop(stream_id, None)
+            if stream:
+                self.draining.add(stream)
         if stream:
+            with self.send_lock:
+                stream.retired = True
             stream.writes.put(None)
         return stream
 
@@ -271,7 +291,7 @@ class WispConnection:
             del self.streams[stream_id]
         stream.close()
         try:
-            self.send_packet(PACKET_CLOSE, stream_id, bytes([reason]))
+            self.send_stream_packet(stream, PACKET_CLOSE, stream_id, bytes([reason]))
         except OSError:
             pass
 
@@ -337,9 +357,13 @@ class WispConnection:
                     consumed += 1
                     if consumed >= WISP_REFILL_EVERY:
                         consumed = 0
-                        self.send_packet(PACKET_CONTINUE, stream_id, struct.pack("<I", WISP_CREDIT))
+                        self.send_stream_packet(stream, PACKET_CONTINUE, stream_id, struct.pack("<I", WISP_CREDIT))
         except Exception:  # whatever happens here ends this stream only, never the connection
+            stream.close()  # finish does nothing for a stream the client already closed
             self.finish(stream_id, stream, CLOSE_UNEXPECTED)
+        finally:
+            with self.streams_lock:
+                self.draining.discard(stream)
 
     def forward(self, stream_id, data):
         with self.streams_lock:
@@ -361,7 +385,7 @@ class WispConnection:
                     if stream.kind == STREAM_UDP:  # an empty datagram, not EOF
                         continue
                     break
-                self.send_packet(PACKET_DATA, stream_id, data)
+                self.send_stream_packet(stream, PACKET_DATA, stream_id, data)
         except Exception:
             reason = CLOSE_UNEXPECTED
         self.finish(stream_id, stream, reason)

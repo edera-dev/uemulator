@@ -7,6 +7,7 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -318,6 +319,98 @@ class ServeTest(unittest.TestCase):
         self.addCleanup(release.set)
         with self.delayed_connect(release):
             self.burst_then_close("slow.test", release)
+
+    def silent_sink(self):
+        """A destination that accepts, reads nothing until told to, then counts to EOF or reset."""
+        listener, port = self.listener()
+        start, state = threading.Event(), {"count": 0, "eof": False}
+
+        def sink():
+            peer, _ = listener.accept()
+            peer.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
+            peer.settimeout(TIMEOUT)
+            start.wait(TIMEOUT)
+            try:
+                while True:
+                    chunk = peer.recv(1 << 16)
+                    if not chunk:
+                        break
+                    state["count"] += len(chunk)
+            except OSError:
+                pass
+            state["eof"] = True
+
+        thread = threading.Thread(target=sink, daemon=True)
+        thread.start()
+        return port, start, state, thread
+
+    def packets_until_pong(self, client):
+        client.send(b"sync", opcode=9)
+        packets = []
+        while True:
+            opcode, payload = client.frame()
+            if opcode == 10:
+                return packets
+            packets.append((payload[0], struct.unpack("<I", payload[1:5])[0], payload[5:]))
+
+    def test_no_data_reaches_the_client_after_its_close(self):
+        listener, port = self.listener()
+        client = self.open()
+        client.packet()
+        client.send(connect_packet(1, TCP, port, "127.0.0.1"))
+        peer, _ = listener.accept()
+        stop = threading.Event()
+        self.addCleanup(stop.set)
+
+        def chatter():
+            try:
+                while not stop.is_set():
+                    peer.sendall(b"y")
+            except OSError:
+                pass
+
+        threading.Thread(target=chatter, daemon=True).start()
+        client.packet()  # some DATA is flowing
+        client.send(wisp(CLOSE, 1, b"\x02"))
+        self.packets_until_pong(client)
+        time.sleep(0.2)
+        self.assertEqual(self.packets_until_pong(client), [])
+
+    def test_reused_id_sees_nothing_from_the_draining_stream(self):
+        port_a, start, state, thread = self.silent_sink()
+        listener, port_b = self.listener()
+        client = self.open()
+        client.packet()
+        block = b"x" * (256 * 1024)
+        client.send(connect_packet(1, TCP, port_a, "127.0.0.1"))
+        for _ in range(40):
+            client.send(wisp(DATA, 1, block))
+        for _ in range(70):
+            client.send(wisp(DATA, 1, b"."))
+        client.send(wisp(CLOSE, 1, b"\x02"))
+        peer = self.echo_round_trip(client, 1, listener, port_b)  # keep it open: its EOF is a legit CLOSE
+        self.addCleanup(peer.close)
+        start.set()
+        thread.join(TIMEOUT)
+        self.assertEqual(state["count"], 40 * len(block) + 70)
+        self.assertEqual(self.packets_until_pong(client), [])
+
+    def test_websocket_end_releases_a_blocked_dropped_stream(self):
+        port, start, state, thread = self.silent_sink()
+        client = self.open()
+        client.packet()
+        block = b"x" * (256 * 1024)
+        blocks = 200
+        client.send(connect_packet(1, TCP, port, "127.0.0.1"))
+        for _ in range(blocks):
+            client.send(wisp(DATA, 1, block))
+        client.send(wisp(CLOSE, 1, b"\x02"))
+        client.close()
+        time.sleep(1)  # the writer is blocked in sendall; the queue holds the rest
+        start.set()
+        thread.join(TIMEOUT)
+        self.assertTrue(state["eof"])
+        self.assertLess(state["count"], blocks * len(block))
 
     def test_client_close_closes_the_socket(self):
         listener, port = self.listener()
