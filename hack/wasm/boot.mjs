@@ -168,6 +168,10 @@ const host = {
   host_net_flush() {},
   host_net_serving: () => 0,
   host_net_status() {},
+  host_wisp_recv: () => -1,
+  host_wisp_send() {},
+  host_wisp_flush() {},
+  host_wisp_status() {},
   host_should_stop: () => (found || performance.now() > deadline ? 1 : 0),
   host_idle: () => Atomics.wait(sleeper, 0, 0, 1),
   host_random(ptr, len) {

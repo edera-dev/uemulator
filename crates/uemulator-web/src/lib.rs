@@ -13,7 +13,9 @@
 //! `ScreenMirror`), in the library's own pixel format: the page's WebGL shader reorders the
 //! channels, so this thread, which is also the guest's, spends nothing converting them. With a network (`uw_set_network`) the guest's NIC is a port on the
 //! segment the page's tabs share: the library's `SegmentAgent` switches its frames, and the
-//! `host_net_*` imports carry them (`www/segment.js`). With a GPU (`uw_set_gpu`) the guest's
+//! `host_net_*` imports carry them (`www/segment.js`). Frames leaving the subnet, and DNS at
+//! 10.0.2.2, go instead to this tab's own `Gateway`, whose streams a `WispClient` carries over the
+//! page's Wisp WebSocket (`host_wisp_*`, `www/wisp.js`). With a GPU (`uw_set_gpu`) the guest's
 //! virgl commands go to the page's render worker through `host_gpu_*` (`gpu.rs`).
 #![cfg(target_arch = "wasm32")]
 
@@ -24,9 +26,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use uemulator::{
     BYTES_PER_PIXEL, BlockBackend, ClockMode, ConsoleKind, Cursor, Disk, DisplayHandle,
-    DisplayMode, EmulatedMachine, ExitReason, GpuLink, InputHandle, JitMode, MachineConfig,
-    MemoryKeyValueStore, NetHandle, PointerButton, RawImage, RemoteImage, ScreenMirror,
-    SegmentAgent, SegmentDestination, SegmentStatus, StopHandle, Udisk, UdiskOptions, disk_io,
+    DisplayMode, EmulatedMachine, Endpoint, ExitReason, Gateway, GatewayConfig, GatewayPolicy,
+    GpuLink, InputHandle, JitMode, MachineConfig, MemoryKeyValueStore, NetHandle, PointerButton,
+    RawImage, RemoteImage, ScreenMirror, SegmentAgent, SegmentDestination, SegmentStatus,
+    StopHandle, Udisk, UdiskOptions, WispClient, WispState, WispStatus, disk_io,
 };
 
 const NS_PER_MS: f64 = 1_000_000.0;
@@ -61,6 +64,29 @@ const MAC_BYTES: usize = 6;
 const DESTINATION_EVERYONE: i32 = 0;
 const DESTINATION_TAB: i32 = 1;
 const DESTINATION_SERVER: i32 = 2;
+
+/// The gateway's DNS at 10.0.2.2:53 goes here unless `uw_set_wisp` names another resolver.
+const DEFAULT_RESOLVER: Endpoint = Endpoint {
+    address: [1, 1, 1, 1],
+    port: 53,
+};
+/// The longest Wisp message the page writes into the wisp ring (`WISP_RECORD_MAX` in
+/// `www/protocol.js`; the page closes a socket that sends a longer one), so `host_wisp_recv`
+/// always has room for the next record.
+const WISP_RECORD_MAX: usize = 1 << 18;
+// Wisp ring events (`WISP_EVENT` in `www/protocol.js`).
+/// The page created a WebSocket; nothing about it is known yet.
+const WISP_EVENT_CONNECTING: u32 = 1;
+/// One binary message from the server.
+const WISP_EVENT_MESSAGE: u32 = 2;
+/// The WebSocket closed or failed.
+const WISP_EVENT_LOST: u32 = 3;
+// `host_wisp_status` states, the library's `WispState`.
+const WISP_STATE_DISCONNECTED: i32 = 0;
+const WISP_STATE_CONNECTING: i32 = 1;
+const WISP_STATE_READY: i32 = 2;
+/// `host_wisp_status`'s close reason when the server never sent a non-voluntary CLOSE.
+const WISP_NO_CLOSE_REASON: i32 = -1;
 
 pub const EXIT_SHUTDOWN: i32 = 0;
 pub const EXIT_RESET: i32 = 1;
@@ -183,6 +209,17 @@ unsafe extern "C" {
     /// The segment status changed: the guest's address (big-endian, 0 for none), the number of
     /// other tabs and whether this one serves.
     fn host_net_status(address: u32, peers: u32, serving: i32);
+    /// The next record of the wisp ring: copies its payload to `ptr` (never more than `capacity`
+    /// bytes, never part of a record), its `WISP_EVENT_*` to `event`, and returns the payload's
+    /// length, or -1 when the ring is empty. Never blocks.
+    fn host_wisp_recv(ptr: *mut u8, capacity: usize, event: *mut u32) -> i32;
+    /// Queues one Wisp packet for the page to send as one binary WebSocket message. Sent at the
+    /// next `host_wisp_flush`.
+    fn host_wisp_send(ptr: *const u8, len: usize);
+    fn host_wisp_flush();
+    /// The Wisp connection's state changed: a `WISP_STATE_*` and the last non-voluntary close
+    /// reason (`WISP_NO_CLOSE_REASON` for none).
+    fn host_wisp_status(state: i32, close_reason: i32);
     /// The pointer image: `CURSOR_*` kind, and for `CURSOR_IMAGE` its size, hotspot and RGBA
     /// pixels (straight alpha).
     fn host_cursor(
@@ -213,8 +250,8 @@ thread_local! {
     static PENDING_HYPERVISOR: RefCell<Option<(Vec<u8>, String)>> = const { RefCell::new(None) };
     /// The machine's screen and input handles, for the poll hook (like `STOP`).
     static SCREEN: RefCell<Option<ScreenLink>> = const { RefCell::new(None) };
-    /// What `uw_set_network` set up for the next `uw_create`: the NIC's address and its agent.
-    static PENDING_NETWORK: RefCell<Option<([u8; MAC_BYTES], SegmentAgent)>> = const { RefCell::new(None) };
+    /// What `uw_set_network` (and `uw_set_wisp`) set up for the next `uw_create`.
+    static PENDING_NETWORK: RefCell<Option<PendingNetwork>> = const { RefCell::new(None) };
     /// The running machine's port on the segment, for the poll hook.
     static NETWORK: RefCell<Option<NetLink>> = const { RefCell::new(None) };
     /// What `uw_set_gpu` made for the next `uw_create`.
@@ -223,13 +260,27 @@ thread_local! {
     static GPU: RefCell<Option<gpu::GpuPump>> = const { RefCell::new(None) };
 }
 
+struct PendingNetwork {
+    mac: [u8; MAC_BYTES],
+    agent: SegmentAgent,
+    resolver: Endpoint,
+}
+
 /// What the poll hook keeps between calls to move frames between the guest's NIC, its agent and
-/// the other tabs.
+/// the other tabs, and the gateway's streams between the guest and the Wisp server.
 struct NetLink {
     net: NetHandle,
     agent: SegmentAgent,
+    /// Exists whether or not the page has a Wisp server: without one the client stays
+    /// `Disconnected` and every open fails at once, so the guest is refused instead of timing
+    /// out.
+    gateway: Gateway,
+    wisp: WispClient,
     frame: Vec<u8>,
+    /// Where `host_wisp_recv` puts a record, `WISP_RECORD_MAX` bytes.
+    wisp_record: Vec<u8>,
     reported: Option<SegmentStatus>,
+    reported_wisp: Option<WispStatus>,
 }
 
 /// What the poll hook keeps between calls to feed the page the screen and the guest the input.
@@ -384,7 +435,13 @@ pub unsafe extern "C" fn uw_set_network(mac: *mut u8, len: usize, tab: u32) -> i
     };
     match SegmentAgent::new(mac, tab, now_ms()) {
         Ok(agent) => {
-            PENDING_NETWORK.with(|network| *network.borrow_mut() = Some((mac, agent)));
+            PENDING_NETWORK.with(|network| {
+                *network.borrow_mut() = Some(PendingNetwork {
+                    mac,
+                    agent,
+                    resolver: DEFAULT_RESOLVER,
+                })
+            });
             0
         }
         Err(error) => {
@@ -392,6 +449,32 @@ pub unsafe extern "C" fn uw_set_network(mac: *mut u8, len: usize, tab: u32) -> i
             1
         }
     }
+}
+
+/// Where the gateway sends the guest's DNS (10.0.2.2:53) for the next `uw_create`: `resolver`
+/// is an IPv4 address, big-endian (1.1.1.1 is 0x01010101). `DEFAULT_RESOLVER` without a call.
+/// Call after `uw_set_network`. Whether a Wisp WebSocket exists is the page's business: it says
+/// so through the wisp ring. Returns 0, or 1 with the message in `uw_error_*` without a network
+/// or for a port past 65535.
+#[unsafe(no_mangle)]
+pub extern "C" fn uw_set_wisp(resolver: u32, port: u32) -> i32 {
+    let Ok(port) = u16::try_from(port) else {
+        set_error(format!("{port} is not a port"));
+        return 1;
+    };
+    PENDING_NETWORK.with(|network| match network.borrow_mut().as_mut() {
+        Some(pending) => {
+            pending.resolver = Endpoint {
+                address: resolver.to_be_bytes(),
+                port,
+            };
+            0
+        }
+        None => {
+            set_error("a resolver needs a network: call uw_set_network first".into());
+            1
+        }
+    })
 }
 
 /// Gives the next `uw_create` a 3D-capable GPU (`VIRTIO_GPU_F_VIRGL`) whose commands go to the
@@ -511,8 +594,8 @@ pub unsafe extern "C" fn uw_create(
         config = config.gpu(link.clone());
     }
     let network = PENDING_NETWORK.with(|network| network.take());
-    if let Some((mac, _)) = &network {
-        config = config.net(*mac);
+    if let Some(pending) = &network {
+        config = config.net(pending.mac);
     }
     for disk in PENDING_DISKS.with(|disks| disks.take()) {
         config = config.disk(disk);
@@ -568,11 +651,25 @@ pub unsafe extern "C" fn uw_create(
         });
     });
     NETWORK.with(|slot| {
-        *slot.borrow_mut() = network.zip(machine.net()).map(|((_, agent), net)| NetLink {
-            net,
-            agent,
-            frame: vec![0; SEGMENT_FRAME_MAX],
-            reported: None,
+        *slot.borrow_mut() = network.zip(machine.net()).map(|(pending, net)| {
+            // The sequence numbers only keep connections apart; any value does.
+            let mut isn_seed = [0u8; 4];
+            unsafe { host_random(isn_seed.as_mut_ptr(), isn_seed.len()) };
+            NetLink {
+                net,
+                agent: pending.agent,
+                gateway: Gateway::new(GatewayConfig {
+                    policy: GatewayPolicy::Segment {
+                        resolver: pending.resolver,
+                    },
+                    isn_seed: u32::from_le_bytes(isn_seed),
+                }),
+                wisp: WispClient::new(),
+                frame: vec![0; SEGMENT_FRAME_MAX],
+                wisp_record: vec![0; WISP_RECORD_MAX],
+                reported: None,
+                reported_wisp: None,
+            }
         });
     });
     GPU.with(|slot| *slot.borrow_mut() = gpu.map(gpu::GpuPump::new));
@@ -739,11 +836,15 @@ impl ScreenLink {
 }
 
 impl NetLink {
-    /// Moves every frame waiting on either side through the agent, then sends what it produced.
+    /// Moves every frame waiting on either side through the agent or the gateway, the Wisp
+    /// server's messages into the gateway and its streams' bytes back out, then sends what all of
+    /// it produced. The order is the `WispClient` contract: the server's messages, the guest's
+    /// frames, `WispClient::pump`, `Gateway::poll`.
     fn pump(&mut self) {
         let now = now_ms();
         self.agent
             .set_serving(unsafe { host_net_serving() } != 0, now);
+        self.take_wisp_records(now);
         loop {
             let mut from = 0u32;
             let len =
@@ -754,13 +855,31 @@ impl NetLink {
             self.agent.from_segment(from, &self.frame[..len], now);
         }
         while let Some(frame) = self.net.try_recv_frame() {
-            self.agent.from_guest(&frame, now);
+            if self.gateway.takes_frame(&frame) {
+                self.gateway.from_guest(&frame, now);
+            } else {
+                self.agent.from_guest(&frame, now);
+            }
         }
+        self.wisp.pump(&mut self.gateway, now);
+        self.gateway.poll(now);
         self.agent.tick(now);
-        // A full receive queue (a guest whose driver is not up) drops the frame, as a NIC
-        // without receive buffers would.
+        // A full receive queue (a guest whose driver is not up) drops the agent's frame, as a
+        // NIC without receive buffers would.
         for frame in self.agent.take_for_guest() {
             self.net.send_frame(&frame);
+        }
+        // The gateway's are kept for the next pump instead: they carry stream bytes the Wisp
+        // server will not send again. `Gateway::poll` stops taking remote data while they pile up.
+        while let Some(frame) = self.gateway.pop_for_guest() {
+            let queued = match frame.segment_size {
+                Some(size) => self.net.send_tcp_segment(&frame.bytes, size),
+                None => self.net.send_frame(&frame.bytes),
+            };
+            if !queued {
+                self.gateway.requeue_for_guest(frame);
+                break;
+            }
         }
         let outgoing = self.agent.take_for_segment();
         if !outgoing.is_empty() {
@@ -774,11 +893,61 @@ impl NetLink {
             }
             unsafe { host_net_flush() };
         }
+        let messages = self.wisp.take_messages();
+        if !messages.is_empty() {
+            for message in &messages {
+                unsafe { host_wisp_send(message.as_ptr(), message.len()) };
+            }
+            unsafe { host_wisp_flush() };
+        }
         let status = self.agent.status();
         if self.reported != Some(status) {
             self.reported = Some(status);
             let address = status.address.map_or(0, u32::from_be_bytes);
             unsafe { host_net_status(address, status.peers as u32, i32::from(status.serving)) };
+        }
+        let wisp = self.wisp.status();
+        if self.reported_wisp != Some(wisp) {
+            self.reported_wisp = Some(wisp);
+            let state = match wisp.state {
+                WispState::Disconnected => WISP_STATE_DISCONNECTED,
+                WispState::Connecting => WISP_STATE_CONNECTING,
+                WispState::Ready => WISP_STATE_READY,
+            };
+            let reason = wisp
+                .last_close_reason
+                .map_or(WISP_NO_CLOSE_REASON, i32::from);
+            unsafe { host_wisp_status(state, reason) };
+        }
+    }
+
+    /// Hands the client everything the page wrote into the wisp ring, in order. Nothing in it
+    /// may be skipped: a lost message would corrupt a guest's TCP stream.
+    fn take_wisp_records(&mut self, now: u64) {
+        loop {
+            let mut event = 0u32;
+            let len = unsafe {
+                host_wisp_recv(
+                    self.wisp_record.as_mut_ptr(),
+                    self.wisp_record.len(),
+                    &mut event,
+                )
+            };
+            let Ok(len) = usize::try_from(len) else {
+                break;
+            };
+            match (event, self.wisp_record.get(..len)) {
+                (WISP_EVENT_CONNECTING, _) => self.wisp.connecting(now),
+                (WISP_EVENT_MESSAGE, Some(message)) => {
+                    self.wisp.from_server(message, &mut self.gateway)
+                }
+                // A record longer than the buffer breaks `host_wisp_recv`'s contract; the
+                // stream it belonged to cannot be trusted, so neither can the connection.
+                (WISP_EVENT_MESSAGE, None) | (WISP_EVENT_LOST, _) => {
+                    self.wisp.connection_lost(&mut self.gateway)
+                }
+                _ => {}
+            }
         }
     }
 }

@@ -2,8 +2,9 @@
 // words, then a byte ring for terminal keystrokes (page writes HEAD, worker reads TAIL), then a
 // ring of screen input events (page writes EVENT_HEAD, worker reads EVENT_TAIL), each EVENT_WORDS
 // Int32: kind (EVENT.*) and two arguments, then a byte ring of Ethernet frames from the other
-// tabs (segment.js writes NET_HEAD, the worker reads NET_TAIL). The worker's idle wait sleeps on
-// HEAD, so the page notifies HEAD after writing any ring.
+// tabs (segment.js writes NET_HEAD, the worker reads NET_TAIL), then a byte ring of the Wisp
+// WebSocket's events and messages (wisp.js writes WISP_HEAD, the worker reads WISP_TAIL). The
+// worker's idle wait sleeps on HEAD, so the page notifies HEAD after writing any ring.
 export const CTRL = {
   HEAD: 0,
   TAIL: 1,
@@ -21,6 +22,8 @@ export const CTRL = {
   NET_TAIL: 10,
   // 1 while this tab holds the segment's server lock (segment.js), read by `host_net_serving`.
   NET_SERVING: 11,
+  WISP_HEAD: 12,
+  WISP_TAIL: 13,
 };
 export const RING_OFFSET = 64;
 export const RING_BYTES = 1 << 16;
@@ -30,7 +33,14 @@ export const EVENT_RECORDS = 4096;
 export const NET_OFFSET = EVENT_OFFSET + EVENT_RECORDS * EVENT_WORDS * 4;
 // About 350 full-size frames: what can pile up while the worker is stuck in a disk read.
 export const NET_RING_BYTES = 1 << 19;
-export const CONTROL_BYTES = NET_OFFSET + NET_RING_BYTES;
+export const WISP_OFFSET = NET_OFFSET + NET_RING_BYTES;
+// Unlike the frame ring this one never drops (a lost message would corrupt a guest's TCP
+// stream): what does not fit waits in wisp.js until the worker drains the ring.
+export const WISP_RING_BYTES = 1 << 20;
+// The longest message the page passes on (WISP_RECORD_MAX in src/lib.rs, the worker's buffer);
+// a server that sends a longer one loses its connection.
+export const WISP_RECORD_MAX = 1 << 18;
+export const CONTROL_BYTES = WISP_OFFSET + WISP_RING_BYTES;
 // FRAME_ACK values: the FRAME_READY_* constants in src/lib.rs. RESEND asks for the whole screen
 // rather than what changed since the last frame: the page lost its picture (a WebGL context
 // loss).
@@ -83,6 +93,20 @@ export const OPTION = {
   SCREEN_CONSOLE: 1 << 10,
   TPM: 1 << 11,
   SECURE_BOOT: 1 << 12,
+};
+// What a wisp ring record carries: the WISP_EVENT_* constants in src/lib.rs. A record is its
+// payload's length (u32 little-endian), the event (u8), then the payload: a server message for
+// MESSAGE, nothing for the others.
+export const WISP_EVENT = {
+  CONNECTING: 1, // the page created a WebSocket
+  MESSAGE: 2,
+  LOST: 3, // the WebSocket closed or failed
+};
+// `host_wisp_status` states: the WISP_STATE_* constants in src/lib.rs, the library's WispState.
+export const WISP_STATE = {
+  DISCONNECTED: 0,
+  CONNECTING: 1,
+  READY: 2,
 };
 // `host_net_send` destinations: the DESTINATION_* constants in src/lib.rs, which are the
 // library's SegmentDestination.

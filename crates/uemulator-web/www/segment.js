@@ -38,14 +38,15 @@ export function randomMac() {
 
 export const formatMac = (mac) => [...mac].map((byte) => byte.toString(16).padStart(2, "0")).join(":");
 
-function ringWrite(ring, at, bytes) {
+// Copies `bytes` into the byte ring at `at`, wrapping at its end, and returns where it ended.
+export function ringWrite(ring, at, bytes) {
   const first = Math.min(bytes.length, ring.length - at);
   ring.set(bytes.subarray(0, first), at);
   ring.set(bytes.subarray(first), 0);
   return (at + bytes.length) % ring.length;
 }
 
-function ringRead(ring, at, out) {
+export function ringRead(ring, at, out) {
   const first = Math.min(out.length, ring.length - at);
   out.set(ring.subarray(at, at + first));
   out.set(ring.subarray(0, out.length - first), first);

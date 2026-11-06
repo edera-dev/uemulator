@@ -1,14 +1,16 @@
 // Runs the emulator. `uw_run` blocks until the guest exits, so it lives here and not on the page.
 // While it runs this worker cannot receive messages: keystrokes, screen input, resizes, frame
 // acknowledgements, the stop request and the frames from other tabs come through the
-// SharedArrayBuffer `control` that main.js shares with us (layout in protocol.js).
+// SharedArrayBuffer `control` that main.js shares with us (layout in protocol.js), and so do the
+// Wisp server's messages (wisp.js).
 import {
   BYTES_PER_PIXEL, CTRL, EVENT_OFFSET, EVENT_RECORDS, EVENT_WORDS, FRAME_READY, NET_OFFSET, NET_RING_BYTES,
-  RECT_WORDS, RING_BYTES, RING_OFFSET,
+  RECT_WORDS, RING_BYTES, RING_OFFSET, WISP_OFFSET, WISP_RING_BYTES,
 } from "./protocol.js";
 import { openRing, readRecords, writeRecords } from "./gpu.js";
 import { createJitHost } from "./jit_host.js";
 import { createSegmentSender, netRingHasFrames, takeFrame } from "./segment.js";
+import { createWispSender, takeWispRecord, wispRingHasRecords } from "./wisp.js";
 
 const OUTPUT_FLUSH_MS = 16;
 const OUTPUT_FLUSH_BYTES = 1 << 16;
@@ -22,8 +24,12 @@ const diskSources = [];
 let ring;
 let events;
 let netRing;
+let wispRing;
 // Posts the guest's frames to the other tabs; only with a network (`uw_set_network`).
 let segment = null;
+// Posts the Wisp client's packets to the page's WebSocket; with any network, since the gateway
+// is there with or without a Wisp server.
+let wispSender = null;
 // The rings to and from the render worker (render.js); only with a GPU (`uw_set_gpu`).
 let gpuCommands = null;
 let gpuCompletions = null;
@@ -96,7 +102,8 @@ const host = {
     flushOutput();
     const head = Atomics.load(control, CTRL.HEAD);
     const noEvents = Atomics.load(control, CTRL.EVENT_HEAD) === Atomics.load(control, CTRL.EVENT_TAIL);
-    if (head === Atomics.load(control, CTRL.TAIL) && noEvents && !netRingHasFrames(control)) {
+    const noRings = !netRingHasFrames(control) && !wispRingHasRecords(control);
+    if (head === Atomics.load(control, CTRL.TAIL) && noEvents && noRings) {
       Atomics.wait(control, CTRL.HEAD, head, IDLE_WAIT_MS);
     }
   },
@@ -132,6 +139,22 @@ const host = {
   },
   host_net_status(address, peers, serving) {
     postMessage({ type: "network", address: address >>> 0, peers, serving: serving !== 0 });
+  },
+  host_wisp_recv(ptr, capacity, eventPtr) {
+    const record = takeWispRecord(control, wispRing, memoryBytes(ptr, capacity));
+    if (!record) return -1;
+    // `eventPtr` points at a Rust `u32`, so it is 4-aligned.
+    new Uint32Array(wasm.memory.buffer, address(eventPtr), 1)[0] = record.event;
+    return record.length;
+  },
+  host_wisp_send(ptr, len) {
+    wispSender.queue(memoryBytes(ptr, len).slice());
+  },
+  host_wisp_flush() {
+    wispSender.flush();
+  },
+  host_wisp_status(state, closeReason) {
+    postMessage({ type: "wisp-status", state, closeReason });
   },
   host_frame_ready() {
     return Atomics.load(control, CTRL.FRAME_ACK);
@@ -249,6 +272,7 @@ async function boot(message) {
   ring = new Uint8Array(message.control, RING_OFFSET, RING_BYTES);
   events = new Int32Array(message.control, EVENT_OFFSET, EVENT_RECORDS * EVENT_WORDS);
   netRing = new Uint8Array(message.control, NET_OFFSET, NET_RING_BYTES);
+  wispRing = new Uint8Array(message.control, WISP_OFFSET, WISP_RING_BYTES);
   const response = await fetch(new URL("uemulator_web.wasm", import.meta.url));
   const { instance } = await WebAssembly.instantiate(await response.arrayBuffer(), { host });
   wasm = instance.exports;
@@ -276,6 +300,13 @@ async function boot(message) {
       return;
     }
     segment = createSegmentSender(message.network.tab);
+    wispSender = createWispSender((reply, transfer) => postMessage(reply, transfer));
+    // `wisp` is { resolver, port }, the resolver an IPv4 address as a big-endian u32
+    // (`uw_set_wisp`), or null for the default; the WebSocket itself is the page's (wisp.js).
+    if (message.wisp && wasm.uw_set_wisp(message.wisp.resolver >>> 0, message.wisp.port)) {
+      postMessage({ type: "exit", code: -2, message: `wisp: ${lastError()}` });
+      return;
+    }
   }
   if (message.gpu) {
     gpuCommands = openRing(message.gpu.commands);

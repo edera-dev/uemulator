@@ -66,6 +66,11 @@ const host = {
   host_net_status(address, peers, serving) {
     parentPort.postMessage({ type: "network", address: address >>> 0, peers, serving: serving !== 0 });
   },
+  // No Wisp server here: the gateway's opens fail at once.
+  host_wisp_recv: () => -1,
+  host_wisp_send() {},
+  host_wisp_flush() {},
+  host_wisp_status() {},
   host_should_stop: () => Atomics.load(control, CTRL.STOP),
   host_idle() {
     const head = Atomics.load(control, CTRL.HEAD);
