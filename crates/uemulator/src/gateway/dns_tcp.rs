@@ -20,9 +20,13 @@ pub(super) const DNS_TCP_PENDING_LIMIT: usize = 64;
 /// With nothing outstanding for this long the stream is closed, so an idle guest holds no proxy
 /// stream.
 pub(super) const DNS_TCP_IDLE_TIMEOUT_MS: u64 = 60_000;
+/// Bytes waiting in `outgoing`. Expiry does not trim it, so without this limit a stream that
+/// never opens, or a driver that stops consuming, would grow it by a full window of queries every
+/// `DNS_TCP_QUERY_TIMEOUT_MS`. A query that would pass it is dropped like one past the pending limit.
+pub(super) const DNS_TCP_OUTGOING_LIMIT: usize = 256 * 1024;
 /// A query unanswered this long is dropped (the guest's resolver retries). Without it a resolver
 /// that accepts TCP and never answers would fill `DNS_TCP_PENDING_LIMIT` for good and keep the
-/// stream from ever idling out.
+/// stream from ever idling out. The clock starts when the query is queued, not when it is sent.
 pub(super) const DNS_TCP_QUERY_TIMEOUT_MS: u64 = 10_000;
 /// What `room` reports: a fixed amount, since answers become datagrams at once and nothing waits
 /// on a guest window.
@@ -108,6 +112,7 @@ impl Gateway {
         if data.len() < DNS_ID_LEN
             || data.len() > usize::from(u16::MAX)
             || self.dns_tcp.outstanding.len() >= DNS_TCP_PENDING_LIMIT
+            || self.dns_tcp.outgoing.len() + LENGTH_PREFIX_LEN + data.len() > DNS_TCP_OUTGOING_LIMIT
         {
             return;
         }

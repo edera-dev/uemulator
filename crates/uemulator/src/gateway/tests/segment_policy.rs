@@ -1,6 +1,7 @@
 use super::*;
 use crate::gateway::dns_tcp::{
-    DNS_TCP_IDLE_TIMEOUT_MS, DNS_TCP_PENDING_LIMIT, DNS_TCP_QUERY_TIMEOUT_MS,
+    DNS_TCP_IDLE_TIMEOUT_MS, DNS_TCP_OUTGOING_LIMIT, DNS_TCP_PENDING_LIMIT,
+    DNS_TCP_QUERY_TIMEOUT_MS,
 };
 
 const QUERY_PORT: u16 = 5353;
@@ -305,5 +306,31 @@ fn a_stream_holding_only_expired_queries_idles_out() {
     assert_eq!(
         remote.requests(&mut gateway),
         [GatewayRequest::Close { stream: tcp }]
+    );
+}
+
+#[test]
+fn outgoing_bytes_are_capped_when_the_stream_never_opens() {
+    const BIG_QUERY_LEN: usize = 1000;
+    let (mut gateway, mut remote) = segment_with_remote();
+    ask(&mut gateway, QUERY_PORT, 1, 0);
+    let udp = remote.single_open(&mut gateway);
+    gateway.failed(udp);
+    let tcp = remote.single_open(&mut gateway);
+    for window in 0..8u64 {
+        let now_ms = window * DNS_TCP_QUERY_TIMEOUT_MS;
+        gateway.poll(now_ms);
+        for id in 0..DNS_TCP_PENDING_LIMIT as u16 {
+            let mut query = dns_query(id);
+            query.resize(BIG_QUERY_LEN, 0);
+            gateway.from_guest(&udp_frame_to_gateway(QUERY_PORT, DNS_PORT, &query), now_ms);
+        }
+    }
+    gateway.opened(tcp);
+    let sent = remote.take_written(&mut gateway, tcp).len();
+    assert!(sent <= DNS_TCP_OUTGOING_LIMIT, "{sent} bytes queued");
+    assert!(
+        sent > DNS_TCP_OUTGOING_LIMIT / 2,
+        "the cap, not a bug, stopped it"
     );
 }
