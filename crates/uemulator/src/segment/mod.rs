@@ -17,8 +17,8 @@
 //!   what they send from. Every agent keeps the resulting lease table, so a new server already
 //!   knows which addresses are taken. The announcements also count the peers.
 //!
-//! There is no way off the segment: the server is not a router, and DHCP gives no gateway or
-//! DNS server.
+//! The segment itself has no way off it: DHCP names the server's address as router and DNS
+//! server, and each tab's gateway (see `crate::gateway`) takes that traffic for its guest.
 
 mod dhcp;
 mod packet;

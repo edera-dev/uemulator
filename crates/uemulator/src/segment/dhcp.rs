@@ -62,6 +62,8 @@ const BOOTP_MIN_LEN: usize = 300;
 
 const OPTION_PAD: u8 = 0;
 const OPTION_SUBNET_MASK: u8 = 1;
+const DHCP_OPTION_ROUTER: u8 = 3;
+const DHCP_OPTION_DNS_SERVER: u8 = 6;
 const OPTION_BROADCAST_ADDRESS: u8 = 28;
 const OPTION_REQUESTED_IP: u8 = 50;
 const OPTION_LEASE_TIME: u8 = 51;
@@ -221,7 +223,7 @@ pub(crate) struct ServerMessage {
     pub yiaddr: Ipv4,
 }
 
-fn options(message: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
+pub(crate) fn options(message: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
     let mut rest = message.get(DHCP_OPTIONS_OFFSET..).unwrap_or_default();
     core::iter::from_fn(move || {
         loop {
@@ -374,6 +376,10 @@ fn reply(message: &ClientMessage, kind: u8, yiaddr: Ipv4) -> Vec<u8> {
         put(OPTION_REBINDING_TIME, &REBINDING_SECS.to_be_bytes());
         put(OPTION_SUBNET_MASK, &SUBNET_MASK);
         put(OPTION_BROADCAST_ADDRESS, &SUBNET_BROADCAST);
+        // The tab's own gateway (crate::gateway) answers for this address: off-subnet traffic
+        // and DNS on port 53.
+        put(DHCP_OPTION_ROUTER, &SERVER_IP);
+        put(DHCP_OPTION_DNS_SERVER, &SERVER_IP);
     }
     bootp.push(OPTION_END);
     if bootp.len() < BOOTP_MIN_LEN {

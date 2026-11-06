@@ -3,7 +3,8 @@
 //! The guests are scripted: DHCP clients, ARP, ping and plain frames between them.
 
 use super::dhcp::{
-    DHCP_DECLINE, DHCP_DISCOVER, DHCP_OFFER, DHCP_RELEASE, DHCP_REQUEST, client_message,
+    DHCP_ACK, DHCP_DECLINE, DHCP_DISCOVER, DHCP_OFFER, DHCP_RELEASE, DHCP_REQUEST, client_message,
+    options,
 };
 use super::packet::{
     UNSPECIFIED_IP, icmp_echo_request, is_icmp_echo_reply, parse_arp, udp_datagram,
@@ -260,6 +261,66 @@ fn two_leased_tabs(bus: &mut Bus) -> (Ipv4, Ipv4) {
 
 mod addresses {
     use super::*;
+
+    type OptionList = Vec<(u8, Vec<u8>)>;
+
+    /// The options of every DHCP reply in `frames`, as (kind, options).
+    fn reply_options(frames: &[Vec<u8>]) -> Vec<(u8, OptionList)> {
+        frames
+            .iter()
+            .filter_map(|frame| {
+                let reply = dhcp_reply(frame)?;
+                let ethernet = parse_ethernet(frame)?;
+                let ip = parse_ipv4(ethernet.payload)?;
+                let udp = parse_udp(ip.payload)?;
+                let all = options(udp.data)
+                    .map(|(code, value)| (code, value.to_vec()))
+                    .collect();
+                Some((reply.kind, all))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn offers_and_acks_name_the_server_as_router_and_dns() {
+        let mut bus = Bus::new();
+        bus.join(1);
+        bus.serve(1);
+        bus.join(2);
+        bus.advance(SETTLE_MS);
+        bus.take_guest(2);
+        let station = mac_of(2);
+        let discover = client_message(DHCP_DISCOVER, station, 1, UNSPECIFIED_IP, None, None);
+        bus.guest_sends(2, discover);
+        let offer_frames = bus.take_guest(2);
+        let offers = reply_options(&offer_frames);
+        let offered = offer_frames
+            .iter()
+            .filter_map(|frame| dhcp_reply(frame))
+            .find(|reply| reply.kind == DHCP_OFFER)
+            .map(|reply| reply.yiaddr);
+        let request = client_message(
+            DHCP_REQUEST,
+            station,
+            2,
+            UNSPECIFIED_IP,
+            offered,
+            Some(SERVER_IP),
+        );
+        bus.guest_sends(2, request);
+        let acks = reply_options(&bus.take_guest(2));
+        for (kind, replies) in [(DHCP_OFFER, offers), (DHCP_ACK, acks)] {
+            let (_, options) = replies
+                .iter()
+                .find(|(k, _)| *k == kind)
+                .expect("the server answers");
+            assert!(
+                options.contains(&(3, SERVER_IP.to_vec())),
+                "router in {kind}"
+            );
+            assert!(options.contains(&(6, SERVER_IP.to_vec())), "dns in {kind}");
+        }
+    }
 
     #[test]
     fn the_server_tab_and_another_tab_get_distinct_addresses_in_the_subnet() {
