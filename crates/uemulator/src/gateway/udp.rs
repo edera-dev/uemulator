@@ -7,7 +7,7 @@ use crate::prelude::*;
 use alloc::collections::BTreeMap;
 
 use super::dhcp::DHCP_SERVER_PORT;
-use super::dns_tcp::DnsQuery;
+use super::dns_tcp::{DNS_ID_LEN, DnsQuery};
 use super::wire::{
     ICMP_CHECKSUM, ICMP_CODE_PORT_UNREACHABLE, ICMP_DEST_UNREACHABLE, ICMP_ERROR_HEADER_LEN,
     IP_PROTO_ICMP, IP_PROTO_UDP, Ipv4Packet, UDP_DST_PORT, UDP_HEADER_LEN, UDP_LENGTH,
@@ -27,6 +27,9 @@ pub(super) const MAX_UDP_FLOWS: usize = 128;
 /// Datagrams a flow holds while the driver opens its stream. Past this the newest are dropped,
 /// as a full socket buffer would; UDP applications already tolerate that.
 pub(super) const UDP_PENDING_LIMIT: usize = 64;
+/// Unanswered queries a `Segment` resolver flow remembers after its open. Past this the oldest
+/// is forgotten: the guest has retried it by then.
+const UNANSWERED_DNS_LIMIT: usize = 64;
 
 pub(super) struct UdpFlow {
     stream: StreamId,
@@ -35,6 +38,10 @@ pub(super) struct UdpFlow {
     /// The driver has confirmed the stream; until then datagrams wait in `pending`.
     opened: bool,
     pending: Vec<Vec<u8>>,
+    /// Only on a `Segment` resolver flow: queries sent and not answered yet. A Wisp driver opens
+    /// a stream before the server has accepted it, so a server that refuses UDP does so after
+    /// these went out; they are replayed over TCP instead of waiting for the guest to retry.
+    unanswered: Vec<Vec<u8>>,
     /// The first datagram's IPv4 header and first 8 payload bytes, which an ICMP error must
     /// quote (RFC 792) so the guest can find the socket it belongs to.
     quote: Vec<u8>,
@@ -164,15 +171,23 @@ impl Gateway {
                     last_activity_ms: now_ms,
                     opened: false,
                     pending: Vec::new(),
+                    unanswered: Vec::new(),
                     quote,
                 },
             );
         }
+        let resolver_flow = self.is_segment_resolver_flow(&key);
         let Some(flow) = self.udp.flows.get_mut(&key) else {
             return;
         };
         flow.last_activity_ms = now_ms;
         if flow.opened {
+            if resolver_flow && data.len() >= DNS_ID_LEN {
+                if flow.unanswered.len() >= UNANSWERED_DNS_LIMIT {
+                    flow.unanswered.remove(0);
+                }
+                flow.unanswered.push(data.to_vec());
+            }
             self.requests.push(GatewayRequest::Datagram {
                 stream: flow.stream,
                 data: data.to_vec(),
@@ -183,11 +198,18 @@ impl Gateway {
     }
 
     pub(super) fn udp_opened(&mut self, stream: StreamId) {
-        let Some((_, flow)) = self.udp.flow_of_stream(stream) else {
+        let Some(key) = self.udp.by_stream.get(&stream).copied() else {
+            return;
+        };
+        let resolver_flow = self.is_segment_resolver_flow(&key);
+        let Some(flow) = self.udp.flows.get_mut(&key) else {
             return;
         };
         flow.opened = true;
         for data in core::mem::take(&mut flow.pending) {
+            if resolver_flow && data.len() >= DNS_ID_LEN {
+                flow.unanswered.push(data.clone());
+            }
             self.requests
                 .push(GatewayRequest::Datagram { stream, data });
         }
@@ -206,7 +228,7 @@ impl Gateway {
             // A Wisp server refusing UDP: the queries wait for the TCP stream, which refuses them
             // in turn when there is no uplink at all.
             self.dns_tcp.fallen_back = true;
-            for data in flow.pending {
+            for data in flow.unanswered.into_iter().chain(flow.pending) {
                 let query = DnsQuery::new(flow.guest_ip, key.guest_port, flow.quote.clone());
                 self.dns_tcp_query(query, &data);
             }
@@ -247,6 +269,14 @@ impl Gateway {
             return;
         };
         flow.last_activity_ms = now_ms;
+        if data.len() >= DNS_ID_LEN
+            && let Some(position) = flow
+                .unanswered
+                .iter()
+                .position(|query| query[..DNS_ID_LEN] == data[..DNS_ID_LEN])
+        {
+            flow.unanswered.remove(position);
+        }
         let guest_ip = flow.guest_ip;
         let datagram = udp_segment(
             key.remote_ip,

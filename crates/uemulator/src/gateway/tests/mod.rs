@@ -12,7 +12,7 @@ use alloc::collections::BTreeMap;
 mod dhcp;
 mod link;
 mod parsing;
-mod segment_policy;
+pub(crate) mod segment_policy;
 pub(crate) mod tcp;
 mod udp;
 mod wire;
@@ -23,7 +23,7 @@ const GUEST_MAC: [u8; 6] = DEFAULT_GUEST_MAC;
 const OTHER_GUEST_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x99];
 const ARP_REQUEST_FRAME_LEN: usize = ETH_HEADER_LEN + ARP_PACKET_LEN;
 const IP_PROTO_GRE: u8 = 47;
-const RESOLVER: Endpoint = Endpoint {
+pub(crate) const RESOLVER: Endpoint = Endpoint {
     address: [1, 1, 1, 1],
     port: DNS_PORT,
 };
@@ -248,7 +248,7 @@ fn segment_with_remote() -> (Gateway, FakeRemote) {
     (segment_gateway(), FakeRemote::default())
 }
 
-fn drain(un: &mut Gateway) -> Vec<Vec<u8>> {
+pub(crate) fn drain(un: &mut Gateway) -> Vec<Vec<u8>> {
     core::iter::from_fn(|| un.pop_for_guest().map(|frame| frame.bytes)).collect()
 }
 

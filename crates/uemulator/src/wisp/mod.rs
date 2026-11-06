@@ -172,10 +172,21 @@ impl WispClient {
                 if !self.is_live(stream) {
                     return;
                 }
+                let udp = self
+                    .streams
+                    .get(&stream)
+                    .is_some_and(|entry| entry.kind == StreamKind::Udp);
                 if reason == CLOSE_VOLUNTARY {
                     gateway.remote_closed(stream);
                 } else {
-                    gateway.reset(stream);
+                    // A UDP stream ending badly is a refusal (servers that turn UDP off close it
+                    // at once), and only `failed` makes the gateway carry DNS over TCP instead,
+                    // or tell the guest port unreachable. `reset` would drop it silently.
+                    if udp {
+                        gateway.failed(stream);
+                    } else {
+                        gateway.reset(stream);
+                    }
                     self.last_close_reason = Some(reason);
                 }
                 if gateway.has_stream(stream) {

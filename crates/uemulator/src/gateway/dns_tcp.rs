@@ -33,7 +33,7 @@ pub(super) const DNS_TCP_QUERY_TIMEOUT_MS: u64 = 10_000;
 const DNS_TCP_ROOM: usize = 64 * 1024;
 const LENGTH_PREFIX_LEN: usize = 2;
 /// The DNS ID is the first field of every message.
-const DNS_ID_LEN: usize = 2;
+pub(super) const DNS_ID_LEN: usize = 2;
 
 pub(super) struct DnsQuery {
     guest_ip: [u8; 4],

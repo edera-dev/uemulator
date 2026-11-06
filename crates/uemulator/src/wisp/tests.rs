@@ -156,10 +156,13 @@ fn decoding_never_panics() {
 // The client against a scripted server: what it sends is decoded, what the server says is
 // encoded, and the guest side is the gateway's own test guest.
 
+use core::net::Ipv4Addr;
+
 use super::{HANDSHAKE_TIMEOUT_MS, WISP_DATA_MAX, WispClient, WispState};
-use crate::gateway::Gateway;
+use crate::gateway::tests::segment_policy::{dns_answer, dns_query, length_prefixed, udp_view};
 use crate::gateway::tests::tcp::{SERVER, TcpGuest, TcpView, drain_tcp};
-use crate::gateway::tests::{ACK, FIN, PSH, RST, SYN, segment_gateway, udp_frame};
+use crate::gateway::tests::{ACK, FIN, PSH, RESOLVER, RST, SYN, drain, segment_gateway, udp_frame};
+use crate::gateway::{GATEWAY_IP, Gateway};
 
 const NOW_MS: u64 = 0;
 const SERVER_HOST: &str = "93.184.216.34";
@@ -173,6 +176,7 @@ const PLENTY_OF_CREDIT: u32 = 1000;
 const UNKNOWN_STREAM: u32 = 999;
 /// v2's INFO packet: type 5, stream 0, protocol version 2.0.
 const INFO_PACKET: [u8; 7] = [0x05, 0, 0, 0, 0, 2, 0];
+const QUERY_ID: u16 = 0x1234;
 
 struct Rig {
     gateway: Gateway,
@@ -624,4 +628,65 @@ fn server_input_never_panics() {
         rig.pump_at(round as u64);
         rig.guest_frames();
     }
+}
+
+#[test]
+fn a_refused_udp_resolver_stream_falls_back_to_dns_over_tcp() {
+    let mut rig = Rig::ready(PLENTY_OF_CREDIT);
+    rig.gateway.from_guest(
+        &udp_frame(GUEST_PORT, GATEWAY_IP, DNS_PORT, &dns_query(QUERY_ID)),
+        NOW_MS,
+    );
+    let sent = rig.pump();
+    let resolver_host = Ipv4Addr::from(RESOLVER.address).to_string();
+    let &[
+        WispPacket::Connect {
+            stream: udp,
+            kind: StreamKind::Udp,
+            ref host,
+            ..
+        },
+        WispPacket::Data { .. },
+    ] = &sent[..]
+    else {
+        panic!("expected the query over UDP first: {sent:?}");
+    };
+    assert_eq!(*host, resolver_host);
+    rig.server(WispPacket::Close {
+        stream: udp,
+        reason: CLOSE_BLOCKED,
+    });
+    assert_eq!(rig.client.status().last_close_reason, Some(CLOSE_BLOCKED));
+    let sent = rig.pump();
+    let &[
+        WispPacket::Connect {
+            stream: tcp,
+            kind: StreamKind::Tcp,
+            port,
+            ref host,
+        },
+        ..,
+    ] = &sent[..]
+    else {
+        panic!("expected a TCP CONNECT to the resolver: {sent:?}");
+    };
+    assert_eq!(
+        (host.as_str(), port),
+        (resolver_host.as_str(), RESOLVER.port)
+    );
+    assert_eq!(
+        data_of(&sent, tcp).concat(),
+        length_prefixed(&dns_query(QUERY_ID))
+    );
+    assert!(drain(&mut rig.gateway).is_empty(), "no port unreachable");
+    rig.server(WispPacket::Data {
+        stream: tcp,
+        payload: length_prefixed(&dns_answer(QUERY_ID)),
+    });
+    let reply = udp_view(&drain(&mut rig.gateway));
+    assert_eq!(
+        (reply.src, reply.sport, reply.dport),
+        (GATEWAY_IP, DNS_PORT, GUEST_PORT)
+    );
+    assert_eq!(reply.data, dns_answer(QUERY_ID));
 }

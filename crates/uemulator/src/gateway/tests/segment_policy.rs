@@ -8,21 +8,21 @@ const QUERY_PORT: u16 = 5353;
 const DNS_HEADER_LEN: usize = 12;
 const DNS_ANSWER_FLAG: u8 = 0x80;
 
-fn dns_query(id: u16) -> Vec<u8> {
+pub(crate) fn dns_query(id: u16) -> Vec<u8> {
     let mut message = id.to_be_bytes().to_vec();
     message.extend_from_slice(&[0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
     message.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01");
     message
 }
 
-fn dns_answer(id: u16) -> Vec<u8> {
+pub(crate) fn dns_answer(id: u16) -> Vec<u8> {
     let mut message = dns_query(id);
     message[2] = DNS_ANSWER_FLAG;
     assert!(message.len() > DNS_HEADER_LEN);
     message
 }
 
-fn length_prefixed(message: &[u8]) -> Vec<u8> {
+pub(crate) fn length_prefixed(message: &[u8]) -> Vec<u8> {
     let mut framed = (message.len() as u16).to_be_bytes().to_vec();
     framed.extend_from_slice(message);
     framed
@@ -37,14 +37,14 @@ fn udp_frame_to_gateway(sport: u16, dport: u16, data: &[u8]) -> Vec<u8> {
     )
 }
 
-struct Reply {
-    src: [u8; 4],
-    sport: u16,
-    dport: u16,
-    data: Vec<u8>,
+pub(crate) struct Reply {
+    pub(crate) src: [u8; 4],
+    pub(crate) sport: u16,
+    pub(crate) dport: u16,
+    pub(crate) data: Vec<u8>,
 }
 
-fn udp_view(frames: &[Vec<u8>]) -> Reply {
+pub(crate) fn udp_view(frames: &[Vec<u8>]) -> Reply {
     let whole = reassemble(frames, GUEST_MAC);
     assert_eq!(whole.proto, IP_PROTO_UDP);
     Reply {
@@ -133,6 +133,30 @@ fn refused_udp_dns_falls_back_to_tcp_with_length_prefix() {
         (reply.src, reply.sport, reply.dport),
         (GATEWAY_IP, 53, QUERY_PORT)
     );
+}
+
+/// A Wisp driver opens the stream as soon as it asks the server, so the refusal comes after the
+/// query already went out.
+#[test]
+fn udp_dns_refused_after_open_replays_its_unanswered_queries_over_tcp() {
+    let (mut gateway, mut remote) = segment_with_remote();
+    ask(&mut gateway, QUERY_PORT, 1, 0);
+    let udp = remote.single_open(&mut gateway);
+    gateway.opened(udp);
+    gateway.remote_data(udp, &dns_answer(1));
+    drain(&mut gateway);
+    ask(&mut gateway, QUERY_PORT, 2, 0);
+    assert_eq!(remote.drain_datagrams(&mut gateway, udp).len(), 2);
+    gateway.failed(udp);
+    let (tcp, kind, target) = remote.single_open_detail(&mut gateway);
+    assert_eq!((kind, target), (StreamKind::Tcp, RESOLVER));
+    gateway.opened(tcp);
+    assert_eq!(
+        remote.take_written(&mut gateway, tcp),
+        length_prefixed(&dns_query(2)),
+        "only the unanswered query"
+    );
+    assert!(drain(&mut gateway).iter().all(|f| !is_icmp_unreachable(f)));
 }
 
 #[test]

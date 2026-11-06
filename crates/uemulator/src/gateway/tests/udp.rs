@@ -502,6 +502,20 @@ fn a_refused_udp_flow_answers_with_port_unreachable() {
 }
 
 #[test]
+fn a_flow_refused_after_its_open_answers_with_port_unreachable() {
+    let (mut gateway, mut remote) = segment_with_remote();
+    let stream = open_flow(&mut gateway, &mut remote, 4000, 0);
+    gateway.failed(stream);
+    let icmp = icmp_view(&drain(&mut gateway)[0]);
+    assert_eq!(
+        (icmp.kind, icmp.code),
+        (ICMP_DEST_UNREACHABLE, ICMP_CODE_PORT_UNREACHABLE)
+    );
+    assert_eq!(icmp.quoted_destination_port, SERVER_PORT);
+    assert!(!gateway.has_stream(stream));
+}
+
+#[test]
 fn port_unreachable_comes_from_the_address_the_guest_sent_to() {
     let (mut gateway, mut remote) = user_net_with_remote();
     send_at(&mut gateway, &udp_frame(4000, GATEWAY_IP, 7, b"hi"), 0);
