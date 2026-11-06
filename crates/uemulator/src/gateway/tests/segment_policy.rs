@@ -1,5 +1,7 @@
 use super::*;
-use crate::gateway::dns_tcp::{DNS_TCP_IDLE_TIMEOUT_MS, DNS_TCP_PENDING_LIMIT};
+use crate::gateway::dns_tcp::{
+    DNS_TCP_IDLE_TIMEOUT_MS, DNS_TCP_PENDING_LIMIT, DNS_TCP_QUERY_TIMEOUT_MS,
+};
 
 const QUERY_PORT: u16 = 5353;
 const DNS_HEADER_LEN: usize = 12;
@@ -274,4 +276,34 @@ fn queries_past_the_pending_limit_are_dropped() {
     }
     let sent = gateway.to_remote(tcp).len();
     assert_eq!(sent, DNS_TCP_PENDING_LIMIT * (2 + dns_query(0).len()));
+}
+
+#[test]
+fn unanswered_queries_expire_so_the_limit_cannot_wedge_dns() {
+    let (mut gateway, mut remote, tcp) = fallen_back();
+    for id in 0..DNS_TCP_PENDING_LIMIT as u16 {
+        ask(&mut gateway, QUERY_PORT, 100 + id, 1);
+    }
+    remote.take_written(&mut gateway, tcp);
+    ask(&mut gateway, QUERY_PORT, 999, 1);
+    assert!(gateway.to_remote(tcp).is_empty(), "full: dropped");
+    gateway.poll(1 + DNS_TCP_QUERY_TIMEOUT_MS);
+    ask(&mut gateway, QUERY_PORT, 999, 1 + DNS_TCP_QUERY_TIMEOUT_MS);
+    assert_eq!(
+        gateway.to_remote(tcp),
+        &length_prefixed(&dns_query(999))[..]
+    );
+}
+
+#[test]
+fn a_stream_holding_only_expired_queries_idles_out() {
+    let (mut gateway, mut remote, tcp) = fallen_back();
+    ask(&mut gateway, QUERY_PORT, 2, 1);
+    gateway.poll(1 + DNS_TCP_QUERY_TIMEOUT_MS);
+    assert!(remote.requests(&mut gateway).is_empty());
+    gateway.poll(1 + DNS_TCP_IDLE_TIMEOUT_MS);
+    assert_eq!(
+        remote.requests(&mut gateway),
+        [GatewayRequest::Close { stream: tcp }]
+    );
 }

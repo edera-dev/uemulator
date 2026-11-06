@@ -20,6 +20,10 @@ pub(super) const DNS_TCP_PENDING_LIMIT: usize = 64;
 /// With nothing outstanding for this long the stream is closed, so an idle guest holds no proxy
 /// stream.
 pub(super) const DNS_TCP_IDLE_TIMEOUT_MS: u64 = 60_000;
+/// A query unanswered this long is dropped (the guest's resolver retries). Without it a resolver
+/// that accepts TCP and never answers would fill `DNS_TCP_PENDING_LIMIT` for good and keep the
+/// stream from ever idling out.
+pub(super) const DNS_TCP_QUERY_TIMEOUT_MS: u64 = 10_000;
 /// What `room` reports: a fixed amount, since answers become datagrams at once and nothing waits
 /// on a guest window.
 const DNS_TCP_ROOM: usize = 64 * 1024;
@@ -32,6 +36,7 @@ pub(super) struct DnsQuery {
     guest_port: u16,
     /// Set from the query's own bytes when it is queued.
     id: u16,
+    asked_ms: u64,
     /// The datagram's IPv4 header and first 8 payload bytes, which an ICMP error must quote.
     quote: Vec<u8>,
 }
@@ -42,6 +47,7 @@ impl DnsQuery {
             guest_ip,
             guest_port,
             id: 0,
+            asked_ms: 0,
             quote,
         }
     }
@@ -123,6 +129,7 @@ impl Gateway {
         dns.outgoing.extend_from_slice(data);
         dns.outstanding.push(DnsQuery {
             id: be_u16(&data[..DNS_ID_LEN]),
+            asked_ms: self.now_ms,
             ..query
         });
     }
@@ -209,8 +216,12 @@ impl Gateway {
         self.emit_ip(GATEWAY_IP, query.guest_ip, IP_PROTO_UDP, &datagram);
     }
 
-    /// Closes a stream nothing has waited on for `DNS_TCP_IDLE_TIMEOUT_MS`.
+    /// Drops queries past `DNS_TCP_QUERY_TIMEOUT_MS`, then closes a stream nothing has waited on for
+    /// `DNS_TCP_IDLE_TIMEOUT_MS`.
     pub(super) fn poll_dns_tcp(&mut self, now_ms: u64) {
+        self.dns_tcp
+            .outstanding
+            .retain(|query| now_ms.saturating_sub(query.asked_ms) < DNS_TCP_QUERY_TIMEOUT_MS);
         let dns = &self.dns_tcp;
         let Some(stream) = dns.stream else {
             return;
