@@ -92,11 +92,11 @@ pub(super) const TCP_OPT_NOP: u8 = 1;
 pub(super) const TCP_OPT_MSS: u8 = 2;
 pub(super) const TCP_OPT_MSS_LEN: usize = 4;
 
-pub(super) const FIN: u8 = 0x01;
-pub(super) const SYN: u8 = 0x02;
-pub(super) const RST: u8 = 0x04;
-pub(super) const PSH: u8 = 0x08;
-pub(super) const ACK: u8 = 0x10;
+pub(crate) const FIN: u8 = 0x01;
+pub(crate) const SYN: u8 = 0x02;
+pub(crate) const RST: u8 = 0x04;
+pub(crate) const PSH: u8 = 0x08;
+pub(crate) const ACK: u8 = 0x10;
 
 /// Adds `data` as big-endian 16-bit words (a trailing odd byte is padded with zero) into a
 /// running ones-complement sum. See `checksum_finish`.

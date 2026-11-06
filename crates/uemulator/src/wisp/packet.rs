@@ -13,17 +13,14 @@ pub(crate) const PACKET_CLOSE: u8 = 0x04;
 pub(crate) const STREAM_TCP: u8 = 0x01;
 pub(crate) const STREAM_UDP: u8 = 0x02;
 
-pub(crate) const CLOSE_UNSPECIFIED: u8 = 0x01;
+/// The one close reason the client acts on: an orderly end, which the guest sees as a FIN.
 pub(crate) const CLOSE_VOLUNTARY: u8 = 0x02;
-pub(crate) const CLOSE_NETWORK_ERROR: u8 = 0x03;
-pub(crate) const CLOSE_INVALID: u8 = 0x41;
-pub(crate) const CLOSE_UNREACHABLE: u8 = 0x42;
-pub(crate) const CLOSE_TIMEOUT: u8 = 0x43;
+// Every other reason is a reset passed through as a number (`WispStatus::last_close_reason`),
+// so only the tests name these.
+#[cfg(test)]
 pub(crate) const CLOSE_REFUSED: u8 = 0x44;
-pub(crate) const CLOSE_TRANSFER_TIMEOUT: u8 = 0x47;
+#[cfg(test)]
 pub(crate) const CLOSE_BLOCKED: u8 = 0x48;
-pub(crate) const CLOSE_THROTTLED: u8 = 0x49;
-pub(crate) const CLOSE_CLIENT_ERROR: u8 = 0x81;
 
 const TYPE_LEN: usize = 1;
 const STREAM_ID_LEN: usize = 4;

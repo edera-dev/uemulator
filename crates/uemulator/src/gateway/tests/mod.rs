@@ -1,10 +1,11 @@
 //! Frames the guest would send, built from the wire module's own codecs and checked by
 //! independent code (`reference_checksum`, `reassemble`). The test modules reach the helpers
-//! through `use super::*`.
+//! through `use super::*`; the Wisp client's tests reach the ones marked `pub(crate)`.
 
 use super::dhcp::*;
 use super::udp::MAX_UDP_FLOWS;
 use super::wire::*;
+pub(crate) use super::wire::{ACK, FIN, PSH, RST, SYN};
 use super::*;
 use alloc::collections::BTreeMap;
 
@@ -12,7 +13,7 @@ mod dhcp;
 mod link;
 mod parsing;
 mod segment_policy;
-mod tcp;
+pub(crate) mod tcp;
 mod udp;
 mod wire;
 
@@ -35,7 +36,7 @@ fn user_net() -> Gateway {
     })
 }
 
-fn segment_gateway() -> Gateway {
+pub(crate) fn segment_gateway() -> Gateway {
     Gateway::new(GatewayConfig {
         policy: GatewayPolicy::Segment { resolver: RESOLVER },
         isn_seed: 1,
@@ -51,7 +52,7 @@ fn ip_frame_to(dst_mac: [u8; 6], dst: [u8; 4], proto: u8, payload: &[u8]) -> Vec
     ethernet_frame(dst_mac, GUEST_MAC, 0x0800, &p)
 }
 
-fn udp_frame(sport: u16, dst: [u8; 4], dport: u16, data: &[u8]) -> Vec<u8> {
+pub(crate) fn udp_frame(sport: u16, dst: [u8; 4], dport: u16, data: &[u8]) -> Vec<u8> {
     guest_ip_frame(
         dst,
         IP_PROTO_UDP,

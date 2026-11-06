@@ -19,7 +19,7 @@ mod dhcp;
 mod dns_tcp;
 mod tcp;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 mod udp;
 mod wire;
 
@@ -352,14 +352,17 @@ impl Gateway {
                 0 => FIRST_STREAM_ID,
                 next => next,
             };
-            if candidate != 0
-                && !self.udp.has_stream(candidate)
-                && !self.tcp.has_stream(candidate)
-                && !self.dns_tcp.has_stream(candidate)
-            {
+            if candidate != 0 && !self.has_stream(candidate) {
                 return candidate;
             }
         }
+    }
+
+    /// Whether `stream` is still live here: once it is not, no request will name it again.
+    pub(crate) fn has_stream(&self, stream: StreamId) -> bool {
+        self.udp.has_stream(stream)
+            || self.tcp.has_stream(stream)
+            || self.dns_tcp.has_stream(stream)
     }
 
     fn emit_ip(&mut self, src: [u8; 4], dst: [u8; 4], proto: u8, payload: &[u8]) {

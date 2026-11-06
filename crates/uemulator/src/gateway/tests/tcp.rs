@@ -7,7 +7,7 @@ use crate::gateway::tcp::{
     ADVERTISED_WINDOW_MAX, ISN_STEP, LARGE_SEGMENT_DATA_MAX, TcpFlow, advertised_window,
 };
 
-const SERVER: [u8; 4] = [93, 184, 216, 34];
+pub(crate) const SERVER: [u8; 4] = [93, 184, 216, 34];
 const SERVER_PORT: u16 = 8080;
 const GUEST_PORT: u16 = 5000;
 const GUEST_ISN: u32 = 1000;
@@ -17,17 +17,17 @@ const MAX_ROUNDS: usize = 10_000;
 const TCP_START: usize = ETH_HEADER_LEN + IPV4_HEADER_LEN;
 
 #[derive(Clone)]
-struct TcpView {
+pub(crate) struct TcpView {
     src: [u8; 4],
     dst: [u8; 4],
-    sport: u16,
-    dport: u16,
-    flags: u8,
-    seq: u32,
+    pub(crate) sport: u16,
+    pub(crate) dport: u16,
+    pub(crate) flags: u8,
+    pub(crate) seq: u32,
     ack: u32,
     window: u16,
     options: Vec<u8>,
-    data: Vec<u8>,
+    pub(crate) data: Vec<u8>,
     segment_size: Option<u16>,
 }
 
@@ -69,7 +69,7 @@ fn finish_checksum(bytes: &mut [u8]) {
 }
 
 /// Every TCP frame queued for the guest, decoded.
-fn drain_tcp(gateway: &mut Gateway) -> Vec<TcpView> {
+pub(crate) fn drain_tcp(gateway: &mut Gateway) -> Vec<TcpView> {
     let mut views = Vec::new();
     while let Some(frame) = gateway.pop_for_guest() {
         let mut bytes = frame.bytes;
@@ -89,12 +89,12 @@ fn data_segments(views: &[TcpView]) -> Vec<&TcpView> {
 }
 
 /// The guest end of one connection.
-struct TcpGuest {
-    sport: u16,
+pub(crate) struct TcpGuest {
+    pub(crate) sport: u16,
     dport: u16,
     dst: [u8; 4],
     seq: u32,
-    ack: u32,
+    pub(crate) ack: u32,
     window: u16,
     /// Next sequence number expected from the gateway; `receive` checks segments arrive in order.
     peer_next: u32,
@@ -102,7 +102,7 @@ struct TcpGuest {
 }
 
 impl TcpGuest {
-    fn new(sport: u16, dport: u16, seq: u32) -> TcpGuest {
+    pub(crate) fn new(sport: u16, dport: u16, seq: u32) -> TcpGuest {
         TcpGuest {
             sport,
             dport,
@@ -130,7 +130,7 @@ impl TcpGuest {
         tcp_segment(&header, data)
     }
 
-    fn send(&mut self, gateway: &mut Gateway, flags: u8, data: &[u8]) {
+    pub(crate) fn send(&mut self, gateway: &mut Gateway, flags: u8, data: &[u8]) {
         let segment = self.segment(flags, data);
         gateway.from_guest(&guest_ip_frame(self.dst, IP_PROTO_TCP, &segment), NOW_MS);
         self.seq = self
@@ -138,7 +138,7 @@ impl TcpGuest {
             .wrapping_add(data.len() as u32 + (flags & (SYN | FIN) != 0) as u32);
     }
 
-    fn send_with_fin(&mut self, gateway: &mut Gateway, data: &[u8]) {
+    pub(crate) fn send_with_fin(&mut self, gateway: &mut Gateway, data: &[u8]) {
         self.send(gateway, FIN | ACK | PSH, data);
     }
 

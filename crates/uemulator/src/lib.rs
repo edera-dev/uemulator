@@ -67,6 +67,7 @@ pub use machine::{
 pub use netdev::{NetHandle, NetOffloads};
 pub use platform::{DEFAULT_CMDLINE, DEFAULT_SERIAL_CMDLINE, Platform, load_linux};
 pub use segment::{SegmentAgent, SegmentDestination, SegmentStatus};
+pub use wisp::{WispClient, WispState, WispStatus};
 
 #[cfg(test)]
 mod api_tests {
@@ -328,6 +329,29 @@ mod api_tests {
         ];
         assert_eq!(commands.len(), 13);
         let _ = (capset, limits);
+    }
+
+    #[test]
+    fn the_wisp_client_has_the_documented_signatures() {
+        let _: fn() -> WispClient = WispClient::new;
+        let _: fn(&mut WispClient, u64) = WispClient::connecting;
+        let _: fn(&mut WispClient, &mut Gateway) = WispClient::connection_lost;
+        let _: fn(&mut WispClient, &[u8], &mut Gateway) = WispClient::from_server;
+        let _: fn(&mut WispClient, &mut Gateway, u64) = WispClient::pump;
+        let _: fn(&mut WispClient) -> Vec<Vec<u8>> = WispClient::take_messages;
+        let _: fn(&WispClient) -> WispStatus = WispClient::status;
+        let _ = WispStatus {
+            state: WispState::Disconnected,
+            last_close_reason: Some(0x44),
+        };
+        let _ = [WispState::Connecting, WispState::Ready];
+        is_send::<WispClient>();
+        is_default::<WispClient>();
+        is_copy::<WispState>();
+        is_debug::<WispState>();
+        is_copy::<WispStatus>();
+        is_debug::<WispStatus>();
+        assert_eq!(WispClient::new().status().state, WispState::Disconnected);
     }
 
     #[test]
