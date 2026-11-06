@@ -12,6 +12,7 @@ import base64
 import hashlib
 import http.server
 import os
+import queue
 import re
 import socket
 import struct
@@ -115,18 +116,39 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
 
 class WispStream:
-    def __init__(self, sock, kind):
-        self.sock = sock
+    """A stream's own thread resolves, connects and then writes the queued DATA in order, so the
+    handler thread only enqueues and one slow or silent destination cannot hold up the others.
+    `None` in the queue ends the writer."""
+
+    def __init__(self, kind):
         self.kind = kind
-        self.received = 0  # DATA from the client since the last CONTINUE
+        self.writes = queue.Queue()  # bounded in practice by the credit we grant the client
+        self.lock = threading.Lock()  # guards sock and closed
+        self.sock = None  # None until connected
+        self.closed = False
+
+    def attach(self, sock):
+        """False if the stream was closed while connecting; the caller then owns closing sock."""
+        with self.lock:
+            if self.closed:
+                return False
+            self.sock = sock
+            return True
+
+    def close(self):
+        with self.lock:
+            self.closed = True
+            sock = self.sock
+        if sock:
+            WispConnection.shutdown(sock)
+        self.writes.put(None)
 
 
 class WispConnection:
-    """One WebSocket carrying Wisp v1. The handler thread reads frames and writes to the
-    destination sockets with blocking `sendall`, so a destination that stops reading stalls the
-    whole connection; so does a CONNECT to a host that is slow to answer, which keeps a stream's
-    DATA behind its CONNECT. Fine for a development server. One reader thread per stream sends the
-    other way; every WebSocket write takes `send_lock` so frames never interleave."""
+    """One WebSocket carrying Wisp v1. The handler thread reads frames and dispatches them; each
+    stream has a writer thread (`serve_stream`) and, once connected, a reader thread (`pump`)
+    sending DATA the other way. Every WebSocket write takes `send_lock` so frames never
+    interleave."""
 
     def __init__(self, sock, rfile):
         self.sock = sock
@@ -145,7 +167,7 @@ class WispConnection:
             with self.streams_lock:
                 streams, self.streams = list(self.streams.values()), {}
             for stream in streams:
-                self.shutdown(stream.sock)
+                stream.close()
 
     def read_exact(self, count):
         data = self.rfile.read(count)
@@ -233,8 +255,21 @@ class WispConnection:
         with self.streams_lock:
             stream = self.streams.pop(stream_id, None)
         if stream:
-            self.shutdown(stream.sock)
+            stream.close()
         return stream
+
+    def finish(self, stream_id, stream, reason):
+        """End a stream from its own threads and tell the client, unless a client CLOSE or the
+        connection ending already removed it."""
+        with self.streams_lock:
+            if self.streams.get(stream_id) is not stream:
+                return
+            del self.streams[stream_id]
+        stream.close()
+        try:
+            self.send_packet(PACKET_CLOSE, stream_id, bytes([reason]))
+        except OSError:
+            pass
 
     def connect(self, stream_id, payload):
         # A CONNECT on a live stream id replaces the stream: the old one is closed first, silently.
@@ -245,21 +280,12 @@ class WispConnection:
         (port,) = struct.unpack("<H", payload[1:3])
         try:
             host = payload[3:].decode()
-            sock = self.open_destination(kind, host, port)
         except UnicodeDecodeError:
             return self.send_packet(PACKET_CLOSE, stream_id, bytes([CLOSE_INVALID_INFO]))
-        except socket.gaierror:
-            return self.send_packet(PACKET_CLOSE, stream_id, bytes([CLOSE_UNREACHABLE]))
-        except TimeoutError:
-            return self.send_packet(PACKET_CLOSE, stream_id, bytes([CLOSE_TIMEOUT]))
-        except ConnectionRefusedError:
-            return self.send_packet(PACKET_CLOSE, stream_id, bytes([CLOSE_REFUSED]))
-        except OSError:
-            return self.send_packet(PACKET_CLOSE, stream_id, bytes([CLOSE_UNEXPECTED]))
-        stream = WispStream(sock, kind)
+        stream = WispStream(kind)
         with self.streams_lock:
             self.streams[stream_id] = stream
-        threading.Thread(target=self.pump, args=(stream_id, stream), daemon=True).start()
+        threading.Thread(target=self.serve_stream, args=(stream_id, stream, host, port), daemon=True).start()
 
     @staticmethod
     def open_destination(kind, host, port):
@@ -276,22 +302,46 @@ class WispConnection:
             raise
         return sock
 
+    def serve_stream(self, stream_id, stream, host, port):
+        """Connects, then writes the stream's queue in order. No timeout on getaddrinfo, and
+        create_connection's applies per resolved address; only this stream waits for either."""
+        try:
+            try:
+                sock = self.open_destination(stream.kind, host, port)
+            except (ValueError, OverflowError):  # includes UnicodeError: a label idna refuses
+                return self.finish(stream_id, stream, CLOSE_INVALID_INFO)
+            except socket.gaierror:
+                return self.finish(stream_id, stream, CLOSE_UNREACHABLE)
+            except (TimeoutError, socket.timeout):  # distinct classes before Python 3.10
+                return self.finish(stream_id, stream, CLOSE_TIMEOUT)
+            except ConnectionRefusedError:
+                return self.finish(stream_id, stream, CLOSE_REFUSED)
+            except OSError:
+                return self.finish(stream_id, stream, CLOSE_UNEXPECTED)
+            if not stream.attach(sock):
+                return self.shutdown(sock)
+            threading.Thread(target=self.pump, args=(stream_id, stream), daemon=True).start()
+            consumed = 0
+            while True:
+                data = stream.writes.get()
+                if data is None:
+                    return
+                stream.sock.sendall(data)
+                if stream.kind == STREAM_TCP:
+                    # Credit comes back only once the destination has taken the data, so the queue
+                    # never holds more than the client's credit.
+                    consumed += 1
+                    if consumed >= WISP_REFILL_EVERY:
+                        consumed = 0
+                        self.send_packet(PACKET_CONTINUE, stream_id, struct.pack("<I", WISP_CREDIT))
+        except Exception:  # whatever happens here ends this stream only, never the connection
+            self.finish(stream_id, stream, CLOSE_UNEXPECTED)
+
     def forward(self, stream_id, data):
         with self.streams_lock:
             stream = self.streams.get(stream_id)
-        if not stream:
-            return
-        try:
-            stream.sock.sendall(data)
-        except OSError:
-            if self.drop(stream_id):
-                self.send_packet(PACKET_CLOSE, stream_id, bytes([CLOSE_UNEXPECTED]))
-            return
-        if stream.kind == STREAM_TCP:
-            stream.received += 1
-            if stream.received >= WISP_REFILL_EVERY:
-                stream.received = 0
-                self.send_packet(PACKET_CONTINUE, stream_id, struct.pack("<I", WISP_CREDIT))
+        if stream:
+            stream.writes.put(data)
 
     def pump(self, stream_id, stream):
         reason = CLOSE_VOLUNTARY
@@ -308,18 +358,9 @@ class WispConnection:
                         continue
                     break
                 self.send_packet(PACKET_DATA, stream_id, data)
-        except OSError:
+        except Exception:
             reason = CLOSE_UNEXPECTED
-        # A client CLOSE (or the connection ending) already removed the stream and needs no reply.
-        with self.streams_lock:
-            if self.streams.get(stream_id) is not stream:
-                return
-            del self.streams[stream_id]
-        self.shutdown(stream.sock)
-        try:
-            self.send_packet(PACKET_CLOSE, stream_id, bytes([reason]))
-        except OSError:
-            pass
+        self.finish(stream_id, stream, reason)
 
 
 def make_server(root, port):

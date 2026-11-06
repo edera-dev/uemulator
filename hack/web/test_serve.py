@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import serve  # noqa: E402
@@ -169,10 +170,100 @@ class ServeTest(unittest.TestCase):
         self.assertEqual(client.packet(), (CLOSE, 7, b"\x44"))
 
     def test_unresolvable_closes_with_0x42(self):
+        real = socket.getaddrinfo
+
+        def fake(host, *args, **kwargs):
+            if host == "unresolvable.test":
+                raise socket.gaierror
+            return real(host, *args, **kwargs)
+
         client = self.open()
         client.packet()
-        client.send(connect_packet(7, TCP, 80, "nonexistent.invalid"))
-        self.assertEqual(client.packet(), (CLOSE, 7, b"\x42"))
+        with mock.patch.object(socket, "getaddrinfo", fake):
+            client.send(connect_packet(7, TCP, 80, "unresolvable.test"))
+            self.assertEqual(client.packet(), (CLOSE, 7, b"\x42"))
+
+    def echo_round_trip(self, client, stream, listener, port):
+        client.send(connect_packet(stream, TCP, port, "127.0.0.1"))
+        peer, _ = listener.accept()
+        peer.settimeout(TIMEOUT)
+        client.send(wisp(DATA, stream, b"echo"))
+        self.assertEqual(read_exact(peer, 4), b"echo")
+        peer.sendall(b"back")
+        self.assertEqual(client.packet(), (DATA, stream, b"back"))
+        return peer
+
+    def test_malformed_hostnames_close_only_their_stream(self):
+        listener, port = self.listener()
+        client = self.open()
+        client.packet()
+        for stream, host in enumerate(["a" * 70 + ".com", "a..b"], 1):
+            client.send(connect_packet(stream, TCP, 80, host))
+            self.assertEqual(client.packet(), (CLOSE, stream, b"\x41"))
+        self.echo_round_trip(client, 9, listener, port)
+
+    def delayed_connect(self, release):
+        """open_destination that blocks hang.test until `release` is set, then fails."""
+        real = serve.WispConnection.open_destination
+
+        def fake(kind, host, port):
+            if host == "hang.test":
+                release.wait(TIMEOUT)
+                raise ConnectionRefusedError
+            if host == "slow.test":
+                release.wait(TIMEOUT)
+                host = "127.0.0.1"
+            return real(kind, host, port)
+
+        return mock.patch.object(serve.WispConnection, "open_destination", staticmethod(fake))
+
+    def test_hung_connect_does_not_delay_other_streams(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+        listener, port = self.listener()
+        client = self.open()
+        client.packet()
+        with self.delayed_connect(release):
+            client.send(connect_packet(1, TCP, 80, "hang.test"))
+            client.send(wisp(DATA, 1, b"queued"))
+            client.send(b"hi", opcode=9)
+            self.assertEqual(client.frame(), (10, b"hi"))
+            self.echo_round_trip(client, 2, listener, port)
+            release.set()
+            self.assertEqual(client.packet(), (CLOSE, 1, b"\x44"))
+
+    def test_data_before_connect_finishes_stays_in_order(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+        listener, port = self.listener()
+        client = self.open()
+        client.packet()
+        with self.delayed_connect(release):
+            client.send(connect_packet(1, TCP, port, "slow.test"))
+            for piece in (b"a", b"b", b"c"):
+                client.send(wisp(DATA, 1, piece))
+            release.set()
+            peer, _ = listener.accept()
+            peer.settimeout(TIMEOUT)
+            self.assertEqual(read_exact(peer, 3), b"abc")
+
+    def test_destination_that_never_reads_does_not_stall_other_streams(self):
+        silent, silent_port = self.listener()
+        listener, port = self.listener()
+        client = self.open()
+        client.packet()
+        client.send(connect_packet(1, TCP, silent_port, "127.0.0.1"))
+        silent.accept()[0].setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
+        block = b"x" * (256 * 1024)
+        for _ in range(80):
+            client.send(wisp(DATA, 1, block))
+        client.send(b"hi", opcode=9)
+        while True:
+            opcode, payload = client.frame()
+            if opcode == 10:
+                break
+        self.assertEqual(payload, b"hi")
+        self.echo_round_trip(client, 2, listener, port)
 
     def test_udp_round_trip(self):
         sock, port = self.listener(socket.SOCK_DGRAM)
