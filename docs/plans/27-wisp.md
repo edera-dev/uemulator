@@ -1,6 +1,6 @@
 # Internet for web guests through Wisp
 
-**Status:** design, not implemented.
+**Status:** implemented and checked under Node and in a browser against `serve.py`'s own Wisp endpoint. Not yet checked against a third-party Wisp server ("Results", "Open").
 
 ## Why
 
@@ -24,7 +24,7 @@ A browser cannot open sockets, and `fetch()` needs CORS, which none of Alpine's 
 
 ## Anti-goals
 
-- No regression in the CLI's network: bulk TCP through usernet is 652 MB/s down and 748 MB/s up (`23-guest-io-perf.md` round 2, `hack/perf/guest` `ubench net`); the shared gateway must stay within noise of that.
+- No regression in the CLI's network: the shared gateway had to stay within noise of usernet's bulk TCP (`hack/perf/guest` `ubench net`). It did: 903 to 945 MB/s down and 1012 to 997 MB/s up across the move (`23-guest-io-perf.md` round 3).
 - No change to how guests on the segment reach each other, or to the DHCP handover between tabs.
 - Never drop or reorder Wisp stream data anywhere between the WebSocket and the gateway. Ethernet frames may be dropped (the guest's TCP recovers); a stream's bytes may not (there is no retransmission on the Wisp side).
 
@@ -71,24 +71,25 @@ The Wisp client (v1, `MercuryWorkshop/wisp-protocol` `protocol.md`):
 - CONNECT with the destination address as a dotted-decimal string (the guest resolved names already).
 - TCP DATA is sent only with credit; credit counts packets, not bytes, so packets are large (a cap such as 16 KiB is the builder's call, bounded by what common servers accept). UDP DATA has no credit and is one datagram per packet.
 - A stream counts as opened as soon as its CONNECT is sent: Wisp v1 has no "connected" packet (a server reports only failure, with CLOSE, and the client may send data at once), so the Wisp driver calls `opened` right away and the guest gets its SYN-ACK without waiting, as v86 does (`wisp_network.js` accepts the guest's connection when it sends CONNECT). Waiting for the server's first packet would deadlock every protocol where the client speaks first; waiting out a delay would add it to every connection. The cost: a refused or unreachable destination reaches the guest as a reset of an established connection, not a refused connect. The gateway keeps the `opened`/`failed` pair because the CLI has a real connect result.
-- CLOSE from the server: 0x02 is the remote side's end of data, so `remote_closed` (FIN to the guest once the data before it is delivered); every other reason is `reset` (RST). The creation-failure reasons (0x41-0x44, 0x48, 0x49) are kept for the pill's tooltip.
+- CLOSE from the server: 0x02 is the remote side's end of data, so `remote_closed` (FIN to the guest once the data before it is delivered); on a TCP stream every other reason is `reset` (RST). On a UDP stream any CLOSE other than 0x02 counts as a failed open (`gateway.failed`), which is what lets the DNS fallback below work on servers that refuse UDP. The last non-voluntary reason is kept for the pill's tooltip.
+- UDP DATA from the server longer than 65 507 bytes (the most an IPv4 datagram carries) is dropped.
 - Wisp v1 has no half-close. A guest FIN is held: the stream stays open and the gateway sends its FIN onwards only as the end of data it already passed; the stream ends with the server's CLOSE or when both sides are done (guest FIN acknowledged and the remote side closed), at which point the client sends CLOSE 0x02. A guest RST sends CLOSE 0x02 at once.
-- If the server refuses a UDP stream to the resolver (some servers turn UDP off), DNS falls back to TCP to the same resolver, the guest's UDP query and answer carried with RFC 7766's two-byte length prefix, so `apk` still resolves.
-- The WebSocket closing fails or resets every stream; the page reconnects with backoff (v86 waits 10 s; something like 1 s doubling to 30 s is fine) and new streams wait for the new connection's CONTINUE.
+- If the server refuses a UDP stream to the resolver (some servers turn UDP off), DNS falls back to TCP to the same resolver, the guest's UDP query and answer carried with RFC 7766's two-byte length prefix, so `apk` still resolves. The resolver's UDP flow keeps up to 64 unanswered queries to replay over TCP. A query over TCP expires after 10 s; at most 64 are pending and 256 KiB queued (`gateway/dns_tcp.rs`).
+- The WebSocket closing fails or resets every stream; the page reconnects with backoff, 1 s doubling to 30 s, reset when a Wisp handshake completes (the server's CONTINUE on stream 0), not when the WebSocket opens, so a server that accepts and then drops does not reset it. The client gives a handshake 10 s; when the worker reports that timeout the page closes the socket and reconnects. New streams wait for the new connection's CONTINUE.
 
 Wisp v1 has no way to slow the server, so data for a guest that reads slower than the network arrives faster than the gateway can pass it on. It buffers in the gateway's per-stream buffers (wasm memory) and in the page's queue. Accepted for now; a guest downloading over a fast relay is the normal case and reads faster than the relay sends.
 
-Setting the URL: a "Wisp server" text field in the sidebar under the Network switch, `?wisp=wss://host/path/` (the trailing slash is Wisp's convention), and `--wisp URL` on `hack/wasm/boot.mjs` and the segment scripts. Empty means no uplink. The bar's network pill says whether the uplink is connected (its tooltip gives the URL and the last close reason).
+Setting the URL: a "Wisp server" text field in the sidebar under the Network switch, `?wisp=wss://host/path/` (the trailing slash is Wisp's convention), and `--wisp URL` on `hack/wasm/segment.mjs` and `hack/wasm/wisp.mjs` (`hack/wasm/boot.mjs` has no network, so no `--wisp`). Empty means no uplink. The bar's network pill says whether the uplink is connected (its tooltip gives the URL and the last close reason).
 
 Published demo: no default URL; the field starts empty on GitHub Pages and anyone can enter a server. `hack/web.sh serve` prefills it with its own local endpoint.
 
 ### Local Wisp server
 
-`hack/web/serve.py` grows a Wisp v1 endpoint at `/wisp/` on its own port and address, stdlib only like the rest of the script: the WebSocket handshake and framing, a thread per connection reading packets and a thread per stream reading its socket, TCP and UDP, CONTINUE every half of the buffer. It is a development tool; the page works with any Wisp server.
+`hack/web/serve.py` grows a Wisp v1 endpoint at `/wisp/` on its own port and address, stdlib only like the rest of the script: the WebSocket handshake and framing, a thread per connection reading packets, and per stream a thread that connects and then writes (so one slow destination does not stall the others) and a thread reading its socket, TCP and UDP, CONTINUE every half of the buffer. A client CLOSE delivers the DATA queued before it, then closes. It is a development tool; the page works with any Wisp server.
 
 It is a proxy, so it guards itself twice. Binding 127.0.0.1 keeps other machines out. That does not keep out other web pages in the developer's browser, since a WebSocket has no CORS: any site could connect to it and reach the developer's localhost and LAN. So the endpoint refuses a handshake whose `Origin` is not serve.py's own (`http://127.0.0.1:PORT` or `http://localhost:PORT`); a handshake with no `Origin` (Node's scripts) is accepted. Past that check every destination is allowed, loopback and private addresses included, so a guest can reach a mirror or a file served on the developer's machine, as the CLI's guests reach the host through 10.0.2.2.
 
-The client must not be written against this endpoint alone, which shares its author's reading of the spec: it is also checked against two third-party servers (wisp-js's server via `npx`, and wisp-server-python), by hand, with the end-to-end script's `--wisp URL`, and the result recorded here.
+The client must not be written against this endpoint alone, which shares its author's reading of the spec: it is to be checked against two third-party servers (wisp-js's server via `npx`, and wisp-server-python), by hand, with the end-to-end script's `--wisp URL`. That has not been done ("Open").
 
 ## Tests
 
@@ -96,8 +97,19 @@ The client must not be written against this endpoint alone, which shares its aut
 - Wisp client: packet encode/decode, the initial CONTINUE gate, credit accounting, CLOSE reason mapping, UDP-refused DNS fallback, reconnect, against a scripted fake server.
 - CLI: `usernet/tests.rs`'s loopback tests keep passing unchanged except for what moved.
 - `segment/tests.rs`: DHCP now offers router and DNS; nothing else in the segment's behaviour changes.
-- End to end (a hack script, not a unit test: it needs the network): `node hack/wasm/wisp.mjs [--wisp URL]` (after `WEB_DEMO=1 hack/web.sh`) starts `serve.py`'s Wisp endpoint unless given another server, boots the Alpine demo under Node with `--wisp`, runs `apk update` and `apk add` of a small package, and checks a `wget` of a few MB matches its checksum. Also checked once by hand in the browser.
+- End to end (a hack script, not a unit test: it needs the network): `node hack/wasm/wisp.mjs [--wisp URL]` (after `WEB_DEMO=1 hack/web.sh`; Node 24.2 or later, as `segment.mjs`, which it shares code with) starts `serve.py`'s Wisp endpoint unless given another server, boots the Alpine demo under Node, runs `apk update` and `apk add jq`, checks a `wget` of the demo kernel over http matches its SHA-256, then drops the WebSocket in the middle of a second download (it restarts `serve.py`; skipped with `--wisp`) and checks the guest's wget fails, the client is ready again and `apk update` works. Also checked by hand in the browser.
 - Performance: `ubench net` before and after the CLI move (anti-goals); the web path's throughput through the local server is measured and recorded, not gated.
+- `hack/web/test_serve.py` (`python3 -m unittest hack/web/test_serve.py`): the Wisp endpoint's framing, CLOSE handling, stream ordering and Origin check.
+
+## Results
+
+- CLI throughput across the gateway move: `23-guest-io-perf.md` round 3 (rx 903 to 945 MB/s, tx 1012 to 997 MB/s, Alpine netboot live).
+- `node hack/wasm/wisp.mjs` under Node against `serve.py`: the whole run takes about 20 s; `apk update` about 5 s; `apk add jq` about 4 s; the 12.1 MiB kernel over http downloads at 17.6 to 20 MiB/s with the SHA-256 matching. A WebSocket drop during a download fails the guest's wget, the client is ready again about 1.1 s later and `apk update` works.
+- In a browser (the desktop app's Chrome-based pane) against `serve.py`: `apk update` over https in 5.1 s.
+
+## Open
+
+- Third-party Wisp servers (wisp-js, wisp-server-python) were not checked: installing them was not approved. Only `serve.py`'s endpoint has run against the client, so a reading of the spec that both share is untested.
 
 ## Left to the builder
 
@@ -115,4 +127,4 @@ The client must not be written against this endpoint alone, which shares its aut
 - The CLI moves onto the shared gateway in the same piece of work.
 - A Wisp stream counts as open when its CONNECT is sent (as in v86), so a refused destination looks to the guest like a reset, not a refused connect.
 - The local endpoint checks `Origin` and otherwise allows every destination, the developer's loopback and LAN included.
-- The client is checked against wisp-js's server and wisp-server-python, not only against `serve.py`.
+- The client is to be checked against wisp-js's server and wisp-server-python, not only against `serve.py` (not done yet).
