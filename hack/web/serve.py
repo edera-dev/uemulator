@@ -252,10 +252,14 @@ class WispConnection:
         # CONTINUE from a client means nothing: our credit to the destination is the socket's.
 
     def drop(self, stream_id):
+        """A client CLOSE ends the stream gracefully: DATA queued before it (possibly still
+        behind a pending connect) is written first, and the writer closes the socket on reaching
+        the end marker. Only the connection ending and writer errors close hard, to release a
+        writer blocked in sendall."""
         with self.streams_lock:
             stream = self.streams.pop(stream_id, None)
         if stream:
-            stream.close()
+            stream.writes.put(None)
         return stream
 
     def finish(self, stream_id, stream, reason):
@@ -325,7 +329,7 @@ class WispConnection:
             while True:
                 data = stream.writes.get()
                 if data is None:
-                    return
+                    return stream.close()
                 stream.sock.sendall(data)
                 if stream.kind == STREAM_TCP:
                     # Credit comes back only once the destination has taken the data, so the queue

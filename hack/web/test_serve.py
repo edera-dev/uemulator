@@ -277,6 +277,48 @@ class ServeTest(unittest.TestCase):
         sock.sendto(b"pong", address)
         self.assertEqual(client.packet(), (DATA, 3, b"pong"))
 
+    def count_until_eof(self, listener):
+        total = []
+
+        def sink():
+            peer, _ = listener.accept()
+            count = 0
+            while True:
+                chunk = peer.recv(1 << 16)
+                if not chunk:
+                    break
+                count += len(chunk)
+            total.append(count)
+
+        thread = threading.Thread(target=sink, daemon=True)
+        thread.start()
+        return thread, total
+
+    BURST_BLOCKS, BURST_BLOCK = 64, b"x" * (64 * 1024)
+
+    def burst_then_close(self, host, release=None):
+        listener, port = self.listener()
+        thread, total = self.count_until_eof(listener)
+        client = self.open()
+        client.packet()
+        client.send(connect_packet(1, TCP, port, host))
+        for _ in range(self.BURST_BLOCKS):
+            client.send(wisp(DATA, 1, self.BURST_BLOCK))
+        client.send(wisp(CLOSE, 1, b"\x02"))
+        if release:
+            release.set()
+        thread.join(TIMEOUT)
+        self.assertEqual(total, [self.BURST_BLOCKS * len(self.BURST_BLOCK)])
+
+    def test_client_close_delivers_queued_data(self):
+        self.burst_then_close("127.0.0.1")
+
+    def test_client_close_behind_pending_connect_delivers_queued_data(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+        with self.delayed_connect(release):
+            self.burst_then_close("slow.test", release)
+
     def test_client_close_closes_the_socket(self):
         listener, port = self.listener()
         client = self.open()
