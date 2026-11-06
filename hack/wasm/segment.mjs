@@ -6,7 +6,7 @@
 //
 //   WEB_DEMO=1 hack/web.sh
 //   node hack/wasm/segment.mjs [--kernel K] [--initrd I] [--firmware none|uefi] [--memory MiB]
-//                              [--no-jit] [--verbose] [--seconds N]
+//                              [--no-jit] [--verbose] [--seconds N] [--wisp URL]
 //
 // The kernel and initramfs default to the page's Alpine demo (target/web/demo), whose /init loads
 // the virtio-net driver and runs udhcpc; another initramfs has to do the same and print
@@ -14,25 +14,24 @@
 // (hack/wasm/segment_machine.mjs) and gets the transport and election the page uses
 // (www/segment.js: BroadcastChannel and a Web Lock, both in Node), so only the browser itself is
 // missing. --verbose copies every console to stderr; otherwise a failure prints the tail of each.
+// --wisp gives every machine the internet through that Wisp server, the WebSocket kept by
+// www/wisp.js here as the page keeps it (hack/wasm/wisp.mjs checks that end to end, and imports
+// `Machine` from here).
 import { Worker } from "node:worker_threads";
 import { parseArgs } from "node:util";
-import { CONTROL_BYTES, CTRL, NET_OFFSET, NET_RING_BYTES, RING_BYTES, RING_OFFSET } from "../../crates/uemulator-web/www/protocol.js";
+import {
+  CONTROL_BYTES, CTRL, NET_OFFSET, NET_RING_BYTES, RING_BYTES, RING_OFFSET, WISP_OFFSET, WISP_RING_BYTES, WISP_STATE,
+} from "../../crates/uemulator-web/www/protocol.js";
 import { joinSegment, randomMac, randomTab } from "../../crates/uemulator-web/www/segment.js";
+import { connectWisp } from "../../crates/uemulator-web/www/wisp.js";
 
 const web = new URL("../../target/web/", import.meta.url);
-const { values } = parseArgs({
-  options: {
-    kernel: { type: "string", default: new URL("demo/vmlinuz-virt", web).pathname },
-    initrd: { type: "string", default: new URL("demo/initramfs.gz", web).pathname },
-    firmware: { type: "string", default: "none" },
-    memory: { type: "string", default: "256" },
-    "no-jit": { type: "boolean", default: false },
-    verbose: { type: "boolean", default: false },
-    seconds: { type: "string", default: "120" },
-  },
-});
-const STEP_TIMEOUT_MS = Number(values.seconds) * 1000;
-const CONSOLE_TAIL = 3000;
+// The page's Alpine demo (WEB_DEMO=1 hack/web.sh).
+export const DEMO = {
+  kernel: new URL("demo/vmlinuz-virt", web).pathname,
+  initrd: new URL("demo/initramfs.gz", web).pathname,
+};
+export const CONSOLE_TAIL = 3000;
 // The shell asks the terminal for the cursor position after its prompt (ESC [6n).
 const PROMPT = /~# (\x1b\[6n)?$/;
 // What the demo's /init prints once udhcpc has configured eth0.
@@ -43,16 +42,22 @@ const BULK_PORT = 5001;
 const BULK_KIB = 4096;
 const started = performance.now();
 
-function log(text) {
+export function log(text) {
   console.log(`[${((performance.now() - started) / 1000).toFixed(1).padStart(6)}s] ${text}`);
 }
 
-class Machine {
-  constructor(name) {
+// `settings`: kernel, initrd, firmware, memoryMib, jit, verbose, timeoutMs (each step's) and wisp
+// (a Wisp server's URL, or undefined for none).
+export class Machine {
+  constructor(name, settings) {
     this.name = name;
+    this.settings = settings;
     this.console = "";
     this.watchers = new Set();
     this.status = null;
+    // The worker's Wisp client (`host_wisp_status`), and how many times it has become READY.
+    this.wispState = WISP_STATE.DISCONNECTED;
+    this.wispReadyCount = 0;
     this.shared = new SharedArrayBuffer(CONTROL_BYTES);
     this.control = new Int32Array(this.shared, 0, RING_OFFSET / 4);
     this.keys = new Uint8Array(this.shared, RING_OFFSET, RING_BYTES);
@@ -66,26 +71,44 @@ class Machine {
     this.worker = new Worker(new URL("segment_machine.mjs", import.meta.url), {
       workerData: {
         wasmPath: new URL("uemulator_web.wasm", web).pathname,
-        kernelPath: values.kernel,
-        initrdPath: values.initrd,
+        kernelPath: settings.kernel,
+        initrdPath: settings.initrd,
         cmdline: "quiet",
-        memoryMib: Number(values.memory),
-        firmware: values.firmware,
-        jit: !values["no-jit"],
+        memoryMib: settings.memoryMib,
+        firmware: settings.firmware,
+        jit: settings.jit,
         control: this.shared,
         network: { mac: randomMac().buffer, tab },
+        wisp: settings.wisp !== undefined,
+      },
+    });
+    this.wisp = settings.wisp === undefined ? null : connectWisp({
+      control: this.control,
+      ring: new Uint8Array(this.shared, WISP_OFFSET, WISP_RING_BYTES),
+      url: settings.wisp,
+      onStatus: ({ socket, retryMs }) => {
+        if (settings.verbose) process.stderr.write(`${name} wisp socket: ${socket}${retryMs ? ` (retry in ${retryMs} ms)` : ""}\n`);
       },
     });
     this.exited = new Promise((resolve) => {
       this.worker.on("message", (message) => {
         if (message.type === "output") {
           this.console += message.text;
-          if (values.verbose) process.stderr.write(message.text.replace(/^/gm, `${name}| `));
+          if (settings.verbose) process.stderr.write(message.text.replace(/^/gm, `${name}| `));
           for (const watcher of this.watchers) watcher();
         } else if (message.type === "network") {
           this.status = message;
+        } else if (message.type === "wisp") {
+          this.wisp?.send(message.messages);
+        } else if (message.type === "wisp-status") {
+          // As the page does: every one, since the reconnect backoff and the handshake timeout
+          // in wisp.js depend on them.
+          this.wisp?.status(message.state);
+          this.wispState = message.state;
+          if (message.state === WISP_STATE.READY) this.wispReadyCount += 1;
+          if (settings.verbose) process.stderr.write(`${name} wisp state ${message.state} (close reason ${message.closeReason})\n`);
         } else if (message.type === "log") {
-          if (values.verbose) process.stderr.write(`${name} log: ${message.text}\n`);
+          if (settings.verbose) process.stderr.write(`${name} log: ${message.text}\n`);
         } else if (message.type === "exit") {
           resolve(message);
         }
@@ -96,6 +119,7 @@ class Machine {
 
   // Waits until the console after `from` matches `pattern`; returns the match.
   waitFor(pattern, from = 0, what = String(pattern)) {
+    const timeoutMs = this.settings.timeoutMs;
     return new Promise((resolve, reject) => {
       const check = () => {
         const match = this.console.slice(from).match(pattern);
@@ -107,8 +131,8 @@ class Machine {
       };
       const timer = setTimeout(() => {
         this.watchers.delete(check);
-        reject(new Error(`${this.name}: no ${what} within ${STEP_TIMEOUT_MS / 1000} s`));
-      }, STEP_TIMEOUT_MS);
+        reject(new Error(`${this.name}: no ${what} within ${timeoutMs / 1000} s`));
+      }, timeoutMs);
       if (!check()) this.watchers.add(check);
     });
   }
@@ -147,13 +171,31 @@ class Machine {
     Atomics.notify(this.control, CTRL.HEAD);
     await this.exited;
     await this.worker.terminate();
+    this.wisp?.close();
     this.segment.leave();
   }
 }
 
+export function waitUntil(condition, what, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const deadline = performance.now() + timeoutMs;
+    const poll = setInterval(() => {
+      if (condition()) {
+        clearInterval(poll);
+        resolve();
+      } else if (performance.now() > deadline) {
+        clearInterval(poll);
+        reject(new Error(`timed out waiting for ${what}`));
+      }
+    }, 100);
+  });
+}
+
+// The scenario's machines and their settings, from the command line.
 const machines = [];
+let settings;
 function start(name) {
-  const machine = new Machine(name);
+  const machine = new Machine(name, settings);
   machines.push(machine);
   return machine;
 }
@@ -203,7 +245,7 @@ async function scenario() {
 
   log("stopping A, the server");
   await a.stop();
-  await waitUntil(() => b.status?.serving, "B to take over serving");
+  await waitUntil(() => b.status?.serving, "B to take over serving", settings.timeoutMs);
   check(b.status.serving, "B serves after A left");
 
   // D asks the new server before anyone else has said a word to it: the server picks the lowest
@@ -218,7 +260,7 @@ async function scenario() {
   check(again === before, `C keeps ${before} when it asks the new server (got ${again})`);
   await ping(d, c);
   await ping(b, d);
-  await waitUntil(() => [b, c, d].every((m) => m.status?.peers === 2), "the peer counts to drop A");
+  await waitUntil(() => [b, c, d].every((m) => m.status?.peers === 2), "the peer counts to drop A", settings.timeoutMs);
   check(true, "B, C and D count two peers each once A is gone");
 }
 
@@ -237,7 +279,7 @@ async function bulk(from, to) {
   for (;;) {
     const [, size] = await to.run("wc -c < /tmp/got", /\n(\d+)\r?\n/);
     if (Number(size) >= bytes) break;
-    if (performance.now() - begun > STEP_TIMEOUT_MS) throw new Error(`${to.name} got ${size} of ${bytes} bytes`);
+    if (performance.now() - begun > settings.timeoutMs) throw new Error(`${to.name} got ${size} of ${bytes} bytes`);
     await new Promise((resolve) => setTimeout(resolve, 1000));
   }
   const seconds = (performance.now() - begun) / 1000;
@@ -247,34 +289,43 @@ async function bulk(from, to) {
   for (const machine of [from, to]) await machine.run("kill %1 2>/dev/null; wait; echo done", /done/);
 }
 
-function waitUntil(condition, what) {
-  return new Promise((resolve, reject) => {
-    const deadline = performance.now() + STEP_TIMEOUT_MS;
-    const poll = setInterval(() => {
-      if (condition()) {
-        clearInterval(poll);
-        resolve();
-      } else if (performance.now() > deadline) {
-        clearInterval(poll);
-        reject(new Error(`timed out waiting for ${what}`));
-      }
-    }, 100);
+if (import.meta.main) {
+  const { values } = parseArgs({
+    options: {
+      kernel: { type: "string", default: DEMO.kernel },
+      initrd: { type: "string", default: DEMO.initrd },
+      firmware: { type: "string", default: "none" },
+      memory: { type: "string", default: "256" },
+      "no-jit": { type: "boolean", default: false },
+      verbose: { type: "boolean", default: false },
+      seconds: { type: "string", default: "120" },
+      wisp: { type: "string" },
+    },
   });
-}
-
-let failed = false;
-try {
-  await scenario();
-  log("all checks passed");
-} catch (error) {
-  failed = true;
-  console.error(String(error?.stack ?? error));
-  if (!values.verbose) {
-    for (const machine of machines) {
-      console.error(`--- ${machine.name} console (tail) ---\n${machine.console.slice(-CONSOLE_TAIL)}`);
+  settings = {
+    kernel: values.kernel,
+    initrd: values.initrd,
+    firmware: values.firmware,
+    memoryMib: Number(values.memory),
+    jit: !values["no-jit"],
+    verbose: values.verbose,
+    timeoutMs: Number(values.seconds) * 1000,
+    wisp: values.wisp,
+  };
+  let failed = false;
+  try {
+    await scenario();
+    log("all checks passed");
+  } catch (error) {
+    failed = true;
+    console.error(String(error?.stack ?? error));
+    if (!values.verbose) {
+      for (const machine of machines) {
+        console.error(`--- ${machine.name} console (tail) ---\n${machine.console.slice(-CONSOLE_TAIL)}`);
+      }
     }
+  } finally {
+    await Promise.all(machines.map((machine) => machine.stop().catch(() => {})));
   }
-} finally {
-  await Promise.all(machines.map((machine) => machine.stop().catch(() => {})));
+  process.exit(failed ? 1 : 0);
 }
-process.exit(failed ? 1 : 0);
