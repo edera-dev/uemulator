@@ -55,6 +55,8 @@ if [ -n "$WEB_DISK" ]; then
 fi
 
 if [ "$1" = serve ]; then
+    # The local Wisp endpoint serve.py provides; the Pages build has none, so the field stays empty.
+    printf '{"url": "/wisp/"}\n' > "$out/wisp.json"
     exec python3 hack/web/serve.py "$out" "${PORT:-8080}"
 fi
 echo "built $out"

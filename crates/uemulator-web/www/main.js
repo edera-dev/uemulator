@@ -1,9 +1,11 @@
 import {
   BYTES_PER_PIXEL, CONTROL_BYTES, CTRL, CURSOR, EVENT, EVENT_OFFSET, EVENT_RECORDS, EVENT_WORDS, EXIT_NAMES, FIRMWARE,
   FRAME_READY, NET_OFFSET, NET_RING_BYTES, OPTION, RECT_WORDS, RING_BYTES, RING_OFFSET, UEFI_FIRMWARE_MAGIC,
+  WISP_OFFSET, WISP_RING_BYTES, WISP_STATE,
 } from "./protocol.js";
 import { COMMAND_RING_BYTES, COMPLETION_RING_BYTES, createRing } from "./gpu.js";
 import { formatMac, joinSegment, randomMac, randomTab } from "./segment.js";
+import { connectWisp } from "./wisp.js";
 import { compileWorkerHelps, createCompileQueue } from "./jit_host.js";
 
 const $ = (id) => document.getElementById(id);
@@ -75,6 +77,17 @@ let events = null;
 // This tab's place on the shared segment while a machine with a network runs (segment.js).
 let segment = null;
 let networkMac = null;
+// The guest's internet while a machine with a network runs (wisp.js): the page owns the socket,
+// the worker's Wisp client reports the state. `wispUrl` is null when none is set or it is invalid.
+let wisp = null;
+let wispUrl = null;
+let wispInvalid = null;
+let wispSocket = null;
+let wispClient = { state: WISP_STATE.DISCONNECTED, closeReason: -1 };
+let lastNetwork = null;
+// The library's own default resolver (DEFAULT_WISP_RESOLVER): Cloudflare's 1.1.1.1.
+const WISP_RESOLVER = 0x01010101;
+const WISP_RESOLVER_PORT = 53;
 let startedAt = 0;
 let clock = null;
 let hasRun = false;
@@ -234,6 +247,7 @@ function readSettings() {
     display: radio("display"),
     input: $("input").checked,
     network: $("network").checked,
+    wisp: $("wisp").value.trim(),
     memoryMib: Number($("memory").value),
     cpus: Number($("cpus").value),
     jit: $("jit").checked,
@@ -422,6 +436,7 @@ function render() {
   // A drive's boot loader brings its own command line; the arguments only matter with a kernel.
   $("cmdline-group").hidden = !s.kernel && firmware !== "none";
   $("cmdline-preview").textContent = s.cmdline || "(empty)";
+  $("wisp-group").hidden = !s.network;
   $("firmware-hint").textContent = FIRMWARE_HINTS[firmware];
 
   const notes = notesFor(s);
@@ -443,6 +458,7 @@ function saveSettings() {
   for (const id of CHECKBOXES) saved[id] = $(id).checked;
   for (const id of SELECTS) saved[id] = $(id).value;
   saved.cmdline = $("cmdline").value;
+  saved.wisp = $("wisp").value;
   saved.hypervisorCmdline = $("hypervisor-cmdline").value;
   for (const key of ["kernel", "initrd", "hypervisor", "firmwareImage"]) saved[key] = state[key]?.url ?? null;
   saved.drives = state.drives.filter((drive) => drive.url).map(({ url, kind }) => ({ url, kind }));
@@ -465,6 +481,7 @@ function restoreSettings() {
   if (params.has("tpm")) $("tpm").checked = $("acpi").checked = true;
   if (params.has("secure-boot")) $("secure-boot").checked = true;
   if (params.has("network")) $("network").checked = !["0", "off", "false"].includes(params.get("network"));
+  $("wisp").value = params.get("wisp") ?? saved.wisp ?? "";
   $("hypervisor-cmdline").value = params.get("hypervisor-args") ?? saved.hypervisorCmdline ?? "";
   for (const key of ["kernel", "initrd", "hypervisor", "firmwareImage"]) {
     const url = params.get(key === "firmwareImage" ? "firmware-image" : key) ?? saved[key];
@@ -1073,7 +1090,9 @@ function showBanner(text, kind) {
 
 // The bar's network pill: the guest's address on the shared segment and how many other tabs'
 // machines are on it.
-function showNetwork({ address, peers, serving }) {
+function showNetwork(shown) {
+  lastNetwork = shown;
+  const { address, peers, serving } = shown;
   const pill = $("net-status");
   const dotted = address ? [24, 16, 8, 0].map((shift) => (address >>> shift) & 0xff).join(".") : null;
   const others = `${peers} other machine${peers === 1 ? "" : "s"}`;
@@ -1084,8 +1103,40 @@ function showNetwork({ address, peers, serving }) {
     dotted ? `address ${dotted}/24` : "the guest has no address yet (run DHCP on its interface, e.g. udhcpc -i eth0)",
     `${others} in this browser's other tabs`,
     serving ? "this tab is the segment's DHCP server (10.0.2.2)" : "another tab is the DHCP server (10.0.2.2)",
+    wispLine(),
   ].join("\n");
   pill.hidden = false;
+}
+
+// A relative URL is the page's own server; http becomes ws and https wss. Returns null for an
+// empty field, and throws for anything that is not a WebSocket URL.
+function resolveWispUrl(text) {
+  if (!text) return null;
+  const url = new URL(text, location.href);
+  if (url.protocol === "http:") url.protocol = "ws:";
+  else if (url.protocol === "https:") url.protocol = "wss:";
+  if (url.protocol !== "ws:" && url.protocol !== "wss:") throw new Error("not a WebSocket URL");
+  return url.href;
+}
+
+// The pill's "Internet" line, from the socket's side (wisp.js onStatus) and the worker's.
+function wispLine() {
+  if (wispInvalid) return `Internet: none (invalid Wisp server: ${wispInvalid})`;
+  if (!wispUrl) return "Internet: none (no Wisp server set)";
+  let word = "connecting";
+  if (wispClient.state === WISP_STATE.READY) word = "connected";
+  else if (wispSocket?.socket === "waiting") word = "reconnecting";
+  const reason = wispClient.closeReason >= 0 ? `, last close 0x${wispClient.closeReason.toString(16).padStart(2, "0")}` : "";
+  return `Internet: ${wispUrl} (${word}${reason})`;
+}
+
+function closeWisp() {
+  wisp?.close();
+  wisp = null;
+  wispUrl = null;
+  wispInvalid = null;
+  wispSocket = null;
+  wispClient = { state: WISP_STATE.DISCONNECTED, closeReason: -1 };
 }
 
 function finish(text, kind) {
@@ -1101,6 +1152,8 @@ function finish(text, kind) {
   // Only now that the worker is gone: leaving hands the server role to another tab.
   segment?.leave();
   segment = null;
+  closeWisp();
+  lastNetwork = null;
   $("net-status").hidden = true;
   control = null;
   ring = null;
@@ -1148,11 +1201,30 @@ async function launch() {
     control[CTRL.ROWS] = term.rows;
     control[CTRL.FRAME_ACK] = FRAME_READY.YES;
     let network = null;
+    let wispSettings = null;
     if (s.network) {
       const tab = randomTab();
       networkMac = randomMac();
       network = { mac: networkMac.buffer, tab };
       segment = joinSegment({ control, ring: new Uint8Array(shared, NET_OFFSET, NET_RING_BYTES), tab });
+      // The gateway is in the worker whether or not a server is set; without one it resets streams.
+      wispSettings = { resolver: WISP_RESOLVER, port: WISP_RESOLVER_PORT };
+      try {
+        wispUrl = resolveWispUrl(s.wisp);
+      } catch {
+        wispInvalid = s.wisp;
+      }
+      if (wispUrl) {
+        wisp = connectWisp({
+          control,
+          ring: new Uint8Array(shared, WISP_OFFSET, WISP_RING_BYTES),
+          url: wispUrl,
+          onStatus: (status) => {
+            wispSocket = status;
+            if (lastNetwork) showNetwork(lastNetwork);
+          },
+        });
+      }
       showNetwork({ address: 0, peers: 0, serving: false });
     }
 
@@ -1174,6 +1246,12 @@ async function launch() {
         setCursor(data);
       } else if (data.type === "network") {
         showNetwork(data);
+      } else if (data.type === "wisp") {
+        wisp?.send(data.messages);
+      } else if (data.type === "wisp-status") {
+        wispClient = { state: data.state, closeReason: data.closeReason };
+        wisp?.status(data.state);
+        if (lastNetwork) showNetwork(lastNetwork);
       } else if (data.type === "log") {
         console.log("[uemulator]", data.text);
       } else if (data.type === "started") {
@@ -1217,6 +1295,7 @@ async function launch() {
       rows: term.rows,
       control: shared,
       network,
+      wisp: wispSettings,
       gpu,
       compileQueue,
     };
@@ -1289,6 +1368,18 @@ window.addEventListener("drop", (event) => {
 });
 
 const saved = restoreSettings();
+// hack/web.sh serve names its own endpoint in wisp.json; a visitor's choice or ?wisp wins.
+if (!$("wisp").value) {
+  fetch("wisp.json")
+    .then((response) => (response.ok ? response.json() : null))
+    .then((found) => {
+      if (typeof found?.url === "string" && !$("wisp").value) {
+        $("wisp").value = found.url;
+        render();
+      }
+    })
+    .catch(() => {});
+}
 setRunning(false);
 // On a phone the sidebar would cover the welcome pane, which already offers the common starts.
 setSidebar(!matchMedia("(max-width: 900px)").matches);

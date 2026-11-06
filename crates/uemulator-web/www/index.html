@@ -309,7 +309,9 @@
             </div>
           </div>
           <label class="switch"><strong>Keyboard and mouse</strong><span>virtio keyboard and tablet, fed from the Screen view.</span><input id="input" type="checkbox" checked></label>
-          <label class="switch"><strong>Network</strong><span>virtio-net on an Ethernet segment shared with the machines in this browser's other tabs of this page. DHCP gives each an address in 10.0.2.0/24 (10.0.2.15 and up); no internet.</span><input id="network" type="checkbox" checked></label>
+          <label class="switch"><strong>Network</strong><span>virtio-net on an Ethernet segment shared with the machines in this browser's other tabs of this page. DHCP gives each an address in 10.0.2.0/24 (10.0.2.15 and up); the internet through a Wisp server, if one is set.</span><input id="network" type="checkbox" checked></label>
+          <label class="field" id="wisp-group">Wisp server
+            <input id="wisp" type="text" spellcheck="false" class="mono" placeholder="wss://example.org/wisp/"></label>
         </section>
 
         <section class="panel">
