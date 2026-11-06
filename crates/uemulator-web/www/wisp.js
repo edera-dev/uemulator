@@ -65,17 +65,23 @@ export function wispRingHasRecords(control) {
 }
 
 // Opens a WebSocket to the Wisp server at `url` and keeps one open until `close`: after a loss it
-// waits FIRST_RECONNECT_MS, doubling up to MAX_RECONNECT_MS, back to the first after a socket
-// opens. `control` and `ring` are the shared control block's Int32 words and wisp ring.
-// `onStatus({ socket, retryMs })` reports the socket: "connecting", "open", "waiting" (to
-// reconnect in `retryMs`) or "closed".
+// waits FIRST_RECONNECT_MS, doubling up to MAX_RECONNECT_MS, back to the first once a socket
+// completes the Wisp handshake. `control` and `ring` are the shared control block's Int32 words
+// and wisp ring. `onStatus({ socket, retryMs })` reports the socket: "connecting", "open",
+// "waiting" (to reconnect in `retryMs`) or "closed".
 //
 // The returned object's `send(messages)` sends the worker's packets (its `{ type: "wisp" }`
 // messages) as one binary message each; packets for a socket that is not open are dropped, since
-// the client in the worker gave up their streams when it heard of the loss. `status(state)` takes
-// the worker's `{ type: "wisp-status" }` state: DISCONNECTED while this socket is open means the
-// client gave up its handshake (a server that is not a Wisp server never sends the first
-// CONTINUE), so the socket is closed and another tried after the usual wait.
+// the client in the worker gave up their streams when it heard of the loss.
+//
+// The page must hand every `{ type: "wisp-status" }` from the worker to `status(state)`: both the
+// backoff reset and the handshake timeout below depend on it. READY resets the backoff (a socket
+// that merely opens proves nothing: an endpoint that accepts the upgrade and closes, or that is
+// not a Wisp server, would otherwise be retried every second forever). DISCONNECTED while this
+// socket is still connecting or open means the client gave up its handshake, whose 10 s clock
+// starts when the socket is created (a server that is not a Wisp server never sends the first
+// CONTINUE, or the socket took that long to open), so the socket is closed and another tried
+// after the usual wait; the client would ignore anything this one still brought.
 export function connectWisp({ control, ring, url, onStatus = () => {} }) {
   // Records that did not fit yet, in order: nothing may overtake them.
   const pending = [];
@@ -109,7 +115,6 @@ export function connectWisp({ control, ring, url, onStatus = () => {} }) {
     onStatus({ socket: "connecting" });
     current.onopen = () => {
       if (socket !== current) return;
-      reconnectMs = FIRST_RECONNECT_MS;
       onStatus({ socket: "open" });
     };
     current.onmessage = ({ data }) => {
@@ -146,9 +151,11 @@ export function connectWisp({ control, ring, url, onStatus = () => {} }) {
       for (const message of messages) socket.send(message);
     },
     status(state) {
+      if (!socket) return;
       if (state !== WISP_STATE.DISCONNECTED) {
         acknowledged = true;
-      } else if (acknowledged && socket?.readyState === SOCKET_OPEN) {
+        if (state === WISP_STATE.READY) reconnectMs = FIRST_RECONNECT_MS;
+      } else if (acknowledged) {
         lose(socket);
       }
     },
