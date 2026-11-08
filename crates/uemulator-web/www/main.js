@@ -41,7 +41,12 @@ const FIRMWARE_HINTS = {
   none: "Enters the kernel above directly in 64-bit mode. Drives are only attached.",
   custom: "A UEMUFW64 image (crates/uemulator-firmware) boots as UEFI; anything else is placed below 1 MiB and started at F000:FFF0. OVMF is not supported.",
 };
-const FIRMWARE_LABELS = { uefi: "UEFI", none: "direct kernel", bios: "BIOS", custom: "custom firmware" };
+const FIRMWARE_LABELS = { uefi: "UEFI", none: "Direct kernel", bios: "BIOS", custom: "Custom firmware" };
+const DISPLAY_LABELS = { none: "Terminal only", screen: "Screen, as the console", both: "Screen and terminal" };
+// Wide enough for a Wisp URL on one line; narrower screens get their width less the gutters.
+const POPOVER_WIDTH_PX = 360;
+const POPOVER_GUTTER_PX = 16;
+const POPOVER_GAP_PX = 6;
 const RADIOS = ["firmware", "console", "display"];
 const CHECKBOXES = ["shell", "replace-cmdline", "jit", "acpi", "iommu", "tpm", "secure-boot", "rng", "reboot", "input", "network"];
 const SELECTS = ["memory", "cpus"];
@@ -107,11 +112,81 @@ const state = {
 };
 let nextDriveId = 1;
 
-function setStatus(text, kind = "") {
-  const status = $("status");
-  status.firstElementChild.textContent = text;
-  status.dataset.kind = kind;
-  status.title = text;
+// The bar's machine chip carries only a short label; its panel (renderMachinePanel) tells the
+// rest. An error keeps its whole text as the label, so that it is seen without a click.
+let statusShown = { label: "Stopped", kind: "", detail: "" };
+
+function setStatus(label, kind = "", detail = "") {
+  statusShown = { label, kind, detail };
+  const chip = $("status");
+  chip.querySelector(".label").textContent = label;
+  chip.dataset.kind = kind;
+  if ($("machine-panel").matches(":popover-open")) renderMachinePanel();
+}
+
+// A row of a panel's <dl>: the value is text, a node, or several of them stacked.
+function addFact(list, term, value) {
+  const name = Object.assign(document.createElement("dt"), { textContent: term });
+  const detail = document.createElement("dd");
+  detail.append(...[value].flat());
+  list.append(name, detail);
+  return detail;
+}
+const factLine = (text, className = "") => Object.assign(document.createElement("span"), { textContent: text, className });
+
+function renderMachinePanel() {
+  const { label, kind, detail } = statusShown;
+  $("machine-head").dataset.kind = kind;
+  const headline = kind === "error" ? "Stopped" : label;
+  $("machine-state").textContent = headline;
+  // A plain Stop's reason is just "stopped", which the headline already says.
+  let message = detail || (kind === "error" ? label : "");
+  if (message.toLowerCase() === headline.toLowerCase()) message = "";
+  $("machine-message").textContent = message;
+  $("machine-message").dataset.kind = kind;
+  $("machine-message").hidden = !message;
+
+  // While it runs, what it was started with; otherwise what Start would boot now.
+  const live = running() && current;
+  const s = live ? current : readSettings();
+  const facts = $("machine-facts");
+  facts.replaceChildren();
+  const media = [
+    s.firmwareImage && [s.firmwareImage.label, "firmware"],
+    s.hypervisor && [s.hypervisor.label, "hypervisor"],
+    s.kernel && [s.kernel.label, "kernel"],
+    s.initrd && [s.initrd.label, "initramfs"],
+    ...s.drives.map((drive, index) => [drive.label, `${driveDevice(index)}, ${drive.kind === "cdrom" ? "CD" : "disk"}`]),
+  ].filter(Boolean).map(([name, role]) => {
+    const row = factLine(name);
+    row.append(" ", factLine(role, "sub"));
+    return row;
+  });
+  addFact(facts, "Boots", media.length ? media : factLine("Nothing yet", "sub"));
+  addFact(facts, "Firmware", FIRMWARE_LABELS[s.firmware]);
+  addFact(facts, "Memory", formatMemory(s.memoryMib));
+  addFact(facts, "vCPUs", String(s.cpus));
+  addFact(facts, "Display", DISPLAY_LABELS[s.display]);
+  addFact(facts, "Console", s.serial || s.hypervisor ? "ttyS0 (serial)" : "hvc0 (virtio)");
+  const devices = [
+    [s.jit, "JIT"], [s.acpi, "ACPI"], [s.iommu, "IOMMU"], [s.tpm, "TPM 2.0"], [s.secureBoot, "Secure Boot"],
+    [s.rng, "virtio-rng"], [s.input, "Keyboard and mouse"], [s.network, "Network"],
+  ].filter(([on]) => on).map(([, name]) => factLine(name));
+  addFact(facts, "Devices", devices.length ? devices : factLine("None", "sub")).classList.add("tags");
+  if (s.kernel && s.cmdline) addFact(facts, "Arguments", factLine(s.cmdline, "mono sub"));
+  $("machine-hint").textContent = live ? "Stop the machine to change these." : "What Start boots. Change it in Settings.";
+}
+
+// Native popovers open centered in the top layer, and CSS anchor positioning is not in every
+// browser yet, so each panel is put under its button, kept inside the window, as it opens.
+// The width is the document's, not innerWidth: on a phone innerWidth grows with anything that
+// overflows the page, and the panel would follow it off screen.
+function placePopover(panel, anchor) {
+  const viewport = document.documentElement.clientWidth;
+  const width = Math.min(POPOVER_WIDTH_PX, viewport - 2 * POPOVER_GUTTER_PX);
+  const bounds = anchor.getBoundingClientRect();
+  const left = Math.max(POPOVER_GUTTER_PX, Math.min(bounds.left, viewport - width - POPOVER_GUTTER_PX));
+  Object.assign(panel.style, { width: `${width}px`, left: `${left}px`, top: `${bounds.bottom + POPOVER_GAP_PX}px` });
 }
 
 let toastTimer = 0;
@@ -297,15 +372,8 @@ function notesFor(s) {
   return notes;
 }
 
-function summaryOf(s) {
-  const media = s.title ?? [
-    s.hypervisor?.label,
-    s.kernel?.label,
-    ...s.drives.map((drive) => drive.label),
-  ].filter(Boolean).join(" + ");
-  return [media || "no media", FIRMWARE_LABELS[s.firmware], s.memoryMib >= 1024 ? `${+(s.memoryMib / 1024).toFixed(1)} GiB` : `${s.memoryMib} MiB`,
-    `${s.cpus} vCPU${s.cpus > 1 ? "s" : ""}`].join(" · ");
-}
+const formatMemory = (mib) => (mib >= 1024 ? `${+(mib / 1024).toFixed(1)} GiB` : `${mib} MiB`);
+const driveDevice = (index) => `vd${String.fromCharCode(97 + index)}`;
 
 const running = () => starting || worker !== null;
 
@@ -327,7 +395,7 @@ function renderDrives() {
     row.querySelector(".name").textContent = drive.label;
     row.querySelector(".name").title = drive.url ?? drive.label;
     // virtio-blk names them in PCI slot order, which is this order.
-    row.querySelector(".device").textContent = `vd${String.fromCharCode(97 + index)}`;
+    row.querySelector(".device").textContent = driveDevice(index);
     row.querySelector(".size").textContent = [formatBytes(drive.size), drive.url ? "URL" : "file"].filter(Boolean).join(" · ");
     const select = row.querySelector("select");
     select.value = drive.kind;
@@ -1088,25 +1156,31 @@ function showBanner(text, kind) {
   $("banner").hidden = false;
 }
 
-// The bar's network pill: the guest's address on the shared segment and how many other tabs'
-// machines are on it.
+// The bar's network button: a dot for how connected the guest is, and a panel with its address,
+// the segment and the uplink.
 function showNetwork(shown) {
   lastNetwork = shown;
   const { address, peers, serving } = shown;
-  const pill = $("net-status");
   const dotted = address ? [24, 16, 8, 0].map((shift) => (address >>> shift) & 0xff).join(".") : null;
-  const others = `${peers} other machine${peers === 1 ? "" : "s"}`;
-  const uplink = wispClient.state === WISP_STATE.READY ? "internet" : "offline";
-  pill.firstElementChild.textContent = `${dotted ?? "no address yet"} · ${others} · ${uplink}`;
-  pill.dataset.kind = dotted ? "network" : "network-waiting";
-  pill.title = [
-    `Shared network, NIC ${formatMac(networkMac)}`,
-    dotted ? `address ${dotted}/24` : "the guest has no address yet (run DHCP on its interface, e.g. udhcpc -i eth0)",
-    `${others} in this browser's other tabs`,
-    serving ? "this tab is the segment's DHCP server (10.0.2.2)" : "another tab is the DHCP server (10.0.2.2)",
-    wispLine(),
-  ].join("\n");
-  pill.hidden = false;
+  const online = wispClient.state === WISP_STATE.READY;
+  let kind = "waiting";
+  if (dotted) kind = online ? "online" : "local";
+  const button = $("net-status");
+  button.dataset.kind = kind;
+  button.title = dotted ? `Network: ${dotted}${online ? ", internet" : ""}` : "Network: no address yet";
+  button.hidden = false;
+  $("network-head").dataset.kind = kind;
+
+  const facts = $("network-facts");
+  facts.replaceChildren();
+  addFact(facts, "Address", dotted ? `${dotted}/24` : "None yet");
+  addFact(facts, "NIC", factLine(formatMac(networkMac), "mono"));
+  addFact(facts, "Segment", `${peers} other machine${peers === 1 ? "" : "s"} in this browser's tabs`);
+  addFact(facts, "Router", [factLine("10.0.2.2"), factLine(serving ? "DHCP and DNS from this tab" : "DHCP and DNS from another tab", "sub")]);
+  const uplink = wispState();
+  addFact(facts, "Internet", [factLine(uplink.word), ...uplink.lines.map((line) => factLine(line, "sub"))]);
+  $("network-hint").textContent = dotted ? "" : "Run DHCP on the guest's interface, for example udhcpc -i eth0.";
+  $("network-hint").hidden = Boolean(dotted);
 }
 
 // A relative URL is the page's own server; http becomes ws and https wss. Returns null for an
@@ -1120,15 +1194,17 @@ function resolveWispUrl(text) {
   return url.href;
 }
 
-// The pill's "Internet" line, from the socket's side (wisp.js onStatus) and the worker's.
-function wispLine() {
-  if (wispInvalid) return `Internet: none (invalid Wisp server: ${wispInvalid})`;
-  if (!wispUrl) return "Internet: none (no Wisp server set)";
-  let word = "connecting";
-  if (wispClient.state === WISP_STATE.READY) word = "connected";
-  else if (wispSocket?.socket === "waiting") word = "reconnecting";
-  const reason = wispClient.closeReason >= 0 ? `, last close 0x${wispClient.closeReason.toString(16).padStart(2, "0")}` : "";
-  return `Internet: ${wispUrl} (${word}${reason})`;
+// The uplink as the network panel shows it, from the socket's side (wisp.js onStatus) and the
+// worker's.
+function wispState() {
+  if (wispInvalid) return { word: "None", lines: [`Invalid Wisp server: ${wispInvalid}`] };
+  if (!wispUrl) return { word: "None", lines: ["No Wisp server set"] };
+  let word = "Connecting";
+  if (wispClient.state === WISP_STATE.READY) word = "Connected";
+  else if (wispSocket?.socket === "waiting") word = "Reconnecting";
+  const lines = [`Wisp: ${wispUrl}`];
+  if (wispClient.closeReason >= 0) lines.push(`Last close 0x${wispClient.closeReason.toString(16).padStart(2, "0")}`);
+  return { word, lines };
 }
 
 function closeWisp() {
@@ -1155,14 +1231,17 @@ function finish(text, kind) {
   segment = null;
   closeWisp();
   lastNetwork = null;
+  $("network-panel").hidePopover();
   $("net-status").hidden = true;
   control = null;
   ring = null;
   events = null;
   // The library's wording names the CLI flag; point at the page's own control instead.
   const shown = text.replace("boot it with firmware none", "choose Direct under Firmware");
-  setStatus(kind === "error" ? shown : `Stopped: ${shown}`, kind);
-  showBanner(shown.charAt(0).toUpperCase() + shown.slice(1), kind);
+  const sentence = shown.charAt(0).toUpperCase() + shown.slice(1);
+  if (kind === "error") setStatus(shown, kind, sentence);
+  else setStatus("Stopped", kind, sentence);
+  showBanner(sentence, kind);
   setRunning(false);
 }
 
@@ -1257,7 +1336,7 @@ async function launch() {
         console.log("[uemulator]", data.text);
       } else if (data.type === "started") {
         startedAt = performance.now();
-        const tick = () => setStatus(`Running ${formatUptime((performance.now() - startedAt) / 1000)} · ${summaryOf(current)}`, "running");
+        const tick = () => setStatus(`Running ${formatUptime((performance.now() - startedAt) / 1000)}`, "running");
         tick();
         clock = setInterval(tick, 1000);
         focusView();
@@ -1336,6 +1415,21 @@ $("start-sidebar").onclick = launch;
 $("banner-restart").onclick = launch;
 $("banner-close").onclick = () => { $("banner").hidden = true; };
 $("toggle-sidebar").onclick = () => setSidebar($("sidebar").hasAttribute("data-collapsed"));
+const POPOVERS = [["machine-panel", "status", renderMachinePanel], ["network-panel", "net-status", () => lastNetwork && showNetwork(lastNetwork)]];
+for (const [panel, anchor, refresh] of POPOVERS) {
+  $(panel).addEventListener("beforetoggle", (event) => {
+    if (event.newState !== "open") return;
+    refresh();
+    placePopover($(panel), $(anchor));
+  });
+}
+window.addEventListener("resize", () => {
+  for (const [panel, anchor] of POPOVERS) if ($(panel).matches(":popover-open")) placePopover($(panel), $(anchor));
+});
+$("machine-settings").onclick = () => {
+  $("machine-panel").hidePopover();
+  setSidebar(true);
+};
 $("stop").onclick = () => {
   if (control) Atomics.store(control, CTRL.STOP, 1);
   else if (starting) toast("Still downloading; the machine stops as soon as it starts.");
