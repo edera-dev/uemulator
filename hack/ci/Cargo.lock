@@ -340,9 +340,9 @@ dependencies = [
 
 [[package]]
 name = "cargo-nextest"
-version = "0.9.150"
+version = "0.9.151"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f9cefe4968341a1776682f84ffd1305cae82a8bff2e1f5cbde866a452b6ccd5"
+checksum = "f21c861100d8ee08937edc925583ab006a47e64e4a1ccd454bf37e6cb7b3a624"
 dependencies = [
  "camino",
  "cfg-if",
@@ -1198,9 +1198,9 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "future-queue"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47cdf4a7eef4808ffa1e5c47dbf37124dfe33a7acc34e8568c5d5359b365a8cb"
+checksum = "c09841083de051df2edffda66cf2a49bd09e78eac36fa0eedd7a45de01d2a828"
 dependencies = [
  "debug-ignore",
  "fnv",
@@ -1973,9 +1973,9 @@ dependencies = [
 
 [[package]]
 name = "nextest-runner"
-version = "0.128.0"
+version = "0.129.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1bd23097a79698b3c186804661362bb4989aa38c86a5c8ae3fbf4fb8946f64b1"
+checksum = "2b00cd56a5d5a95654b66b162dd20aefb5aaf2e699388c903cd6f38a19bd7d08"
 dependencies = [
  "aho-corasick",
  "anstyle-progress",
