@@ -32,5 +32,6 @@ Index of the design plans, in reading order. Each file starts with a status line
 | 25-gpu-3d.md | guest 3D through virtio-gpu (partially implemented: the device side and `GpuLink`, and the web spike that clears through Mesa's virgl driver): virgl on WebGL2 against Venus on WebGPU, the render worker, fences, milestones |
 | 26-tpm-secure-boot.md | TPM 2.0 (CRB device, measured-boot command set), the firmware's TCG2 protocol and event log, Secure Boot with Microsoft's keys and authenticated variables, `uemulator-crypto` |
 | 27-wisp.md | internet for web guests through a Wisp relay over WebSocket; the user-mode gateway moved into the library and shared with the CLI (implemented) |
+| 28-apple.md | SwiftUI app for macOS, iOS and iPadOS (proposal): a native engine (JIT on macOS, interpreter on iOS) and a WebKit engine that runs the WebAssembly build and its JIT in a hidden `WKWebView`, the Xcode project, the bridge, milestones |
 
 Rules for implementers: `../ext/qemu-uplink` is read-only reference. Behaviour and algorithms are studied there; code is written fresh in Rust, not transliterated. The library has zero crate dependencies when built with `--no-default-features`.
