@@ -401,7 +401,7 @@ impl Cpu {
                 return self.far_return_legacy(i, extra).map(|()| true);
             }
             0xcf => {
-                let result = self.iret_legacy(i);
+                let result = self.iret_legacy(i, next);
                 if result.is_ok() {
                     self.nmi_blocked = false;
                 }

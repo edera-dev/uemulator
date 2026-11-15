@@ -306,6 +306,10 @@ impl Lapic {
         self.init_pending || self.startup_vector.is_some()
     }
 
+    pub fn init_pending(&self) -> bool {
+        self.init_pending
+    }
+
     pub fn take_init(&mut self) -> bool {
         core::mem::take(&mut self.init_pending)
     }

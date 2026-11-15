@@ -365,10 +365,11 @@ fn address_size_leaf_reports_40_physical_and_48_virtual_bits_and_the_extensions(
 fn leaf_0x8000000a_describes_svm() {
     let mut h = blank();
     let [revision, asids, ecx, features] = cpuid(&mut h, 0x8000_000a, 0);
-    assert_eq!((revision, asids, ecx), (1, 64, 0));
-    // nested paging, next-RIP save, VMCB clean bits, flush by ASID; decode assists, the pause
-    // filter, AVIC, V_GIF, LBR virtualization and the TSC ratio MSR are not implemented
-    assert_eq!(features, bits(&[0, 3, 5, 6]));
+    assert_eq!((revision, asids, ecx), (1, 32768, 0));
+    // nested paging, LBR virtualization, SVM lock, next-RIP save, the TSC ratio MSR, VMCB clean
+    // bits, flush by ASID, the pause filter and its threshold (tested in svm.rs); decode assists,
+    // AVIC, V_GIF, vNMI and the rest are not implemented
+    assert_eq!(features, bits(&[0, 1, 2, 3, 4, 5, 6, 10, 12]));
 }
 
 /// One subleaf of leaf 0x8000_001D as type, level, sharing threads, ways, sets, line size.

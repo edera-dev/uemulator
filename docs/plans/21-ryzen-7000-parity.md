@@ -44,8 +44,8 @@ Rules from `CLAUDE.md` hold for all of it: a CPUID bit goes on in the same commi
 
 ### C. Virtualisation (SVM) completeness
 
-`svm::SVM_FEATURES` today: nested paging, next-RIP save, VMCB clean bits, flush-by-ASID, all in their "reload and flush everything" form. Zen 4 reports more in 0x8000_000A EDX; audit the list against the APM and add what a hypervisor will use, each with a guest test in `hack/kvm/run.sh`'s style or a fake kernel:
-- `vGIF` (virtual GIF, `STGI`/`CLGI` without exit), `V_VMSAVE_VMLOAD`, TSC rate MSR (`TscRatioMsr`), pause filter (count and threshold), decode assists (`DecodeAssists` fills the VMCB instruction bytes on #PF/INVLPG exits), SVM lock/`SvmLock` and `SVME_DISABLE` plumbing, `GMET`, and the host-visible `VIRT_SPEC_CTRL`.
+`svm::SVM_FEATURES` today: nested paging, next-RIP save, VMCB clean bits, flush-by-ASID (all in their "reload and flush everything" form), LBR virtualization, SVM lock, the TSC ratio MSR, the pause filter and its threshold; 32768 ASIDs; the NMI, INIT, SMI (never raised) and task-switch intercepts (`docs/plans/03-cpu.md`, "SVM"). Zen 4 reports more in 0x8000_000A EDX; audit the list against the APM and add what a hypervisor will use, each with a guest test in `hack/kvm/run.sh`'s style or a fake kernel:
+- `vGIF` (virtual GIF, `STGI`/`CLGI` without exit), `V_VMSAVE_VMLOAD`, decode assists (`DecodeAssists` fills the VMCB instruction bytes on #PF/INVLPG exits), `GMET`, and the host-visible `VIRT_SPEC_CTRL`. Done: TSC rate MSR, pause filter (count and threshold), SVM lock and `SVM_KEY`, LBR virtualization.
 - AVIC/x2AVIC (hardware-virtualised local APIC) is the large one; skip unless a guest hypervisor needs it, and then design it with the multi-APIC model in `docs/plans/03-cpu.md`.
 - SEV, SEV-ES, SEV-SNP: not on client Ryzen; not planned.
 
@@ -113,7 +113,7 @@ Vulnerability files of the Alpine 6.18 guest (`grep -r . /sys/devices/system/cpu
 
 Zen 5 instructions advertised, each with reference tests and an interpreter/JIT differential case (they reach the JIT through the interpreter helper, no `jit/` change): AVX-VNNI (VEX vpdpbusd(s)/vpdpwssd(s), one kernel with the EVEX forms), MOVDIRI, MOVDIR64B, AVX512_VP2INTERSECT, PREFETCHI (`0F 18` hints). MOVDIR64B's 64-byte store is eight 8-byte stores, so with one host thread per vCPU another vCPU can see it half done; the SDM promises a single unit, which no guest seen so far depends on.
 
-Present on Turin, not advertised (not implemented): LA57, PKU/OSPKE, CET shadow stacks, SSE4A, MMXEXT, FFXSR, MWAITX/MONITORX, RDPRU, INVLPGB/TLBSYNC, OSVW, CR8_LEGACY, PERFCTR_CORE and PerfMonV2, IBS, LBR v2, SRSO_BP_SPEC_REDUCE (needs the BP_CFG bit KVM toggles), ERAPS, NO_SMM_CTL_MSR, the extended SVM features (vGIF, vNMI, V_VMSAVE_VMLOAD, TSC scaling, pause filter, AVIC/x2AVIC), SEV/SEV-ES/SEV-SNP, CPPC, RAPL, 52/57 address bits. AMD_SSB_NO and IBRS_ALWAYS_ON stay clear because Turin does not report them.
+Present on Turin, not advertised (not implemented): LA57, PKU/OSPKE, CET shadow stacks, SSE4A, MMXEXT, FFXSR, MWAITX/MONITORX, RDPRU, INVLPGB/TLBSYNC, OSVW, CR8_LEGACY, PERFCTR_CORE and PerfMonV2, IBS, LBR v2, SRSO_BP_SPEC_REDUCE (needs the BP_CFG bit KVM toggles), ERAPS, NO_SMM_CTL_MSR, the extended SVM features (vGIF, vNMI, V_VMSAVE_VMLOAD, decode assists, AVIC/x2AVIC; TSC scaling, the pause filter, LBR virtualization and SVM lock are advertised), SEV/SEV-ES/SEV-SNP, CPPC, RAPL, 52/57 address bits. AMD_SSB_NO and IBRS_ALWAYS_ON stay clear because Turin does not report them.
 
 ## Order
 

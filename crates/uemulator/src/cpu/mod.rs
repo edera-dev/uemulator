@@ -724,9 +724,6 @@ impl Cpu {
         const MSR_UCODE_REV: u32 = 0x8b;
         const UCODE_REV_TURIN: u64 = 0x0b00_215a;
         const MSR_K7_HWCR: u32 = 0xc001_0015;
-        /// IA32_DEBUGCTL: a KVM host saves and restores it around every guest run. Stored only (no
-        /// branch recording).
-        const MSR_IA32_DEBUGCTL: u32 = 0x1d9;
         const MSR_AMD64_NB_CFG: u32 = 0xc001_001f;
         const MSR_AMD64_LS_CFG: u32 = 0xc001_1020;
         const MSR_AMD64_DE_CFG: u32 = 0xc001_1029;
@@ -822,7 +819,7 @@ impl Cpu {
             dr: [0, 0, 0, 0, 0, 0, DR6_RESET, DR7_RESET],
             msr_misc: [
                 (MSR_UCODE_REV, UCODE_REV_TURIN),
-                (MSR_IA32_DEBUGCTL, 0),
+                (sys::MSR_DEBUGCTL, 0),
                 (MSR_K7_HWCR, HWCR_INITIAL),
                 (MSR_AMD64_NB_CFG, 0),
                 (MSR_AMD64_LS_CFG, 0),
@@ -965,9 +962,9 @@ impl Cpu {
         self.time_base_ns + busy / self.time_divisor * NS_PER_INSN + self.idle_skipped_ns
     }
 
-    /// The TSC is just guest time in nanoseconds.
+    /// The TSC is just guest time in nanoseconds (scaled and offset inside an SVM guest).
     pub fn tsc(&self) -> u64 {
-        self.now_ns().wrapping_add(self.svm_tsc_offset())
+        self.svm_visible_tsc(self.now_ns())
     }
 
     /// Logs `msg` at most once per `key`. Callers keep their key ranges disjoint by adding the
@@ -1040,18 +1037,23 @@ impl Cpu {
     /// Takes a pending NMI at this instruction boundary. NMIs ignore IF but not the one-instruction
     /// shadow of `mov ss`, and a second one waits until the handler's `iret` (SDM 6.7.1).
     fn take_pending_nmi(&mut self) -> bool {
-        // A threaded vCPU asks the device lock only when the device model says something is
-        // waiting for it (`vcpus::ATTENTION_NMI`).
-        if self.nmi_blocked
-            || self.interrupt_shadow
-            || (self.threads.is_some() && self.attention() & vcpus::ATTENTION_NMI == 0)
-            || !self.dev.lock().nmi_pending()
-        {
+        if !self.nmi_recognized() {
             return false;
         }
         self.dev.lock().take_nmi();
         self.nmi_blocked = true;
         true
+    }
+
+    /// Whether an NMI is pending and would be taken at this boundary (GIF aside), without taking
+    /// it: the SVM NMI intercept exits on exactly the NMI `take_pending_nmi` would deliver.
+    pub(crate) fn nmi_recognized(&mut self) -> bool {
+        // A threaded vCPU asks the device lock only when the device model says something is
+        // waiting for it (`vcpus::ATTENTION_NMI`).
+        !(self.nmi_blocked
+            || self.interrupt_shadow
+            || (self.threads.is_some() && self.attention() & vcpus::ATTENTION_NMI == 0)
+            || !self.dev.lock().nmi_pending())
     }
 
     /// Runs the per-step housekeeping: device/stop polling, interrupt delivery, halt handling.

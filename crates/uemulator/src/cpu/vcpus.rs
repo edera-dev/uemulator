@@ -573,7 +573,8 @@ impl Cpu {
         if attention & ATTENTION_EXIT != 0 {
             return true;
         }
-        if attention & ATTENTION_START != 0 {
+        // An INIT held while GIF is clear does not wake the vCPU: it would only halt again.
+        if attention & ATTENTION_START != 0 && (self.svm.gif || self.wait_for_sipi) {
             return true;
         }
         if self.wait_for_sipi {
@@ -630,15 +631,22 @@ impl Cpu {
 
     /// Acts on INIT and start-up IPIs other vCPUs sent this one (time-sharing runs it when the
     /// scheduler enters the vCPU, threads when the device bit says so).
+    ///
+    /// INIT is held pending while GIF is clear, and a guest that intercepts it exits instead
+    /// (which clears GIF), so the hypervisor sees the exit before the reset (APM 15.17).
     pub(super) fn apply_start_signals(&mut self) {
         let index = self.cpu_index as usize;
+        if self.svm_init_exit() {
+            return;
+        }
+        let hold_init = !self.svm.gif;
         let (init, startup) = {
             let mut devices = self.dev.lock();
             let lapic = devices.lapic_of(index);
             if !lapic.start_signal_pending() {
                 return;
             }
-            let init = lapic.take_init();
+            let init = !hold_init && lapic.take_init();
             let startup = lapic.take_startup();
             if init {
                 lapic.init_reset();

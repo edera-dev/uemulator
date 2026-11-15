@@ -291,7 +291,7 @@ impl Cpu {
         self.zmm_hi = [[0; 2]; 16];
         self.zmm_extra = [[0; 4]; 16];
         self.opmask = [0; 8];
-        self.svm = svm::Svm::new();
+        self.svm = self.svm.after_init();
         self.nmi_blocked = false;
         self.interrupt_shadow = false;
         self.monitor_armed = false;

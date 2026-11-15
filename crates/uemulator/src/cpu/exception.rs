@@ -177,8 +177,11 @@ impl Cpu {
                 // being delivered is reported to the hypervisor so it can inject it again
                 Err(Exception::AtomicRetry) => unreachable!("exec retries locked instructions"),
                 Err(Exception::Vmexit) => {
+                    // No exception uses vector 2, so a hardware event there is an NMI.
                     let kind = if software {
                         super::svm::EVENT_TYPE_SOFTWARE
+                    } else if vector == super::NMI_VECTOR {
+                        super::svm::EVENT_TYPE_NMI
                     } else if class != FaultClass::Benign || first_is_exception {
                         super::svm::EVENT_TYPE_EXCEPTION
                     } else {

@@ -707,7 +707,8 @@ impl Cpu {
     }
 
     /// iret / iretd / 16-bit iret in real mode, virtual-8086 mode and protected mode.
-    pub(super) fn iret_legacy(&mut self, i: &Insn) -> ExecResult<()> {
+    /// `next` is the address after the `iret`, which a task switch saves in the outgoing TSS.
+    pub(super) fn iret_legacy(&mut self, i: &Insn, next: u64) -> ExecResult<()> {
         let size = i.opsize.min(4);
         let stack_mask = self.stack_mask();
         let sp = self.stack_pointer();
@@ -765,7 +766,7 @@ impl Cpu {
             return Ok(());
         }
         if self.eflags & NT != 0 {
-            return self.task_return();
+            return self.task_return(next);
         }
         let eip = read(self, sp, size)?;
         let selector = read(self, sp.wrapping_add(step), size)? as u16;

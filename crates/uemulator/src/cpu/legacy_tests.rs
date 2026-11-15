@@ -762,6 +762,11 @@ fn call_to_a_tss_links_back_and_iret_with_nt_returns() {
     assert_eq!(h.cpu.gpr[RAX], 7, "the first task got its registers back");
     assert_eq!(h.cpu.tr.sel, LEGACY_TSS);
     assert_eq!(h.cpu.eflags_full() & flags::NT, 0);
+    assert_eq!(
+        dword(&h, LEGACY_SECOND_TSS_BASE + 32),
+        (HANDLER + handler.len() as u64) as u32,
+        "the task iret left resumes after the iret, not on it"
+    );
 }
 
 #[test]

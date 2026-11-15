@@ -79,10 +79,11 @@ impl Cpu {
         self.write_sys(address, 4, updated)
     }
 
-    /// `iret` with NT set: switch back to the task the current TSS links to.
-    pub(super) fn task_return(&mut self) -> ExecResult<()> {
+    /// `iret` with NT set: switch back to the task the current TSS links to. The outgoing task
+    /// resumes at `next`, after the `iret`.
+    pub(super) fn task_return(&mut self, next: u64) -> ExecResult<()> {
         let link = self.read_sys(self.tr.base.wrapping_add(TSS_LINK), 2)? as u16;
-        self.task_switch(link, TaskSwitchSource::Return, self.rip, None)
+        self.task_switch(link, TaskSwitchSource::Return, next, None)
     }
 
     pub(super) fn task_switch(
@@ -92,6 +93,9 @@ impl Cpu {
         return_eip: u64,
         error_code: Option<u32>,
     ) -> ExecResult<()> {
+        // A guest that intercepts task switches exits before anything is checked or written; the
+        // hypervisor emulates the whole switch.
+        self.svm_task_switch_intercept(selector, source, return_eip, error_code)?;
         let new_tss = self.tss_descriptor(selector)?;
         let required = if source == TaskSwitchSource::Return {
             TSS_TYPE_32_BUSY

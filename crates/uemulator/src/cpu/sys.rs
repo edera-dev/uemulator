@@ -12,6 +12,10 @@ pub(crate) const MSR_SYSENTER_CS: u32 = 0x174;
 pub(crate) const MSR_SYSENTER_ESP: u32 = 0x175;
 pub(crate) const MSR_SYSENTER_EIP: u32 = 0x176;
 pub(crate) const MSR_PAT: u32 = 0x277;
+/// DEBUGCTL: stored only (nothing records branches or single-steps on branches), in
+/// `Cpu::msr_misc`; a KVM host saves and restores it around every guest run, and LBR
+/// virtualization swaps it with the VMCB's.
+pub(crate) const MSR_DEBUGCTL: u32 = 0x1d9;
 pub(crate) const MSR_EFER: u32 = 0xc000_0080;
 pub(crate) const MSR_STAR: u32 = 0xc000_0081;
 pub(crate) const MSR_LSTAR: u32 = 0xc000_0082;
@@ -256,6 +260,11 @@ impl Cpu {
             MSR_XSS => xsave::XSS_SUPPORTED,
             super::svm::MSR_VM_CR => self.svm.vm_cr,
             super::svm::MSR_VM_HSAVE_PA => self.svm.hsave_pa,
+            super::svm::MSR_SVM_KEY => 0,
+            super::svm::MSR_TSC_RATIO => self.svm.tsc_ratio(),
+            super::svm::MSR_LAST_BRANCH_FROM_IP..=super::svm::MSR_LAST_EXCEPTION_TO_IP => {
+                self.svm.last_branches[(msr - super::svm::MSR_LAST_BRANCH_FROM_IP) as usize]
+            }
             MSR_SPEC_CTRL => self.spec_ctrl,
             MSR_SYSENTER_CS..=MSR_SYSENTER_EIP => self.sysenter[(msr - MSR_SYSENTER_CS) as usize],
             _ => match self.msr_misc.get(&msr) {
@@ -349,11 +358,11 @@ impl Cpu {
                     return Err(Exception::general_protection(0));
                 }
             }
-            super::svm::MSR_VM_CR => {
-                if v & !super::svm::VM_CR_WRITABLE != 0 {
-                    return Err(Exception::general_protection(0));
-                }
-                self.svm.vm_cr = v;
+            super::svm::MSR_VM_CR => self.write_vm_cr(v)?,
+            super::svm::MSR_SVM_KEY => self.svm.write_key(v),
+            super::svm::MSR_TSC_RATIO => self.svm.write_tsc_ratio(v)?,
+            super::svm::MSR_LAST_BRANCH_FROM_IP..=super::svm::MSR_LAST_EXCEPTION_TO_IP => {
+                return Err(Exception::general_protection(0));
             }
             super::svm::MSR_VM_HSAVE_PA => {
                 // a 4 KiB aligned physical address inside the address space
@@ -1947,7 +1956,10 @@ mod sys_tests {
             let efer = h.cpu.rdmsr(TEST_MSR_EFER).unwrap();
             h.cpu.wrmsr(TEST_MSR_EFER, efer | (1 << 12)).unwrap();
             assert_ne!(h.cpu.efer & (1 << 12), 0);
+            // SVMDIS cannot be set under EFER.SVME
+            assert_gp0(h.cpu.wrmsr(0xc001_0114, 1 << 4));
             // VM_CR takes its five defined bits; VM_HSAVE_PA needs a 4 KiB aligned physical address
+            let mut h = blank();
             h.cpu.wrmsr(0xc001_0114, 0b1_1111).unwrap();
             assert_eq!(h.cpu.rdmsr(0xc001_0114).unwrap(), 0b1_1111);
             assert_gp0(h.cpu.wrmsr(0xc001_0114, 1 << 5));

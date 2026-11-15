@@ -21,10 +21,28 @@ use super::*;
 
 pub(crate) const MSR_VM_CR: u32 = 0xc001_0114;
 pub(crate) const MSR_VM_HSAVE_PA: u32 = 0xc001_0117;
+/// SVM-Lock key (APM 15.31): write-only, reads as zero.
+pub(crate) const MSR_SVM_KEY: u32 = 0xc001_0118;
+/// TSC_RATIO (APM 15.30.5): the guest's TSC is the host's times this 8.32 fixed-point ratio,
+/// plus the VMCB's TSC offset. Applies only while a guest runs.
+pub(crate) const MSR_TSC_RATIO: u32 = 0xc000_0104;
+/// 1.0, the reset value.
+pub(crate) const TSC_RATIO_ONE: u64 = 1 << 32;
+const TSC_RATIO_FRACTION_BITS: u32 = 32;
+const TSC_RATIO_RESERVED: u64 = !0 << 40;
+/// The branch record MSRs (LastBranchFromIP, LastBranchToIP, LastExceptionFromIP,
+/// LastExceptionToIP). Read-only, and nothing records branches, so they only ever change through
+/// LBR virtualization: VMRUN loads a guest's from its VMCB and #VMEXIT puts the host's back.
+pub(crate) const MSR_LAST_BRANCH_FROM_IP: u32 = 0x1db;
+pub(crate) const MSR_LAST_EXCEPTION_TO_IP: u32 = 0x1de;
+#[cfg(test)]
+const MSR_LAST_EXCEPTION_FROM_IP: u32 = 0x1dd;
+const LAST_BRANCH_MSRS: usize = 4;
 /// EFER.SVME: enables the SVM instructions.
 pub(crate) const EFER_SVME: u64 = 1 << 12;
 /// VM_CR bits software may write: DPD, R_INIT, DIS_A20M, LOCK, SVMDIS.
 pub(super) const VM_CR_WRITABLE: u64 = 0b1_1111;
+pub(super) const VM_CR_LOCK: u64 = 1 << 3;
 pub(super) const VM_CR_SVMDIS: u64 = 1 << 4;
 
 // VMCB control area offsets.
@@ -33,6 +51,9 @@ const VMCB_INTERCEPT_DR: u64 = 0x04;
 const VMCB_INTERCEPT_EXCEPTIONS: u64 = 0x08;
 const VMCB_INTERCEPT3: u64 = 0x0c;
 const VMCB_INTERCEPT4: u64 = 0x10;
+/// Two words: the pause filter threshold (cycles) and count (APM 15.14.4).
+const VMCB_PAUSE_FILTER_THRESHOLD: u64 = 0x3c;
+const VMCB_PAUSE_FILTER_COUNT: u64 = 0x3e;
 const VMCB_IOPM_BASE: u64 = 0x40;
 const VMCB_MSRPM_BASE: u64 = 0x48;
 const VMCB_TSC_OFFSET: u64 = 0x50;
@@ -50,6 +71,9 @@ const VMCB_NP_ENABLE: u64 = 0x90;
 const VMCB_EVENTINJ: u64 = 0xa8;
 const VMCB_EVENTINJ_ERROR: u64 = 0xac;
 const VMCB_N_CR3: u64 = 0xb0;
+/// LBR virtualization (bit 0) and virtualized VMSAVE/VMLOAD (bit 1, not supported).
+const VMCB_VIRTUAL_EXTENSIONS: u64 = 0xb8;
+const LBR_VIRTUALIZATION_ENABLE: u64 = 1 << 0;
 const VMCB_NEXT_RIP: u64 = 0xc8;
 
 // State save area (starts at 0x400); each segment is selector u16, attrib u16, limit u32, base u64.
@@ -84,6 +108,10 @@ const SAVE_CR2: u64 = 0x640;
 const SAVE_RSP: u64 = 0x5d8;
 const SAVE_RAX: u64 = 0x5f8;
 const SAVE_G_PAT: u64 = 0x668;
+/// DEBUGCTL and the four branch record MSRs, in `MSR_LAST_BRANCH_FROM_IP` order: swapped only
+/// under LBR virtualization.
+const SAVE_DEBUGCTL: u64 = 0x670;
+const SAVE_LAST_BRANCHES: [u64; LAST_BRANCH_MSRS] = [0x678, 0x680, 0x688, 0x690];
 
 const SEGMENT_SELECTOR: u64 = 0;
 const SEGMENT_ATTRIB: u64 = 2;
@@ -92,6 +120,11 @@ const SEGMENT_BASE: u64 = 8;
 
 // Intercept vector 3 (VMCB 0x0c).
 const INTERCEPT_INTR: u32 = 1 << 0;
+const INTERCEPT_NMI: u32 = 1 << 1;
+/// Accepted and never taken: nothing raises an SMI (there is no SMM), so only the tests name it.
+#[cfg(test)]
+const INTERCEPT_SMI: u32 = 1 << 2;
+const INTERCEPT_INIT: u32 = 1 << 3;
 const INTERCEPT_VINTR: u32 = 1 << 4;
 const INTERCEPT_CR0_SELECTIVE_WRITE: u32 = 1 << 5;
 const INTERCEPT_IDTR_READ: u32 = 1 << 6;
@@ -116,6 +149,7 @@ const INTERCEPT_INVLPG: u32 = 1 << 25;
 const INTERCEPT_INVLPGA: u32 = 1 << 26;
 const INTERCEPT_IOIO_PROT: u32 = 1 << 27;
 const INTERCEPT_MSR_PROT: u32 = 1 << 28;
+const INTERCEPT_TASK_SWITCH: u32 = 1 << 29;
 const INTERCEPT_SHUTDOWN: u32 = 1 << 31;
 // Intercept vector 4 (VMCB 0x10).
 const INTERCEPT_VMRUN: u32 = 1 << 0;
@@ -138,6 +172,10 @@ pub(crate) const VMEXIT_DR_READ: u64 = 0x20;
 pub(crate) const VMEXIT_DR_WRITE: u64 = 0x30;
 pub(crate) const VMEXIT_EXCEPTION: u64 = 0x40;
 pub(crate) const VMEXIT_INTR: u64 = 0x60;
+const VMEXIT_NMI: u64 = 0x61;
+#[cfg(test)]
+const VMEXIT_SMI: u64 = 0x62;
+const VMEXIT_INIT: u64 = 0x63;
 pub(crate) const VMEXIT_VINTR: u64 = 0x64;
 pub(crate) const VMEXIT_CR0_SELECTIVE_WRITE: u64 = 0x65;
 const VMEXIT_IDTR_READ: u64 = 0x66;
@@ -162,6 +200,7 @@ const VMEXIT_INVLPG: u64 = 0x79;
 const VMEXIT_INVLPGA: u64 = 0x7a;
 const VMEXIT_IOIO: u64 = 0x7b;
 const VMEXIT_MSR: u64 = 0x7c;
+const VMEXIT_TASK_SWITCH: u64 = 0x7d;
 const VMEXIT_SHUTDOWN: u64 = 0x7f;
 const VMEXIT_VMRUN: u64 = 0x80;
 const VMEXIT_VMMCALL: u64 = 0x81;
@@ -177,6 +216,13 @@ const VMEXIT_MWAIT: u64 = 0x8b;
 const VMEXIT_XSETBV: u64 = 0x8d;
 pub(crate) const VMEXIT_NPF: u64 = 0x400;
 pub(crate) const VMEXIT_INVALID: u64 = u64::MAX;
+
+// Task switch exit information (EXITINFO2; EXITINFO1 is the target TSS selector). A switch
+// through a task gate during event delivery sets neither reason bit and reports the event in
+// EXITINTINFO.
+const TASK_SWITCH_BY_IRET: u64 = 1 << 36;
+const TASK_SWITCH_BY_JUMP: u64 = 1 << 38;
+const TASK_SWITCH_ERROR_CODE_VALID: u64 = 1 << 44;
 
 // IOIO exit information (EXITINFO1).
 const IOIO_IN: u64 = 1 << 0;
@@ -201,7 +247,7 @@ const EVENTINJ_VECTOR_MASK: u32 = 0xff;
 const EVENTINJ_TYPE_SHIFT: u32 = 8;
 const EVENTINJ_TYPE_MASK: u32 = 7;
 pub(super) const EVENT_TYPE_INTERRUPT: u32 = 0;
-const EVENT_TYPE_NMI: u32 = 2;
+pub(super) const EVENT_TYPE_NMI: u32 = 2;
 pub(super) const EVENT_TYPE_EXCEPTION: u32 = 3;
 pub(super) const EVENT_TYPE_SOFTWARE: u32 = 4;
 
@@ -234,15 +280,32 @@ const CR0_PE_BIT: u64 = 1;
 /// the set because a KVM guest that sees automatic IBRS turns it on and KVM passes its EFER on.
 const EFER_KNOWN: u64 = EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE | EFER_SVME | EFER_AIBRSE;
 const DR_HIGH_BITS: u64 = !0u64 << 32;
-/// Number of ASIDs reported in CPUID 0x8000000A; any non-zero ASID in a VMCB is accepted.
-pub(crate) const SVM_ASIDS: u32 = 64;
+/// Number of ASIDs reported in CPUID 0x8000000A, Turin's. Nothing is sized by it: any non-zero
+/// ASID in a VMCB is accepted, and only the last guest's TLB is kept (`ParkedTlb`).
+pub(crate) const SVM_ASIDS: u32 = 32768;
 /// The host's ASID; a VMCB may not use it.
 const HOST_ASID: u32 = 0;
 
-/// CPUID 0x8000000A EDX: nested paging, next-RIP save, VMCB clean bits (every VMRUN reloads the
-/// whole VMCB, which clean bits permit), flush-by-ASID (any non-zero TLB_CONTROL empties the
-/// guest's whole TLB, `ParkedTlb`).
-pub(crate) const SVM_FEATURES: u32 = (1 << 0) | (1 << 3) | (1 << 5) | (1 << 6);
+const SVM_FEATURE_NESTED_PAGING: u32 = 1 << 0;
+const SVM_FEATURE_LBR_VIRTUALIZATION: u32 = 1 << 1;
+const SVM_FEATURE_SVM_LOCK: u32 = 1 << 2;
+const SVM_FEATURE_NEXT_RIP_SAVE: u32 = 1 << 3;
+const SVM_FEATURE_TSC_RATIO: u32 = 1 << 4;
+const SVM_FEATURE_VMCB_CLEAN_BITS: u32 = 1 << 5;
+const SVM_FEATURE_FLUSH_BY_ASID: u32 = 1 << 6;
+const SVM_FEATURE_PAUSE_FILTER: u32 = 1 << 10;
+const SVM_FEATURE_PAUSE_FILTER_THRESHOLD: u32 = 1 << 12;
+/// CPUID 0x8000000A EDX. VMCB clean bits: every VMRUN reloads the whole VMCB, which clean bits
+/// permit. Flush-by-ASID: any non-zero TLB_CONTROL empties the guest's whole TLB (`ParkedTlb`).
+pub(crate) const SVM_FEATURES: u32 = SVM_FEATURE_NESTED_PAGING
+    | SVM_FEATURE_LBR_VIRTUALIZATION
+    | SVM_FEATURE_SVM_LOCK
+    | SVM_FEATURE_NEXT_RIP_SAVE
+    | SVM_FEATURE_TSC_RATIO
+    | SVM_FEATURE_VMCB_CLEAN_BITS
+    | SVM_FEATURE_FLUSH_BY_ASID
+    | SVM_FEATURE_PAUSE_FILTER
+    | SVM_FEATURE_PAUSE_FILTER_THRESHOLD;
 
 /// What `vmrun` saved of the host, and restores at #VMEXIT. The other registers (including all
 /// GPRs but RAX/RSP) are deliberately *not* here: the hypervisor swaps those itself.
@@ -261,6 +324,9 @@ struct Host {
     dr6: u64,
     dr7: u64,
     pdpte: [u64; 4],
+    /// DEBUGCTL and the branch records, put back at #VMEXIT under LBR virtualization.
+    debugctl: u64,
+    last_branches: [u64; LAST_BRANCH_MSRS],
 }
 
 /// The guest being run: the intercepts read from its VMCB at `vmrun` time (the hypervisor cannot
@@ -285,6 +351,23 @@ pub(crate) struct Guest {
     virtual_priority: u8,
     ignore_tpr: bool,
     virtual_tpr: u8,
+    /// The VMCB's DEBUGCTL and branch records are the guest's own (swapped at VMRUN and #VMEXIT).
+    lbr_virtualization: bool,
+    pause_filter: PauseFilter,
+}
+
+/// The PAUSE intercept's filter (APM 15.14.4): a guest spinning on `pause` exits only after
+/// `count` of them, and with a threshold, only if they come less than `threshold` cycles apart
+/// (a pause after a longer gap restarts the count: the guest is not spinning). A count of 0 is no
+/// filter. KVM uses this to tell a vCPU waiting for a preempted lock holder from one that merely
+/// pauses now and then.
+struct PauseFilter {
+    count: u16,
+    threshold: u16,
+    /// Pauses left before the one that exits; loaded from `count` at VMRUN.
+    remaining: u16,
+    /// Host time (one cycle per nanosecond) of the last pause, or of VMRUN.
+    last_pause_ns: u64,
 }
 
 /// SVM state of the CPU.
@@ -293,6 +376,12 @@ pub(crate) struct Svm {
     pub(crate) vm_cr: u64,
     /// Global interrupt flag: clear while the host handles a #VMEXIT (`clgi`).
     pub(crate) gif: bool,
+    /// SVM-Lock key: `MSR_SVM_KEY` written while unlocked, compared while locked.
+    key: u64,
+    tsc_ratio: u64,
+    /// DEBUGCTL lives in `Cpu::msr_misc`; these are the other LBR MSRs (`MSR_LAST_BRANCH_FROM_IP`
+    /// on).
+    pub(crate) last_branches: [u64; LAST_BRANCH_MSRS],
     pub(crate) guest: Option<Box<Guest>>,
     /// The VMCB of the guest that exited last, so an exit that happened while delivering an event
     /// can still report that event (`exit_int_info`).
@@ -306,11 +395,55 @@ pub(crate) struct Svm {
 }
 
 impl Svm {
+    /// The state after INIT: no guest and GIF set, but the MSRs keep their values, except that
+    /// VM_CR.SVMDIS clears unless VM_CR.LOCK is set (APM 15.30.1).
+    pub(crate) fn after_init(&self) -> Self {
+        let vm_cr = if self.vm_cr & VM_CR_LOCK != 0 {
+            self.vm_cr
+        } else {
+            self.vm_cr & !VM_CR_SVMDIS
+        };
+        Svm {
+            hsave_pa: self.hsave_pa,
+            vm_cr,
+            key: self.key,
+            tsc_ratio: self.tsc_ratio,
+            last_branches: self.last_branches,
+            ..Svm::new()
+        }
+    }
+
+    pub(crate) fn tsc_ratio(&self) -> u64 {
+        self.tsc_ratio
+    }
+
+    pub(crate) fn write_tsc_ratio(&mut self, ratio: u64) -> ExecResult<()> {
+        if ratio & TSC_RATIO_RESERVED != 0 {
+            return Err(Exception::general_protection(0));
+        }
+        self.tsc_ratio = ratio;
+        Ok(())
+    }
+
+    /// SVM_KEY (APM 15.31): unlocked, a write sets the key; locked, writing the key (if one was
+    /// set: a lock taken with no key holds until reset) clears VM_CR.LOCK. Anything else is
+    /// ignored.
+    pub(crate) fn write_key(&mut self, value: u64) {
+        if self.vm_cr & VM_CR_LOCK == 0 {
+            self.key = value;
+        } else if self.key != 0 && value == self.key {
+            self.vm_cr &= !VM_CR_LOCK;
+        }
+    }
+
     pub(crate) fn new() -> Self {
         Svm {
             hsave_pa: 0,
             vm_cr: 0,
             gif: true,
+            key: 0,
+            tsc_ratio: TSC_RATIO_ONE,
+            last_branches: [0; LAST_BRANCH_MSRS],
             guest: None,
             last_vmcb: 0,
             parked_tlb: None,
@@ -525,6 +658,32 @@ fn flags_to_attrib(flags: u32) -> u16 {
 impl Cpu {
     pub(crate) fn svm_enabled(&self) -> bool {
         self.efer & EFER_SVME != 0
+    }
+
+    /// VM_CR (APM 15.30.1): while LOCK is set, writes to LOCK and SVMDIS are ignored; SVMDIS
+    /// cannot be set under EFER.SVME, locked or not.
+    pub(crate) fn write_vm_cr(&mut self, value: u64) -> ExecResult<()> {
+        if value & !VM_CR_WRITABLE != 0 || (value & VM_CR_SVMDIS != 0 && self.svm_enabled()) {
+            return Err(Exception::general_protection(0));
+        }
+        let frozen = if self.svm.vm_cr & VM_CR_LOCK != 0 {
+            VM_CR_LOCK | VM_CR_SVMDIS
+        } else {
+            0
+        };
+        self.svm.vm_cr = (self.svm.vm_cr & frozen) | (value & !frozen);
+        Ok(())
+    }
+
+    fn debugctl(&self) -> u64 {
+        self.msr_misc
+            .get(&super::sys::MSR_DEBUGCTL)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn set_debugctl(&mut self, value: u64) {
+        self.msr_misc.insert(super::sys::MSR_DEBUGCTL, value);
     }
 
     fn vmcb_read(&mut self, base: u64, offset: u64, size: u8) -> u64 {
@@ -763,9 +922,20 @@ impl Cpu {
             dr6: self.dr[6],
             dr7: self.dr[7],
             pdpte: self.pdpte,
+            debugctl: self.debugctl(),
+            last_branches: self.svm.last_branches,
         };
         let v_intr = self.vmcb_read(vmcb, VMCB_V_INTR, 8);
         let nested = self.vmcb_read(vmcb, VMCB_NP_ENABLE, 8) & NP_ENABLE != 0;
+        let lbr_virtualization =
+            self.vmcb_read(vmcb, VMCB_VIRTUAL_EXTENSIONS, 8) & LBR_VIRTUALIZATION_ENABLE != 0;
+        let pause_filter_count = self.vmcb_read(vmcb, VMCB_PAUSE_FILTER_COUNT, 2) as u16;
+        let pause_filter = PauseFilter {
+            count: pause_filter_count,
+            threshold: self.vmcb_read(vmcb, VMCB_PAUSE_FILTER_THRESHOLD, 2) as u16,
+            remaining: pause_filter_count,
+            last_pause_ns: self.now_ns(),
+        };
         let guest = Guest {
             vmcb,
             asid: asid as u32,
@@ -784,6 +954,8 @@ impl Cpu {
             virtual_priority: ((v_intr >> V_PRIORITY_SHIFT) & V_PRIORITY_MASK) as u8,
             ignore_tpr: v_intr & V_IGNORE_TPR != 0,
             virtual_tpr: v_intr as u8,
+            lbr_virtualization,
+            pause_filter,
         };
         if self.trace.is_some() {
             let guest_rip = self.vmcb_read(vmcb, SAVE_RIP, 8);
@@ -824,6 +996,13 @@ impl Cpu {
         if nested {
             self.pat = self.vmcb_read(vmcb, SAVE_G_PAT, 8);
         }
+        if lbr_virtualization {
+            let debugctl = self.vmcb_read(vmcb, SAVE_DEBUGCTL, 8);
+            self.set_debugctl(debugctl);
+            for (k, offset) in SAVE_LAST_BRANCHES.into_iter().enumerate() {
+                self.svm.last_branches[k] = self.vmcb_read(vmcb, offset, 8);
+            }
+        }
         self.interrupt_shadow =
             self.vmcb_read(vmcb, VMCB_INTERRUPT_SHADOW, 8) & INTERRUPT_SHADOW != 0;
         self.halted = false;
@@ -856,7 +1035,7 @@ impl Cpu {
             let error_code = (event & EVENTINJ_ERROR_VALID != 0).then_some(error);
             let reason = match (event >> EVENTINJ_TYPE_SHIFT) & EVENTINJ_TYPE_MASK {
                 EVENT_TYPE_INTERRUPT => self.deliver_hardware_interrupt(vector),
-                EVENT_TYPE_NMI => self.deliver_event(2, None, false),
+                EVENT_TYPE_NMI => self.deliver_event(NMI_VECTOR, None, false),
                 EVENT_TYPE_EXCEPTION => self.deliver_event(vector, error_code, false),
                 EVENT_TYPE_SOFTWARE => self.deliver_event(vector, None, true),
                 _ => None,
@@ -932,6 +1111,12 @@ impl Cpu {
         if guest.nested_cr3.is_some() {
             self.vmcb_write(vmcb, SAVE_G_PAT, 8, self.pat);
         }
+        if guest.lbr_virtualization {
+            self.vmcb_write(vmcb, SAVE_DEBUGCTL, 8, self.debugctl());
+            for (k, offset) in SAVE_LAST_BRANCHES.into_iter().enumerate() {
+                self.vmcb_write(vmcb, offset, 8, self.svm.last_branches[k]);
+            }
+        }
         self.vmcb_write(
             vmcb,
             VMCB_INTERRUPT_SHADOW,
@@ -973,6 +1158,10 @@ impl Cpu {
         self.dr[6] = host.dr6;
         self.dr[7] = host.dr7;
         self.pdpte = host.pdpte;
+        if guest.lbr_virtualization {
+            self.set_debugctl(host.debugctl);
+            self.svm.last_branches = host.last_branches;
+        }
         self.eflags = (host.eflags & !(VM | RF)) | RESERVED_ONE;
         self.lazy_op = LazyFlagsOp::Eflags;
         self.rip = host.rip;
@@ -999,9 +1188,38 @@ impl Cpu {
         self.vmcb_write(vmcb, VMCB_EXIT_INT_INFO, 4, info as u64);
     }
 
-    /// The guest's time stamp counter is the host's plus the VMCB offset.
-    pub(crate) fn svm_tsc_offset(&self) -> u64 {
-        self.svm.guest.as_ref().map_or(0, |guest| guest.tsc_offset)
+    /// The time stamp counter as the running side sees it: `host_tsc` for the host, scaled by
+    /// TSC_RATIO and then offset by the VMCB for a guest.
+    pub(crate) fn svm_visible_tsc(&self, host_tsc: u64) -> u64 {
+        match &self.svm.guest {
+            None => host_tsc,
+            Some(guest) => {
+                let scaled =
+                    (host_tsc as u128 * self.svm.tsc_ratio as u128) >> TSC_RATIO_FRACTION_BITS;
+                (scaled as u64).wrapping_add(guest.tsc_offset)
+            }
+        }
+    }
+
+    /// The pause filter's verdict on a guest `pause` under the PAUSE intercept: true when it
+    /// exits.
+    fn pause_filter_exhausted(&mut self) -> bool {
+        let now = self.now_ns();
+        let Some(guest) = self.svm.guest.as_deref_mut() else {
+            return false;
+        };
+        let filter = &mut guest.pause_filter;
+        if filter.count == 0 {
+            return true;
+        }
+        if filter.threshold != 0
+            && now.saturating_sub(filter.last_pause_ns) > filter.threshold as u64
+        {
+            filter.remaining = filter.count;
+        }
+        filter.last_pause_ns = now;
+        filter.remaining = filter.remaining.saturating_sub(1);
+        filter.remaining == 0
     }
 
     /// Whether the running guest intercepts exception `vector`; performs the #VMEXIT if so.
@@ -1049,9 +1267,80 @@ impl Cpu {
         }
     }
 
-    /// Housekeeping before each guest instruction: physical interrupts (INTR intercept) and virtual
-    /// interrupts. Returns true when a #VMEXIT happened.
+    /// An INIT for a guest that intercepts it: performs the #VMEXIT and leaves the INIT pending.
+    /// Returns true when it did.
+    pub(crate) fn svm_init_exit(&mut self) -> bool {
+        let intercepted = self
+            .svm
+            .guest
+            .as_ref()
+            .is_some_and(|guest| guest.intercept3 & INTERCEPT_INIT != 0);
+        let index = self.cpu_index as usize;
+        if !intercepted || !self.dev.lock().lapic_of(index).init_pending() {
+            return false;
+        }
+        let next = self.rip;
+        self.vmexit(VMEXIT_INIT, 0, 0, next);
+        true
+    }
+
+    /// The task switch intercept, at the start of a switch to the TSS `selector`. `return_eip`
+    /// is the address after the instruction that switches (meaningless for a gate), and
+    /// `error_code` the one an exception delivered through a task gate pushes. A gate's event
+    /// goes into EXITINTINFO on the way out (`deliver_chain`), which is how KVM and Xen tell a
+    /// gate from a `call`.
+    pub(super) fn svm_task_switch_intercept(
+        &mut self,
+        selector: u16,
+        source: super::legacy_flow::TaskSwitchSource,
+        return_eip: u64,
+        error_code: Option<u32>,
+    ) -> ExecResult<()> {
+        use super::legacy_flow::TaskSwitchSource;
+        if !self
+            .svm
+            .guest
+            .as_ref()
+            .is_some_and(|guest| guest.intercept3 & INTERCEPT_TASK_SWITCH != 0)
+        {
+            return Ok(());
+        }
+        let reason = match source {
+            TaskSwitchSource::Return => TASK_SWITCH_BY_IRET,
+            TaskSwitchSource::Jump => TASK_SWITCH_BY_JUMP,
+            TaskSwitchSource::Call | TaskSwitchSource::Gate => 0,
+        };
+        let error = error_code.map_or(0, |code| TASK_SWITCH_ERROR_CODE_VALID | code as u64);
+        let next_rip = if source == TaskSwitchSource::Gate {
+            0
+        } else {
+            return_eip
+        };
+        Err(self.vmexit(
+            VMEXIT_TASK_SWITCH,
+            selector as u64,
+            reason | error,
+            next_rip,
+        ))
+    }
+
+    /// Housekeeping before each guest instruction: physical NMIs and interrupts (the NMI and INTR
+    /// intercepts) and virtual interrupts. Returns true when a #VMEXIT happened.
+    ///
+    /// An intercepted NMI or interrupt is the host's: it stays pending, the exit clears GIF, and
+    /// the host takes it once it sets GIF again (APM 15.17). The NMI comes first, as it would be
+    /// delivered first. Without its intercept a physical NMI goes to the guest through the guest's
+    /// IDT (`before_step`), which is what hardware does, and which a hypervisor that always sets
+    /// the intercept (KVM, Xen) never expects.
     pub(crate) fn svm_before_step(&mut self) -> bool {
+        let Some(guest) = &self.svm.guest else {
+            return false;
+        };
+        if guest.intercept3 & INTERCEPT_NMI != 0 && self.nmi_recognized() {
+            let next = self.rip;
+            self.vmexit(VMEXIT_NMI, 0, 0, next);
+            return true;
+        }
         let Some(guest) = &self.svm.guest else {
             return false;
         };
@@ -1129,7 +1418,10 @@ impl Cpu {
             0x108 => simple(VMEXIT_INVD, v3 & INTERCEPT_INVD != 0),
             0x109 => simple(VMEXIT_WBINVD, v4 & INTERCEPT_WBINVD != 0),
             // pause is `f3 90`
-            0x90 if i.rep == 1 => simple(VMEXIT_PAUSE, v3 & INTERCEPT_PAUSE != 0),
+            0x90 if i.rep == 1 => simple(
+                VMEXIT_PAUSE,
+                v3 & INTERCEPT_PAUSE != 0 && self.pause_filter_exhausted(),
+            ),
             0x132 | 0x130 => {
                 let write = op == 0x130;
                 if v3 & INTERCEPT_MSR_PROT != 0
@@ -1423,6 +1715,7 @@ mod tests {
     use super::*;
     use crate::cpu::BeforeStep;
     use crate::cpu::mem::AccessKind;
+    use crate::cpu::sys::{MSR_DEBUGCTL, MSR_EFER};
     use crate::cpu::test_support::{LegacyTables, PTE_P, PaeTables};
     use crate::testkit::RBX;
     use crate::testkit::{CODE_BASE, Harness, SCRATCH};
@@ -1981,6 +2274,135 @@ mod tests {
         assert_guest_exited_on_cpuid(&h, GUEST_CODE + 5);
     }
 
+    /// A 32-bit protected-mode guest with its own GDT (flat code at 8 and data at 16, as
+    /// `set_guest_mode` loads them, the running task's TSS at `TSS_RUNNING`, an available one at
+    /// `TSS_TARGET`) and a 32-bit IDT whose vector 13 is a task gate to `TSS_TARGET`.
+    fn task_switch_rig(guest_code: &[u8]) -> Harness {
+        use crate::cpu::test_support::descriptor;
+        const GDT: u64 = 0x61_0000;
+        const IDT32: u64 = 0x62_0000;
+        const TSS_TYPE_32_AVAILABLE: u8 = 0x89;
+        const TSS_TYPE_32_BUSY: u8 = 0x8b;
+        const TASK_GATE: u64 = 0x85 << 40;
+        const FLAT_4GIB: u8 = 0xc;
+        let mut h = rig(guest_code);
+        set_guest_mode(&mut h, 0, CR0_PE_BIT, 0, 0, FLAT_CODE32);
+        for (selector, entry) in [
+            (8, descriptor(0, 0xfffff, 0x9a, FLAT_4GIB)),
+            (16, descriptor(0, 0xfffff, 0x92, FLAT_4GIB)),
+            (
+                TSS_RUNNING,
+                descriptor(TSS_RUNNING_BASE as u32, 0x67, TSS_TYPE_32_BUSY, 0),
+            ),
+            (
+                TSS_TARGET,
+                descriptor(TSS_TARGET_BASE as u32, 0x67, TSS_TYPE_32_AVAILABLE, 0),
+            ),
+        ] {
+            h.write(GDT + selector as u64, &entry.to_le_bytes());
+        }
+        put(&mut h, SAVE_GDTR + SEGMENT_LIMIT, 4, 0x27);
+        put(&mut h, SAVE_GDTR + SEGMENT_BASE, 8, GDT);
+        let gate = TASK_GATE | ((TSS_TARGET as u64) << 16);
+        h.write(IDT32 + 13 * 8, &gate.to_le_bytes());
+        put(&mut h, SAVE_IDTR + SEGMENT_LIMIT, 4, 0xff);
+        put(&mut h, SAVE_IDTR + SEGMENT_BASE, 8, IDT32);
+        // VMRUN leaves TR alone (VMLOAD loads it), so the guest runs on the live one
+        h.cpu.tr = Seg {
+            sel: TSS_RUNNING,
+            base: TSS_RUNNING_BASE,
+            limit: 0x67,
+            flags: (TSS_TYPE_32_BUSY as u32) << 8,
+        };
+        put(
+            &mut h,
+            VMCB_INTERCEPT3,
+            4,
+            (INTERCEPT_CPUID | INTERCEPT_TASK_SWITCH) as u64,
+        );
+        h
+    }
+
+    const TSS_RUNNING: u16 = 0x18;
+    const TSS_TARGET: u16 = 0x20;
+    const TSS_RUNNING_BASE: u64 = 0x63_0000;
+    const TSS_TARGET_BASE: u64 = 0x63_1000;
+
+    fn assert_no_task_switch(h: &Harness) {
+        assert_eq!(h.cpu.tr.sel, TSS_RUNNING, "the switch did not happen");
+        assert_eq!(
+            h.read(TSS_TARGET_BASE, 4),
+            [0; 4],
+            "nothing was written to the incoming TSS"
+        );
+    }
+
+    #[test]
+    fn a_task_switch_by_jump_exits_before_switching() {
+        let jump_to_tss = [0xea, 0, 0, 0, 0, TSS_TARGET as u8, 0]; // jmp far TSS_TARGET:0
+        let mut h = task_switch_rig(&jump_to_tss);
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_TASK_SWITCH);
+        assert_eq!(get(&h, VMCB_EXITINFO1, 8), TSS_TARGET as u64);
+        assert_eq!(get(&h, VMCB_EXITINFO2, 8), TASK_SWITCH_BY_JUMP);
+        assert_eq!(get(&h, SAVE_RIP, 8), GUEST_CODE);
+        assert_eq!(get(&h, VMCB_NEXT_RIP, 8), GUEST_CODE + 7);
+        assert_no_task_switch(&h);
+        // without the intercept the guest switches tasks
+        let mut h = task_switch_rig(&jump_to_tss);
+        put(&mut h, VMCB_INTERCEPT3, 4, INTERCEPT_CPUID as u64);
+        let mut tss = [0u8; 0x68];
+        tss[32..36].copy_from_slice(&((GUEST_CODE + 0x100) as u32).to_le_bytes());
+        tss[36..40].copy_from_slice(&2u32.to_le_bytes());
+        for offset in [72, 80, 84] {
+            tss[offset..offset + 4].copy_from_slice(&16u32.to_le_bytes());
+        }
+        tss[76..80].copy_from_slice(&8u32.to_le_bytes());
+        h.write(TSS_TARGET_BASE, &tss);
+        h.write(GUEST_CODE + 0x100, ASM_CPUID);
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_CPUID);
+        assert_eq!(get(&h, SAVE_RIP, 8), GUEST_CODE + 0x100);
+        assert_eq!(h.cpu.tr.sel, TSS_TARGET);
+    }
+
+    #[test]
+    fn a_task_switch_by_iret_exits_with_the_linked_tss() {
+        let mut h = task_switch_rig(&[0xcf]); // iret
+        put(&mut h, SAVE_RFLAGS, 8, RESERVED_ONE | NT);
+        h.write(TSS_RUNNING_BASE, &TSS_TARGET.to_le_bytes());
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_TASK_SWITCH);
+        assert_eq!(get(&h, VMCB_EXITINFO1, 8), TSS_TARGET as u64);
+        assert_eq!(get(&h, VMCB_EXITINFO2, 8), TASK_SWITCH_BY_IRET);
+        assert_eq!(get(&h, SAVE_RIP, 8), GUEST_CODE);
+        assert_eq!(get(&h, VMCB_NEXT_RIP, 8), GUEST_CODE + 1);
+        assert_no_task_switch(&h);
+    }
+
+    #[test]
+    fn a_task_switch_through_a_gate_reports_the_event_and_its_error_code() {
+        const GENERAL_PROTECTION: u32 = 13;
+        let mut h = task_switch_rig(ASM_CPUID);
+        let event = EVENTINJ_VALID
+            | (EVENT_TYPE_EXCEPTION << EVENTINJ_TYPE_SHIFT)
+            | GENERAL_PROTECTION
+            | EVENTINJ_ERROR_VALID;
+        put(&mut h, VMCB_EVENTINJ, 4, event as u64);
+        put(&mut h, VMCB_EVENTINJ_ERROR, 4, 0x1234);
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_TASK_SWITCH);
+        assert_eq!(get(&h, VMCB_EXITINFO1, 8), TSS_TARGET as u64);
+        assert_eq!(
+            get(&h, VMCB_EXITINFO2, 8),
+            TASK_SWITCH_ERROR_CODE_VALID | 0x1234
+        );
+        assert_eq!(get(&h, VMCB_EXIT_INT_INFO, 4), event as u64);
+        assert_eq!(get(&h, VMCB_EXIT_INT_INFO_ERROR, 4), 0x1234);
+        assert_eq!(get(&h, SAVE_RIP, 8), GUEST_CODE, "the guest ran nothing");
+        assert_no_task_switch(&h);
+    }
+
     #[test]
     fn a_real_mode_guest_runs_with_sixteen_bit_decoding() {
         // mov eax, 0x5aa5 (operand-size prefix); cpuid
@@ -2164,6 +2586,125 @@ mod tests {
         );
     }
 
+    /// Executes the host's `vmrun`, so that what the test raises next arrives while the guest runs.
+    fn enter_guest(h: &mut Harness) {
+        h.cpu.step().unwrap();
+        assert!(h.cpu.svm.guest.is_some(), "vmrun failed");
+    }
+
+    /// Raises an NMI at the (only) local APIC, as an NMI IPI or the LINT1 pin would.
+    fn raise_nmi(h: &mut Harness) {
+        use crate::dev::apic::{DELIVERY_NMI, Interrupt};
+        h.cpu.dev.lock().lapic_of(0).accept_addressed(&Interrupt {
+            vector: 0,
+            delivery_mode: DELIVERY_NMI,
+            level_triggered: false,
+            destination: 0,
+            logical: false,
+        });
+    }
+
+    #[test]
+    fn an_nmi_for_the_host_exits_the_guest_when_intercepted() {
+        // KVM always sets the NMI intercept: an NMI that arrives while its guest runs is the
+        // host's, and must not run the guest's NMI handler. The handler here would stop on its
+        // cpuid with rbx = 0x77.
+        let handler = GUEST_CODE + 0x100;
+        let mut h = rig(&[0x90, 0x90, 0x90, 0x0f, 0xa2]);
+        h.write(handler, &[0xbb, 0x77, 0, 0, 0, 0x0f, 0xa2]);
+        let cs = h.cpu.seg[SEG_CS].sel;
+        install_idt_gate(&mut h, NMI_VECTOR, handler, cs);
+        put(&mut h, SAVE_IDTR + SEGMENT_LIMIT, 4, 0x4ff);
+        put(&mut h, SAVE_IDTR + SEGMENT_BASE, 8, IDT);
+        put(
+            &mut h,
+            VMCB_INTERCEPT3,
+            4,
+            (INTERCEPT_CPUID | INTERCEPT_NMI) as u64,
+        );
+        h.cpu.gpr[3] = 0;
+        enter_guest(&mut h);
+        raise_nmi(&mut h);
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_NMI);
+        assert_eq!(
+            get(&h, SAVE_RIP, 8),
+            GUEST_CODE,
+            "taken before the first instruction"
+        );
+        assert_eq!(h.cpu.gpr[3], 0, "the guest's NMI handler did not run");
+        assert!(
+            h.cpu.dev.lock().nmi_pending(),
+            "the NMI stays pending for the host, held while GIF is clear"
+        );
+        assert!(!h.cpu.nmi_blocked);
+        // without the intercept the NMI is the guest's
+        let mut h = rig(&[0x90, 0x90, 0x90, 0x0f, 0xa2]);
+        h.write(handler, &[0xbb, 0x77, 0, 0, 0, 0x0f, 0xa2]);
+        install_idt_gate(&mut h, NMI_VECTOR, handler, cs);
+        put(&mut h, SAVE_IDTR + SEGMENT_LIMIT, 4, 0x4ff);
+        put(&mut h, SAVE_IDTR + SEGMENT_BASE, 8, IDT);
+        enter_guest(&mut h);
+        raise_nmi(&mut h);
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_CPUID);
+        assert_eq!(h.cpu.gpr[3], 0x77, "the guest took its NMI");
+    }
+
+    fn raise_init(h: &mut Harness) {
+        use crate::dev::apic::{DELIVERY_INIT, Interrupt};
+        h.cpu.dev.lock().lapic_of(0).accept_addressed(&Interrupt {
+            vector: 0,
+            delivery_mode: DELIVERY_INIT,
+            level_triggered: false,
+            destination: 0,
+            logical: false,
+        });
+    }
+
+    #[test]
+    fn an_init_exits_the_guest_when_intercepted_and_waits_for_gif() {
+        const HSAVE: u64 = 0x3e_0000;
+        let mut h = rig(&[0x90, 0x90, 0x0f, 0xa2]);
+        h.cpu.wrmsr(MSR_VM_HSAVE_PA, HSAVE).unwrap();
+        put(
+            &mut h,
+            VMCB_INTERCEPT3,
+            4,
+            (INTERCEPT_CPUID | INTERCEPT_INIT | INTERCEPT_SMI) as u64,
+        );
+        enter_guest(&mut h);
+        raise_init(&mut h);
+        h.cpu.apply_start_signals();
+        assert!(h.cpu.svm.guest.is_none());
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_INIT);
+        assert_eq!(get(&h, SAVE_RIP, 8), GUEST_CODE);
+        assert!(!h.cpu.wait_for_sipi, "the host is not reset");
+        // held while GIF is clear: the hypervisor's exit handler runs undisturbed
+        h.cpu.apply_start_signals();
+        assert!(!h.cpu.wait_for_sipi);
+        assert!(h.cpu.dev.lock().lapic_of(0).start_signal_pending());
+        // `stgi` lets it in
+        h.cpu.svm.gif = true;
+        h.cpu.apply_start_signals();
+        assert!(h.cpu.wait_for_sipi, "INIT reset the processor");
+        assert!(!h.cpu.dev.lock().lapic_of(0).start_signal_pending());
+        assert_eq!(
+            h.cpu.rdmsr(MSR_VM_HSAVE_PA).unwrap(),
+            HSAVE,
+            "INIT keeps the MSRs"
+        );
+        // without the intercept the INIT resets the processor out of the guest
+        let mut h = rig(&[0x90, 0x90, 0x0f, 0xa2]);
+        enter_guest(&mut h);
+        raise_init(&mut h);
+        h.cpu.apply_start_signals();
+        assert!(h.cpu.svm.guest.is_none());
+        assert!(h.cpu.wait_for_sipi);
+        assert_ne!(get(&h, VMCB_EXITCODE, 8), VMEXIT_INIT);
+        assert_ne!(get(&h, VMCB_EXITCODE, 8), VMEXIT_SMI);
+    }
+
     #[test]
     fn vmload_and_vmsave_move_the_state_vmrun_leaves_alone() {
         let mut h = Harness::new(&[0x0f, 0x01, 0xdb, 0x0f, 0x01, 0xda, 0xf4]); // vmsave; vmload; hlt
@@ -2284,6 +2825,226 @@ mod tests {
             h.cpu.tsc() < 1_000_000_000,
             "the host's counter is unchanged"
         );
+    }
+
+    /// rdtsc; mov ebx, eax; mov ecx, edx; cpuid: the guest's TSC ends up in ecx:ebx.
+    const GUEST_READS_TSC: &[u8] = &[0x0f, 0x31, 0x89, 0xc3, 0x89, 0xd1, 0x0f, 0xa2];
+    const ONE_SECOND_NS: u64 = 1_000_000_000;
+
+    /// What the guest read with `GUEST_READS_TSC`, the host clock starting at one second.
+    fn guest_tsc_with_ratio(ratio: u64, offset: u64) -> (u64, Harness) {
+        let mut h = rig(GUEST_READS_TSC);
+        h.cpu.time_base_ns = ONE_SECOND_NS;
+        h.cpu.wrmsr(MSR_TSC_RATIO, ratio).unwrap();
+        put(&mut h, VMCB_TSC_OFFSET, 8, offset);
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_CPUID);
+        ((h.cpu.gpr[1] << 32) | (h.cpu.gpr[3] & 0xffff_ffff), h)
+    }
+
+    #[test]
+    fn the_tsc_ratio_scales_guest_reads_before_the_offset() {
+        let mut h = Harness::new(ASM_HLT);
+        assert_eq!(h.cpu.rdmsr(MSR_TSC_RATIO).unwrap(), TSC_RATIO_ONE);
+        assert!(
+            h.cpu.wrmsr(MSR_TSC_RATIO, 1 << 40).is_err(),
+            "bits 63:40 are reserved"
+        );
+        // a guest whose TSC runs twice as fast; the host's own is untouched
+        let (doubled, h) = guest_tsc_with_ratio(2 * TSC_RATIO_ONE, 0);
+        assert!(
+            (2 * ONE_SECOND_NS..2 * ONE_SECOND_NS + 1000).contains(&doubled),
+            "{doubled}"
+        );
+        assert!(h.cpu.tsc() < ONE_SECOND_NS + 1000, "{}", h.cpu.tsc());
+        // half speed, then the offset: (TSC * ratio) + offset
+        let (halved, _) = guest_tsc_with_ratio(TSC_RATIO_ONE / 2, 7 * ONE_SECOND_NS);
+        assert!(
+            (ONE_SECOND_NS / 2 + 7 * ONE_SECOND_NS..ONE_SECOND_NS / 2 + 7 * ONE_SECOND_NS + 1000)
+                .contains(&halved),
+            "{halved}"
+        );
+    }
+
+    /// The guest reads DEBUGCTL into ebx and LastExceptionFromIP into esi, clears DEBUGCTL, and
+    /// stops on a cpuid.
+    const GUEST_USES_DEBUGCTL: &[u8] = &[
+        0xb9, 0xd9, 0x01, 0, 0, // mov ecx, DEBUGCTL
+        0x0f, 0x32, // rdmsr
+        0x89, 0xc3, // mov ebx, eax
+        0xb9, 0xdd, 0x01, 0, 0, // mov ecx, LastExceptionFromIP
+        0x0f, 0x32, // rdmsr
+        0x89, 0xc6, // mov esi, eax
+        0xb9, 0xd9, 0x01, 0, 0, // mov ecx, DEBUGCTL
+        0x31, 0xc0, // xor eax, eax
+        0x31, 0xd2, // xor edx, edx
+        0x0f, 0x30, // wrmsr
+        0x0f, 0xa2, // cpuid
+    ];
+    const HOST_DEBUGCTL: u64 = 1;
+    const GUEST_DEBUGCTL: u64 = 2;
+
+    fn lbr_rig(virtualized: bool) -> Harness {
+        let mut h = rig(GUEST_USES_DEBUGCTL);
+        h.cpu.wrmsr(MSR_DEBUGCTL, HOST_DEBUGCTL).unwrap();
+        if virtualized {
+            put(
+                &mut h,
+                VMCB_VIRTUAL_EXTENSIONS,
+                8,
+                LBR_VIRTUALIZATION_ENABLE,
+            );
+        }
+        put(&mut h, SAVE_DEBUGCTL, 8, GUEST_DEBUGCTL);
+        for (k, offset) in SAVE_LAST_BRANCHES.into_iter().enumerate() {
+            put(&mut h, offset, 8, 0x1111 * (k as u64 + 1));
+        }
+        h
+    }
+
+    #[test]
+    fn lbr_virtualization_gives_the_guest_the_vmcbs_debugctl_and_branch_records() {
+        let mut h = lbr_rig(true);
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_CPUID);
+        assert_eq!(h.cpu.gpr[3], GUEST_DEBUGCTL, "the guest's DEBUGCTL");
+        assert_eq!(h.cpu.gpr[6], 0x3333, "the guest's LastExceptionFromIP");
+        assert_eq!(get(&h, SAVE_DEBUGCTL, 8), 0, "the guest's write went back");
+        assert_eq!(get(&h, SAVE_LAST_BRANCHES[0], 8), 0x1111);
+        assert_eq!(h.cpu.rdmsr(MSR_DEBUGCTL).unwrap(), HOST_DEBUGCTL);
+        assert_eq!(h.cpu.rdmsr(MSR_LAST_EXCEPTION_FROM_IP).unwrap(), 0);
+        // without it the guest shares the host's, and the VMCB's are left alone
+        let mut h = lbr_rig(false);
+        run(&mut h);
+        assert_eq!(h.cpu.gpr[3], HOST_DEBUGCTL);
+        assert_eq!(h.cpu.gpr[6], 0);
+        assert_eq!(get(&h, SAVE_DEBUGCTL, 8), GUEST_DEBUGCTL);
+        assert_eq!(
+            h.cpu.rdmsr(MSR_DEBUGCTL).unwrap(),
+            0,
+            "the guest cleared it"
+        );
+    }
+
+    #[test]
+    fn the_branch_record_msrs_are_read_only() {
+        let mut h = Harness::new(ASM_HLT);
+        for msr in MSR_LAST_BRANCH_FROM_IP..=MSR_LAST_EXCEPTION_TO_IP {
+            assert_eq!(h.cpu.rdmsr(msr).unwrap(), 0, "{msr:#x}");
+            assert!(h.cpu.wrmsr(msr, 1).is_err(), "{msr:#x}");
+        }
+    }
+
+    #[test]
+    fn svm_lock_freezes_svmdis_until_the_key_unlocks_it() {
+        let mut h = Harness::new(ASM_HLT);
+        h.cpu.efer &= !EFER_SVME;
+        h.cpu.wrmsr(MSR_SVM_KEY, 0x55).unwrap();
+        assert_eq!(
+            h.cpu.rdmsr(MSR_SVM_KEY).unwrap(),
+            0,
+            "the key reads as zero"
+        );
+        h.cpu.wrmsr(MSR_VM_CR, VM_CR_LOCK | VM_CR_SVMDIS).unwrap();
+        h.cpu.wrmsr(MSR_VM_CR, 0).unwrap();
+        assert_eq!(
+            h.cpu.rdmsr(MSR_VM_CR).unwrap(),
+            VM_CR_LOCK | VM_CR_SVMDIS,
+            "writes to LOCK and SVMDIS are ignored while locked"
+        );
+        assert!(h.cpu.wrmsr(MSR_EFER, h.cpu.efer | EFER_SVME).is_err());
+        // INIT keeps a locked SVMDIS
+        h.cpu.init();
+        assert_eq!(h.cpu.rdmsr(MSR_VM_CR).unwrap(), VM_CR_LOCK | VM_CR_SVMDIS);
+        h.cpu.wrmsr(MSR_SVM_KEY, 0x54).unwrap();
+        assert_ne!(h.cpu.rdmsr(MSR_VM_CR).unwrap() & VM_CR_LOCK, 0, "wrong key");
+        h.cpu.wrmsr(MSR_SVM_KEY, 0x55).unwrap();
+        assert_eq!(h.cpu.rdmsr(MSR_VM_CR).unwrap(), VM_CR_SVMDIS, "unlocked");
+        // unlocked, INIT clears SVMDIS
+        h.cpu.init();
+        assert_eq!(h.cpu.rdmsr(MSR_VM_CR).unwrap(), 0);
+        // locked without a key, only a reset unlocks it
+        let mut h = Harness::new(ASM_HLT);
+        h.cpu.wrmsr(MSR_VM_CR, VM_CR_LOCK).unwrap();
+        h.cpu.wrmsr(MSR_SVM_KEY, 0).unwrap();
+        assert_eq!(h.cpu.rdmsr(MSR_VM_CR).unwrap(), VM_CR_LOCK);
+        // SVMDIS cannot be set under a running EFER.SVME
+        let mut h = Harness::new(ASM_HLT);
+        h.cpu.efer |= EFER_SVME;
+        assert!(h.cpu.wrmsr(MSR_VM_CR, VM_CR_SVMDIS).is_err());
+    }
+
+    const ASM_PAUSE: [u8; 2] = [0xf3, 0x90];
+    const ASM_INC_EBX: [u8; 2] = [0xff, 0xc3];
+
+    fn pause_rig(code: &[u8], count: u64, threshold: u64) -> Harness {
+        let mut h = rig(code);
+        put(
+            &mut h,
+            VMCB_INTERCEPT3,
+            4,
+            (INTERCEPT_CPUID | INTERCEPT_PAUSE) as u64,
+        );
+        put(&mut h, VMCB_PAUSE_FILTER_COUNT, 2, count);
+        put(&mut h, VMCB_PAUSE_FILTER_THRESHOLD, 2, threshold);
+        h.cpu.gpr[3] = 0;
+        h
+    }
+
+    #[test]
+    fn the_pause_filter_count_lets_pauses_through_until_it_runs_out() {
+        let code = [
+            ASM_PAUSE,
+            ASM_INC_EBX,
+            ASM_PAUSE,
+            ASM_INC_EBX,
+            ASM_PAUSE,
+            ASM_INC_EBX,
+        ]
+        .concat();
+        let mut h = pause_rig(&[&code[..], ASM_CPUID].concat(), 3, 0);
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_PAUSE);
+        assert_eq!(get(&h, SAVE_RIP, 8), GUEST_CODE + 8, "on the third pause");
+        assert_eq!(h.cpu.gpr[3], 2);
+        // the counter is reloaded by every VMRUN
+        let mut h = pause_rig(&[&code[..], ASM_CPUID].concat(), 3, 0);
+        run(&mut h);
+        put(&mut h, SAVE_RIP, 8, GUEST_CODE);
+        h.cpu.svm.gif = true;
+        h.cpu.halted = false;
+        h.cpu.rip = CODE_BASE;
+        h.cpu.gpr[RAX] = VMCB;
+        run(&mut h);
+        assert_eq!(get(&h, SAVE_RIP, 8), GUEST_CODE + 8);
+        assert_eq!(h.cpu.gpr[3], 4);
+    }
+
+    #[test]
+    fn the_pause_filter_threshold_restarts_the_count_after_a_slow_pause() {
+        // pause; mov ecx, 1000; loop $; pause; cpuid
+        let spaced = [
+            &ASM_PAUSE[..],
+            &[0xb9, 0xe8, 0x03, 0, 0, 0xe2, 0xfe],
+            &ASM_PAUSE,
+            ASM_CPUID,
+        ]
+        .concat();
+        let mut h = pause_rig(&spaced, 2, 100);
+        run(&mut h);
+        assert_eq!(
+            get(&h, VMCB_EXITCODE, 8),
+            VMEXIT_CPUID,
+            "the second pause came too late to count"
+        );
+        let mut h = pause_rig(&spaced, 2, 0);
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_PAUSE, "no threshold");
+        let back_to_back = [&ASM_PAUSE[..], &ASM_PAUSE, ASM_CPUID].concat();
+        let mut h = pause_rig(&back_to_back, 2, 100);
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_PAUSE, "a spin loop");
+        assert_eq!(get(&h, SAVE_RIP, 8), GUEST_CODE + 2);
     }
 
     #[test]
@@ -2553,10 +3314,17 @@ mod tests {
                     | 0x31
                     | EVENTINJ_ERROR_VALID,
             ),
+            // an NMI is reported as one (type 2), not as exception 2: the hypervisor re-injects
+            // what it reads here
+            (
+                EVENTINJ_VALID | (EVENT_TYPE_NMI << EVENTINJ_TYPE_SHIFT) | NMI_VECTOR as u32,
+                EVENTINJ_VALID | (EVENT_TYPE_NMI << EVENTINJ_TYPE_SHIFT) | NMI_VECTOR as u32,
+            ),
         ] {
             let mut h = nested_rig(ASM_HLT);
             h.write(handler, &[0x0f, 0xa2]);
             let cs = h.cpu.seg[SEG_CS].sel;
+            install_idt_gate(&mut h, NMI_VECTOR, handler, cs);
             install_idt_gate(&mut h, 0x30, handler, cs);
             install_idt_gate(&mut h, 0x31, handler, cs);
             put(&mut h, SAVE_IDTR + SEGMENT_LIMIT, 4, 0x4ff);
@@ -2777,5 +3545,10 @@ mod tests {
         a_guest_keeps_its_translations_across_an_exit_unless_a_flush_is_asked_for,
         invlpga_drops_the_guests_translations,
         a_page_flagged_as_code_while_the_guest_is_out_loses_the_guests_write_tags,
+        an_nmi_for_the_host_exits_the_guest_when_intercepted,
+        the_tsc_ratio_scales_guest_reads_before_the_offset,
+        lbr_virtualization_gives_the_guest_the_vmcbs_debugctl_and_branch_records,
+        the_pause_filter_count_lets_pauses_through_until_it_runs_out,
+        the_pause_filter_threshold_restarts_the_count_after_a_slow_pause,
     );
 }
