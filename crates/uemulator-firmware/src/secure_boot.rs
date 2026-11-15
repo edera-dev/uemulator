@@ -11,7 +11,7 @@
 use alloc::vec::Vec;
 
 use uemulator_crypto::authenticode;
-use uemulator_crypto::pkcs7::{Content, SignedData};
+use uemulator_crypto::pkcs7::{Content, MAX_CHAIN_LENGTH, SignedData};
 use uemulator_crypto::sha::HashAlgorithm;
 use uemulator_crypto::x509::Certificate;
 
@@ -280,6 +280,76 @@ fn revoked_by_hash(certificate: &Certificate, forbidden: &[SignatureEntry]) -> b
     })
 }
 
+fn signature_revoked<'a>(
+    signed: &SignedData<'a>,
+    forbidden_anchors: &[&'a [u8]],
+    forbidden: &[SignatureEntry],
+) -> bool {
+    const MAX_REVOCATION_PATHS: usize = 64;
+    const MAX_ISSUER_CHECKS: usize = 256;
+    if forbidden_anchors.is_empty()
+        && !forbidden.iter().any(|entry| {
+            entry.kind == signature_type::X509_SHA256
+                || entry.kind == signature_type::X509_SHA384
+                || entry.kind == signature_type::X509_SHA512
+        })
+    {
+        return false;
+    }
+    if signed.verify(Content::Embedded, forbidden_anchors).is_ok() {
+        return true;
+    }
+    let revoked_certificates: Vec<Certificate<'a>> = forbidden_anchors
+        .iter()
+        .filter_map(|der| Certificate::parse(der).ok())
+        .collect();
+    let mut issuer_checks = 0;
+    for index in 0..signed.signers.len() {
+        let Ok(signer) = signed.verify_signer(index, Content::Embedded, &revoked_certificates)
+        else {
+            continue;
+        };
+        let mut paths = alloc::vec![alloc::vec![signer]];
+        let mut checked = 0;
+        while let Some(chain) = paths.pop() {
+            checked += 1;
+            if checked > MAX_REVOCATION_PATHS {
+                // A hostile certificate bag must not make validation unbounded. A chain
+                // we did not inspect might be revoked, so fail closed.
+                return true;
+            }
+            let current = &chain[chain.len() - 1];
+            if revoked_by_hash(current, forbidden)
+                || revoked_certificates.iter().any(|certificate| {
+                    certificate.raw == current.raw || certificate.issued(current)
+                })
+            {
+                return true;
+            }
+            if chain.len() == MAX_CHAIN_LENGTH {
+                continue;
+            }
+            // The bag may carry unrelated and cross-signed certificates. Visit every
+            // issuer path of a verified signer, never an unattached certificate.
+            for issuer in &signed.certificates {
+                issuer_checks += 1;
+                if issuer_checks > MAX_ISSUER_CHECKS {
+                    return true;
+                }
+                if !chain.iter().any(|link| link.raw == issuer.raw) && issuer.issued(current) {
+                    let mut path = chain.clone();
+                    path.push(issuer.clone());
+                    if paths.len() == MAX_REVOCATION_PATHS {
+                        return true;
+                    }
+                    paths.push(path);
+                }
+            }
+        }
+    }
+    false
+}
+
 fn image_hash_kind(algorithm: HashAlgorithm) -> Option<Guid> {
     match algorithm {
         HashAlgorithm::Sha256 => Some(signature_type::SHA256),
@@ -338,20 +408,20 @@ pub fn verify_image<'a>(file: &[u8], db: &'a [u8], dbx: &'a [u8]) -> Verdict<'a>
         .iter()
         .map(|(der, _)| *der)
         .collect();
+    // A malformed later WIN_CERTIFICATE must not erase an earlier revocation and let a
+    // db hash authorize the image. Treat an unreadable certificate table as invalid.
+    let Ok(signatures) = authenticode::signatures(file) else {
+        return Verdict::NotAllowed;
+    };
     let mut verdict = None;
-    for blob in authenticode::signatures(file).unwrap_or_default() {
+    for blob in signatures {
         let Ok(signed) = SignedData::parse(blob) else {
             continue;
         };
         if authenticode::check_digest(file, &signed).is_err() {
             continue;
         }
-        if signed.verify(Content::Embedded, &forbidden_anchors).is_ok()
-            || signed
-                .certificates
-                .iter()
-                .any(|certificate| revoked_by_hash(certificate, &forbidden))
-        {
+        if signature_revoked(&signed, &forbidden_anchors, &forbidden) {
             return Verdict::Forbidden;
         }
         if verdict.is_none()
@@ -539,6 +609,28 @@ mod tests {
         signature_list(signature_type::SHA256, MICROSOFT_OWNER, &[digest])
     }
 
+    #[test]
+    fn db_hash_cannot_authorize_unhashed_section_addresses() {
+        // Before header validation, this digest authorized both the original and a file
+        // whose section RVAs were swapped outside the hashed SizeOfHeaders.
+        const OLD_DIGEST: [u8; 32] = [
+            0xcd, 0x96, 0x03, 0x30, 0xa7, 0xa4, 0xfb, 0x47, 0x27, 0x8d, 0x21, 0xa6, 0xe9, 0xc3,
+            0xf2, 0x54, 0x5a, 0x61, 0x31, 0xd3, 0x7a, 0x9f, 0x14, 0x1b, 0x87, 0x4d, 0x22, 0x56,
+            0xdb, 0xcc, 0x27, 0xc8,
+        ];
+        let mut file = UNSIGNED_IMAGE.to_vec();
+        const PE: usize = 0x80;
+        const OPTIONAL: usize = PE + 4 + 20;
+        const SECTIONS: usize = OPTIONAL + 240;
+        file[OPTIONAL + 60..OPTIONAL + 64].copy_from_slice(&0x180u32.to_le_bytes());
+        file[SECTIONS + 12..SECTIONS + 16].copy_from_slice(&0x2000u32.to_le_bytes());
+        file[SECTIONS + 40 + 12..SECTIONS + 40 + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+        assert_eq!(
+            verify_image(&file, &sha256_list(&OLD_DIGEST), &[]),
+            Verdict::NotAllowed
+        );
+    }
+
     fn image_sha256(file: &[u8]) -> Vec<u8> {
         authenticode::digest(file, HashAlgorithm::Sha256).unwrap()
     }
@@ -657,6 +749,85 @@ mod tests {
         let revocation = [tbs_hash.as_slice(), &[0; 16]].concat();
         let dbx = signature_list(signature_type::X509_SHA256, MICROSOFT_OWNER, &[&revocation]);
         assert_eq!(verify_image(SIGNED_IMAGE, &db, &dbx), Verdict::Forbidden);
+    }
+
+    #[test]
+    fn unrelated_certificate_in_signature_bag_does_not_revoke_signer() {
+        let blob = authenticode::signatures(SIGNED_IMAGE).unwrap()[0];
+        let mut signed = SignedData::parse(blob).unwrap();
+        let unrelated =
+            Certificate::parse(include_bytes!("../secure-boot/uemulator-pk.der")).unwrap();
+        let mut revocation = unrelated.tbs_digest(HashAlgorithm::Sha256);
+        revocation.extend_from_slice(&[0; 16]);
+        let dbx = signature_list(signature_type::X509_SHA256, MICROSOFT_OWNER, &[&revocation]);
+        let forbidden = entries(&dbx).unwrap();
+        signed.certificates.push(unrelated);
+        assert!(signed.verify(Content::Embedded, &[TEST_CA]).is_ok());
+        assert!(!signature_revoked(&signed, &[], &forbidden));
+    }
+
+    #[test]
+    fn dbx_checks_all_issuer_paths_in_a_signature_bag() {
+        let blob = authenticode::signatures(SIGNED_IMAGE).unwrap()[0];
+        let mut signed = SignedData::parse(blob).unwrap();
+        let original = Certificate::parse(TEST_CA).unwrap();
+        // The test CA's serial starts at byte 15. Changing it keeps its subject and
+        // public key, so both certificates can issue the test signer.
+        let mut alternate_der = TEST_CA.to_vec();
+        alternate_der[15] ^= 1;
+        let alternate = Certificate::parse(&alternate_der).unwrap();
+        let leaf = Certificate::parse(TEST_LEAF).unwrap();
+        assert!(alternate.issued(&leaf));
+        assert!(original.issued(&leaf));
+        signed.certificates = alloc::vec![leaf, alternate, original.clone()];
+        let mut revocation = original.tbs_digest(HashAlgorithm::Sha256);
+        revocation.extend_from_slice(&[0; 16]);
+        let dbx = signature_list(signature_type::X509_SHA256, MICROSOFT_OWNER, &[&revocation]);
+        let forbidden = entries(&dbx).unwrap();
+        assert!(signature_revoked(&signed, &[], &forbidden));
+    }
+
+    #[test]
+    fn excessive_unrelated_certificates_fail_closed() {
+        let blob = authenticode::signatures(SIGNED_IMAGE).unwrap()[0];
+        let mut signed = SignedData::parse(blob).unwrap();
+        let unrelated =
+            Certificate::parse(include_bytes!("../secure-boot/uemulator-pk.der")).unwrap();
+        signed
+            .certificates
+            .extend(core::iter::repeat_n(unrelated, 300));
+        let other = Certificate::parse(include_bytes!(
+            "../secure-boot/microsoft-kek-2k-ca-2023.der"
+        ))
+        .unwrap();
+        let mut revocation = other.tbs_digest(HashAlgorithm::Sha256);
+        revocation.extend_from_slice(&[0; 16]);
+        let dbx = signature_list(signature_type::X509_SHA256, MICROSOFT_OWNER, &[&revocation]);
+        let forbidden = entries(&dbx).unwrap();
+        assert!(signature_revoked(&signed, &[], &forbidden));
+    }
+
+    #[test]
+    fn malformed_later_certificate_cannot_hide_a_dbx_revocation() {
+        let digest = image_sha256(SIGNED_IMAGE);
+        let db = sha256_list(&digest);
+        let dbx = x509_list(TEST_LEAF);
+        assert_eq!(verify_image(SIGNED_IMAGE, &db, &dbx), Verdict::Forbidden);
+
+        let mut image = SIGNED_IMAGE.to_vec();
+        let pe = u32::from_le_bytes(image[0x3c..0x40].try_into().unwrap()) as usize;
+        let certificate_directory = pe + 24 + 112 + 4 * 8;
+        let size = u32::from_le_bytes(
+            image[certificate_directory + 4..certificate_directory + 8]
+                .try_into()
+                .unwrap(),
+        );
+        image.extend_from_slice(&[0; 8]);
+        image[certificate_directory + 4..certificate_directory + 8]
+            .copy_from_slice(&(size + 8).to_le_bytes());
+        assert_eq!(image_sha256(&image), digest);
+        assert!(authenticode::signatures(&image).is_err());
+        assert_eq!(verify_image(&image, &db, &dbx), Verdict::NotAllowed);
     }
 
     #[test]

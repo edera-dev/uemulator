@@ -10,6 +10,8 @@ use crate::x509::{Certificate, SignatureAlgorithm};
 
 /// Longest signer-to-anchor chain followed: real ones have two or three links.
 pub const MAX_CHAIN_LENGTH: usize = 8;
+/// Cap issuer signature checks across all branches of an untrusted certificate bag.
+const MAX_CHAIN_CANDIDATE_CHECKS: usize = 128;
 
 /// What the signature covers.
 #[derive(Clone, Copy, Debug)]
@@ -225,31 +227,50 @@ impl<'a> SignedData<'a> {
         anchors: &[Option<Certificate<'a>>],
     ) -> Result<VerifiedSigner<'a>, Error> {
         let mut chain = alloc::vec![signer];
-        loop {
-            let current = &chain[chain.len() - 1];
-            for (index, anchor) in anchors.iter().enumerate() {
-                let Some(anchor) = anchor else { continue };
-                if anchor.raw == current.raw || anchor.issued(current) {
-                    return Ok(VerifiedSigner {
-                        anchor: index,
-                        chain,
-                    });
-                }
+        let mut candidate_checks = 0;
+        self.find_anchor_path(&mut chain, anchors, &mut candidate_checks)
+            .ok_or(Error::Untrusted)
+    }
+
+    fn find_anchor_path(
+        &self,
+        chain: &mut Vec<Certificate<'a>>,
+        anchors: &[Option<Certificate<'a>>],
+        candidate_checks: &mut usize,
+    ) -> Option<VerifiedSigner<'a>> {
+        let current = chain[chain.len() - 1].clone();
+        for (index, anchor) in anchors.iter().enumerate() {
+            let Some(anchor) = anchor else { continue };
+            if anchor.raw == current.raw || anchor.issued(&current) {
+                return Some(VerifiedSigner {
+                    anchor: index,
+                    chain: chain.clone(),
+                });
             }
-            if chain.len() >= MAX_CHAIN_LENGTH {
-                return Err(Error::Untrusted);
-            }
-            // A certificate already in the chain is never added again, so loops end.
-            let issuer = self
-                .certificates
-                .iter()
-                .find(|candidate| {
-                    !chain.iter().any(|link| link.raw == candidate.raw) && candidate.issued(current)
-                })
-                .cloned()
-                .ok_or(Error::Untrusted)?;
-            chain.push(issuer);
         }
+        if chain.len() >= MAX_CHAIN_LENGTH {
+            return None;
+        }
+        // Cross-signed intermediates can share a subject and key but reach different roots.
+        // Try every issuer; taking only the first can miss a dbx revocation path.
+        for candidate in &self.certificates {
+            if chain.iter().any(|link| link.raw == candidate.raw) {
+                continue;
+            }
+            if *candidate_checks == MAX_CHAIN_CANDIDATE_CHECKS {
+                return None;
+            }
+            *candidate_checks += 1;
+            if !candidate.issued(&current) {
+                continue;
+            }
+            chain.push(candidate.clone());
+            if let Some(verified) = self.find_anchor_path(chain, anchors, candidate_checks) {
+                return Some(verified);
+            }
+            chain.pop();
+        }
+        None
     }
 }
 
@@ -416,6 +437,57 @@ pub(crate) mod tests {
     const DETACHED_MESSAGE: &[u8] = b"uemulator authenticated variable";
     const DETACHED_WITH_ATTRIBUTES: &[u8] = include_bytes!("testdata/detached-attributes.p7");
     const DETACHED_WITHOUT_ATTRIBUTES: &[u8] = include_bytes!("testdata/detached-noattributes.p7");
+    const DETACHED_CROSS_SIGNED: &[u8] = include_bytes!("testdata/detached-cross-signed.p7");
+
+    #[test]
+    fn cross_signed_chain_checks_every_issuer_path() {
+        // Both intermediates carry TEST_CA's public key and subject, so either one verifies
+        // the test leaf. They are signed by different roots. The first path cannot shadow
+        // the second when the second root is the trust anchor (or a dbx revocation).
+        let signed = SignedData::parse(DETACHED_CROSS_SIGNED).unwrap();
+        let allowed = include_bytes!("testdata/cross-allowed-root.der");
+        let forbidden = include_bytes!("testdata/cross-forbidden-root.der");
+        assert_eq!(signed.certificates.len(), 3);
+        let signer = &signed.certificates[0];
+        let first = &signed.certificates[1];
+        let second = &signed.certificates[2];
+        assert!(first.issued(signer) && second.issued(signer));
+        assert_eq!(
+            signed
+                .verify(Content::Detached(DETACHED_MESSAGE), &[allowed])
+                .unwrap()
+                .signers[0]
+                .chain
+                .len(),
+            2
+        );
+        assert_eq!(
+            signed
+                .verify(Content::Detached(DETACHED_MESSAGE), &[forbidden])
+                .unwrap()
+                .signers[0]
+                .chain
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn cross_signed_chain_search_has_a_candidate_budget() {
+        let mut signed = SignedData::parse(DETACHED_CROSS_SIGNED).unwrap();
+        let first = signed.certificates[1].clone();
+        let second = signed.certificates[2].clone();
+        let forbidden = include_bytes!("testdata/cross-forbidden-root.der");
+        signed.certificates.truncate(1);
+        signed
+            .certificates
+            .extend(core::iter::repeat_n(first, MAX_CHAIN_CANDIDATE_CHECKS + 1));
+        signed.certificates.push(second);
+        assert!(matches!(
+            signed.verify(Content::Detached(DETACHED_MESSAGE), &[forbidden]),
+            Err(Error::Untrusted)
+        ));
+    }
 
     #[test]
     fn detached_cms_signatures_verify_with_and_without_signed_attributes() {

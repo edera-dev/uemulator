@@ -297,9 +297,17 @@ extern "efiapi" fn load_image(
         read_file_of(path)
             .and_then(|(bytes, device)| load_checked(&bytes, parent, device, Some(path)))
     } else {
-        let bytes = unsafe { core::slice::from_raw_parts(source.cast::<u8>(), source_size) };
+        // An AP can change caller RAM while the BSP checks the signature and copies the
+        // image. Verify and load from the same private snapshot.
+        let mut bytes = Vec::new();
+        if bytes.try_reserve_exact(source_size).is_err() {
+            return OUT_OF_RESOURCES;
+        }
+        bytes.extend_from_slice(unsafe {
+            core::slice::from_raw_parts(source.cast::<u8>(), source_size)
+        });
         let device = path.as_ref().map_or(ptr::null_mut(), device_of);
-        load_checked(bytes, parent, device, path.as_ref())
+        load_checked(&bytes, parent, device, path.as_ref())
     };
     match result {
         Ok((handle, status)) => {

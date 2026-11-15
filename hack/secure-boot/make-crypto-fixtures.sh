@@ -1,13 +1,14 @@
 #!/bin/sh
 # Regenerates the test fixtures in crates/uemulator-crypto/src/testdata with openssl and
 # python3: a throwaway CA and leaf, an RSA-1024 signature, detached CMS signatures like an
-# authenticated variable's, and a small PE32+ image signed with hand-built Authenticode (no
-# sbsign or osslsigncode needed). The private keys are thrown away; only public material and
-# signatures are kept. Every run makes new keys, so all fixtures change together.
+# authenticated variable's, cross-signed issuer paths, and a small PE32+ image signed with
+# hand-built Authenticode (no sbsign or osslsigncode needed). Private keys are thrown away;
+# only public material and signatures are kept. Every run makes new keys, so all fixtures
+# change together.
 set -eu
 
 cd "$(dirname "$0")/../.."
-out=crates/uemulator-crypto/src/testdata
+out=${CRYPTO_FIXTURE_OUT:-crates/uemulator-crypto/src/testdata}
 mkdir -p "$out"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -36,6 +37,68 @@ openssl cms -sign -binary -outform der -md sha256 -signer "$work/leaf.pem" -inke
     -in "$work/variable" -out "$out/detached-attributes.p7"
 openssl cms -sign -binary -noattr -outform der -md sha256 -signer "$work/leaf.pem" \
     -inkey "$work/leaf.key" -in "$work/variable" -out "$out/detached-noattributes.p7"
+
+# Two roots cross-sign the same intermediate public key. This puts two valid issuer paths
+# in one CMS bag so PKCS#7 tests catch a verifier that follows only the first path.
+printf 'basicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign\n' > "$work/cross.ext"
+openssl req -new -key "$work/ca.key" \
+    -subj "/O=uemulator tests/CN=uemulator Test CA" -out "$work/ca.csr" 2>/dev/null
+for side in allowed forbidden; do
+    openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 36500 \
+        -subj "/CN=$side Root" \
+        -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign \
+        -keyout "$work/$side.key" -out "$work/$side.pem" 2>/dev/null
+    openssl x509 -in "$work/$side.pem" -outform der -out "$out/cross-$side-root.der"
+    openssl x509 -req -in "$work/ca.csr" -CA "$work/$side.pem" \
+        -CAkey "$work/$side.key" -set_serial 0x01 -days 36500 -sha256 \
+        -extfile "$work/cross.ext" -out "$work/cross-$side.pem" 2>/dev/null
+    openssl x509 -in "$work/cross-$side.pem" -outform der \
+        -out "$work/cross-$side.der"
+done
+
+python3 -I - "$work" "$out" <<'EOF'
+from pathlib import Path
+import sys
+
+work, output = map(Path, sys.argv[1:])
+
+def parts(data):
+    result = []
+    at = 0
+    while at < len(data):
+        start = at
+        tag, length = data[at:at + 2]
+        at += 2
+        if length & 0x80:
+            count = length & 0x7f
+            length = int.from_bytes(data[at:at + count], 'big')
+            at += count
+        result.append((tag, data[at:at + length], data[start:at + length]))
+        at += length
+    assert at == len(data)
+    return result
+
+def tlv(tag, body):
+    size = len(body)
+    length = bytes([size]) if size < 128 else \
+        bytes([0x80 | (size.bit_length() + 7) // 8]) + \
+        size.to_bytes((size.bit_length() + 7) // 8, 'big')
+    return bytes([tag]) + length + body
+
+outer = parts((output / 'detached-noattributes.p7').read_bytes())[0]
+content = parts(outer[1])
+signed = parts(content[1][1])[0]
+fields = parts(signed[1])
+assert fields[3][0] == 0xa0  # certificates
+certificates = fields[3][1]
+for side in ('allowed', 'forbidden'):
+    certificates += (work / f'cross-{side}.der').read_bytes()
+body = b''.join(field[2] for field in fields[:3]) + tlv(0xa0, certificates) + \
+       b''.join(field[2] for field in fields[4:])
+(output / 'detached-cross-signed.p7').write_bytes(
+    tlv(0x30, content[0][2] + tlv(0xa0, tlv(0x30, body)))
+)
+EOF
 
 python3 -I - "$work" "$out" <<'EOF'
 import hashlib, struct, subprocess, sys
