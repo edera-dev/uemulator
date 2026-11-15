@@ -48,7 +48,7 @@ const POPOVER_WIDTH_PX = 360;
 const POPOVER_GUTTER_PX = 16;
 const POPOVER_GAP_PX = 6;
 const RADIOS = ["firmware", "console", "display"];
-const CHECKBOXES = ["shell", "replace-cmdline", "jit", "acpi", "iommu", "tpm", "secure-boot", "rng", "reboot", "input", "network"];
+const CHECKBOXES = ["shell", "replace-cmdline", "jit", "acpi", "iommu", "tpm", "secure-boot", "rng", "reboot", "input", "network", "smt"];
 const SELECTS = ["memory", "cpus"];
 // The guest's RAM is byte for byte its physical address space, and the PCI hole starts at
 // 3 GiB: more would put RAM above 4 GiB, past the end of a 32-bit module's memory.
@@ -165,7 +165,7 @@ function renderMachinePanel() {
   addFact(facts, "Boots", media.length ? media : factLine("Nothing yet", "sub"));
   addFact(facts, "Firmware", FIRMWARE_LABELS[s.firmware]);
   addFact(facts, "Memory", formatMemory(s.memoryMib));
-  addFact(facts, "vCPUs", String(s.cpus));
+  addFact(facts, "vCPUs", s.cpus > 1 && s.cpus % 2 === 0 && s.smt ? `${s.cpus} (${s.cpus / 2} cores, SMT)` : String(s.cpus));
   addFact(facts, "Display", DISPLAY_LABELS[s.display]);
   addFact(facts, "Console", s.serial || s.hypervisor ? "ttyS0 (serial)" : "hvc0 (virtio)");
   const devices = [
@@ -325,6 +325,7 @@ function readSettings() {
     wisp: $("wisp").value.trim(),
     memoryMib: Number($("memory").value),
     cpus: Number($("cpus").value),
+    smt: $("smt").checked,
     jit: $("jit").checked,
     acpi,
     iommu: $("iommu").checked,
@@ -628,7 +629,7 @@ function applyDemo(d) {
   $("shell").checked = false;
   $("replace-cmdline").checked = false;
   $("cmdline").value = d.args ?? "";
-  for (const id of ["jit", "acpi", "rng", "reboot"]) $(id).checked = true;
+  for (const id of ["jit", "acpi", "rng", "reboot", "smt"]) $(id).checked = true;
   $("iommu").checked = Boolean(d.iommu);
   $("tpm").checked = Boolean(d.tpm);
   $("secure-boot").checked = Boolean(d.secureBoot);
@@ -1359,7 +1360,7 @@ async function launch() {
       (s.rng ? OPTION.RNG : 0) | (s.serial ? OPTION.SERIAL_CONSOLE : 0) | (s.reboot ? OPTION.REBOOT : 0) |
       (s.replaceCmdline ? OPTION.REPLACE_CMDLINE : 0) | (s.display !== "none" ? OPTION.DISPLAY : 0) |
       (s.display === "screen" ? OPTION.SCREEN_CONSOLE : 0) | (s.input ? OPTION.INPUT : 0) |
-      (s.tpm ? OPTION.TPM : 0) | (s.secureBoot ? OPTION.SECURE_BOOT : 0);
+      (s.tpm ? OPTION.TPM : 0) | (s.secureBoot ? OPTION.SECURE_BOOT : 0) | (s.smt ? 0 : OPTION.NO_SMT);
     const message = {
       firmware,
       kernel,

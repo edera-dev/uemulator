@@ -27,27 +27,23 @@
 use super::sys::{CR4_OSXSAVE, PHYSICAL_ADDRESS_BITS, RAX, RBX, RCX, RDX, VIRTUAL_ADDRESS_BITS};
 use super::{Cpu, xsave};
 
-/// Where this logical processor sits. The defaults describe a machine with one CPU. SMP is not
-/// implemented yet; the shape is accepted now so that the leaves already agree with whatever
-/// count the embedder configures, and the local APIC id has to be set to the same `x2apic_id`.
+/// Where this logical processor sits, and the brand of the part (`profile.rs` builds it from the
+/// machine's vCPU count and SMT choice). The local APIC id has to be the same `x2apic_id`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CpuTopology {
-    /// Logical processors in the package, 1 to 255.
+    /// Logical processors in the package, 1 to `profile::MAX_LOGICAL_PROCESSORS`. Above 255 the
+    /// 8-bit counts of leaves 1 and 0x8000_0008 saturate; leaves 0xB and 0x8000_0026 carry it.
     pub logical_processors: u32,
     /// Hardware threads per core: 1 or 2 (Zen has SMT2). Must divide `logical_processors`.
     pub threads_per_core: u32,
     /// This processor's x2APIC id: `core << smt_shift | thread` (AMD numbers threads of a core
     /// consecutively, which is what leaf 0x8000_001E reports).
     pub x2apic_id: u32,
+    /// Leaves 0x8000_0002..=0x8000_0004, NUL padded; shorter than `profile::BRAND_BYTES`.
+    pub brand: &'static str,
 }
 
 impl CpuTopology {
-    pub(crate) const SINGLE_PROCESSOR: CpuTopology = CpuTopology {
-        logical_processors: 1,
-        threads_per_core: 1,
-        x2apic_id: 0,
-    };
-
     /// Bits of the x2APIC id that select the thread within a core.
     fn smt_shift(&self) -> u32 {
         ceil_log2(self.threads_per_core)
@@ -59,12 +55,17 @@ impl CpuTopology {
         ceil_log2(self.logical_processors).max(1)
     }
 
+    /// Logical processors behind one L3: the `CORES_PER_COMPLEX` cores of a die with all their
+    /// threads, or the whole package when it is smaller. Leaves 0x8000_001D and 0x8000_0026 both
+    /// report it, so Linux's LLC and tile domains agree.
+    fn l3_sharing(&self) -> u32 {
+        (CORES_PER_COMPLEX * self.threads_per_core).min(self.logical_processors)
+    }
+
     /// Bits of the x2APIC id below the core complex (the threads sharing one L3). Never wider than
-    /// the package field, so the shifts of leaf 0x8000_0026 only grow from level to level; with
-    /// fewer than `L3_SHARING_THREADS` processors the whole package is one complex, which is also
-    /// what leaf 0x8000_001D's L3 sharing count says.
+    /// the package field, so the shifts of leaf 0x8000_0026 only grow from level to level.
     fn complex_shift(&self) -> u32 {
-        ceil_log2(L3_SHARING_THREADS).min(self.package_shift())
+        ceil_log2(CORES_PER_COMPLEX * self.threads_per_core).min(self.package_shift())
     }
 
     fn core_id(&self) -> u32 {
@@ -405,11 +406,6 @@ const EXT_FEATURE_PDPE1GB: u32 = 1 << 26;
 const EXT_FEATURE_RDTSCP: u32 = 1 << 27;
 const EXT_FEATURE_LONG_MODE: u32 = 1 << 29;
 
-/// 48 bytes returned over leaves 0x8000_0002..=0x8000_0004, NUL padded. The name QEMU gives the
-/// same model; the SKU strings carry core counts that would be wrong for a configurable machine.
-const BRAND_STRING: &[u8; 48] =
-    b"AMD EPYC-Turin Processor\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
-
 // Cache and TLB geometry of one Zen 5 core complex die, reported by leaves 0x8000_0005,
 // 0x8000_0006 and 0x8000_001D from the same numbers so they cannot disagree. Zen 5 widened the L1
 // data cache to 48 KiB / 12 ways and the L2 to 16 ways (the cache sizes match QEMU's
@@ -423,9 +419,9 @@ const L2_BYTES: u32 = 1024 * 1024;
 const L2_WAYS: u32 = 16;
 const L3_BYTES: u32 = 32 * 1024 * 1024;
 const L3_WAYS: u32 = 16;
-/// Logical processors that share one L3: the 8 cores (16 threads) of a die. Leaf 0x8000_0026
+/// Cores that share one L3: the 8 of a Zen 5 die (16 threads with SMT). Leaf 0x8000_0026
 /// derives its complex level from the same number, so Linux's tiles and LLC domains agree.
-const L3_SHARING_THREADS: u32 = 16;
+const CORES_PER_COMPLEX: u32 = 8;
 /// TLB entry counts go into 8-bit fields in leaf 0x8000_0005 and 12-bit ones in 0x8000_0006
 /// (asserted below; a larger count would spill into the associativity code). The Zen 5 L2 data
 /// TLB is described as 4096 entries, which the 12-bit field cannot hold, so it keeps the Zen 4
@@ -792,13 +788,13 @@ impl Cpu {
                     | (LEAF1_EDX & EXT_ALIASED_EDX),
             ),
             LEAF_BRAND_FIRST..=LEAF_BRAND_LAST => {
+                let brand = topology.brand.as_bytes();
                 let offset = (leaf - LEAF_BRAND_FIRST) as usize * 16;
                 let word = |k: usize| {
-                    u32::from_le_bytes(
-                        BRAND_STRING[offset + k * 4..offset + k * 4 + 4]
-                            .try_into()
-                            .unwrap(),
-                    )
+                    let at = offset + k * 4;
+                    u32::from_le_bytes(core::array::from_fn(|byte| {
+                        brand.get(at + byte).copied().unwrap_or(0)
+                    }))
                 };
                 (word(0), word(1), word(2), word(3))
             }
@@ -818,7 +814,7 @@ impl Cpu {
             LEAF_ADDRESS_SIZES => (
                 ADDRESS_SIZES,
                 EXT_ADDRESS_EBX,
-                (topology.logical_processors - 1) & 0xff
+                (topology.logical_processors - 1).min(0xff)
                     | ceil_log2(topology.logical_processors) << EXT_ADDRESS_APIC_ID_SIZE_SHIFT,
                 0,
             ),
@@ -855,7 +851,7 @@ impl Cpu {
                     ),
                     AMD_TOPOLOGY_SUBLEAF_COMPLEX => (
                         topology.complex_shift(),
-                        topology.logical_processors.min(L3_SHARING_THREADS),
+                        topology.l3_sharing(),
                         AMD_TOPOLOGY_LEVEL_COMPLEX,
                     ),
                     AMD_TOPOLOGY_SUBLEAF_DIE => (
@@ -889,7 +885,7 @@ impl Cpu {
     fn cache_properties(&self, cache: &CacheLevel) -> (u32, u32, u32, u32) {
         let topology = self.topology;
         let sharing = if cache.per_die {
-            topology.logical_processors.min(L3_SHARING_THREADS)
+            topology.l3_sharing()
         } else {
             topology.threads_per_core
         };

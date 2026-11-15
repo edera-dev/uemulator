@@ -9,7 +9,7 @@ uemulator is an x86_64 PC emulator written in Rust, built to be embedded. It boo
 - **Real guests.** Boots stock Alpine, Debian installer and Fedora kernels, Xen 4.21 with a dom0 and domU, and Linux KVM running nested inside the guest. Xen can also be handed to the machine directly (`--hypervisor xen.gz` or `xen.efi`), and the firmware boots it with the kernel as dom0, no disk or GRUB needed.
 - **Modern CPU model.** AMD Zen 5 (EPYC Turin) with AVX2 and AVX-512, AES-NI and SHA, and AMD SVM with nested paging. Linux needs no software mitigations and runs with KASLR. Real mode, protected mode and compatibility mode are all supported.
 - **Your choice of firmware.** The built-in UEFI firmware (the default), a built-in BIOS for legacy disk boot, or direct kernel entry with no firmware.
-- **SMP.** Up to 64 vCPUs. Each one runs on its own host thread, or all of them share one thread and run deterministically.
+- **SMP.** Up to 384 vCPUs, paired into SMT cores by default. Each one runs on its own host thread, or all of them share one thread and run deterministically.
 - **A full PC platform.** ACPI, local APIC and x2APIC, I/O APIC, HPET, PCIe with MSI-X and an AMD IOMMU.
 - **virtio devices.** Block, network (with built-in user-mode NAT), console, entropy, and a GPU with keyboard and tablet.
 - **A screen in your browser.** `--display framebuffer` gives the machine a graphical console, and the CLI serves a KVM-style viewer for its screen, keyboard and mouse.
