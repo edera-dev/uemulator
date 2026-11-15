@@ -176,17 +176,14 @@ fn misaligned_operands_and_the_sse_gate_fault_like_the_interpreter() {
 
 #[test]
 fn forms_the_lowering_must_not_claim() {
-    // 66 sha256rnds2 is #UD; unprefixed 0f 3a 0f is the MMX palignr the interpreter refuses.
+    // 66 sha256rnds2 is #UD; unprefixed 0f 3a 0f is the MMX palignr, which only the interpreter
+    // implements.
     check_stop_with(
         &[0x66, 0x0f, 0x38, 0xcb, 0xd1, HLT],
         sse_setup,
         fault(6, None),
     );
-    check_stop_with(
-        &[0x0f, 0x3a, 0x0f, 0xca, 0x03, HLT],
-        sse_setup,
-        fault(6, None),
-    );
+    check_with(&[0x0f, 0x3a, 0x0f, 0xca, 0x03, HLT], sse_setup);
     // f2/f3 0f 70 are pshuflw/pshufhw, which only touch one half.
     check_with(
         &[

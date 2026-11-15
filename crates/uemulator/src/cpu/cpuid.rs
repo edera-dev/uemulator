@@ -13,18 +13,22 @@
 //!
 //! Deliberate departures from the hardware, each so a guest does not run code the emulator would
 //! only slow down:
-//! - TSC deadline is advertised (AMD has none) because the local APIC model implements it and
-//!   guests calibrate the timer far faster with it.
-//! - Leaf 0x8000_0021 claims SRSO_NO, which Turin does not: the CPU never speculates, so it is
-//!   true here, and without it Linux puts an IBPB on every #VMEXIT of a nested KVM guest. The rest
-//!   of the speculation-control interface is Turin's, in the AMD spelling only (leaf 0x8000_0008
-//!   EBX, 0x8000_0021 EAX): automatic IBRS, so Spectre v2 costs one EFER write per CPU at boot,
-//!   and no Intel leaf 7 EDX bits or IA32_ARCH_CAPABILITIES. Linux then reports Spectre v2 as
-//!   "Enhanced / Automatic IBRS", speculative store bypass as "disabled via prctl" (Turin has no
-//!   SSB_NO) and VMSCAPE as "IBPB before exit to userspace" (only after running a KVM guest).
 //! - 40 physical and 48 virtual address bits, not 52 and 57.
+//!
+//! The speculation-control interface is Turin's, in the AMD spelling only (leaf 0x8000_0008 EBX,
+//! 0x8000_0021 EAX): automatic IBRS, so Spectre v2 costs one EFER write per CPU at boot, and no
+//! Intel leaf 7 EDX bits or IA32_ARCH_CAPABILITIES. Linux then reports Spectre v2 as "Enhanced /
+//! Automatic IBRS", speculative store bypass as "disabled via prctl" (Turin has no SSB_NO) and
+//! VMSCAPE as "IBPB before exit to userspace" (only after running a KVM guest). Like Turin there
+//! is no SRSO_NO, only SRSO_USER_KERNEL_NO and SRSO_BP_SPEC_REDUCE, so KVM sets BP_CFG bit 4 while
+//! it has guests instead of an IBPB on every #VMEXIT. Like every AMD part there is no TSC-deadline
+//! timer: Linux calibrates the local APIC timer against the PIT and runs it one-shot.
 
-use super::sys::{CR4_OSXSAVE, PHYSICAL_ADDRESS_BITS, RAX, RBX, RCX, RDX, VIRTUAL_ADDRESS_BITS};
+use super::model_msr::CpuidMask;
+use super::sys::{
+    CR4_OSXSAVE, PHYSICAL_ADDRESS_BITS, RAX, RBX, RCX, RDPRU_MAX_REGISTER, RDX,
+    VIRTUAL_ADDRESS_BITS,
+};
 use super::{Cpu, mca, rdt, xsave};
 
 /// Where this logical processor sits, and the brand of the part (`profile.rs` builds it from the
@@ -94,6 +98,7 @@ const LEAF_ADVANCED_POWER: u32 = 0x8000_0007;
 const LEAF_ADDRESS_SIZES: u32 = 0x8000_0008;
 const LEAF_SVM: u32 = 0x8000_000a;
 const LEAF_TLB_1G: u32 = 0x8000_0019;
+const LEAF_FP_HINTS: u32 = 0x8000_001a;
 const LEAF_CACHE_PROPERTIES: u32 = 0x8000_001d;
 const LEAF_EXTENDED_APIC_ID: u32 = 0x8000_001e;
 const LEAF_EXT_FEATURES_2: u32 = 0x8000_0021;
@@ -196,7 +201,7 @@ const FEATURE_SSE3: u32 = 1 << 0;
 const FEATURE_PCLMULQDQ: u32 = 1 << 1;
 /// MONITOR/MWAIT (leaf 5 describes them).
 const FEATURE_MONITOR: u32 = 1 << 3;
-/// SSSE3, XMM forms only (the MMX forms are #UD, see `sse_ext.rs`).
+/// SSSE3, the XMM and the MMX-register forms (`sse_ext.rs`).
 const FEATURE_SSSE3: u32 = 1 << 9;
 /// FMA3: the vfmadd/vfmsub/vfnmadd/vfnmsub families.
 const FEATURE_FMA: u32 = 1 << 12;
@@ -210,8 +215,6 @@ const FEATURE_SSE4_2: u32 = 1 << 20;
 const FEATURE_X2APIC: u32 = 1 << 21;
 const FEATURE_MOVBE: u32 = 1 << 22;
 const FEATURE_POPCNT: u32 = 1 << 23;
-/// IA32_TSC_DEADLINE (0x6e0) and the LVT timer's deadline mode.
-const FEATURE_TSC_DEADLINE: u32 = 1 << 24;
 /// AES-NI: aesenc, aesenclast, aesdec, aesdeclast, aesimc, aeskeygenassist.
 const FEATURE_AES: u32 = 1 << 25;
 /// xsave, xrstor, xsaveopt, xgetbv, xsetbv; the state components and layouts are in `xsave.rs`.
@@ -236,7 +239,6 @@ const LEAF1_ECX: u32 = FEATURE_SSE3
     | FEATURE_X2APIC
     | FEATURE_MOVBE
     | FEATURE_POPCNT
-    | FEATURE_TSC_DEADLINE
     | FEATURE_AES
     | FEATURE_XSAVE
     | FEATURE_AVX
@@ -251,6 +253,8 @@ const MONITOR_ECX_EXTENSIONS_AND_BREAK: u32 = 0b11;
 /// Leaf 6 EAX bit 2: the APIC timer keeps running in every power state (Linux "arat"), true
 /// because the machine has no power states.
 const THERMAL_POWER_ARAT: u32 = 1 << 2;
+/// Leaf 6 ECX bit 0: the MPERF and APERF effective-frequency counters (`model_msr.rs`).
+const THERMAL_POWER_ECX_EFFECTIVE_FREQUENCY: u32 = 1 << 0;
 
 // Leaf 7 subleaf 0 EBX.
 /// rdfsbase, rdgsbase, wrfsbase, wrgsbase.
@@ -394,13 +398,25 @@ const EXT_FEATURE_LAHF_LM: u32 = 1 << 0;
 const EXT_FEATURE_CMP_LEGACY: u32 = 1 << 1;
 /// AMD SVM.
 const EXT_FEATURE_SVM: u32 = 1 << 2;
+/// `lock mov cr0` is `mov cr8` (AltMovCr8), decoded in `decode.rs`.
+const EXT_FEATURE_CR8_LEGACY: u32 = 1 << 4;
 /// Advanced bit manipulation, i.e. LZCNT (POPCNT has its own bit in leaf 1).
 const EXT_FEATURE_ABM: u32 = 1 << 5;
+/// SSE4A: extrq, insertq, movntss, movntsd (`sse_ext.rs`).
+const EXT_FEATURE_SSE4A: u32 = 1 << 6;
+/// Misaligned SSE mode: MXCSR.MM (bit 17) lifts the 16-byte alignment rule of legacy SSE memory
+/// operands except the explicitly aligned moves (`MXCSR_MISALIGNED_MASK` in `sse.rs`).
+const EXT_FEATURE_MISALIGNSSE: u32 = 1 << 7;
 /// PREFETCH and PREFETCHW (`0F 0D`, hints that execute as no-ops). Windows 8.1 and later refuse
 /// to start without it.
 const EXT_FEATURE_PREFETCHW: u32 = 1 << 8;
 /// The extended APIC register space (feature register, extended LVT entries; `dev/apic.rs`).
 const EXT_FEATURE_EXTAPIC: u32 = 1 << 3;
+/// OS visible workarounds: MSRs 0xC001_0140/0141, which describe no errata (`model_msr.rs`).
+const EXT_FEATURE_OSVW: u32 = 1 << 9;
+/// Translation cache extension: EFER.TCE (bit 15) is accepted. It lets `invlpg` keep upper-level
+/// paging-structure entries; the soft TLB caches none, so it flushes at least as much either way.
+const EXT_FEATURE_TCE: u32 = 1 << 17;
 /// Leaves 0x8000_001D and 0x8000_001E (cache properties, extended APIC id and core topology).
 const EXT_FEATURE_TOPOEXT: u32 = 1 << 22;
 /// Six core performance counters at 0xC001_0200 (`pmu.rs`).
@@ -409,9 +425,17 @@ const EXT_FEATURE_PERFCTR_CORE: u32 = 1 << 23;
 /// and readable (by rdmsr and rdpmc 6-15) but never count.
 const EXT_FEATURE_PERFCTR_NB: u32 = 1 << 24;
 const EXT_FEATURE_PERFCTR_LLC: u32 = 1 << 28;
+/// monitorx and mwaitx (`protection.rs`), including the mwaitx timer.
+const EXT_FEATURE_MWAITX: u32 = 1 << 29;
 // Leaf 0x8000_0001 EDX, besides the aliases of leaf 1.
 const EXT_FEATURE_SYSCALL: u32 = 1 << 11;
 const EXT_FEATURE_NX: u32 = 1 << 20;
+/// The AMD MMX extensions: the integer SSE instructions on MMX registers (pavgb/w, pmaxub/sw,
+/// pminub/sw, pmovmskb, pmulhuw, psadbw, pshufw, pextrw, pinsrw, maskmovq, movntq) plus prefetch
+/// and sfence, all of which the SSE bit already covers (`Cpu::mmx` in `sse.rs`).
+const EXT_FEATURE_MMXEXT: u32 = 1 << 22;
+/// Fast FXSAVE/FXRSTOR: EFER.FFXSR (bit 14) skips XMM0-15 in 64-bit mode at CPL 0 (`fpu.rs`).
+const EXT_FEATURE_FFXSR: u32 = 1 << 25;
 /// 1 GiB pages (PDPT entries with PS set; tested in `mem.rs`).
 const EXT_FEATURE_PDPE1GB: u32 = 1 << 26;
 /// rdtscp: rdtsc plus IA32_TSC_AUX in ECX.
@@ -585,12 +609,19 @@ const ADDRESS_SIZES: u32 = (VIRTUAL_ADDRESS_BITS << 8) | PHYSICAL_ADDRESS_BITS;
 // Leaf 0x8000_0008 EBX.
 /// clzero (0F 01 FC).
 const EXT_ADDRESS_CLZERO: u32 = 1 << 0;
+/// rdpru (0F 01 FD): MPERF and APERF at any CPL unless CR4.TSD (`sys.rs`).
+const EXT_ADDRESS_RDPRU: u32 = 1 << 4;
+/// mcommit (F3 0F 01 FA), enabled by EFER.MCOMMIT (bit 17).
+const EXT_ADDRESS_MCOMMIT: u32 = 1 << 8;
 /// XSAVE/XRSTOR and FXSAVE/FXRSTOR save and restore the x87 error pointers whether or not an
 /// exception is pending. The kernel otherwise does a fnclex/emms/fildl dance on every context
 /// switch to avoid a leak this model has no way to have.
 const EXT_ADDRESS_XSAVEERPTR: u32 = 1 << 2;
 /// wbnoinvd (F3 0F 09).
 const EXT_ADDRESS_WBNOINVD: u32 = 1 << 9;
+/// wbinvd and wbnoinvd are interruptible: true of any instruction here, as none takes long
+/// enough to hold off an interrupt.
+const EXT_ADDRESS_INT_WBINVD: u32 = 1 << 13;
 // The AMD speculation-control interface. The CPU never speculates, so every control is accepted
 // and has nothing to restrict; what each bit promises is the MSR behaviour in sys.rs
 // (`SPEC_CTRL_WRITABLE`, `PRED_CMD_WRITABLE`, `EFER_AIBRSE`).
@@ -608,6 +639,8 @@ const EXT_ADDRESS_IBRS_SAME_MODE: u32 = 1 << 19;
 /// EFER.LMSLE (bit 13, long-mode segment limits) does not exist and must be zero: a write of it
 /// is #GP (`EFER_WRMSR_ALLOWED`). KVM keys on this to refuse it to guests too.
 const EXT_ADDRESS_EFER_LMSLE_MBZ: u32 = 1 << 20;
+/// Protected processor inventory number: PPIN_CTL and PPIN (0xC001_02F0/F1, `model_msr.rs`).
+const EXT_ADDRESS_PPIN: u32 = 1 << 23;
 /// IA32_SPEC_CTRL bit 2.
 const EXT_ADDRESS_SSBD: u32 = 1 << 24;
 /// MSR-based CPPC (`cppc.rs`, 0xC001_02B0..=0xC001_02B4), which the `_CPC` of every processor
@@ -621,14 +654,18 @@ const EXT_ADDRESS_BTC_NO: u32 = 1 << 29;
 /// IBPB also flushes the return predictor; without it Linux marks the CPU "ibpb_no_ret".
 const EXT_ADDRESS_IBPB_RET: u32 = 1 << 30;
 const EXT_ADDRESS_EBX: u32 = EXT_ADDRESS_CLZERO
+    | EXT_ADDRESS_RDPRU
     | EXT_ADDRESS_XSAVEERPTR
+    | EXT_ADDRESS_MCOMMIT
     | EXT_ADDRESS_WBNOINVD
+    | EXT_ADDRESS_INT_WBINVD
     | EXT_ADDRESS_IBPB
     | EXT_ADDRESS_IBRS
     | EXT_ADDRESS_STIBP
     | EXT_ADDRESS_STIBP_ALWAYS_ON
     | EXT_ADDRESS_IBRS_SAME_MODE
     | EXT_ADDRESS_EFER_LMSLE_MBZ
+    | EXT_ADDRESS_PPIN
     | EXT_ADDRESS_SSBD
     | EXT_ADDRESS_CPPC
     | EXT_ADDRESS_PSFD
@@ -637,9 +674,32 @@ const EXT_ADDRESS_EBX: u32 = EXT_ADDRESS_CLZERO
     | rdt::ADDRESS_SIZES_MBE;
 /// ECX: number of logical processors minus one (7:0), APIC id width in bits (15:12).
 const EXT_ADDRESS_APIC_ID_SIZE_SHIFT: u32 = 12;
+/// EDX bits 23:16: the highest ECX rdpru accepts.
+const EXT_ADDRESS_EDX_RDPRU_MAX_SHIFT: u32 = 16;
 
-/// Leaf 0x8000_0007 EDX bit 8: invariant TSC, so the kernel trusts it as a clocksource.
+// Leaf 0x8000_0007 EDX. The thermal bits (TS, TTP, TM) stay clear: there is no temperature.
+/// Hardware P-states: the P-state MSRs 0xC001_0061-6B (`model_msr.rs`).
+const APM_HARDWARE_PSTATE: u32 = 1 << 7;
+/// Invariant TSC, so the kernel trusts it as a clocksource.
 const APM_INVARIANT_TSC: u32 = 1 << 8;
+/// Core performance boost, switched off by HWCR.CpbDis (bit 25, stored). There is no boost to
+/// switch: APERF never runs ahead of MPERF.
+const APM_CORE_PERFORMANCE_BOOST: u32 = 1 << 9;
+/// Read-only copies of MPERF and APERF at 0xC000_00E7/E8.
+const APM_EFFECTIVE_FREQUENCY_READ_ONLY: u32 = 1 << 10;
+/// RAPL energy counters, MSRs 0xC001_0299-029B.
+const APM_RAPL: u32 = 1 << 14;
+const APM_EDX: u32 = APM_HARDWARE_PSTATE
+    | APM_INVARIANT_TSC
+    | APM_CORE_PERFORMANCE_BOOST
+    | APM_EFFECTIVE_FREQUENCY_READ_ONLY
+    | APM_RAPL;
+
+/// Leaf 0x8000_001A EAX: performance hints for the floating-point unit. MOVU: unaligned loads are
+/// as fast as aligned ones; FP256: 256-bit operations run at full width, not as two 128-bit
+/// halves, as on every Zen since Zen 2 (which is also when FP128 went clear).
+const FP_HINTS_MOVU: u32 = 1 << 1;
+const FP_HINTS_FP256: u32 = 1 << 2;
 
 // Leaf 0x8000_0021 EAX.
 /// Data breakpoints never fire while a #DB is being delivered. True because no hardware
@@ -659,6 +719,16 @@ const EXT_FEATURES_2_NULL_SEL_CLR_BASE: u32 = 1 << 6;
 /// treats it as enhanced IBRS and picks "Mitigation: Enhanced / Automatic IBRS" for Spectre v2,
 /// one EFER write per CPU instead of retpolines.
 const EXT_FEATURES_2_AUTOIBRS: u32 = 1 << 8;
+/// SMM_CTL (0xC001_0116) does not exist: it is #GP, as for any MSR `rdmsr` does not know.
+const EXT_FEATURES_2_NO_SMM_CTL_MSR: u32 = 1 << 9;
+/// Fast short `rep stosb` and fast short `repe cmpsb`: performance hints only.
+const EXT_FEATURES_2_FSRS: u32 = 1 << 10;
+const EXT_FEATURES_2_FSRC: u32 = 1 << 11;
+/// PREFETCH_CONTROL (0xC000_0108) exists (stored only, `model_msr::STORED_ONLY`).
+const EXT_FEATURES_2_PREFETCH_CONTROL_MSR: u32 = 1 << 13;
+/// HWCR bit 35 makes `cpuid` #GP(0) outside CPL 0 (`HWCR_CPUID_USER_DISABLE` in sys.rs). Linux
+/// uses it for arch_prctl(ARCH_SET_CPUID).
+const EXT_FEATURES_2_CPUID_USER_DISABLE: u32 = 1 << 17;
 /// prefetchit0/prefetchit1 (`0F 18 /7` and `/6` with a RIP-relative operand, Zen 5): code
 /// prefetch hints, which execute as the no-ops the whole `0F 18..1F` hint space already is and
 /// never touch (or fault on) their operand.
@@ -669,22 +739,26 @@ const EXT_FEATURES_2_PREFETCHI: u32 = 1 << 20;
 const EXT_FEATURES_2_SBPB: u32 = 1 << 27;
 /// IBPB flushes every branch type's predictions; nothing to flush here.
 const EXT_FEATURES_2_IBPB_BRTYPE: u32 = 1 << 28;
-/// Not affected by Speculative Return Stack Overflow. Real Turin does not say this (Linux then
-/// picks "IBPB on VMEXIT only"); see the module comment for why the emulator does.
-const EXT_FEATURES_2_SRSO_NO: u32 = 1 << 29;
-/// Not affected by SRSO across the user/kernel boundary, which real Turin does say; implied by
-/// SRSO_NO, and kept so the leaf reads like the hardware's to a consumer that checks only it.
+/// Not affected by SRSO across the user/kernel boundary (Turin has no SRSO_NO, bit 29).
 const EXT_FEATURES_2_SRSO_USER_KERNEL_NO: u32 = 1 << 30;
+/// BP_CFG (0xC001_102E) bit 4 reduces branch speculation, which KVM sets instead of an IBPB on
+/// every #VMEXIT. BP_CFG is stored (`MSR_ZEN4_BP_CFG` in mod.rs); nothing speculates anyway.
+const EXT_FEATURES_2_SRSO_BP_SPEC_REDUCE: u32 = 1 << 31;
 const EXT_FEATURES_2_EAX: u32 = EXT_FEATURES_2_NO_NESTED_DATA_BP
     | EXT_FEATURES_2_WRMSR_XX_BASE_NS
     | EXT_FEATURES_2_LFENCE_ALWAYS_SERIALIZING
     | EXT_FEATURES_2_NULL_SEL_CLR_BASE
     | EXT_FEATURES_2_AUTOIBRS
+    | EXT_FEATURES_2_NO_SMM_CTL_MSR
+    | EXT_FEATURES_2_FSRS
+    | EXT_FEATURES_2_FSRC
+    | EXT_FEATURES_2_PREFETCH_CONTROL_MSR
+    | EXT_FEATURES_2_CPUID_USER_DISABLE
     | EXT_FEATURES_2_PREFETCHI
     | EXT_FEATURES_2_SBPB
     | EXT_FEATURES_2_IBPB_BRTYPE
-    | EXT_FEATURES_2_SRSO_NO
-    | EXT_FEATURES_2_SRSO_USER_KERNEL_NO;
+    | EXT_FEATURES_2_SRSO_USER_KERNEL_NO
+    | EXT_FEATURES_2_SRSO_BP_SPEC_REDUCE;
 // Leaf 0x8000_0022 (`pmu.rs`).
 /// EAX: PerfMonV2 (the global control and status MSRs at 0xC000_0300) and the LBR v2 stack.
 /// LbrAndPmcFreeze (bit 2) stays clear: nothing freezes on a PMI.
@@ -710,9 +784,53 @@ impl Cpu {
     pub fn cpuid(&mut self) {
         let leaf = self.gpr[RAX] as u32;
         let subleaf = self.gpr[RCX] as u32;
+        let (eax, ebx, ecx, edx) = self.cpuid_leaf(leaf, subleaf);
+        // The feature-override MSRs (`model_msr.rs`) can only take bits away.
+        let (eax, ebx, ecx, edx) = match (leaf, subleaf) {
+            (LEAF_FEATURES, _) => {
+                let (high, low) = self.model_msrs.cpuid_mask(CpuidMask::Features);
+                (eax, ebx, ecx & high, edx & low)
+            }
+            (LEAF_STRUCTURED_EXTENDED_FEATURES, 0) => {
+                let (high, low) = self.model_msrs.cpuid_mask(CpuidMask::Structured);
+                (eax & high, ebx & low, ecx, edx)
+            }
+            (LEAF_EXT_FEATURES, _) => {
+                let (high, low) = self.model_msrs.cpuid_mask(CpuidMask::ExtendedFeatures);
+                (eax, ebx, ecx & high, edx & low)
+            }
+            _ => (eax, ebx, ecx, edx),
+        };
+        self.gpr[RAX] = eax as u64;
+        self.gpr[RBX] = ebx as u64;
+        self.gpr[RCX] = ecx as u64;
+        self.gpr[RDX] = edx as u64;
+    }
+
+    /// The two registers of `leaf` that the override MSR `which` covers, before any override: the
+    /// value a read of that MSR starts from.
+    pub(super) fn cpuid_overridable(&self, which: CpuidMask) -> (u32, u32) {
+        match which {
+            CpuidMask::Features => {
+                let (_, _, ecx, edx) = self.cpuid_leaf(LEAF_FEATURES, 0);
+                (ecx, edx)
+            }
+            CpuidMask::Structured => {
+                let (eax, ebx, _, _) = self.cpuid_leaf(LEAF_STRUCTURED_EXTENDED_FEATURES, 0);
+                (eax, ebx)
+            }
+            CpuidMask::ExtendedFeatures => {
+                let (_, _, ecx, edx) = self.cpuid_leaf(LEAF_EXT_FEATURES, 0);
+                (ecx, edx)
+            }
+        }
+    }
+
+    /// One leaf as the hardware describes it, before the override MSRs.
+    fn cpuid_leaf(&self, leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
         let topology = self.topology;
         let threads = topology.logical_processors > 1;
-        let (eax, ebx, ecx, edx): (u32, u32, u32, u32) = match leaf {
+        match leaf {
             LEAF_VENDOR => (MAX_STANDARD_LEAF, VENDOR_EBX, VENDOR_ECX, VENDOR_EDX),
             LEAF_FEATURES => {
                 let osxsave = if self.cr4 & CR4_OSXSAVE != 0 {
@@ -736,7 +854,12 @@ impl Cpu {
                 MONITOR_ECX_EXTENSIONS_AND_BREAK,
                 0,
             ),
-            LEAF_THERMAL_POWER => (THERMAL_POWER_ARAT, 0, 0, 0),
+            LEAF_THERMAL_POWER => (
+                THERMAL_POWER_ARAT,
+                0,
+                THERMAL_POWER_ECX_EFFECTIVE_FREQUENCY,
+                0,
+            ),
             LEAF_STRUCTURED_EXTENDED_FEATURES => match subleaf {
                 0 => (
                     STRUCTURED_MAX_SUBLEAF,
@@ -810,15 +933,23 @@ impl Cpu {
                 EXT_FEATURE_LAHF_LM
                     | if threads { EXT_FEATURE_CMP_LEGACY } else { 0 }
                     | EXT_FEATURE_SVM
+                    | EXT_FEATURE_CR8_LEGACY
                     | EXT_FEATURE_ABM
+                    | EXT_FEATURE_SSE4A
+                    | EXT_FEATURE_MISALIGNSSE
                     | EXT_FEATURE_PREFETCHW
-                    | EXT_FEATURE_TOPOEXT
                     | EXT_FEATURE_EXTAPIC
+                    | EXT_FEATURE_OSVW
+                    | EXT_FEATURE_TCE
+                    | EXT_FEATURE_TOPOEXT
                     | EXT_FEATURE_PERFCTR_CORE
                     | EXT_FEATURE_PERFCTR_NB
-                    | EXT_FEATURE_PERFCTR_LLC,
+                    | EXT_FEATURE_PERFCTR_LLC
+                    | EXT_FEATURE_MWAITX,
                 EXT_FEATURE_SYSCALL
                     | EXT_FEATURE_NX
+                    | EXT_FEATURE_MMXEXT
+                    | EXT_FEATURE_FFXSR
                     | EXT_FEATURE_PDPE1GB
                     | EXT_FEATURE_RDTSCP
                     | EXT_FEATURE_LONG_MODE
@@ -847,17 +978,18 @@ impl Cpu {
                 l2_cache_descriptor(),
                 l3_cache_descriptor(),
             ),
-            LEAF_ADVANCED_POWER => (0, mca::ADVANCED_POWER_EBX, 0, APM_INVARIANT_TSC),
+            LEAF_ADVANCED_POWER => (0, mca::ADVANCED_POWER_EBX, 0, APM_EDX),
             LEAF_ADDRESS_SIZES => (
                 ADDRESS_SIZES,
                 EXT_ADDRESS_EBX,
                 (topology.logical_processors - 1).min(0xff)
                     | ceil_log2(topology.logical_processors) << EXT_ADDRESS_APIC_ID_SIZE_SHIFT,
-                0,
+                RDPRU_MAX_REGISTER << EXT_ADDRESS_EDX_RDPRU_MAX_SHIFT,
             ),
             // revision 1, number of ASIDs, features
             LEAF_SVM => (1, super::svm::SVM_ASIDS, 0, super::svm::SVM_FEATURES),
             LEAF_TLB_1G => (l1_tlb_1g_descriptor(), 0, 0, 0),
+            LEAF_FP_HINTS => (FP_HINTS_MOVU | FP_HINTS_FP256, 0, 0, 0),
             LEAF_CACHE_PROPERTIES => match CACHES.get(subleaf as usize) {
                 Some(cache) => self.cache_properties(cache),
                 None => (0, 0, 0, 0),
@@ -912,11 +1044,7 @@ impl Cpu {
                 )
             }
             _ => (0, 0, 0, 0),
-        };
-        self.gpr[RAX] = eax as u64;
-        self.gpr[RBX] = ebx as u64;
-        self.gpr[RCX] = ecx as u64;
-        self.gpr[RDX] = edx as u64;
+        }
     }
 
     /// One subleaf of leaf 0x8000_001D.

@@ -2065,6 +2065,9 @@ impl Cpu {
                 }
             }
             0x1a2 => {
+                if self.cpuid_faults() {
+                    return Err(Exception::general_protection(0));
+                }
                 self.cpuid();
                 self.serialize();
             }
@@ -14423,9 +14426,12 @@ mod exec_tests {
         // prefetch/prefetchw are executed as hints in sys.rs's `prefetchw_is_a_hint_that_never_faults`
         const PREFETCHW: u64 = 1 << 8;
         const TOPOEXT: u64 = 1 << 22;
-        // the extended APIC space and the performance counters are tested in pmu_tests.rs
+        // the extended APIC space and the performance counters are tested in pmu_tests.rs; the AMD
+        // extensions in model_msr_tests.rs and sse_amd_tests.rs: CR8_LEGACY, SSE4A, MISALIGNSSE,
+        // OSVW, TCE, MWAITX
         const EXTAPIC: u64 = 1 << 3;
         const PERFCTR_CORE_NB_LLC: u64 = (1 << 23) | (1 << 24) | (1 << 28);
+        const AMD_EXTENSIONS: u64 = 1 << 4 | 1 << 6 | 1 << 7 | 1 << 9 | 1 << 17 | 1 << 29;
         assert_eq!(
             ecx & !(LAHF_SAHF
                 | LZCNT_ABM
@@ -14433,9 +14439,11 @@ mod exec_tests {
                 | PREFETCHW
                 | TOPOEXT
                 | EXTAPIC
-                | PERFCTR_CORE_NB_LLC),
+                | PERFCTR_CORE_NB_LLC
+                | AMD_EXTENSIONS),
             0,
-            "nothing beyond lahf, svm, abm, prefetchw, the topology leaves and the PMU"
+            "nothing beyond lahf, svm, abm, prefetchw, the topology leaves, the PMU and the tested \
+             AMD extensions"
         );
     }
 

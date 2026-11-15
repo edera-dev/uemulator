@@ -313,7 +313,8 @@ impl Cpu {
         };
         for part in &COMPONENTS {
             match component(part.bit) {
-                LegacyRestore::Skip => {}
+                // `component` never asks for MxcsrOnly, which only fast fxrstor uses
+                LegacyRestore::Skip | LegacyRestore::MxcsrOnly => {}
                 LegacyRestore::Init => pending.initialize(part.bit),
                 LegacyRestore::Load => self.load_component(address, part, layout, &mut pending)?,
             }

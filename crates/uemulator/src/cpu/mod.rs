@@ -25,6 +25,7 @@ mod legacy_task;
 mod legacy_tests;
 pub(crate) mod mca;
 pub(crate) mod mem;
+mod model_msr;
 pub(crate) mod modes;
 pub(crate) mod mtrr;
 pub(crate) mod pmu;
@@ -464,6 +465,9 @@ pub(crate) struct Cpu {
     /// An MSR that is neither handled in `rdmsr`/`wrmsr` nor listed here raises #GP, which
     /// the kernel's `rdmsr_safe` probing depends on. Seeded in `Cpu::new`.
     pub msr_misc: alloc::collections::BTreeMap<u32, u64>,
+    /// TSC adjustment, effective-frequency counters, P-state, PPIN and CPUID override MSRs
+    /// (`model_msr.rs`). Per vCPU.
+    pub model_msrs: model_msr::ModelMsrs,
     pub xmm: [u128; 16],
     /// Bits 255:128 of YMM0-15 (AVX). Legacy SSE instructions leave them alone; VEX.128 forms zero
     /// them.
@@ -739,7 +743,6 @@ impl Cpu {
         /// 02h stepping 1, `cpuid::SIGNATURE`) is exactly this value. Lowering it loses `rdseed`.
         const MSR_UCODE_REV: u32 = 0x8b;
         const UCODE_REV_TURIN: u64 = 0x0b00_215a;
-        const MSR_K7_HWCR: u32 = 0xc001_0015;
         const MSR_AMD64_NB_CFG: u32 = 0xc001_001f;
         const MSR_AMD64_LS_CFG: u32 = 0xc001_1020;
         const MSR_AMD64_DE_CFG: u32 = 0xc001_1029;
@@ -831,7 +834,7 @@ impl Cpu {
             msr_misc: [
                 (MSR_UCODE_REV, UCODE_REV_TURIN),
                 (sys::MSR_DEBUGCTL, 0),
-                (MSR_K7_HWCR, HWCR_INITIAL),
+                (mca::MSR_HWCR, HWCR_INITIAL),
                 (MSR_AMD64_NB_CFG, 0),
                 (MSR_AMD64_LS_CFG, 0),
                 (MSR_AMD64_DE_CFG, 0),
@@ -845,7 +848,9 @@ impl Cpu {
             ]
             .into_iter()
             .chain((MSR_AMD64_IORR_FIRST..=MSR_AMD64_IORR_LAST).map(|msr| (msr, 0)))
+            .chain(model_msr::STORED_ONLY)
             .collect(),
+            model_msrs: model_msr::ModelMsrs::default(),
             cpl: 0,
             xmm: [0; 16],
             ymm_hi: [0; 16],
@@ -979,9 +984,10 @@ impl Cpu {
         self.time_base_ns + busy / self.time_divisor * NS_PER_INSN + self.idle_skipped_ns
     }
 
-    /// The TSC is just guest time in nanoseconds (scaled and offset inside an SVM guest).
+    /// The TSC is guest time in nanoseconds, moved by whatever a write of the TSC MSR set
+    /// (`model_msr.rs`), and scaled and offset inside an SVM guest.
     pub fn tsc(&self) -> u64 {
-        self.svm_visible_tsc(self.now_ns())
+        self.svm_visible_tsc(self.now_ns().wrapping_add(self.model_msrs.tsc_adjust))
     }
 
     /// Logs `msg` at most once per `key`. Callers keep their key ranges disjoint by adding the
@@ -1811,7 +1817,9 @@ mod cpu_tests {
                 (0xc001_1020, 0),
                 (0xc001_1029, 0),
             ];
-            assert_eq!(h.cpu.msr_misc.len(), expected.len());
+            // the model MSRs that are only stored are tested with their module
+            let model_stored = crate::cpu::model_msr::STORED_ONLY.len();
+            assert_eq!(h.cpu.msr_misc.len(), expected.len() + model_stored);
             for (msr, value) in expected {
                 assert_eq!(h.cpu.msr_misc.get(&msr), Some(&value), "msr {msr:#x}");
             }

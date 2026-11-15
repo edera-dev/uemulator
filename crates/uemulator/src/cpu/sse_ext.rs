@@ -7,10 +7,9 @@
 //! enable rules (`Cpu::sse_gate`). CRC32, MOVBE, ADCX/ADOX, MOVDIRI and MOVDIR64B are integer
 //! instructions that live in the same opcode map and skip the gate.
 //!
-//! The MMX-register forms of SSSE3 (`0F 38 xx` / `0F 3A 0F` without a prefix) are deliberately
-//! left as #UD (logged once as unimplemented): glibc and the kernel only use the XMM forms, and
-//! every MMX form would need its own lane layout. CPUID still advertises SSSE3, as the bit
-//! describes the XMM forms for all software that matters.
+//! The MMX-register forms of SSSE3 (`0F 38 xx` / `0F 3A 0F` without a prefix) reuse the XMM
+//! kernels on 64-bit operands (`ssse3_mmx`), and AMD's SSE4A (extrq, insertq, movntss, movntsd)
+//! lives here too.
 
 use super::*;
 
@@ -30,6 +29,20 @@ const OPCODE_MAP_0F3A: u16 = 3;
 const OPCODE_ADX: u8 = 0xf6;
 const OPCODE_MOVDIR64B: u8 = 0xf8;
 const OPCODE_MOVDIRI: u8 = 0xf9;
+/// SSE4A in the `0F` map: extrq (66) and insertq (F2) with two immediates (78) or with the field
+/// described by a register (79), and movntss (F3) / movntsd (F2) on the movntps opcode.
+const OPCODE_SSE4A_IMMEDIATE: u8 = 0x78;
+const OPCODE_SSE4A_REGISTER: u8 = 0x79;
+const OPCODE_MOVNT_SCALAR: u8 = 0x2b;
+/// The SSSE3 opcodes that also exist on MMX registers without a prefix: `0F 38 00-0B, 1C-1E` and
+/// palignr, `0F 3A 0F`.
+const OPCODE_SSSE3_LAST_BINARY: u8 = 0x0b;
+const OPCODE_SSSE3_ABS_FIRST: u8 = 0x1c;
+const OPCODE_SSSE3_ABS_LAST: u8 = 0x1e;
+const OPCODE_PALIGNR: u8 = 0x0f;
+/// SSE4A bit fields: length and index are 6-bit fields; a length of 0 means 64.
+const SSE4A_FIELD_MASK: u64 = 0x3f;
+const SSE4A_INDEX_SHIFT: u32 = 8;
 
 /// The operation of an instruction, decoded from (map, opcode, prefix).
 #[derive(Clone, Copy)]
@@ -1061,6 +1074,20 @@ impl Cpu {
                 _ => Ok(false),
             };
         }
+        if map == OPCODE_MAP_0F {
+            match (opcode, prefix) {
+                (OPCODE_SSE4A_IMMEDIATE | OPCODE_SSE4A_REGISTER, Prefix::P66 | Prefix::F2) => {
+                    return self.sse4a_bit_field(i, opcode, prefix).map(|()| true);
+                }
+                (OPCODE_MOVNT_SCALAR, Prefix::F3 | Prefix::F2) => {
+                    return self.movnt_scalar(i, next, prefix).map(|()| true);
+                }
+                _ => {}
+            }
+        }
+        if prefix == Prefix::Np && ssse3_has_mmx_form(map, opcode) {
+            return self.ssse3_mmx(i, next, map, opcode).map(|()| true);
+        }
         let Some(op) = decode_op(map, opcode, prefix) else {
             return Ok(false);
         };
@@ -1086,8 +1113,10 @@ impl Cpu {
                 }
             }
             (Source::Aligned, Some(addr)) => {
-                // VEX relaxes the rule for everything but vmovntdqa
-                let enforced = !self.vex_active || matches!(op, Op::LoadAligned);
+                // VEX, and MXCSR.MM for the legacy forms, relax the rule for everything but
+                // (v)movntdqa
+                let enforced =
+                    matches!(op, Op::LoadAligned) || !(self.vex_active || self.misaligned_sse());
                 if enforced && addr & (VECTOR_ALIGNMENT - 1) != 0 {
                     return Err(Exception::general_protection(0));
                 }
@@ -1175,6 +1204,138 @@ impl Cpu {
         self.xmm[reg] = result;
         Ok(true)
     }
+}
+
+impl Cpu {
+    /// SSE4A extrq and insertq, register forms only (#UD with a memory operand). The field is
+    /// `length` bits (0 means 64) at bit `index` of the low quadword: from the immediates, or for
+    /// the `79` forms from the source register (extrq: bits 5:0 and 13:8; insertq: the same
+    /// fields of its upper quadword). A field that runs past bit 63 is undefined in the APM; here
+    /// it is cut off at bit 63. The upper quadword of the destination is also undefined; here it
+    /// is left alone, as Bochs does.
+    fn sse4a_bit_field(&mut self, i: &Insn, opcode: u8, prefix: Prefix) -> ExecResult<()> {
+        const EXTRQ_IMMEDIATE_GROUP: u8 = 0;
+        if i.md != MODRM_MOD_REGISTER
+            || (opcode == OPCODE_SSE4A_IMMEDIATE
+                && prefix == Prefix::P66
+                && i.reg & 7 != EXTRQ_IMMEDIATE_GROUP)
+        {
+            return Err(Exception::invalid_opcode());
+        }
+        self.sse_gate()?;
+        let extract = prefix == Prefix::P66;
+        // The immediate extrq names its one register in ModRM.rm; every other form has the
+        // destination in ModRM.reg and the source (or the field description) in ModRM.rm.
+        let target = if extract && opcode == OPCODE_SSE4A_IMMEDIATE {
+            i.rm as usize
+        } else {
+            i.reg as usize
+        };
+        let source = self.xmm[i.rm as usize];
+        let (length, index) = match (opcode, extract) {
+            (OPCODE_SSE4A_IMMEDIATE, _) => (i.imm as u64, i.imm2 as u64),
+            (_, true) => (source as u64, (source as u64) >> SSE4A_INDEX_SHIFT),
+            (_, false) => {
+                let high = (source >> 64) as u64;
+                (high, high >> SSE4A_INDEX_SHIFT)
+            }
+        };
+        let index = index & SSE4A_FIELD_MASK;
+        let field = match length & SSE4A_FIELD_MASK {
+            0 => u64::MAX,
+            bits => (1u64 << bits) - 1,
+        };
+        let old = self.xmm[target];
+        let low = old as u64;
+        let result = if extract {
+            (low >> index) & field
+        } else {
+            (low & !(field << index)) | (((source as u64) & field) << index)
+        };
+        self.xmm[target] = (old & !LOW_64) | result as u128;
+        Ok(())
+    }
+
+    /// SSE4A movntss (F3) and movntsd (F2): a non-temporal store of the low single or double of
+    /// an xmm register. Memory only, and unlike movntps no alignment rule.
+    fn movnt_scalar(&mut self, i: &Insn, next: u64, prefix: Prefix) -> ExecResult<()> {
+        const SINGLE_BYTES: u8 = 4;
+        const DOUBLE_BYTES: u8 = 8;
+        if i.md == MODRM_MOD_REGISTER {
+            return Err(Exception::invalid_opcode());
+        }
+        self.sse_gate()?;
+        let address = self.linear_address(i, self.effective_address(i, next))?;
+        let size = if prefix == Prefix::F3 {
+            SINGLE_BYTES
+        } else {
+            DOUBLE_BYTES
+        };
+        self.write(address, size, self.xmm[i.reg as usize] as u64)
+    }
+
+    /// The MMX-register forms of SSSE3: `mm, mm/m64` (palignr also takes an imm8). The enable
+    /// rules are MMX's (CR0.EM #UD, CR0.TS #NM, CR4.OSFXSR irrelevant), the memory operand has no
+    /// alignment rule, and the result puts the x87 unit in MMX state, as every MMX instruction
+    /// does (`Cpu::mmx`).
+    fn ssse3_mmx(&mut self, i: &Insn, next: u64, map: u16, opcode: u8) -> ExecResult<()> {
+        if self.cr0 & CR0_EM != 0 {
+            return Err(Exception::invalid_opcode());
+        }
+        self.fpu_check()?;
+        let source = if i.md == MODRM_MOD_REGISTER {
+            self.mm_get(i.rm)
+        } else {
+            let address = self.linear_address(i, self.effective_address(i, next))?;
+            self.read(address, MMX_QWORD_BYTES as u8)?
+        };
+        let result = ssse3_on_mmx(map, opcode, self.mm_get(i.reg), source, i.imm as u8);
+        self.mmx_enter();
+        self.mm_put(i.reg, result);
+        Ok(())
+    }
+}
+
+fn ssse3_has_mmx_form(map: u16, opcode: u8) -> bool {
+    match map {
+        OPCODE_MAP_0F38 => {
+            opcode <= OPCODE_SSSE3_LAST_BINARY
+                || (OPCODE_SSSE3_ABS_FIRST..=OPCODE_SSSE3_ABS_LAST).contains(&opcode)
+        }
+        OPCODE_MAP_0F3A => opcode == OPCODE_PALIGNR,
+        _ => false,
+    }
+}
+
+/// One SSSE3 instruction on 64-bit MMX operands, computed with the XMM kernel. The lane-wise
+/// ones run on registers whose upper halves are zero. The horizontal ones pair adjacent lanes of
+/// the destination and then of the source, so `dst | src << 64` as the XMM destination puts the
+/// four (or two) MMX results in the low quadword. pshufb indexes only 8 bytes, so its selector
+/// keeps bit 7 (zero the byte) and bits 2:0.
+fn ssse3_on_mmx(map: u16, opcode: u8, dst: u64, src: u64, count: u8) -> u64 {
+    const PSHUFB_MMX_SELECTOR: u64 = 0x8787_8787_8787_8787;
+    const OPCODE_PSHUFB: u8 = 0x00;
+    const HORIZONTAL_OPCODES: [u8; 6] = [0x01, 0x02, 0x03, 0x05, 0x06, 0x07];
+    let (a, b) = (dst as u128, src as u128);
+    if map == OPCODE_MAP_0F3A {
+        // palignr: the 128-bit dst:src shifted right by whole bytes
+        return if count >= 16 {
+            0
+        } else {
+            ((a << 64 | b) >> (count as u32 * 8)) as u64
+        };
+    }
+    let Some(op) = decode_integer_op(map, opcode, Prefix::P66) else {
+        return dst;
+    };
+    let result = match op {
+        Op::Binary(f) if opcode == OPCODE_PSHUFB => f(a, (src & PSHUFB_MMX_SELECTOR) as u128),
+        Op::Binary(f) if HORIZONTAL_OPCODES.contains(&opcode) => f(a | b << 64, 0),
+        Op::Binary(f) => f(a, b),
+        Op::Unary(f) => f(b),
+        _ => a,
+    };
+    result as u64
 }
 
 /// A mask of the low `bytes` bytes of a vector register.
@@ -2094,14 +2255,11 @@ mod tests {
         }
 
         #[test]
-        fn mmx_register_forms_and_foreign_prefixes_are_invalid() {
-            // The MMX forms (no prefix) are deliberately not implemented: see the module comment of
-            // sse_ext.rs. They are #UD, as are the F2/F3-prefixed encodings.
+        fn foreign_prefixes_are_invalid() {
+            // The F2/F3-prefixed encodings are #UD (the unprefixed MMX forms are tested in
+            // sse_amd_tests.rs).
             let mut rig = Rig::new();
             for asm in [
-                ".byte 0x0f, 0x38, 0x00, 0xc1",
-                ".byte 0x0f, 0x38, 0x1c, 0xc1",
-                ".byte 0x0f, 0x3a, 0x0f, 0xc1, 0x04",
                 ".byte 0xf2, 0x0f, 0x38, 0x00, 0xc1",
                 ".byte 0xf3, 0x0f, 0x38, 0x00, 0xc1",
             ] {
@@ -5611,3 +5769,7 @@ mod tests {
         // SNIPPETS-END
     ];
 }
+
+#[cfg(test)]
+#[path = "sse_amd_tests.rs"]
+mod amd_tests;

@@ -141,11 +141,34 @@ pub(crate) const EFER_SCE: u64 = 1 << 0;
 /// the BSP's EFER with a plain wrmsr, in 32-bit code), and a KVM guest's EFER carries it into the
 /// VMCB, so `svm::EFER_KNOWN` must accept it too.
 pub(crate) const EFER_AIBRSE: u64 = 1 << 21;
+/// EFER.FFXSR: fast fxsave/fxrstor, which skip XMM0-15 in 64-bit mode at CPL 0 (`Cpu::fxsave`).
+pub(crate) const EFER_FFXSR: u64 = 1 << 14;
+/// EFER.TCE, translation cache extension: `invlpg` may keep upper-level paging-structure entries.
+/// The soft TLB caches no such entries and flushes as before, so the bit is stored only.
+pub(crate) const EFER_TCE: u64 = 1 << 15;
+/// EFER.MCOMMIT: enables `mcommit` (#UD while clear).
+pub(crate) const EFER_MCOMMIT: u64 = 1 << 17;
+/// The EFER bits that are stored and read back; `svm::EFER_KNOWN` accepts the same in a VMCB.
+pub(crate) const EFER_WRMSR_STORED: u64 = EFER_SCE
+    | EFER_LME
+    | EFER_NXE
+    | super::svm::EFER_SVME
+    | EFER_FFXSR
+    | EFER_TCE
+    | EFER_MCOMMIT
+    | EFER_AIBRSE;
 /// wrmsr to EFER faults if any bit outside this set is 1. LMA is accepted in the value but
 /// never stored: it is recomputed from CR0.PG and EFER.LME on CR0 writes.
-const EFER_WRMSR_ALLOWED: u64 =
-    EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE | super::svm::EFER_SVME | EFER_AIBRSE;
-const EFER_WRMSR_STORED: u64 = EFER_SCE | EFER_LME | EFER_NXE | super::svm::EFER_SVME | EFER_AIBRSE;
+const EFER_WRMSR_ALLOWED: u64 = EFER_WRMSR_STORED | EFER_LMA;
+
+/// HWCR (`mca::MSR_HWCR`, kept in `msr_misc`) bit 35, CpuidUserDis: `cpuid` is #GP(0) at
+/// CPL > 0.
+const HWCR_CPUID_USER_DISABLE: u64 = 1 << 35;
+
+/// rdpru's ECX: 0 reads MPERF, 1 reads APERF; leaf 0x8000_0008 EDX reports the highest.
+const RDPRU_MPERF: u64 = 0;
+const RDPRU_APERF: u64 = 1;
+pub(super) const RDPRU_MAX_REGISTER: u32 = RDPRU_APERF as u32;
 
 const EFLAGS_ID: u64 = 1 << 21;
 /// Bit 1 of EFLAGS always reads as 1.
@@ -267,6 +290,7 @@ impl Cpu {
             }
             MSR_SPEC_CTRL => self.spec_ctrl,
             MSR_SYSENTER_CS..=MSR_SYSENTER_EIP => self.sysenter[(msr - MSR_SYSENTER_CS) as usize],
+            _ if super::model_msr::owns(msr) => self.model_msr_read(msr)?,
             _ => match self.msr_misc.get(&msr) {
                 Some(v) => *v,
                 None => {
@@ -405,8 +429,8 @@ impl Cpu {
                     return Err(Exception::general_protection(0));
                 }
             }
-            // the TSC follows the virtual clock and cannot be set
-            MSR_TSC => {}
+            MSR_TSC => self.set_tsc(v),
+            _ if super::model_msr::owns(msr) => self.model_msr_write(msr, v)?,
             MSR_SYSENTER_CS..=MSR_SYSENTER_EIP => {
                 self.sysenter[(msr - MSR_SYSENTER_CS) as usize] = v
             }
@@ -1025,6 +1049,11 @@ impl Cpu {
         const MODRM_CLAC: u8 = 0xca;
         const MODRM_STAC: u8 = 0xcb;
         const MODRM_CLZERO: u8 = 0xfc;
+        // AMD: monitorx, or with an F3 prefix mcommit; mwaitx; rdpru
+        const MODRM_MONITORX: u8 = 0xfa;
+        const MODRM_MWAITX: u8 = 0xfb;
+        const MODRM_RDPRU: u8 = 0xfd;
+        const REP_F3: u8 = 1;
         let reg = i.reg & 7;
         if i.op == OP_GROUP6 {
             let loc = self.modrm_location(i, next)?;
@@ -1093,6 +1122,10 @@ impl Cpu {
                 }
                 MODRM_XSETBV => self.xsetbv()?,
                 MODRM_CLZERO => self.clzero(i)?,
+                MODRM_MONITORX if i.rep == REP_F3 => self.mcommit()?,
+                MODRM_MONITORX => self.monitorx()?,
+                MODRM_MWAITX => self.mwaitx()?,
+                MODRM_RDPRU => self.rdpru()?,
                 // Same CR4.TSD rule as rdtsc; ECX = IA32_TSC_AUX (zero-extended), EDX:EAX = TSC.
                 MODRM_RDTSCP => {
                     if self.cr4 & CR4_TSD != 0 && self.cpl != 0 {
@@ -1192,6 +1225,46 @@ impl Cpu {
             self.write(line + 8 * qword, 8, 0)?;
         }
         Ok(())
+    }
+
+    /// 0F 01 FD (AMD): reads the processor register ECX selects into EDX:EAX: 0 is MPERF and 1 is
+    /// APERF. Unprivileged unless CR4.TSD, which makes it #UD outside CPL 0 (not #GP, unlike
+    /// rdtsc). CF says whether the register exists; an unknown one reads as zero. The other
+    /// arithmetic flags are cleared (APM vol. 3, RDPRU).
+    fn rdpru(&mut self) -> ExecResult<()> {
+        if self.cr4 & CR4_TSD != 0 && self.cpl != 0 {
+            return Err(Exception::invalid_opcode());
+        }
+        let (value, valid) = match self.gpr[RCX] & 0xffff_ffff {
+            RDPRU_MPERF => (self.mperf(), true),
+            RDPRU_APERF => (self.aperf(), true),
+            _ => (0, false),
+        };
+        self.set_edx_eax(value);
+        let rflags = self.eflags_full() & !(CF | PF | AF | ZF | SF | OF);
+        self.set_eflags_arith(rflags | if valid { CF } else { 0 });
+        Ok(())
+    }
+
+    /// F3 0F 01 FA (AMD): waits until the earlier stores reach persistent memory, which they did
+    /// when they retired. #UD unless EFER.MCOMMIT. CF clear is success (set would report a memory
+    /// error); the other arithmetic flags are cleared.
+    fn mcommit(&mut self) -> ExecResult<()> {
+        if self.efer & EFER_MCOMMIT == 0 {
+            return Err(Exception::invalid_opcode());
+        }
+        let rflags = self.eflags_full() & !(CF | PF | AF | ZF | SF | OF);
+        self.set_eflags_arith(rflags);
+        Ok(())
+    }
+
+    /// Whether `cpuid` is #GP(0) here: HWCR.CpuidUserDis outside CPL 0.
+    pub(super) fn cpuid_faults(&self) -> bool {
+        self.cpl != 0
+            && self
+                .msr_misc
+                .get(&mca::MSR_HWCR)
+                .is_some_and(|hwcr| hwcr & HWCR_CPUID_USER_DISABLE != 0)
     }
 
     /// 0F 33: ECX selects a counter (`Cpu::pmu_rdpmc` numbers them). Allowed at CPL > 0 only with
@@ -1885,12 +1958,14 @@ mod sys_tests {
         }
 
         #[test]
-        fn tsc_msr_follows_the_virtual_clock_and_ignores_writes() {
+        fn tsc_msr_follows_the_virtual_clock_from_where_a_write_set_it() {
             let mut h = blank();
             h.cpu.icount = 1000;
             assert_eq!(h.cpu.rdmsr(TEST_MSR_TSC).unwrap(), 1000 * NS_PER_INSN);
             h.cpu.wrmsr(TEST_MSR_TSC, 5).unwrap();
-            assert_eq!(h.cpu.rdmsr(TEST_MSR_TSC).unwrap(), 1000 * NS_PER_INSN);
+            assert_eq!(h.cpu.rdmsr(TEST_MSR_TSC).unwrap(), 5);
+            h.cpu.icount += 10;
+            assert_eq!(h.cpu.rdmsr(TEST_MSR_TSC).unwrap(), 5 + 10 * NS_PER_INSN);
         }
 
         #[test]
@@ -2127,15 +2202,18 @@ mod sys_tests {
         }
 
         /// Linux's `VULNBL_AMD` names families 0x15-0x17 for RETBLEED (a return thunk on every
-        /// `ret`) and 0x19/0x1a for SRSO; the model has family 0x1a, so it must also say SRSO_NO.
+        /// `ret`) and 0x19/0x1a for SRSO. Like Turin the model says SRSO_USER_KERNEL_NO and
+        /// SRSO_BP_SPEC_REDUCE but not SRSO_NO, so Linux protects only KVM guests, through BP_CFG.
         #[test]
-        fn zen_5_says_it_has_neither_retbleed_nor_srso() {
+        fn zen_5_is_srso_affected_only_across_vmexit_as_turin_is() {
             let mut h = blank();
             let [eax, _, _, _] = cpuid(&mut h, 1, 0);
             let family = ((eax >> 8) & 0xf) + ((eax >> 20) & 0xff);
             assert_eq!(family, 0x1a);
-            let [srso_no, ..] = cpuid(&mut h, 0x8000_0021, 0);
-            assert_ne!(srso_no & (1 << 29), 0);
+            let [srso, ..] = cpuid(&mut h, 0x8000_0021, 0);
+            assert_eq!(srso & (1 << 29), 0, "no SRSO_NO");
+            assert_ne!(srso & (1 << 30), 0, "SRSO_USER_KERNEL_NO");
+            assert_ne!(srso & (1 << 31), 0, "SRSO_BP_SPEC_REDUCE");
         }
 
         #[test]
@@ -4761,7 +4839,8 @@ mod sys_tests {
 
         #[test]
         fn ldmxcsr_reserved_bits_are_gp0_and_leave_mxcsr_alone() {
-            for bit in 16..32 {
+            // bit 17 is MM, misaligned SSE mode
+            for bit in (16..32).filter(|&bit| bit != 17) {
                 // ldmxcsr [rsi]; hlt
                 let h = assert_general_protection_zero(&[0x0f, 0xae, 0x16, 0xf4], |h| {
                     h.write(DATA, &(0x1f80u32 | 1 << bit).to_le_bytes());

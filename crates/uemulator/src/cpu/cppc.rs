@@ -7,10 +7,9 @@
 //! performance are the same level (no boost, no preferred cores), nominal frequency is the TSC
 //! rate, and requests are stored without changing anything.
 //!
-//! The legacy P-state control registers live here too, because amd_pstate writes PERF_CTL
-//! (`amd_perf_ctl_reset`, an unchecked wrmsr that warns on #GP) on every CPU it takes over.
-//! There is one P-state, P0. The P-state definition registers (0xC001_0064 up) and CPUID
-//! 0x8000_0007 EDX HwPstate are not implemented.
+//! The hardware P-state registers, which amd_pstate also writes (`amd_perf_ctl_reset`, an
+//! unchecked wrmsr of PERF_CTL that warns on #GP, on every CPU it takes over), are
+//! `model_msr.rs`; the lowest nonlinear level here is its slowest P-state.
 
 /// Read-only: lowest (7:0), lowest nonlinear (15:8), nominal (23:16) and highest (31:24)
 /// performance.
@@ -24,16 +23,6 @@ pub(crate) const MSR_CPPC_CAPABILITY_2: u32 = 0xc001_02b2;
 pub(crate) const MSR_CPPC_REQUEST: u32 = 0xc001_02b3;
 /// Read-only and zero: the performance never had to drop below what was requested.
 pub(crate) const MSR_CPPC_STATUS: u32 = 0xc001_02b4;
-
-/// Read-only: the highest P-state the OS may request (6:4) and the current limit (2:0), both P0.
-pub(crate) const MSR_PSTATE_CURRENT_LIMIT: u32 = 0xc001_0061;
-/// The requested P-state in bits 2:0 (Linux's MSR_AMD_PERF_CTL).
-pub(crate) const MSR_PSTATE_CONTROL: u32 = 0xc001_0062;
-/// Read-only: the current P-state in bits 2:0, always P0.
-pub(crate) const MSR_PSTATE_STATUS: u32 = 0xc001_0063;
-/// PstateCmd; a command beyond the highest P-state is accepted and leaves the CPU in that one,
-/// so storing it and reporting P0 is the hardware's behaviour here.
-const PSTATE_COMMAND_MASK: u64 = 0x7;
 
 pub(crate) const ENABLE_BIT: u64 = 1;
 /// The request fields; bits 63:32 are reserved and #GP when set.
@@ -53,11 +42,14 @@ pub(crate) const PERFORMANCE_FIELD_BITS: u8 = 8;
 /// Abstract performance levels, 10 MHz each. Nominal is the TSC rate, 1 GHz (`Cpu::tsc` counts
 /// nanoseconds; the UEFI handoff's `TSC_HZ` says the same). Linux's `amd_pstate_init_freq` fails
 /// the driver unless lowest < lowest nonlinear <= nominal <= highest, with the frequencies
-/// derived from them positive.
+/// derived from them positive. Lowest nonlinear is the slowest P-state, as on hardware, where the
+/// levels below it are reached by throttling rather than by a lower clock.
 const MHZ_PER_PERFORMANCE_LEVEL: u32 = 10;
 const LOWEST_PERFORMANCE: u32 = 20;
-const LOWEST_NONLINEAR_PERFORMANCE: u32 = 40;
-const NOMINAL_PERFORMANCE: u32 = 100;
+const LOWEST_NONLINEAR_PERFORMANCE: u32 =
+    super::model_msr::SLOWEST_PSTATE_MHZ as u32 / MHZ_PER_PERFORMANCE_LEVEL;
+const NOMINAL_PERFORMANCE: u32 =
+    super::model_msr::FASTEST_PSTATE_MHZ as u32 / MHZ_PER_PERFORMANCE_LEVEL;
 const HIGHEST_PERFORMANCE: u32 = NOMINAL_PERFORMANCE;
 /// The integers `_CPC` gives next to the registers (entries 21 and 22 of revision 3), in MHz.
 pub(crate) const LOWEST_FREQUENCY_MHZ: u32 = LOWEST_PERFORMANCE * MHZ_PER_PERFORMANCE_LEVEL;
@@ -80,7 +72,6 @@ const REQUEST_RESET: u64 = (HIGHEST_PERFORMANCE << REQUEST_MAXIMUM_SHIFT
 pub(crate) struct Cppc {
     enable: u64,
     request: u64,
-    pstate_command: u64,
 }
 
 impl Cppc {
@@ -88,13 +79,11 @@ impl Cppc {
         Cppc {
             enable: 0,
             request: REQUEST_RESET,
-            pstate_command: 0,
         }
     }
 
     pub fn owns(msr: u32) -> bool {
         (MSR_CPPC_CAPABILITY_1..=MSR_CPPC_STATUS).contains(&msr)
-            || (MSR_PSTATE_CURRENT_LIMIT..=MSR_PSTATE_STATUS).contains(&msr)
     }
 
     pub fn read(&self, msr: u32) -> Option<u64> {
@@ -103,8 +92,6 @@ impl Cppc {
             MSR_CPPC_ENABLE => Some(self.enable),
             MSR_CPPC_CAPABILITY_2 | MSR_CPPC_STATUS => Some(0),
             MSR_CPPC_REQUEST => Some(self.request),
-            MSR_PSTATE_CURRENT_LIMIT | MSR_PSTATE_STATUS => Some(0),
-            MSR_PSTATE_CONTROL => Some(self.pstate_command),
             _ => None,
         }
     }
@@ -119,10 +106,6 @@ impl Cppc {
             }
             MSR_CPPC_REQUEST if value & !REQUEST_WRITABLE == 0 => {
                 self.request = value;
-                true
-            }
-            MSR_PSTATE_CONTROL if value & !PSTATE_COMMAND_MASK == 0 => {
-                self.pstate_command = value;
                 true
             }
             _ => false,
@@ -192,33 +175,28 @@ mod tests {
         assert_eq!(cppc.read(MSR_CPPC_REQUEST), Some(0xff64_1464));
     }
 
-    /// amd_pstate resets PERF_CTL to P0 with an unchecked wrmsr on every CPU it takes over
-    /// (`amd_perf_ctl_reset`), so the P-state control registers must exist with CPPC.
     #[test]
-    fn pstate_control_accepts_p0_and_reports_only_p0() {
-        let mut cppc = Cppc::new();
-        assert!(Cppc::owns(MSR_PSTATE_CONTROL));
-        assert!(cppc.write(MSR_PSTATE_CONTROL, 0));
-        assert_eq!(cppc.read(MSR_PSTATE_CONTROL), Some(0));
-        // A deeper P-state is accepted and kept, but the CPU stays in P0, the only one there is.
-        assert!(cppc.write(MSR_PSTATE_CONTROL, 2));
-        assert_eq!(cppc.read(MSR_PSTATE_CONTROL), Some(2));
-        assert_eq!(cppc.read(MSR_PSTATE_STATUS), Some(0));
-        assert!(!cppc.write(MSR_PSTATE_CONTROL, 8), "reserved bits");
-        assert_eq!(cppc.read(MSR_PSTATE_CURRENT_LIMIT), Some(0));
-        assert!(!cppc.write(MSR_PSTATE_CURRENT_LIMIT, 0));
-        assert!(!cppc.write(MSR_PSTATE_STATUS, 0));
-    }
-
-    #[test]
-    fn the_ranges_are_exactly_the_cppc_and_pstate_control_registers() {
+    fn the_range_is_exactly_the_cppc_registers() {
         assert!(!Cppc::owns(MSR_CPPC_CAPABILITY_1 - 1));
         assert!((MSR_CPPC_CAPABILITY_1..=MSR_CPPC_STATUS).all(Cppc::owns));
         assert!(!Cppc::owns(MSR_CPPC_STATUS + 1));
-        assert!(!Cppc::owns(MSR_PSTATE_CURRENT_LIMIT - 1));
-        assert!(
-            !Cppc::owns(MSR_PSTATE_STATUS + 1),
-            "the P-state definitions"
+        // the P-state registers are `model_msr.rs`'s
+        assert!(!(0xc001_0061..=0xc001_006b).any(Cppc::owns));
+    }
+
+    /// The levels and the P-state definitions describe the same clock: nominal is P0 and lowest
+    /// nonlinear the slowest P-state.
+    #[test]
+    fn nominal_and_lowest_nonlinear_are_the_fastest_and_slowest_pstates() {
+        let capability = Cppc::new().read(MSR_CPPC_CAPABILITY_1).unwrap();
+        let mhz = |shift| field(capability, shift) * MHZ_PER_PERFORMANCE_LEVEL;
+        assert_eq!(
+            mhz(NOMINAL_SHIFT) as u64,
+            super::super::model_msr::FASTEST_PSTATE_MHZ
+        );
+        assert_eq!(
+            mhz(LOWEST_NONLINEAR_SHIFT) as u64,
+            super::super::model_msr::SLOWEST_PSTATE_MHZ
         );
     }
 }
