@@ -84,14 +84,14 @@ fn leaf_1_ebx_has_a_64_byte_clflush_line_and_the_processor_count_and_apic_id() {
 fn leaf_1_edx_advertises_exactly_the_implemented_features() {
     let mut h = blank();
     let [_, _, _, edx] = cpuid(&mut h, 1, 0);
-    // FPU DE PSE TSC MSR PAE MCE CX8 APIC SEP MTRR PGE MCA CMOV PAT PSE-36 CLFSH MMX FXSR SSE SSE2
+    // FPU VME DE PSE TSC MSR PAE MCE CX8 APIC SEP MTRR PGE MCA CMOV PAT PSE-36 CLFSH MMX FXSR SSE
+    // SSE2
     let expected = bits(&[
-        0, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 17, 19, 23, 24, 25, 26,
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 17, 19, 23, 24, 25, 26,
     ]);
     assert_eq!(edx, expected, "{edx:#034b}");
-    assert_eq!(edx, 0x078b_fbfd);
+    assert_eq!(edx, 0x078b_fbff);
     for (bit, name) in [
-        (1, "VME"),
         (18, "PSN"),
         (21, "DS"),
         (22, "ACPI"),
@@ -161,9 +161,9 @@ fn leaf_7_subleaf_0_features() {
     let ebx = bits(&[
         0, 3, 5, 7, 8, 9, 10, 16, 17, 18, 19, 20, 21, 23, 24, 28, 29, 30, 31,
     ]);
-    // AVX512_VBMI UMIP AVX512_VBMI2 GFNI VAES VPCLMULQDQ AVX512_VNNI AVX512_BITALG
-    // AVX512_VPOPCNTDQ RDPID MOVDIRI MOVDIR64B; no PKU, LA57, CET_SS
-    let ecx = bits(&[1, 2, 6, 8, 9, 10, 11, 12, 14, 22, 27, 28]);
+    // AVX512_VBMI UMIP AVX512_VBMI2 CET_SS GFNI VAES VPCLMULQDQ AVX512_VNNI AVX512_BITALG
+    // AVX512_VPOPCNTDQ RDPID MOVDIRI MOVDIR64B; no PKU, LA57
+    let ecx = bits(&[1, 2, 6, 7, 8, 9, 10, 11, 12, 14, 22, 27, 28]);
     // FSRM and AVX512_VP2INTERSECT; the speculation controls are in the AMD leaves
     let edx = bits(&[4, 8]);
     // EAX is the highest subleaf
@@ -220,10 +220,11 @@ fn leaf_0xd_describes_the_xsave_area() {
     assert_eq!(cpuid(&mut h, 0xd, 0), [0xe7, 832, 2688, 0]);
     h.cpu.xcr0 = 0xe7;
     assert_eq!(cpuid(&mut h, 0xd, 0), [0xe7, 2688, 2688, 0]);
-    // xsaveopt, xsavec, xgetbv1, xsaves; EBX is the compacted size for the enabled set
-    assert_eq!(cpuid(&mut h, 0xd, 1), [0xf, 2432, 0, 0]);
+    // xsaveopt, xsavec, xgetbv1, xsaves; EBX is the compacted size for the enabled set; ECX the
+    // IA32_XSS components (CET_U, CET_S)
+    assert_eq!(cpuid(&mut h, 0xd, 1), [0xf, 2432, 0x1800, 0]);
     h.cpu.xcr0 = 7;
-    assert_eq!(cpuid(&mut h, 0xd, 1), [0xf, 832, 0, 0]);
+    assert_eq!(cpuid(&mut h, 0xd, 1), [0xf, 832, 0x1800, 0]);
     h.cpu.xcr0 = 0xe7;
     // component 2 (AVX): 256 bytes at offset 576
     assert_eq!(cpuid(&mut h, 0xd, 2), [256, 576, 0, 0]);
@@ -274,8 +275,8 @@ fn extended_leaf_1_ecx_has_lahf_svm_abm_prefetchw_and_topoext() {
 fn extended_leaf_1_edx_has_syscall_nx_page1gb_rdtscp_long_mode_and_the_amd_aliases() {
     let mut h = blank();
     let [_, _, _, edx] = cpuid(&mut h, 0x8000_0001, 0);
-    // SYSCALL NX PDPE1GB RDTSCP LM, then the aliased FPU TSC MSR PAE CX8 PGE CMOV PAT MMX FXSR
-    let expected = bits(&[11, 20, 26, 27, 29, 0, 4, 5, 6, 8, 13, 15, 16, 23, 24]);
+    // SYSCALL NX PDPE1GB RDTSCP LM, then the aliased FPU VME TSC MSR PAE CX8 PGE CMOV PAT MMX FXSR
+    let expected = bits(&[11, 20, 26, 27, 29, 0, 1, 4, 5, 6, 8, 13, 15, 16, 23, 24]);
     assert_eq!(edx, expected, "{edx:#034b}");
     for (bit, name) in [
         (22, "MMXEXT"),

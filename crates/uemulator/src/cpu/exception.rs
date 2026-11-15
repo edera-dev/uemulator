@@ -99,7 +99,8 @@ impl Exception {
 }
 
 /// Classes of exceptions for double-fault detection (SDM Vol. 3A, "Interrupt 8 - Double Fault
-/// Exception", Table 6-5). Software interrupts and external interrupts are always benign.
+/// Exception", Table 6-5, which counts #CP as contributory). Software interrupts and external
+/// interrupts are always benign.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FaultClass {
     Benign,
@@ -114,7 +115,8 @@ fn fault_class(vector: u8) -> FaultClass {
         | VECTOR_INVALID_TSS
         | VECTOR_SEGMENT_NOT_PRESENT
         | VECTOR_STACK_FAULT
-        | VECTOR_GENERAL_PROTECTION => FaultClass::Contributory,
+        | VECTOR_GENERAL_PROTECTION
+        | super::cet::VECTOR_CONTROL_PROTECTION => FaultClass::Contributory,
         VECTOR_PAGE_FAULT => FaultClass::PageFault,
         _ => FaultClass::Benign,
     }
@@ -309,6 +311,8 @@ impl Cpu {
         if let Some(error_code) = error_code {
             push(self, error_code as u64)?;
         }
+        let shadow_stack = self.shadow_stack_enter(new_cpl, ist as u8, true, false)?;
+        shadow_stack.commit(self);
         self.gpr[GPR_RSP] = stack_pointer;
         if new_cpl != self.cpl {
             // Hardware loads a null SS with RPL = new CPL; modeled as a flat data segment of
@@ -559,7 +563,7 @@ mod tests {
         fn fault_classes_follow_the_sdm() {
             for vector in 0..=255u8 {
                 let expected = match vector {
-                    0 | 10 | 11 | 12 | 13 => FaultClass::Contributory,
+                    0 | 10 | 11 | 12 | 13 | 21 => FaultClass::Contributory,
                     14 => FaultClass::PageFault,
                     _ => FaultClass::Benign,
                 };

@@ -242,7 +242,7 @@ impl Harness {
         while self.cpu.icount - start < max_insns {
             self.cpu.interrupt_shadow = false;
             self.cpu.icount += 1;
-            let result = if self.cpu.jit.is_some() && self.cpu.is_long64() {
+            let result = if self.cpu.jit.is_some() && self.cpu.jit_may_run() {
                 self.cpu.step_block()
             } else {
                 self.cpu.step()

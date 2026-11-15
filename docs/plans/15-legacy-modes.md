@@ -68,5 +68,5 @@ SVM guests may be in any of these modes (see 03, "SVM"); the VMRUN state swap al
 ## Not implemented
 
 - Everything 32-bit runs on the interpreter only; a 32-bit JIT is not planned.
-- Virtual-8086 extensions (CR4.VME/PVI, the interrupt redirection bitmap, VIF/VIP), SMM, and the whole-extent segment check for x87/SSE operands.
+- SMM, and the whole-extent segment check for x87/SSE operands. (The virtual-8086 extensions are in `cpu/vme.rs`: CR4.VME/PVI, VIF/VIP, the TSS interrupt redirection bitmap; `int3`/`into` keep the plain IOPL rule.)
 - 16-bit TSS switching, legacy-mode (non-IA-32e) `syscall`, 64-bit call gates and task switches in IA-32e mode (not architectural), the debug registers' breakpoints.

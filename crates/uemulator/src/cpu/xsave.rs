@@ -88,9 +88,28 @@ const XSAVE_HEADER_RESERVED_QWORDS: u64 = 6;
 /// XCOMP_BV bit 63: the area is in the compacted format (xsavec/xsaves wrote it). The remaining
 /// bits then name the components present, which are stored back to back with no gaps.
 const XCOMP_BV_COMPACTED: u64 = 1 << 63;
-/// Supervisor state components IA32_XSS could enable (CET, PT, ...). None are implemented, so the
-/// MSR reads zero and only zero can be written.
-pub(super) const XSS_SUPPORTED: u64 = 0;
+/// Supervisor state component 11, CET_U: U_CET then PL3_SSP (`cet.rs`).
+pub(super) const XSS_CET_U: u64 = 1 << 11;
+/// Supervisor state component 12, CET_S: PL0_SSP, PL1_SSP, PL2_SSP.
+pub(super) const XSS_CET_S: u64 = 1 << 12;
+/// Supervisor state components IA32_XSS can enable (no PT, PASID, ...).
+pub(super) const XSS_SUPPORTED: u64 = XSS_CET_U | XSS_CET_S;
+/// The supervisor components, which exist only in the compacted format (xsaves/xrstors).
+/// CPUID.0xD.n reports offset 0 for them and sets ECX bit 0 ("supervisor").
+pub(super) const SUPERVISOR_COMPONENTS: [Component; 2] = [
+    Component {
+        bit: XSS_CET_U,
+        index: 11,
+        offset: 0,
+        size: 16,
+    },
+    Component {
+        bit: XSS_CET_S,
+        index: 12,
+        offset: 0,
+        size: 24,
+    },
+];
 /// XGETBV's ECX selector for XINUSE (CPUID.0xD.1:EAX bit 2).
 const XGETBV_XINUSE: u32 = 1;
 
@@ -268,7 +287,7 @@ impl Cpu {
     }
 
     fn xrstor_area(&mut self, address: u64, supervisor: bool) -> ExecResult<()> {
-        let requested = self.xsave_prologue(address)?;
+        let requested = self.xsave_prologue(address)? | self.supervisor_requested(supervisor);
         if supervisor {
             self.need_cpl0()?;
         }
@@ -276,9 +295,10 @@ impl Cpu {
         let compaction = self.read(address + XCOMP_BV_OFFSET, 8)?;
         let compacted = compaction & XCOMP_BV_COMPACTED != 0;
         let components = compaction & !XCOMP_BV_COMPACTED;
+        let enabled = self.xcr0 | if supervisor { self.xss } else { 0 };
         let valid = if compacted {
             // the components present must be ones the OS enabled, and only they can be in use
-            components & !(self.xcr0 | XSS_SUPPORTED) == 0 && state_bv & !components == 0
+            components & !enabled == 0 && state_bv & !components == 0
         } else {
             !supervisor && compaction == 0 && state_bv & !self.xcr0 == 0
         };
@@ -318,12 +338,83 @@ impl Cpu {
                 LegacyRestore::Load => self.load_component(address, part, layout, &mut pending)?,
             }
         }
+        let cet = self.load_cet_components(address, components, component)?;
         self.restore_legacy_region(address, component(XCR0_X87), component(XCR0_SSE))?;
         self.ymm_hi = pending.ymm_hi;
         self.opmask = pending.opmask;
         self.zmm_hi = pending.zmm_hi;
         self.zmm_extra = pending.zmm_extra;
+        self.cet = cet;
         Ok(())
+    }
+
+    /// The CET state xrstors would leave (components 11 and 12, which only xrstors names), read
+    /// and checked before anything is committed: a U_CET with reserved bits or an SSP that the
+    /// MSR would refuse is #GP(0).
+    fn load_cet_components(
+        &mut self,
+        address: u64,
+        components: u64,
+        restore: impl Fn(u64) -> LegacyRestore,
+    ) -> ExecResult<super::cet::Cet> {
+        let mut cet = self.cet;
+        let invalid_ssp = |ssp: u64| !super::cet::ssp_msr_value_is_valid(ssp);
+        for part in &SUPERVISOR_COMPONENTS {
+            let base = address + supervisor_component_offset(components, part);
+            let values: [u64; 3] = match restore(part.bit) {
+                LegacyRestore::Skip => continue,
+                LegacyRestore::Init => [0; 3],
+                LegacyRestore::Load => {
+                    let mut values = [0; 3];
+                    for (k, value) in values.iter_mut().take(part.size as usize / 8).enumerate() {
+                        *value = self.read(base + 8 * k as u64, 8)?;
+                    }
+                    values
+                }
+            };
+            if part.bit == XSS_CET_U {
+                let [control, user_ssp, _] = values;
+                if control & !super::cet::CET_CONTROL_WRITABLE != 0 || invalid_ssp(user_ssp) {
+                    return Err(Exception::general_protection(0));
+                }
+                cet.u_cet = control;
+                cet.pl_ssp[3] = user_ssp;
+            } else {
+                if values.iter().any(|&ssp| invalid_ssp(ssp)) {
+                    return Err(Exception::general_protection(0));
+                }
+                cet.pl_ssp[..3].copy_from_slice(&values);
+            }
+        }
+        Ok(cet)
+    }
+
+    /// Stores the CET components among `requested` (only xsaves asks for them).
+    fn save_cet_components(&mut self, address: u64, requested: u64) -> ExecResult<()> {
+        for part in &SUPERVISOR_COMPONENTS {
+            if requested & part.bit == 0 {
+                continue;
+            }
+            let base = address + supervisor_component_offset(requested, part);
+            let values = if part.bit == XSS_CET_U {
+                [self.cet.u_cet, self.cet.pl_ssp[3], 0]
+            } else {
+                [self.cet.pl_ssp[0], self.cet.pl_ssp[1], self.cet.pl_ssp[2]]
+            };
+            for (k, value) in values.into_iter().take(part.size as usize / 8).enumerate() {
+                self.write(base + 8 * k as u64, 8, value)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The supervisor components xsaves and xrstors are asked for: EDX:EAX masked by IA32_XSS
+    /// (`supervisor` false, for the other instructions: none).
+    fn supervisor_requested(&self, supervisor: bool) -> u64 {
+        if !supervisor {
+            return 0;
+        }
+        ((self.gpr[RDX] << 32) | (self.gpr[RAX] & 0xffff_ffff)) & self.xss
     }
 
     /// xsavec: like xsave but the components are packed (see `Layout`), XCOMP_BV records which
@@ -340,7 +431,7 @@ impl Cpu {
     }
 
     fn xsave_compacted(&mut self, address: u64, supervisor: bool) -> ExecResult<()> {
-        let requested = self.xsave_prologue(address)?;
+        let requested = self.xsave_prologue(address)? | self.supervisor_requested(supervisor);
         if supervisor {
             self.need_cpl0()?;
         }
@@ -358,6 +449,7 @@ impl Cpu {
             components: requested,
         };
         self.save_vector_components(address, requested, layout)?;
+        self.save_cet_components(address, requested)?;
         self.write(address + XSTATE_BV_OFFSET, 8, requested)?;
         self.write(address + XCOMP_BV_OFFSET, 8, XCOMP_BV_COMPACTED | requested)?;
         for k in 0..XSAVE_HEADER_RESERVED_QWORDS {
@@ -476,9 +568,22 @@ pub(super) fn compacted_area_size(xcr0: u64) -> u32 {
     (XSAVE_AREA_SIZE
         + COMPONENTS
             .iter()
+            .chain(&SUPERVISOR_COMPONENTS)
             .filter(|part| xcr0 & part.bit != 0)
             .map(|part| part.size)
             .sum::<u64>()) as u32
+}
+
+/// Where a supervisor component sits in a compacted area holding `components`. Every user
+/// component has a lower number (the highest is 7, or 9 with PKRU), so all of them come first.
+fn supervisor_component_offset(components: u64, part: &Component) -> u64 {
+    XSAVE_AREA_SIZE
+        + COMPONENTS
+            .iter()
+            .chain(&SUPERVISOR_COMPONENTS)
+            .filter(|lower| lower.index < part.index && components & lower.bit != 0)
+            .map(|lower| lower.size)
+            .sum::<u64>()
 }
 
 #[cfg(test)]
@@ -1037,7 +1142,11 @@ mod tests {
             "xsaveopt, xsavec, xgetbv1, xsaves"
         );
         assert_eq!(h.cpu.gpr[RBX], COMPACT_HI16_ZMM + HI16_ZMM_STATE_SIZE);
-        assert_eq!((h.cpu.gpr[RCX], h.cpu.gpr[RDX]), (0, 0), "no IA32_XSS bits");
+        assert_eq!(
+            (h.cpu.gpr[RCX], h.cpu.gpr[RDX]),
+            (XSS_SUPPORTED, 0),
+            "IA32_XSS: CET_U and CET_S"
+        );
         h.cpu.xcr0 = XCR0_X87 | XCR0_SSE;
         h.cpu.gpr[RAX] = 0xd;
         h.cpu.gpr[RCX] = 1;
@@ -1051,12 +1160,13 @@ mod tests {
     }
 
     #[test]
-    fn ia32_xss_reads_zero_and_accepts_only_zero() {
+    fn ia32_xss_starts_at_zero_and_accepts_only_the_cet_components() {
         use crate::cpu::sys::MSR_XSS;
         let mut h = Harness::new(&[HLT]);
         assert_eq!(h.cpu.rdmsr(MSR_XSS).unwrap(), 0);
-        assert!(h.cpu.wrmsr(MSR_XSS, 0).is_ok());
-        assert!(h.cpu.wrmsr(MSR_XSS, 1 << 11).is_err());
+        assert!(h.cpu.wrmsr(MSR_XSS, XSS_CET_U).is_ok());
+        assert_eq!(h.cpu.rdmsr(MSR_XSS).unwrap(), XSS_CET_U);
+        assert!(h.cpu.wrmsr(MSR_XSS, 1 << 8).is_err(), "PT");
     }
 
     #[test]

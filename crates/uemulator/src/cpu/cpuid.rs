@@ -124,6 +124,8 @@ const LEAF1_EBX_LOGICAL_PROCESSORS_SHIFT: u32 = 16;
 const LEAF1_EBX_APIC_ID_SHIFT: u32 = 24;
 
 const FEATURE_FPU: u32 = 1 << 0;
+/// Virtual-8086 mode extensions and protected-mode virtual interrupts (CR4.VME/PVI, `vme.rs`).
+const FEATURE_VME: u32 = 1 << 1;
 const FEATURE_DE: u32 = 1 << 2;
 const FEATURE_PSE: u32 = 1 << 3;
 const FEATURE_TSC: u32 = 1 << 4;
@@ -153,6 +155,7 @@ const FEATURE_SSE2: u32 = 1 << 26;
 /// Hyper-threading: more than one logical processor in the package. Not advertised for one.
 const FEATURE_HTT: u32 = 1 << 28;
 const LEAF1_EDX: u32 = FEATURE_FPU
+    | FEATURE_VME
     | FEATURE_DE
     | FEATURE_PSE
     | FEATURE_TSC
@@ -177,6 +180,7 @@ const LEAF1_EDX: u32 = FEATURE_FPU
 /// Leaf 0x8000_0001 EDX repeats this subset of the leaf 1 bits (the AMD aliases); DE and PSE
 /// are not mirrored.
 const EXT_ALIASED_EDX: u32 = FEATURE_FPU
+    | FEATURE_VME
     | FEATURE_TSC
     | FEATURE_MSR
     | FEATURE_PAE
@@ -307,6 +311,9 @@ const STRUCTURED_EBX: u32 = STRUCTURED_FEATURE_FSGSBASE
 const STRUCTURED_ECX_AVX512_VBMI: u32 = 1 << 1;
 const STRUCTURED_ECX_UMIP: u32 = 1 << 2;
 const STRUCTURED_ECX_AVX512_VBMI2: u32 = 1 << 6;
+/// CET_SS: shadow stacks (`cet.rs`). Indirect branch tracking (EDX bit 20) is Intel only and
+/// stays clear, as on every Zen.
+const STRUCTURED_ECX_CET_SS: u32 = 1 << 7;
 const STRUCTURED_ECX_GFNI: u32 = 1 << 8;
 const STRUCTURED_ECX_VAES: u32 = 1 << 9;
 const STRUCTURED_ECX_VPCLMULQDQ: u32 = 1 << 10;
@@ -321,6 +328,7 @@ const STRUCTURED_ECX_MOVDIR64B: u32 = 1 << 28;
 const STRUCTURED_ECX: u32 = STRUCTURED_ECX_AVX512_VBMI
     | STRUCTURED_ECX_UMIP
     | STRUCTURED_ECX_AVX512_VBMI2
+    | STRUCTURED_ECX_CET_SS
     | STRUCTURED_ECX_GFNI
     | STRUCTURED_ECX_VAES
     | STRUCTURED_ECX_VPCLMULQDQ
@@ -380,6 +388,8 @@ const XSTATE_FEATURE_XSAVEC: u32 = 1 << 1;
 const XSTATE_FEATURE_XGETBV1: u32 = 1 << 2;
 /// Leaf 0xd subleaf 1 EAX bit 3: xsaves, xrstors and IA32_XSS.
 const XSTATE_FEATURE_XSAVES: u32 = 1 << 3;
+/// Leaf 0xd subleaf n ECX bit 0: component n is supervisor state (IA32_XSS, not XCR0).
+const XSTATE_COMPONENT_SUPERVISOR: u32 = 1 << 0;
 
 // Leaf 0x8000_0001 ECX.
 /// LAHF/SAHF in 64-bit mode.
@@ -764,10 +774,18 @@ impl Cpu {
                         | XSTATE_FEATURE_XSAVEC
                         | XSTATE_FEATURE_XGETBV1
                         | XSTATE_FEATURE_XSAVES,
-                    xsave::compacted_area_size(self.xcr0),
+                    xsave::compacted_area_size(self.xcr0 | self.xss),
                     xsave::XSS_SUPPORTED as u32,
                     (xsave::XSS_SUPPORTED >> 32) as u32,
                 ),
+                // Components 11 and 12 (CET_U, CET_S): supervisor (ECX bit 0), compacted only, so
+                // no standard-format offset.
+                _ if let Some(part) = xsave::SUPERVISOR_COMPONENTS
+                    .iter()
+                    .find(|part| part.index == subleaf) =>
+                {
+                    (part.size as u32, 0, XSTATE_COMPONENT_SUPERVISOR, 0)
+                }
                 // Components 2 (AVX) and 5-7 (AVX-512): size and offset in the standard format
                 _ => match xsave::COMPONENTS.iter().find(|part| part.index == subleaf) {
                     Some(part) => (part.size as u32, part.offset as u32, 0, 0),

@@ -9,6 +9,9 @@ mod bios;
 #[cfg(not(freestanding))]
 mod bios_keys;
 mod bmi;
+pub(crate) mod cet;
+#[cfg(test)]
+mod cet_tests;
 mod cpuid;
 pub(crate) mod decode;
 pub(crate) mod exception;
@@ -36,6 +39,7 @@ mod sys;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub(crate) mod vcpus;
+mod vme;
 mod wall_clock;
 pub(crate) mod xsave;
 
@@ -306,6 +310,8 @@ pub(crate) struct LargePage {
     pub no_execute: bool,
     /// The leaf already has Dirty set, so a store needs no walk.
     pub dirty: bool,
+    /// The leaf is a shadow-stack page (`TLB_FLAG_SHADOW_STACK`).
+    pub shadow_stack: bool,
 }
 
 pub(crate) const LARGE_PAGE_EMPTY: LargePage = LargePage {
@@ -316,6 +322,7 @@ pub(crate) const LARGE_PAGE_EMPTY: LargePage = LargePage {
     user_allowed: false,
     no_execute: false,
     dirty: false,
+    shadow_stack: false,
 };
 
 /// Never equals a page-aligned address, so an empty tag always misses.
@@ -334,6 +341,9 @@ pub(crate) const TLB_FLAG_USER: u8 = 2;
 pub(crate) const TLB_FLAG_NO_EXECUTE: u8 = 4;
 /// The leaf PTE already has its dirty bit, so a store can skip the walk that would set it.
 pub(crate) const TLB_FLAG_DIRTY: u8 = 8;
+/// The page is a shadow-stack page (`cet.rs`): the leaf is read-only and dirty and every level
+/// above it writable. Only shadow-stack accesses look at it, and they always walk.
+pub(crate) const TLB_FLAG_SHADOW_STACK: u8 = 16;
 pub(crate) const TLB_INDEX_BITS: usize = 10;
 /// `Cpu::tlb` holds two halves of this many entries: supervisor first, then user. They are
 /// separate because the same page can be accessible to one privilege and not the other, and a
@@ -439,6 +449,10 @@ pub(crate) struct Cpu {
     pub spec_ctrl: u64,
     /// XCR0, the enabled extended-state components (xgetbv/xsetbv). Bit 0 (x87) is always set.
     pub xcr0: u64,
+    /// IA32_XSS, the supervisor state components xsaves/xrstors handle (`xsave::XSS_SUPPORTED`).
+    pub xss: u64,
+    /// SSP and the CET MSRs (`cet.rs`).
+    pub cet: cet::Cet,
     /// AMD SVM: host/guest switching state (see `svm.rs`).
     pub svm: svm::Svm,
     /// MONITOR address and whether a monitor is armed for the next MWAIT.
@@ -812,6 +826,8 @@ impl Cpu {
             },
             spec_ctrl: 0,
             xcr0: xsave::XCR0_X87,
+            xss: 0,
+            cet: cet::Cet::default(),
             svm: svm::Svm::new(),
             monitor_address: 0,
             monitor_armed: false,
@@ -1165,7 +1181,7 @@ impl Cpu {
             }
             self.interrupt_shadow = false;
             self.icount += 1;
-            let result = if self.jit.is_some() && self.is_long64() {
+            let result = if self.jit.is_some() && self.jit_may_run() {
                 self.step_block()
             } else {
                 self.step()
@@ -1199,7 +1215,7 @@ impl Cpu {
             let start = self.rip;
             self.icount += 1;
             shadow.icount += 1;
-            let main_result = if self.is_long64() {
+            let main_result = if self.jit_may_run() {
                 self.step_block()
             } else {
                 self.last_block_insns = 1;

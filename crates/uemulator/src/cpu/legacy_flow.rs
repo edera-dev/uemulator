@@ -185,7 +185,8 @@ impl Cpu {
         let lo = self.read_sys(self.idtr.base.wrapping_add(entry_offset), 8)?;
         let gate_type = descriptor_type(lo);
         let dpl = descriptor_dpl(lo);
-        // INT n in virtual-8086 mode needs IOPL 3 (VME redirection is not implemented).
+        // INT n in virtual-8086 mode needs IOPL 3, unless VME sent it to the task's own vector
+        // table already (`redirect_software_interrupt`).
         if software && self.eflags & VM != 0 && self.iopl() < USER_CPL {
             return Err(Exception::general_protection(0));
         }
@@ -294,12 +295,22 @@ impl Cpu {
             }
             Ok(())
         })();
-        if let Err(error) = result {
-            self.gpr[GPR_RSP] = saved_sp;
-            self.seg[SEG_SS] = saved_ss;
-            self.set_cpl(saved_cpl);
-            return Err(error);
-        }
+        // The shadow stack goes last, after every fault the data stack can raise, so a fault
+        // there never leaves a supervisor token claimed for a delivery that did not happen. CS,
+        // rIP and CPL still describe the interrupted code, as it needs.
+        let handler_long = new_cs.long() && self.efer & EFER_LMA != 0;
+        let result =
+            result.and_then(|()| self.shadow_stack_enter(new_cpl, 0, handler_long, from_v86));
+        let shadow_stack = match result {
+            Ok(shadow_stack) => shadow_stack,
+            Err(error) => {
+                self.gpr[GPR_RSP] = saved_sp;
+                self.seg[SEG_SS] = saved_ss;
+                self.set_cpl(saved_cpl);
+                return Err(error);
+            }
+        };
+        shadow_stack.commit(self);
         self.seg[SEG_CS] = new_cs;
         self.set_cpl(new_cpl);
         self.rip = offset;
@@ -487,18 +498,25 @@ impl Cpu {
         if target.flags & SEG_LONG == 0 && offset > target.limit as u64 {
             return Err(Exception::general_protection(0));
         }
+        let mut new_ssp = self.cet.ssp;
         if transfer == Transfer::Call {
             let old_cs = self.seg[SEG_CS].sel as u64;
             let saved = self.gpr[GPR_RSP];
+            let target_long = target.flags & SEG_LONG != 0;
             let pushed = self
                 .push(size, old_cs)
-                .and_then(|()| self.push(size, return_eip & mask(size)));
-            if let Err(error) = pushed {
-                self.gpr[GPR_RSP] = saved;
-                return Err(error);
+                .and_then(|()| self.push(size, return_eip & mask(size)))
+                .and_then(|()| self.shadow_stack_far_call(return_eip & mask(size), target_long));
+            match pushed {
+                Ok(ssp) => new_ssp = ssp,
+                Err(error) => {
+                    self.gpr[GPR_RSP] = saved;
+                    return Err(error);
+                }
             }
         }
         self.mark_descriptor_accessed(selector)?;
+        self.cet.ssp = new_ssp;
         let mut loaded = target;
         loaded.sel = (selector & !SELECTOR_RPL_MASK) | self.cpl as u16;
         self.seg[SEG_CS] = loaded;
@@ -565,6 +583,13 @@ impl Cpu {
             }
             self.push_on(&new_ss, &mut sp, size, old_cs)?;
             self.push_on(&new_ss, &mut sp, size, return_eip & mask(size))?;
+            // Last, so no later fault leaves its token claimed. It records the current rIP as
+            // the return address, which for a call is the next instruction.
+            let call_rip = self.rip;
+            self.rip = return_eip;
+            let shadow_stack = self.shadow_stack_enter(new_cpl, 0, false, false);
+            self.rip = call_rip;
+            shadow_stack?.commit(self);
             self.seg[SEG_SS] = new_ss;
             self.gpr[GPR_RSP] = sp;
             self.set_cpl(new_cpl);
@@ -572,10 +597,14 @@ impl Cpu {
             let saved = self.gpr[GPR_RSP];
             let pushed = self
                 .push(size, old_cs)
-                .and_then(|()| self.push(size, return_eip & mask(size)));
-            if let Err(error) = pushed {
-                self.gpr[GPR_RSP] = saved;
-                return Err(error);
+                .and_then(|()| self.push(size, return_eip & mask(size)))
+                .and_then(|()| self.shadow_stack_far_call(return_eip & mask(size), false));
+            match pushed {
+                Ok(ssp) => self.cet.ssp = ssp,
+                Err(error) => {
+                    self.gpr[GPR_RSP] = saved;
+                    return Err(error);
+                }
             }
         }
         self.seg[SEG_CS] = new_cs;
@@ -640,7 +669,9 @@ impl Cpu {
             return Err(Exception::general_protection(0));
         }
         if new_cpl == self.cpl {
+            let new_ssp = self.shadow_stack_return(new_cpl, &new_cs, offset, false)?;
             self.mark_descriptor_accessed(selector)?;
+            self.cet.ssp = new_ssp;
             self.seg[SEG_CS] = new_cs;
             self.rip = offset;
             self.set_stack_pointer(released);
@@ -649,6 +680,7 @@ impl Cpu {
         let new_sp = read(self, released, size)?;
         let ss = read(self, released.wrapping_add(size as u64), size)? as u16;
         let new_ss = self.checked_data_seg_for_return(ss, new_cpl)?;
+        self.cet.ssp = self.shadow_stack_return(new_cpl, &new_cs, offset, false)?;
         self.seg[SEG_CS] = new_cs;
         self.seg[SEG_SS] = new_ss;
         self.set_cpl(new_cpl);
@@ -742,7 +774,7 @@ impl Cpu {
         }
         if self.eflags & VM != 0 {
             if self.iopl() < USER_CPL {
-                return Err(Exception::general_protection(0));
+                return self.iret_virtual_8086(size);
             }
             let ip = read(self, sp, size)?;
             let cs = read(self, sp.wrapping_add(step), size)? as u16;
@@ -780,14 +812,18 @@ impl Cpu {
             return Err(Exception::general_protection(0));
         }
         let loadable = {
-            let mut loadable = self.loadable_eflags(old_cpl);
+            // VIF and VIP only change from ring 0.
+            let mut loadable =
+                self.loadable_eflags(old_cpl) | if old_cpl == 0 { VIF | VIP } else { 0 };
             if size == 2 {
                 loadable &= WORD_MASK;
             }
             loadable
         };
         if new_cpl == old_cpl {
+            let new_ssp = self.shadow_stack_return(new_cpl, &new_cs, eip, true)?;
             self.mark_descriptor_accessed(selector)?;
+            self.cet.ssp = new_ssp;
             self.seg[SEG_CS] = new_cs;
             self.rip = eip;
             self.set_stack_pointer(sp.wrapping_add(3 * step));
@@ -795,6 +831,7 @@ impl Cpu {
             let new_sp = read(self, sp.wrapping_add(3 * step), size)?;
             let ss = read(self, sp.wrapping_add(4 * step), size)? as u16;
             let new_ss = self.checked_data_seg_for_return(ss, new_cpl)?;
+            self.cet.ssp = self.shadow_stack_return(new_cpl, &new_cs, eip, true)?;
             self.seg[SEG_CS] = new_cs;
             self.seg[SEG_SS] = new_ss;
             self.set_cpl(new_cpl);
@@ -832,7 +869,8 @@ impl Cpu {
         let ds = read(self, sp.wrapping_add(24))? as u16;
         let fs = read(self, sp.wrapping_add(28))? as u16;
         let gs = read(self, sp.wrapping_add(32))? as u16;
-        let loadable = self.loadable_eflags(0) | VM;
+        self.shadow_stack_leave_for_virtual_8086()?;
+        let loadable = self.loadable_eflags(0) | VM | VIF | VIP;
         let current = self.eflags_full();
         self.eflags = ((current & !loadable) | (flags & loadable)) | RESERVED_ONE;
         self.lazy_op = LazyFlagsOp::Eflags;

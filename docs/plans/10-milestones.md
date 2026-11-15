@@ -43,6 +43,8 @@
 
 - UMIP, SMEP/SMAP, PCID/INVPCID, MONITOR/MWAIT, RDTSCP done (see 03).
 
+- CET shadow stacks and VME/PVI done (see 21, "Zen 5 Turin model"; `cpu/cet.rs`, `cpu/vme.rs`): CET_SS and VME advertised, user and supervisor shadow stacks with the token protocol, #CP, the CET instructions, XSAVES components 11/12 and the VMCB's S_CET/SSP/ISST_ADDR. A privilege level with a shadow stack runs on the interpreter.
+
 - VEX decoding, BMI1 and BMI2 done (see 03, "VEX and BMI").
 
 - Speculation control, XSAVE and RDRAND done (see 03, "Speculation control" and "XSAVE and RDRAND"): guests see an in-order CPU immune to every speculative-execution bug (no retpolines, return thunks, KPTI or VERW), use `xsaveopt` for context switches, and seed the crng from `rdrand`/`rdseed`.
