@@ -156,10 +156,10 @@ fn leaf_6_has_only_the_always_running_apic_timer() {
 #[test]
 fn leaf_7_subleaf_0_features() {
     let mut h = blank();
-    // FSGSBASE BMI1 AVX2 SMEP BMI2 ERMS INVPCID AVX512F AVX512DQ RDSEED ADX SMAP AVX512IFMA
-    // CLFLUSHOPT CLWB AVX512CD SHA AVX512BW AVX512VL
+    // FSGSBASE BMI1 AVX2 SMEP BMI2 ERMS INVPCID PQM PQE AVX512F AVX512DQ RDSEED ADX SMAP
+    // AVX512IFMA CLFLUSHOPT CLWB AVX512CD SHA AVX512BW AVX512VL
     let ebx = bits(&[
-        0, 3, 5, 7, 8, 9, 10, 16, 17, 18, 19, 20, 21, 23, 24, 28, 29, 30, 31,
+        0, 3, 5, 7, 8, 9, 10, 12, 15, 16, 17, 18, 19, 20, 21, 23, 24, 28, 29, 30, 31,
     ]);
     // AVX512_VBMI UMIP AVX512_VBMI2 GFNI VAES VPCLMULQDQ AVX512_VNNI AVX512_BITALG
     // AVX512_VPOPCNTDQ RDPID MOVDIRI MOVDIR64B; no PKU, LA57, CET_SS
@@ -182,7 +182,7 @@ fn leaf_7_subleaf_1_has_avx_vnni_and_avx512_bf16_and_nothing_else() {
 #[test]
 fn other_standard_leaves_are_zero() {
     let mut h = blank();
-    for leaf in [2, 3, 4, 8, 0xa, 0xc, 0xe, 0xf, 0x10, 0x11, 0x14, 0x15, 0x1f] {
+    for leaf in [2, 3, 4, 8, 0xa, 0xc, 0xe, 0x11, 0x14, 0x15, 0x1f] {
         assert_eq!(cpuid(&mut h, leaf, 0), [0, 0, 0, 0], "leaf {leaf:#x}");
     }
 }
@@ -335,9 +335,42 @@ fn l2_and_l3_leaf_report_1m_16way_and_32m_16way() {
 }
 
 #[test]
-fn advanced_power_leaf_marks_the_tsc_invariant_and_nothing_else() {
+fn advanced_power_leaf_has_the_invariant_tsc_and_scalable_mca() {
     let mut h = blank();
-    assert_eq!(cpuid(&mut h, 0x8000_0007, 0), [0, 0, 0, 1 << 8]);
+    // EBX: McaOverflowRecov SUCCOR ScalableMca; EDX: invariant TSC
+    assert_eq!(
+        cpuid(&mut h, 0x8000_0007, 0),
+        [0, bits(&[0, 1, 3]), 0, 1 << 8]
+    );
+}
+
+#[test]
+fn the_machine_check_bank_count_matches_the_scalable_mca_banks() {
+    let mut h = blank();
+    let banks = h.cpu.rdmsr(0x179).unwrap() & 0xff;
+    assert_eq!(banks, 24);
+    // every bank's SMCA block exists, and the next one does not
+    assert!(h.cpu.rdmsr(0xc000_2005 + 0x10 * (banks as u32 - 1)).is_ok());
+    assert!(h.cpu.rdmsr(0xc000_2000 + 0x10 * banks as u32).is_err());
+}
+
+#[test]
+fn quality_of_service_leaves_describe_l3_monitoring_allocation_and_bandwidth() {
+    let mut h = blank();
+    // leaf 0xF: highest RMID 255, L3 monitored; subleaf 1: 64-byte occupancy units, 256 RMIDs,
+    // occupancy and total and local bandwidth events
+    assert_eq!(cpuid(&mut h, 0xf, 0), [0, 255, 0, 1 << 1]);
+    assert_eq!(cpuid(&mut h, 0xf, 1), [0, 64, 255, 0b111]);
+    // leaf 0x10: L3 allocation with a 16-bit mask, no CDP, 16 classes of service
+    assert_eq!(cpuid(&mut h, 0x10, 0), [0, 1 << 1, 0, 0]);
+    assert_eq!(cpuid(&mut h, 0x10, 1), [15, 0, 0, 15]);
+    // leaf 0x8000_0020: L3 bandwidth enforcement, 11-bit limits, 16 classes
+    assert_eq!(cpuid(&mut h, 0x8000_0020, 0), [0, 1 << 1, 0, 0]);
+    assert_eq!(cpuid(&mut h, 0x8000_0020, 1), [11, 0, 0, 15]);
+    // the registers behind them
+    assert_eq!(h.cpu.rdmsr(0xc90 + 15).ok(), Some(0xffff));
+    assert_eq!(h.cpu.rdmsr(0xc000_0200 + 15).ok(), Some(1 << 11));
+    assert!(h.cpu.rdmsr(0xc90 + 16).is_err());
 }
 
 #[test]
@@ -348,10 +381,10 @@ fn address_size_leaf_reports_40_physical_and_48_virtual_bits_and_the_extensions(
     assert_eq!((eax >> 8) & 0xff, 48);
     assert_eq!(eax >> 16, 0);
     // CLZERO XSAVEERPTR WBNOINVD IBPB IBRS STIBP STIBP_ALWAYS_ON IBRS_SAME_MODE EFER_LMSLE_MBZ
-    // SSBD PSFD BTC_NO IBPB_RET; no AMD_SSB_NO, VIRT_SSBD, PPIN, IBRS_ALWAYS_ON
+    // SSBD PSFD BTC_NO IBPB_RET MBE; no AMD_SSB_NO, VIRT_SSBD, PPIN, IBRS_ALWAYS_ON
     assert_eq!(
         ebx,
-        bits(&[0, 2, 9, 12, 14, 15, 17, 19, 20, 24, 28, 29, 30])
+        bits(&[0, 2, 6, 9, 12, 14, 15, 17, 19, 20, 24, 28, 29, 30])
     );
     assert_eq!((ecx, edx), (0, 0));
     // NC is the processor count minus one, ApicIdSize the bits the ids need
@@ -506,7 +539,6 @@ fn leaves_past_the_last_extended_leaf_and_the_unused_ones_are_zero() {
         0x8000_001b,
         0x8000_001c,
         0x8000_001f,
-        0x8000_0020,
         0x8000_0022,
         0x8000_0023,
         0x8000_0024,

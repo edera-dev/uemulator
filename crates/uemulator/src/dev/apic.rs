@@ -53,6 +53,16 @@ const REG_SELF_IPI: u32 = 0x3f0;
 /// AMD extended APIC space (feature register at 0x400); not implemented, reads as zero.
 const REG_EXTENDED_FEATURE: u32 = 0x400;
 const REG_EXTENDED_LAST: u32 = 0x530;
+/// The four extended LVT entries (APM vol. 2 sec. 16.4.5), the only part of the extended space
+/// that exists, in both modes: stored, reset masked, never delivered (nothing raises them). They
+/// must read masked: Linux's `setup_APIC_eilvt` takes an unmasked entry with another vector as
+/// firmware's and refuses it with a "[Firmware Bug]" line, and it programs offsets 1 and 2 for
+/// the machine-check threshold and deferred-error interrupts as soon as CPUID has SUCCOR.
+const REG_EXTENDED_LVT_FIRST: u32 = 0x500;
+const EXTENDED_LVT_COUNT: usize = 4;
+const REG_EXTENDED_LVT_LAST: u32 = REG_EXTENDED_LVT_FIRST + 0x10 * (EXTENDED_LVT_COUNT as u32 - 1);
+/// Vector, message type (10:8) and mask.
+const EXTENDED_LVT_WRITABLE: u32 = 0x0001_07ff;
 
 /// Version register: version 0x14 (integrated APIC), maximum LVT entry 6 (so LVT entries up to
 /// CMCI are valid), and the EOI-broadcast-suppression bit clear.
@@ -168,6 +178,7 @@ pub(crate) struct Lapic {
     lvt_lint0: u32,
     lvt_lint1: u32,
     lvt_error: u32,
+    extended_lvt: [u32; EXTENDED_LVT_COUNT],
     icr_high: u32,
     timer_initial: u32,
     divide_config: u32,
@@ -232,6 +243,7 @@ impl Lapic {
             lvt_lint0: DELIVERY_EXTINT << LVT_DELIVERY_SHIFT,
             lvt_lint1: (DELIVERY_NMI << LVT_DELIVERY_SHIFT) | LVT_MASKED,
             lvt_error: LVT_RESET,
+            extended_lvt: [LVT_RESET; EXTENDED_LVT_COUNT],
             icr_high: 0,
             timer_initial: 0,
             divide_config: DIVIDE_RESET,
@@ -583,6 +595,9 @@ impl Lapic {
             REG_LVT_LINT0 => self.lvt_lint0,
             REG_LVT_LINT1 => self.lvt_lint1,
             REG_LVT_ERROR => self.lvt_error,
+            REG_EXTENDED_LVT_FIRST..=REG_EXTENDED_LVT_LAST if offset & 0xf == 0 => {
+                self.extended_lvt[((offset - REG_EXTENDED_LVT_FIRST) >> 4) as usize]
+            }
             _ => return None,
         })
     }
@@ -691,6 +706,10 @@ impl Lapic {
             REG_LVT_LINT0 => self.lvt_lint0 = value & 0x0001_a7ff,
             REG_LVT_LINT1 => self.lvt_lint1 = value & 0x0001_a7ff,
             REG_LVT_ERROR => self.lvt_error = value & 0x0001_00ff,
+            REG_EXTENDED_LVT_FIRST..=REG_EXTENDED_LVT_LAST if offset & 0xf == 0 => {
+                self.extended_lvt[((offset - REG_EXTENDED_LVT_FIRST) >> 4) as usize] =
+                    value & EXTENDED_LVT_WRITABLE;
+            }
             REG_LVT_TIMER => {
                 let previous_mode = self.timer_mode();
                 self.lvt_timer = value & (0x0001_00ff | LVT_TIMER_MODE_MASK);
@@ -1132,6 +1151,29 @@ mod tests {
         assert!(!apic.hardware_enabled());
         assert!(apic.set_base_msr(enable));
         assert!(!apic.set_base_msr(1 << 63));
+    }
+
+    #[test]
+    fn extended_lvt_entries_reset_masked_and_store_in_both_modes() {
+        let mut apic = Lapic::new(0);
+        for x2apic in [false, true] {
+            if x2apic {
+                let enable = APIC_DEFAULT_BASE | APIC_BASE_ENABLE;
+                assert!(apic.set_base_msr(enable | APIC_BASE_X2APIC));
+            }
+            for offset in [0x500, 0x510, 0x520, 0x530] {
+                assert_eq!(
+                    apic.read_register(offset, 0),
+                    Some(LVT_MASKED),
+                    "{offset:#x}"
+                );
+            }
+            // what Linux's setup_APIC_eilvt writes for the deferred-error interrupt (vector 0xf4)
+            apic.write_register(0x520, 0xffff_00f4, 0).unwrap();
+            assert_eq!(apic.read_register(0x520, 0), Some(0x0001_00f4));
+            apic.write_register(0x520, LVT_MASKED, 0).unwrap();
+        }
+        assert!(apic.read_register(0x540, 0).is_none());
     }
 
     #[test]

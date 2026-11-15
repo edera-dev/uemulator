@@ -113,6 +113,8 @@ Vulnerability files of the Alpine 6.18 guest (`grep -r . /sys/devices/system/cpu
 
 Zen 5 instructions advertised, each with reference tests and an interpreter/JIT differential case (they reach the JIT through the interpreter helper, no `jit/` change): AVX-VNNI (VEX vpdpbusd(s)/vpdpwssd(s), one kernel with the EVEX forms), MOVDIRI, MOVDIR64B, AVX512_VP2INTERSECT, PREFETCHI (`0F 18` hints). MOVDIR64B's 64-byte store is eight 8-byte stores, so with one host thread per vCPU another vCPU can see it half done; the SDM promises a single unit, which no guest seen so far depends on.
 
+Machine-check architecture and platform QoS are Turin's (`docs/plans/03-cpu.md`, "Machine check and platform QoS"): ScalableMca, SUCCOR and McaOverflowRecov in 0x8000_0007 EBX with 24 SMCA banks named by Zen 5 IPIDs, and PQM/PQE with leaves 0xF, 0x10 and 0x8000_0020 (L3 monitoring, allocation and bandwidth enforcement, no CDP, BMEC, ABMC or slow-memory enforcement) behind MSRs that store and counters that read zero.
+
 Present on Turin, not advertised (not implemented): LA57, PKU/OSPKE, CET shadow stacks, SSE4A, MMXEXT, FFXSR, MWAITX/MONITORX, RDPRU, INVLPGB/TLBSYNC, OSVW, CR8_LEGACY, PERFCTR_CORE and PerfMonV2, IBS, LBR v2, SRSO_BP_SPEC_REDUCE (needs the BP_CFG bit KVM toggles), ERAPS, NO_SMM_CTL_MSR, the extended SVM features (vGIF, vNMI, V_VMSAVE_VMLOAD, TSC scaling, pause filter, AVIC/x2AVIC), SEV/SEV-ES/SEV-SNP, CPPC, RAPL, 52/57 address bits. AMD_SSB_NO and IBRS_ALWAYS_ON stay clear because Turin does not report them.
 
 ## Order

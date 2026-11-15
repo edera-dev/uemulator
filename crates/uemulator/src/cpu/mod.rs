@@ -27,6 +27,7 @@ pub(crate) mod mem;
 pub(crate) mod modes;
 pub(crate) mod mtrr;
 mod protection;
+mod rdt;
 pub(crate) mod smp;
 #[cfg(test)]
 mod smp_tests;
@@ -425,6 +426,7 @@ pub(crate) struct Cpu {
     pub nmi_blocked: bool,
     pub mtrr: mtrr::Mtrr,
     pub mca: mca::Mca,
+    pub rdt: rdt::Rdt,
     pub efer: u64,
     pub star: u64,
     pub lstar: u64,
@@ -799,6 +801,7 @@ impl Cpu {
             nmi_blocked: false,
             mtrr: mtrr::Mtrr::new(),
             mca: mca::Mca::new(),
+            rdt: rdt::Rdt::new(),
             efer: EFER_LMA | EFER_LME,
             star: 0,
             lstar: 0,

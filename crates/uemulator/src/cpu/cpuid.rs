@@ -25,7 +25,7 @@
 //! - 40 physical and 48 virtual address bits, not 52 and 57.
 
 use super::sys::{CR4_OSXSAVE, PHYSICAL_ADDRESS_BITS, RAX, RBX, RCX, RDX, VIRTUAL_ADDRESS_BITS};
-use super::{Cpu, xsave};
+use super::{Cpu, mca, rdt, xsave};
 
 /// Where this logical processor sits. The defaults describe a machine with one CPU. SMP is not
 /// implemented yet; the shape is accepted now so that the leaves already agree with whatever
@@ -98,8 +98,9 @@ const LEAF_EXTENDED_APIC_ID: u32 = 0x8000_001e;
 const LEAF_EXT_FEATURES_2: u32 = 0x8000_0021;
 const LEAF_EXTENDED_TOPOLOGY_AMD: u32 = 0x8000_0026;
 
-/// Highest standard leaf. Zen stops at 0x10 (the quality-of-service leaves 0xF and 0x10 read
-/// as zero here); 2-4, 8-0xA, 0xC, 0xE are within range and zero, as on AMD.
+/// Highest standard leaf. Zen stops at 0x10 (the quality-of-service leaves 0xF and 0x10, which
+/// `rdt.rs` answers along with 0x8000_0020); 2-4, 8-0xA, 0xC, 0xE are within range and zero, as
+/// on AMD.
 const MAX_STANDARD_LEAF: u32 = 0x10;
 /// Leaves 0x8000_0022..=0x8000_0025 (PerfMonV2, memory encryption, platform QoS) are in range and
 /// read as zero: nothing behind them is implemented.
@@ -290,6 +291,8 @@ const STRUCTURED_EBX: u32 = STRUCTURED_FEATURE_FSGSBASE
     | STRUCTURED_FEATURE_BMI2
     | STRUCTURED_FEATURE_ERMS
     | STRUCTURED_FEATURE_INVPCID
+    | rdt::STRUCTURED_FEATURE_PQM
+    | rdt::STRUCTURED_FEATURE_PQE
     | STRUCTURED_FEATURE_AVX512F
     | STRUCTURED_FEATURE_AVX512DQ
     | STRUCTURED_FEATURE_RDSEED
@@ -621,7 +624,8 @@ const EXT_ADDRESS_EBX: u32 = EXT_ADDRESS_CLZERO
     | EXT_ADDRESS_SSBD
     | EXT_ADDRESS_PSFD
     | EXT_ADDRESS_BTC_NO
-    | EXT_ADDRESS_IBPB_RET;
+    | EXT_ADDRESS_IBPB_RET
+    | rdt::ADDRESS_SIZES_MBE;
 /// ECX: number of logical processors minus one (7:0), APIC id width in bits (15:12).
 const EXT_ADDRESS_APIC_ID_SIZE_SHIFT: u32 = 12;
 
@@ -679,8 +683,8 @@ const EXT_FEATURES_2_TSA_SQ_NO: u32 = 1 << 1;
 const EXT_FEATURES_2_TSA_L1_NO: u32 = 1 << 2;
 
 impl Cpu {
-    /// The subleaf (ECX) matters for leaves 7, 0xB, 0xD and 0x8000_001D; unknown leaves return
-    /// zeros.
+    /// The subleaf (ECX) matters for leaves 7, 0xB, 0xD, 0xF, 0x10, 0x8000_001D and 0x8000_0020;
+    /// unknown leaves return zeros.
     pub fn cpuid(&mut self) {
         let leaf = self.gpr[RAX] as u32;
         let subleaf = self.gpr[RCX] as u32;
@@ -774,6 +778,9 @@ impl Cpu {
                     None => (0, 0, 0, 0),
                 },
             },
+            rdt::LEAF_MONITORING | rdt::LEAF_ALLOCATION | rdt::LEAF_EXTENDED_QOS => {
+                rdt::cpuid(leaf, subleaf)
+            }
             LEAF_EXT_MAX => (MAX_EXTENDED_LEAF, VENDOR_EBX, VENDOR_ECX, VENDOR_EDX),
             LEAF_EXT_FEATURES => (
                 SIGNATURE,
@@ -814,7 +821,7 @@ impl Cpu {
                 l2_cache_descriptor(),
                 l3_cache_descriptor(),
             ),
-            LEAF_ADVANCED_POWER => (0, 0, 0, APM_INVARIANT_TSC),
+            LEAF_ADVANCED_POWER => (0, mca::ADVANCED_POWER_EBX, 0, APM_INVARIANT_TSC),
             LEAF_ADDRESS_SIZES => (
                 ADDRESS_SIZES,
                 EXT_ADDRESS_EBX,

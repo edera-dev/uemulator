@@ -14,6 +14,7 @@ pub(crate) const VECTOR_SEGMENT_NOT_PRESENT: u8 = 11;
 pub(crate) const VECTOR_STACK_FAULT: u8 = 12;
 pub(crate) const VECTOR_GENERAL_PROTECTION: u8 = 13;
 pub(crate) const VECTOR_PAGE_FAULT: u8 = 14;
+pub(crate) const VECTOR_MACHINE_CHECK: u8 = 18;
 
 /// Long-mode IDT entries are 16 bytes.
 const IDT_ENTRY_BYTES: u64 = 16;
@@ -501,6 +502,7 @@ mod tests {
             assert_eq!(VECTOR_STACK_FAULT, 12);
             assert_eq!(VECTOR_GENERAL_PROTECTION, 13);
             assert_eq!(VECTOR_PAGE_FAULT, 14);
+            assert_eq!(VECTOR_MACHINE_CHECK, 18);
         }
 
         #[test]
