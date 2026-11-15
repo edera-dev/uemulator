@@ -15,6 +15,7 @@ standard library: tarballs are read, never extracted, so nothing in them can wri
 import argparse
 import gzip
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -22,6 +23,8 @@ import re
 import stat
 import sys
 import tarfile
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -117,12 +120,46 @@ CPIO_ALIGN = 4
 CONSOLE_MAJOR, CONSOLE_MINOR = 5, 1
 
 
+# Xcode Cloud's network drops connections mid-body (http.client.IncompleteRead), so every
+# download is retried. The waits double from DOWNLOAD_FIRST_WAIT; DOWNLOAD_TIMEOUT is per socket
+# operation, not for the whole body, so it only catches a connection that has gone silent.
+DOWNLOAD_ATTEMPTS = 6
+DOWNLOAD_FIRST_WAIT = 2
+DOWNLOAD_TIMEOUT = 60
+# Statuses worth asking again: rate limiting and the server's own failures. A 404 or 401 is not.
+HTTP_TOO_MANY_REQUESTS = 429
+HTTP_FIRST_SERVER_ERROR = 500
+
+
+def download(request):
+    """The whole body of `request` (a URL or a urllib Request), retried on network failures."""
+    url = request.full_url if isinstance(request, urllib.request.Request) else request
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT) as response:
+                return response.read()
+        except urllib.error.HTTPError as error:
+            retryable = error.code == HTTP_TOO_MANY_REQUESTS or error.code >= HTTP_FIRST_SERVER_ERROR
+            if not retryable or attempt == DOWNLOAD_ATTEMPTS:
+                raise
+            failure = error
+        # HTTPError is caught above; URLError covers DNS and refused connections, OSError resets
+        # and timeouts, HTTPException a body cut short (IncompleteRead) or a garbled response.
+        except (urllib.error.URLError, http.client.HTTPException, OSError) as error:
+            if attempt == DOWNLOAD_ATTEMPTS:
+                raise
+            failure = error
+        wait = DOWNLOAD_FIRST_WAIT * 2 ** (attempt - 1)
+        print(f"demo: {url}: {failure!r}; retrying in {wait} s ({attempt} of {DOWNLOAD_ATTEMPTS})", file=sys.stderr)
+        time.sleep(wait)
+    raise AssertionError("unreachable: the last attempt returns or raises")
+
+
 def fetch(url, sha256, cache):
     path = os.path.join(cache, os.path.basename(url))
     if not os.path.exists(path):
         print(f"demo: downloading {url}", file=sys.stderr)
-        with urllib.request.urlopen(url) as response:
-            data = response.read()
+        data = download(url)
         with open(path + ".part", "wb") as out:
             out.write(data)
         os.replace(path + ".part", path)
@@ -159,8 +196,7 @@ class Registry:
     def _token(self):
         if self.token is None:
             scope = urllib.parse.quote(f"repository:{self.repository}:pull")
-            with urllib.request.urlopen(f"https://{self.registry}/token?scope={scope}") as response:
-                self.token = json.load(response)["token"]
+            self.token = json.loads(download(f"https://{self.registry}/token?scope={scope}"))["token"]
         return self.token
 
     def get(self, digest, accept=None):
@@ -180,8 +216,7 @@ class Registry:
             request.add_header("Accept", accept)
         # Unredirected: a blob redirects to a signed CDN URL, which must not see the token.
         request.add_unredirected_header("Authorization", f"Bearer {self._token()}")
-        with urllib.request.urlopen(request) as response:
-            data = response.read()
+        data = download(request)
         actual = hashlib.sha256(data).hexdigest()
         if actual != sha256:
             sys.exit(f"demo: {url} has SHA-256 {actual}, expected {sha256}")
