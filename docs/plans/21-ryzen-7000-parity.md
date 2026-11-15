@@ -46,7 +46,7 @@ Rules from `CLAUDE.md` hold for all of it: a CPUID bit goes on in the same commi
 
 `svm::SVM_FEATURES` today: nested paging, next-RIP save, VMCB clean bits, flush-by-ASID (all in their "reload and flush everything" form), LBR virtualization, SVM lock, the TSC ratio MSR, the pause filter and its threshold, decode assists, virtual VMLOAD/VMSAVE, vGIF, vNMI, SPEC_CTRL virtualization, SVME_ADDR_CHK, AVIC and x2AVIC; 32768 ASIDs; the NMI, INIT, SMI (never raised) and task-switch intercepts (`docs/plans/03-cpu.md`, "SVM"). Zen 4 reports more in 0x8000_000A EDX; audit the list against the APM and add what a hypervisor will use, each with a guest test in `hack/kvm/run.sh`'s style or a fake kernel:
 - The host-visible `VIRT_SPEC_CTRL` remains. Done: GMET, ROGPT, HOST_MCE_OVERRIDE and TlbiCtl (the guest INVLPGB enable; `docs/plans/03-cpu.md`, "SVM"), TSC rate MSR, pause filter (count and threshold), SVM lock and `SVM_KEY`, LBR virtualization, vGIF, vNMI, `V_VMSAVE_VMLOAD`, decode assists, SPEC_CTRL virtualization, SVME_ADDR_CHK, VM_CR.R_INIT.
-- AVIC/x2AVIC are done (`cpu/svm_avic.rs`; `docs/plans/03-cpu.md`, "SVM"), without the IOMMU's guest APIC mode and with the broadcast shorthands and x2APIC logical IPIs left to the hypervisor.
+- AVIC/x2AVIC are done (`cpu/svm_avic.rs`; `docs/plans/03-cpu.md`, "SVM"), with the IOMMU's guest virtual APIC mode posting into the backing page (`docs/plans/16-iommu.md`) and the broadcast shorthands and x2APIC logical IPIs left to the hypervisor.
 - SEV, SEV-ES, SEV-SNP: not on client Ryzen; not planned.
 
 ### D. Counters and monitoring a guest can program

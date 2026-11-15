@@ -323,6 +323,37 @@ impl PhysWrite for GuestMem<'_> {
     fn write_phys(&mut self, phys_addr: u64, data: &[u8]) -> bool {
         self.write_raw(phys_addr, data)
     }
+
+    fn fetch_or_u32(&mut self, phys_addr: u64, bits: u32) -> bool {
+        const WORD: usize = 4;
+        let Ok(start) = usize::try_from(phys_addr) else {
+            return false;
+        };
+        if start % WORD != 0 || !is_ram_range(self.ram.len() as u64, phys_addr, WORD as u64) {
+            return false;
+        }
+        let Some(word) = self.ram.get_mut(start..start + WORD) else {
+            return false;
+        };
+        // SAFETY: four aligned bytes of guest RAM, which vCPU threads also reach only through
+        // atomics (or plain accesses the guest itself must order).
+        let word = unsafe { core::sync::atomic::AtomicU32::from_ptr(word.as_mut_ptr().cast()) };
+        word.fetch_or(bits, Ordering::SeqCst);
+        if self
+            .code
+            .get(start >> PAGE_SHIFT)
+            .is_some_and(|&flag| flag != 0)
+            && !self.code_pages_written.contains(&(start >> PAGE_SHIFT))
+        {
+            if self.code_pages_written.is_empty()
+                && let Some(barrier) = self.code_write_barrier
+            {
+                barrier.fetch_add(1, Ordering::SeqCst);
+            }
+            self.code_pages_written.push(start >> PAGE_SHIFT);
+        }
+        true
+    }
 }
 
 #[cfg(test)]

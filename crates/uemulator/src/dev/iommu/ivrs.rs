@@ -45,6 +45,41 @@ const IVHD_BASE_HEADER_BYTES: usize = 24;
 const IVHD_EXTENDED_HEADER_BYTES: usize = 40;
 /// IOMMU info: MSINum (4:0), UnitID (12:8); both 0 here.
 const IVHD_IOMMU_INFO: u16 = 0;
+/// IVHD 10h has no EFR image; its feature reporting field says the same in its own layout
+/// (its "IOMMU feature reporting"): XTSup (0), NXSup (1), GTSup (2), IASup (5), GASup (6), HESup (7), HATS
+/// (31:30). Linux reads the GASup and XTSup bits from it when 10h is the newest block it knows,
+/// and turns interrupt remapping's x2APIC and 128-bit modes off when they are clear. 11h and
+/// 40h carry IOMMU attributes there instead (counters, MSI numbers), all zero here.
+const IVHD10_XT: u32 = 1 << 0;
+const IVHD10_NX: u32 = 1 << 1;
+const IVHD10_GT: u32 = 1 << 2;
+const IVHD10_IA: u32 = 1 << 5;
+const IVHD10_GA: u32 = 1 << 6;
+const IVHD10_HE: u32 = 1 << 7;
+const IVHD10_HATS_SHIFT: u32 = 30;
+/// The EFR bits the 10h field repeats, in the same order as the constants above.
+const EFR_FOR_IVHD10: [(u64, u32); 6] = [
+    (1 << 2, IVHD10_XT),
+    (1 << 3, IVHD10_NX),
+    (1 << 4, IVHD10_GT),
+    (1 << 6, IVHD10_IA),
+    (1 << 7, IVHD10_GA),
+    (1 << 8, IVHD10_HE),
+];
+const EFR_HATS_SHIFT: u32 = 10;
+const HATS_MASK: u64 = 0b11;
+
+/// The IVHD 10h feature reporting field `EXTENDED_FEATURES` implies.
+fn ivhd10_features() -> u32 {
+    let hats = ((EXTENDED_FEATURES >> EFR_HATS_SHIFT) & HATS_MASK) as u32;
+    let mut features = hats << IVHD10_HATS_SHIFT;
+    for (efr, bit) in EFR_FOR_IVHD10 {
+        if EXTENDED_FEATURES & efr != 0 {
+            features |= bit;
+        }
+    }
+    features
+}
 
 /// Device entries (4 bytes: type, device id, data; the special entry is 8 bytes).
 const ENTRY_SELECT: u8 = 0x02;
@@ -113,7 +148,8 @@ fn ivhd_block(block_type: u8, topology: &IvrsTopology) -> Vec<u8> {
     block.extend_from_slice(&MMIO_BASE.to_le_bytes());
     block.extend_from_slice(&0u16.to_le_bytes());
     block.extend_from_slice(&IVHD_IOMMU_INFO.to_le_bytes());
-    block.extend_from_slice(&0u32.to_le_bytes());
+    let features = if extended { 0 } else { ivhd10_features() };
+    block.extend_from_slice(&features.to_le_bytes());
     if extended {
         block.extend_from_slice(&EXTENDED_FEATURES.to_le_bytes());
         block.extend_from_slice(&0u64.to_le_bytes());

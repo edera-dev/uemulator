@@ -434,8 +434,8 @@ fn extended_feature_register_advertises_what_is_implemented() {
     assert_ne!(EXTENDED_FEATURES & EFR_INVALIDATE_ALL, 0);
     assert_ne!(EXTENDED_FEATURES & EFR_GUEST_APIC, 0);
     assert_ne!(EXTENDED_FEATURES & EFR_NO_EXECUTE, 0);
-    // Not implemented, so not advertised: PPR, GT, HE, PC, GAM (vAPIC), HA/HD, EPH.
-    for unimplemented in [1, 4, 8, 9, 21, 50, 52] {
+    // Not implemented, so not advertised: PPR, GT, HE, PC, HA/HD, EPH.
+    for unimplemented in [1, 4, 8, 9, 50, 52] {
         assert_eq!(
             EXTENDED_FEATURES & 1 << unimplemented,
             0,
@@ -1349,7 +1349,9 @@ fn msi(requester: u16, index: u32, mode: u32) -> InterruptRequest {
 
 fn remap(f: &mut Fixture, request: InterruptRequest) -> Result<RemappedInterrupt, InterruptFault> {
     let mem = GuestMem::new(&mut f.ram, &[]);
-    f.iommu.remap_interrupt(&mem, request)
+    f.iommu
+        .remap_interrupt(&mem, request)
+        .map(|remapped| remapped.expect("delivered to the host"))
 }
 
 #[test]
@@ -2088,4 +2090,198 @@ fn denied_available_index_read_breaks_queue_instead_of_appearing_empty() {
         assert!(queue.pop(mem).is_none());
     });
     assert!(queue.broken);
+}
+
+// Guest virtual APIC mode (`ga.rs`).
+
+const GA_LOG_AT: u64 = 0x7_0000;
+const GA_LOG_TAIL_STORE_AT: u64 = 0x7_2000;
+const BACKING_PAGE: u64 = 0x8_0000;
+/// GALogLen 8: 4 KiB, 512 eight-byte entries (Linux's `GA_LOG_SIZE_512`).
+const GA_LOG_LENGTH_4K: u64 = 8 << 56;
+/// GAEn, GAMEn = 001b (virtual APIC), GALogEn, GAIntEn.
+const CONTROL_VIRTUAL_APIC: u64 = CONTROL_GUEST_APIC_ENABLE | 1 << 25 | 1 << 28 | 1 << 29;
+const STATUS_GA_RUN: u64 = 1 << 8;
+const STATUS_GA_OVERFLOW: u64 = 1 << 9;
+const STATUS_GA_INTERRUPT: u64 = 1 << 10;
+const IRTE_REMAP_ENABLE: u64 = 1 << 0;
+const IRTE_GA_LOG_INTERRUPT: u64 = 1 << 2;
+const IRTE_IS_RUNNING: u64 = 1 << 6;
+const IRTE_GUEST_MODE: u64 = 1 << 7;
+const GA_TAG: u64 = 0x0012_3456;
+const POSTED_VECTOR: u8 = 0x45;
+
+/// A virtual APIC mode IOMMU with its GA log at `GA_LOG_AT`, and IRTE 3 of `DEVICE` in guest
+/// mode for `BACKING_PAGE` with `flags` (IsRun, GALogIntr).
+fn virtual_apic_fixture(flags: u64, control: u64) -> Fixture {
+    let mut f = interrupt_fixture(9, 0);
+    f.mmio_write(ga::REG_GA_LOG_BASE, 8, GA_LOG_AT | GA_LOG_LENGTH_4K);
+    f.mmio_write(ga::REG_GA_LOG_TAIL_ADDRESS, 8, GA_LOG_TAIL_STORE_AT);
+    f.mmio_write(REG_CONTROL, 8, CONTROL_ALL | CONTROL_VIRTUAL_APIC | control);
+    let at = INTERRUPT_TABLE_AT + 16 * 3;
+    f.write64(
+        at,
+        IRTE_REMAP_ENABLE | IRTE_GUEST_MODE | flags | 0x02 << 8 | GA_TAG << 32,
+    );
+    f.write64(at + 8, POSTED_VECTOR as u64 | BACKING_PAGE);
+    f
+}
+
+/// Remaps the guest-mode IRTE, then lets the IOMMU write what it queued.
+fn post(f: &mut Fixture) -> Result<Option<RemappedInterrupt>, InterruptFault> {
+    let result = {
+        let mem = GuestMem::new(&mut f.ram, &[]);
+        f.iommu.remap_interrupt(&mem, msi(DEVICE, 3, 0))
+    };
+    let mut mem = GuestMem::new(&mut f.ram, &[]);
+    f.iommu.service(&mut mem);
+    result
+}
+
+/// The IRR word of the backing page that holds `POSTED_VECTOR`.
+fn posted_irr(f: &Fixture) -> u32 {
+    let word = BACKING_PAGE + 0x200 + (POSTED_VECTOR as u64 / 32) * 0x10;
+    f.read64(word) as u32
+}
+
+#[test]
+fn the_extended_features_offer_virtual_apic_mode() {
+    assert_eq!((EXTENDED_FEATURES >> 21) & 0b111, 1, "GAMSup: virtual APIC");
+    assert_ne!(
+        EXTENDED_FEATURES & EFR_GUEST_APIC,
+        0,
+        "GASup, which it needs"
+    );
+}
+
+#[test]
+fn ga_log_registers_store_and_the_log_runs_while_enabled() {
+    let mut f = Fixture::enabled();
+    assert_eq!(f.read(REG_STATUS) & STATUS_GA_RUN, 0);
+    f.mmio_write(ga::REG_GA_LOG_BASE, 8, GA_LOG_AT | GA_LOG_LENGTH_4K);
+    f.mmio_write(ga::REG_GA_LOG_TAIL_ADDRESS, 8, GA_LOG_TAIL_STORE_AT | 7);
+    assert_eq!(f.read(ga::REG_GA_LOG_BASE), GA_LOG_AT | GA_LOG_LENGTH_4K);
+    assert_eq!(
+        f.read(ga::REG_GA_LOG_TAIL_ADDRESS),
+        GA_LOG_TAIL_STORE_AT,
+        "8-byte aligned"
+    );
+    f.mmio_write(REG_CONTROL, 8, CONTROL_ALL | CONTROL_VIRTUAL_APIC);
+    assert_ne!(f.read(REG_STATUS) & STATUS_GA_RUN, 0, "GALogRun");
+    f.mmio_write(REG_CONTROL, 8, CONTROL_ALL);
+    assert_eq!(f.read(REG_STATUS) & STATUS_GA_RUN, 0);
+}
+
+#[test]
+fn a_guest_mode_irte_posts_into_the_backing_page_instead_of_the_host() {
+    let mut f = virtual_apic_fixture(IRTE_IS_RUNNING | IRTE_GA_LOG_INTERRUPT, 0);
+    assert_eq!(post(&mut f), Ok(None), "nothing for the host's APIC");
+    assert_eq!(posted_irr(&f), 1 << (POSTED_VECTOR % 32));
+    // running: the doorbell, no GA log entry and no interrupt
+    assert_eq!(f.read(ga::REG_GA_LOG_TAIL), 0);
+    assert_eq!(f.read(REG_STATUS) & STATUS_GA_INTERRUPT, 0);
+    assert!(f.iommu.take_interrupt().is_none());
+    // another vector of the same word keeps the first
+    f.write64(INTERRUPT_TABLE_AT + 16 * 3 + 8, 0x46 | BACKING_PAGE);
+    post(&mut f).unwrap();
+    assert_eq!(posted_irr(&f), 0b11 << (POSTED_VECTOR % 32));
+}
+
+#[test]
+fn a_vcpu_that_is_not_running_gets_a_ga_log_entry_and_the_host_an_interrupt() {
+    let mut f = virtual_apic_fixture(IRTE_GA_LOG_INTERRUPT, 0);
+    assert_eq!(post(&mut f), Ok(None));
+    assert_eq!(posted_irr(&f), 1 << (POSTED_VECTOR % 32));
+    assert_eq!(f.read(ga::REG_GA_LOG_TAIL), 8);
+    // GATag, the requester, type 1 (guest not running): what Linux's GA_TAG, GA_DEVID and
+    // GA_REQ_TYPE read
+    assert_eq!(
+        f.read64(GA_LOG_AT),
+        GA_TAG | (DEVICE as u64) << 32 | 1 << 60
+    );
+    assert_eq!(f.read64(GA_LOG_TAIL_STORE_AT), 8, "the tail, stored");
+    assert_ne!(f.read(REG_STATUS) & STATUS_GA_INTERRUPT, 0);
+    let Some(IommuInterrupt::Message(message)) = f.iommu.take_interrupt() else {
+        panic!("expected the IOMMU's MSI");
+    };
+    assert_eq!(message.data, MSI_DATA_VALUE);
+    // GALogInt is write-1-to-clear, and the head is the driver's
+    f.mmio_write(REG_STATUS, 8, STATUS_GA_INTERRUPT);
+    assert_eq!(f.read(REG_STATUS) & STATUS_GA_INTERRUPT, 0);
+    f.mmio_write(ga::REG_GA_LOG_HEAD, 8, 8);
+    assert_eq!(f.read(ga::REG_GA_LOG_HEAD), 8);
+}
+
+#[test]
+fn without_ga_log_interrupt_or_with_the_log_off_nothing_is_logged() {
+    let mut f = virtual_apic_fixture(0, 0);
+    post(&mut f).unwrap();
+    assert_eq!(posted_irr(&f), 1 << (POSTED_VECTOR % 32));
+    assert_eq!(f.read(ga::REG_GA_LOG_TAIL), 0);
+    let mut f = virtual_apic_fixture(IRTE_GA_LOG_INTERRUPT, 0);
+    f.mmio_write(
+        REG_CONTROL,
+        8,
+        CONTROL_ALL | CONTROL_GUEST_APIC_ENABLE | 1 << 25,
+    );
+    post(&mut f).unwrap();
+    assert_eq!(posted_irr(&f), 1 << (POSTED_VECTOR % 32), "still posted");
+    assert_eq!(f.read(ga::REG_GA_LOG_TAIL), 0);
+    assert!(f.iommu.take_interrupt().is_none());
+}
+
+#[test]
+fn with_intcapxt_the_ga_log_interrupt_uses_its_own_register() {
+    let mut f = virtual_apic_fixture(IRTE_GA_LOG_INTERRUPT, CONTROL_XT_INTERRUPTS);
+    f.mmio_write(
+        REG_XT_GENERAL_INTERRUPT,
+        8,
+        intcapxt_register(0x1, 0x70, false),
+    );
+    f.mmio_write(
+        REG_XT_GA_LOG_INTERRUPT,
+        8,
+        intcapxt_register(0x2, 0x72, false),
+    );
+    post(&mut f).unwrap();
+    let Some(IommuInterrupt::Direct(interrupt)) = f.iommu.take_interrupt() else {
+        panic!("expected a direct interrupt");
+    };
+    assert_eq!((interrupt.vector, interrupt.destination), (0x72, 2));
+    assert!(f.iommu.take_interrupt().is_none(), "once");
+}
+
+#[test]
+fn a_full_ga_log_overflows_and_stops() {
+    let mut f = virtual_apic_fixture(IRTE_GA_LOG_INTERRUPT, 0);
+    // the tail one entry short of the head: full
+    f.mmio_write(ga::REG_GA_LOG_HEAD, 8, 8);
+    f.mmio_write(ga::REG_GA_LOG_TAIL, 8, 0);
+    post(&mut f).unwrap();
+    assert_eq!(f.read(ga::REG_GA_LOG_TAIL), 0);
+    let status = f.read(REG_STATUS);
+    assert_ne!(status & STATUS_GA_OVERFLOW, 0);
+    assert_eq!(
+        status & STATUS_GA_RUN,
+        0,
+        "stopped until GALogEn is toggled"
+    );
+}
+
+#[test]
+fn guest_mode_without_virtual_apic_mode_is_unsupported() {
+    let mut f = virtual_apic_fixture(IRTE_IS_RUNNING, 0);
+    f.mmio_write(REG_CONTROL, 8, CONTROL_ALL | CONTROL_GUEST_APIC_ENABLE);
+    assert_eq!(post(&mut f), Err(InterruptFault::Unsupported));
+    assert_eq!(posted_irr(&f), 0);
+}
+
+#[test]
+fn ivhd_10h_reports_the_same_features_as_the_efr() {
+    let table = Iommu::new().ivrs_table(&IvrsTopology::default());
+    let blocks = ivrs_blocks(&table);
+    let (_, block) = blocks.iter().find(|(ty, _)| *ty == 0x10).unwrap();
+    let features = u32::from_le_bytes(block[20..24].try_into().unwrap());
+    // XTSup, NXSup, IASup, GASup, HATS 10b (six levels); GTSup and HESup clear
+    assert_eq!(features, 1 | 1 << 1 | 1 << 5 | 1 << 6 | 2 << 30);
 }

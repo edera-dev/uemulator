@@ -224,14 +224,15 @@ impl Iommu {
     /// device with IV=1 sends fixed and arbitrated interrupts through its IntCtl (abort, forward
     /// unchanged, or remap through the IRTE) and NMI, INIT and ExtInt only when the matching
     /// DTE pass bit is set; LINT0/LINT1 pass also admit ExtInt and NMI, the types those pins
-    /// carry. SMI is not supported.
+    /// carry. SMI is not supported. `Ok(None)`: a guest-mode IRTE took the interrupt for a
+    /// guest's virtual APIC (`ga.rs`), and the host's local APIC gets nothing.
     pub fn remap_interrupt(
         &mut self,
         mem: &dyn PhysRead,
         request: InterruptRequest,
-    ) -> Result<RemappedInterrupt, InterruptFault> {
+    ) -> Result<Option<RemappedInterrupt>, InterruptFault> {
         if !self.enabled() || self.device_table_bytes() == 0 {
-            return decode_message(&request);
+            return decode_message(&request).map(Some);
         }
         let entry = match self.fetch_device_entry(mem, request.requester) {
             Ok(entry) => entry,
@@ -247,7 +248,7 @@ impl Iommu {
         // Only IV decides, not V: Linux leaves V clear in the entries of the I/O APIC and HPET
         // special devices (nothing translates their DMA) and still has their interrupts remapped.
         if !entry.interrupt_map_valid() {
-            return decode_message(&request);
+            return decode_message(&request).map(Some);
         }
         match self.remap_with_entry(mem, &request, &entry) {
             Ok(remapped) => Ok(remapped),
@@ -269,21 +270,21 @@ impl Iommu {
         mem: &dyn PhysRead,
         request: &InterruptRequest,
         entry: &DeviceTableEntry,
-    ) -> Result<RemappedInterrupt, Rejected> {
+    ) -> Result<Option<RemappedInterrupt>, Rejected> {
         if !(INTERRUPT_WINDOW_FIRST..=INTERRUPT_WINDOW_LAST).contains(&request.address) {
             return Err(InterruptFault::InvalidAddress.into());
         }
         let message = decode_message(request)?;
         let pass = |allowed: bool| {
             if allowed {
-                Ok(message)
+                Ok(Some(message))
             } else {
                 Err(InterruptFault::TargetAbort.into())
             }
         };
         match message.delivery_mode {
             DeliveryMode::Fixed | DeliveryMode::LowestPriority => match entry.interrupt_control() {
-                InterruptControl::Forward => Ok(message),
+                InterruptControl::Forward => Ok(Some(message)),
                 InterruptControl::Abort => Err(InterruptFault::TargetAbort.into()),
                 InterruptControl::Reserved => Err(InterruptFault::Unsupported.into()),
                 InterruptControl::Remap => self.remap_through_table(mem, request, entry, message),
@@ -301,7 +302,7 @@ impl Iommu {
         request: &InterruptRequest,
         entry: &DeviceTableEntry,
         message: RemappedInterrupt,
-    ) -> Result<RemappedInterrupt, Rejected> {
+    ) -> Result<Option<RemappedInterrupt>, Rejected> {
         let length = entry.interrupt_table_length();
         if length == 0 || length > INTERRUPT_TABLE_MAX_LENGTH {
             return Err(InterruptFault::InterruptTable.into());
@@ -317,9 +318,10 @@ impl Iommu {
             IRTE_LEGACY_BYTES
         };
         let address = entry.interrupt_table_root() + index * entry_bytes;
+        let mut high = 0;
         let (flags, destination, vector) = if guest_apic {
             let low = read_u64(mem, address).ok_or(InterruptFault::InterruptTable)?;
-            let high = read_u64(mem, address + 8).ok_or(InterruptFault::InterruptTable)?;
+            high = read_u64(mem, address + 8).ok_or(InterruptFault::InterruptTable)?;
             let mut destination =
                 (low >> IRTE_DESTINATION_SHIFT) & IRTE_GUEST_APIC_DESTINATION_MASK;
             if self.xt_enabled() {
@@ -342,15 +344,21 @@ impl Iommu {
                 log: flags & IRTE_SUPPRESS_FAULT == 0,
             });
         }
+        // GuestMode means something only in virtual APIC mode (GAMEn); in legacy mode it is an
+        // IRTE this IOMMU cannot use.
         if flags & IRTE_GUEST_MODE != 0 {
-            return Err(InterruptFault::Unsupported.into());
+            if !self.virtual_apic_mode() {
+                return Err(InterruptFault::Unsupported.into());
+            }
+            self.queue_post(request.requester, flags, high);
+            return Ok(None);
         }
         let delivery_mode = match (flags >> IRTE_INT_TYPE_SHIFT) & IRTE_INT_TYPE_MASK {
             IRTE_INT_TYPE_FIXED => DeliveryMode::Fixed,
             IRTE_INT_TYPE_ARBITRATED => DeliveryMode::LowestPriority,
             _ => return Err(InterruptFault::Unsupported.into()),
         };
-        Ok(RemappedInterrupt {
+        Ok(Some(RemappedInterrupt {
             vector,
             delivery_mode,
             logical_destination: flags & IRTE_LOGICAL_DESTINATION != 0,
@@ -359,6 +367,6 @@ impl Iommu {
             redirection_hint: false,
             level_triggered: message.level_triggered,
             destination: destination as u32,
-        })
+        }))
     }
 }
