@@ -131,6 +131,28 @@ fn kind<T>(result: io::Result<T>) -> io::ErrorKind {
     }
 }
 
+#[test]
+fn drop_flushes_an_overwrite_of_already_mapped_data() {
+    let storage = Shared::default();
+    let mut disk = Udisk::create(
+        storage.clone(),
+        &UdiskOptions::new(CLUSTER as u64, ID),
+        None,
+    )
+    .unwrap();
+    disk.write_at(0, &[1; SUB_BLOCK]).unwrap();
+    disk.flush().unwrap();
+    storage.take_log();
+    disk.write_at(0, &[2; SUB_BLOCK]).unwrap();
+    drop(disk);
+    assert_eq!(
+        storage.take_log(),
+        vec![Op::Write(CLUSTER as u64, SUB_BLOCK), Op::Flush]
+    );
+    let mut reopened = Udisk::open(storage, None).unwrap();
+    assert_eq!(read(&mut reopened, 0, SUB_BLOCK), vec![2; SUB_BLOCK]);
+}
+
 /// Deterministic pseudo-random numbers, so a failing case repeats.
 struct Lcg(u64);
 

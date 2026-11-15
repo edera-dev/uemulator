@@ -341,6 +341,8 @@ pub struct Udisk {
     pages: Vec<Option<Box<[u64]>>>,
     /// Pages with entries changed since the last flush.
     dirty: BTreeSet<u64>,
+    /// Overwrites of mapped data can leave the map unchanged but still need a final sync.
+    data_unflushed: bool,
 }
 
 impl Udisk {
@@ -425,6 +427,7 @@ impl Udisk {
             next_cluster,
             pages: (0..pages).map(|_| None).collect(),
             dirty: BTreeSet::new(),
+            data_unflushed: false,
         })
     }
 
@@ -668,6 +671,7 @@ impl Udisk {
         }
         let base = entry.data_cluster << self.cluster_shift;
         for (from, to) in writes {
+            self.data_unflushed = true;
             self.storage.write_at(
                 base + from as u64,
                 &buffer[from - span_start..to - span_start],
@@ -748,6 +752,7 @@ impl BlockBackend for Udisk {
             return Ok(());
         }
         self.storage.flush()?;
+        self.data_unflushed = false;
         if self.dirty.is_empty() {
             return Ok(());
         }
@@ -780,7 +785,7 @@ impl Drop for Udisk {
     /// A machine that is dropped without the guest flushing still keeps what it wrote, as a raw
     /// file would. Errors have nowhere to go here.
     fn drop(&mut self) {
-        if !self.dirty.is_empty() {
+        if !self.dirty.is_empty() || self.data_unflushed {
             let _ = self.flush();
         }
     }
