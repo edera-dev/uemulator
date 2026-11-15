@@ -1,6 +1,6 @@
 # Apple platforms: a SwiftUI app
 
-**Status:** proposal. Nothing is built yet; M0 below is the spike that decides whether the WebKit engine is worth building.
+**Status:** proposal. M0, the spike that decides whether the WebKit engine is worth building, is done ("M0 results" below: it is, served from loopback HTTP rather than a scheme handler). Nothing of the app itself is built yet.
 
 A native app for macOS, iOS and iPadOS (visionOS later, tvOS only interpreted) that does what the web page does (`13-web.md`): pick or create a machine, boot it, show the terminal or the screen, type into it, network it. The UI is SwiftUI throughout. No web page is ever shown.
 
@@ -46,26 +46,26 @@ hack/apple/build-core.sh        cargo builds -> UemulatorCore.xcframework; also 
 
 ## WebKitEngine
 
-A `WKWebView` that is never added to a window (on iOS it must sit in the view hierarchy, 1×1 and hidden, or WebKit may suspend its process: check in M0). It loads `uemulator://engine/engine.html` from a `WKURLSchemeHandler` that serves the bundle and the app's files. The shim is `www/worker.js` and `www/jit_host.js` almost unchanged. `main.js`, xterm.js and every piece of UI are dropped.
+A `WKWebView` that sits in the view hierarchy, 1×1 with opacity 0 (M0 boots in it like that). It loads `http://127.0.0.1:<port>/<token>/engine.html` from a small HTTP server the app runs on loopback (`NWListener`), which serves the bundle and the app's files. Not a `WKURLSchemeHandler`: see the next paragraph. The shim is `www/worker.js` and `www/jit_host.js` almost unchanged. `main.js`, xterm.js and every piece of UI are dropped.
 
-**Cross-origin isolation.** `uw_run` blocks a Worker, and the page talks to it through `SharedArrayBuffer` rings (`www/protocol.js`). WebKit grants `SharedArrayBuffer` only to a cross-origin-isolated page, so the scheme handler sends `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` on every response, as `hack/web/serve.py` does. M0 must confirm that `crossOriginIsolated` is true on a custom scheme. The fallback is serving from a loopback `NWListener` on `http://127.0.0.1` (secure context, headers under our control).
+**Cross-origin isolation.** `uw_run` blocks a Worker, and the page talks to it through `SharedArrayBuffer` rings (`www/protocol.js`). WebKit grants `SharedArrayBuffer` only to a cross-origin-isolated page, so every response carries `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp`, as `hack/web/serve.py` sends. M0 found that a custom scheme is not enough: on `uemulator://` the page reports `crossOriginIsolated === true` and still has no `SharedArrayBuffer` constructor and no shared wasm memory, also after a first navigation to a page without the headers (which should have forced a process swap). WebKit only enables them in a WebContent process it started for a COOP navigation, and evidently not for custom schemes. The same headers from `http://127.0.0.1` work: `127.0.0.1` is a secure context, and ATS lets loopback through without an exception. The server listens on 127.0.0.1 only. Other apps can still reach a loopback port, so every path starts with a random per-launch token, and anything else gets a 404.
 
 **The bridge.** Everything the page did with UI now crosses a process boundary:
 
-- Disk reads: the worker already reads disks with synchronous range XHRs (`host_disk_read`, `rangeRequest`). Those go to `uemulator://disk/<id>`, and the scheme handler answers them from the file with `FileHandle` reads. Nothing new is needed, and big ISOs never load into memory.
-- Disk writes: today they land in an in-memory udisk overlay that dies with the page. For a persistent disk, add a `host_disk_write` import: a synchronous `POST uemulator://disk/<id>?offset=` whose body the scheme handler writes to the udisk file. M0 checks that WebKit hands request bodies from a worker's XHR to a scheme handler. If it doesn't, the overlay is flushed in batches over the stream channel below.
-- Console, screen, input, network and Wisp: one binary stream each way between the page's main thread and the app. The page's main thread drains the worker's rings as `main.js` does today and forwards the bytes; going the other way, it fills the input, net and Wisp rings. Two candidate transports, measured in M0:
-  1. `WKScriptMessageHandlerWithReply` / `callAsyncJavaScript`. Simple, but its values are property lists (no `ArrayBuffer`), so bytes travel as base64 strings.
-  2. A WebSocket from the page to an `NWListener` on loopback in the app. Binary frames, no base64; costs a listener and a random token so another app can't connect.
+- Disk reads: the worker already reads disks with synchronous range XHRs (`host_disk_read`, `rangeRequest`). Those go to `/<token>/disk/<id>` on the loopback server, which answers them from the file with `FileHandle` reads (M0: a 512-byte range read from a worker works). Nothing new is needed, and big ISOs never load into memory.
+- Disk writes: today they land in an in-memory udisk overlay that dies with the page. For a persistent disk, add a `host_disk_write` import: a synchronous `POST /<token>/disk/<id>?offset=` whose body the server writes to the udisk file. M0: a worker's synchronous 1 MiB POST arrives whole in 6 to 11 ms, on both transports.
+- Console, screen, input, network and Wisp: one binary stream each way between the page's main thread and the app. The page's main thread drains the worker's rings as `main.js` does today and forwards the bytes; going the other way, it fills the input, net and Wisp rings. Two candidate transports, measured in M0 (a 3 MiB frame, round trip, one in flight):
+  1. `WKScriptMessageHandlerWithReply` / `callAsyncJavaScript`. Simple, but its values are property lists (no `ArrayBuffer`), so bytes travel as base64 strings: 31 to 34 ms a frame.
+  2. A WebSocket from the page to an `NWListener` on loopback in the app. Binary frames, no base64; same listener and token as the HTTP server: 5.2 to 5.9 ms a frame (about 550 MB/s), 6× faster. **This is the transport.**
 
   The screen is the heavy one: a 1024×768 frame is 3 MiB, 180 MiB/s at 60 Hz. Only the damaged rectangles cross (virtio-gpu flushes come with rects; `host_frame` takes a rect), at most once per display refresh. The app acknowledges each frame the way the page does (`FRAME_ACK`), so a slow bridge drops frames instead of queueing them.
 - Network: the guest's NIC stays on the library's `Gateway` + `WispClient`, which run inside the wasm (`27-wisp.md`). The app is the Wisp v1 relay: a small Swift server for the protocol (TCP and UDP streams over `Network.framework`) on the same stream. No external relay, no browser networking. `NativeEngine` uses the library's gateway directly, as the CLI does.
 - Lifetime: WebKit can kill WebContent under memory pressure (`webViewWebContentProcessDidTerminate`). The engine reports it as the machine stopping with an error, never as a crash. Guest RAM counts against the WebContent process's jetsam limit, so the RAM picker on this engine is capped by what M0 measures on the smallest supported device (and never above the wasm32 3 GiB in any case).
 
-**What the WebAssembly JIT loses on JavaScriptCore.** Each item is a measurement for M0, not an assumption:
+**What the WebAssembly JIT loses on JavaScriptCore.** Measured in M0 (simulator):
 
-- The compile worker relies on V8's process-wide native module cache (`jit_compiler.js`). JSC has no measured equivalent, so the page already skips it outside V8 (`compileWorkerHelps`), and blocks compile on the emulator's thread. Expect the 38 µs-a-block figure, or JSC's own number.
-- Tail calls chain blocks (`return_call_indirect`). Without them the chain stub fails to compile and the JIT runs unchained. That is correct but slower, so M0 notes which iOS versions have them.
+- The compile worker relies on V8's process-wide native module cache (`jit_compiler.js`). JSC has no measured equivalent, so the page already skips it outside V8 (`compileWorkerHelps`), and blocks compile on the emulator's thread. The boot ("M0 results") is 1.4× slower than V8 without its compile worker and 1.9× slower than V8 with it, and module creation is the first place to look: 26k one-block modules, all compiled on the emulator's thread. Batching blocks into modules without the worker (the batching exists, gated on the queue), or a JSC-specific compile worker if JSC shares compiled code, is the first JIT work for this engine.
+- Tail calls chain blocks (`return_call_indirect`). Without them the chain stub fails to compile and the JIT runs unchained. That is correct but slower. JSC validates `return_call` and `return_call_indirect` (and fixed-width SIMD) in the simulator's WebKit, so the chained JIT runs; the minimum iOS version that has them still needs checking on devices.
 - Fixed-width SIMD (`probe_simd`) is probed already and works either way.
 - SMP: the WebAssembly JIT runs all vCPUs on one thread (`13-web.md`, "The JIT"). A machine that needs real parallelism belongs on `NativeEngine`.
 
@@ -88,13 +88,33 @@ It follows the web page's structure (`13-web.md`, "The page") so the two stay re
 
 ## Milestones
 
-- **M0 — WebKit spike (decides the plan).** A throwaway iOS app: hidden `WKWebView`, scheme handler with COOP/COEP, the existing `uemulator_web.wasm` and `worker.js`, console bytes to a `Text` view. It answers, on a real iPhone and on the simulator: `crossOriginIsolated` on a custom scheme, whether the web view runs while hidden, tail calls and SIMD on JSC, sync XHR with a body from a worker to a scheme handler, the WebContent memory ceiling, and boot time to `Run /init` for the Alpine demo with the JIT, with `--no-jit` in the same web view, and on `NativeEngine` interpreted. Exit: those numbers written into this file. If `WebKitEngine` doesn't beat the native interpreter by a clear margin, it is dropped, and iOS ships interpreted.
+- **M0 — WebKit spike (decides the plan). Done; results below.** A throwaway iOS app (`apple/M0Spike`, run by `hack/apple/m0.sh`): hidden `WKWebView`, scheme handler and loopback HTTP with COOP/COEP, the existing `uemulator_web.wasm` and `worker.js`, console bytes to a `Text` view. It answers, on a real iPhone and on the simulator: `crossOriginIsolated` on a custom scheme, whether the web view runs while hidden, tail calls and SIMD on JSC, sync XHR with a body from a worker to a scheme handler, the WebContent memory ceiling, and boot time to `Run /init` for the Alpine demo with the JIT, with `--no-jit` in the same web view, and on `NativeEngine` interpreted. Exit: those numbers written into this file. If `WebKitEngine` doesn't beat the native interpreter by a clear margin, it is dropped, and iOS ships interpreted.
 - **M1 — Core and project.** `crates/uemulator-apple`, `hack/apple/build-core.sh`, the xcframework, the Xcode project with a SwiftUI shell, and `NativeEngine` booting the Alpine demo to a shell on macOS (JIT) and iOS (interpreted) in a SwiftTerm view. Exit: ⌘R on both, and `xcodebuild` in CI.
-- **M2 — WebKitEngine.** The headless shim, the bridge (winning transport from M0), disk reads through the scheme handler, console and keyboard. Exit: the same Alpine demo on iOS through `WebKitEngine`, with the JIT on.
+- **M2 — WebKitEngine.** The headless shim, the bridge (winning transport from M0), disk reads through the loopback server, console and keyboard. Exit: the same Alpine demo on iOS through `WebKitEngine`, with the JIT on.
 - **M3 — Screen and input.** Damaged-rect frames on both engines, virtio keyboard and tablet, cursor. Exit: a live ISO's desktop (the KDE ISO from `20-jit-perf.md`) is usable on an iPad with a keyboard and trackpad.
 - **M4 — Machines and persistence.** `MachineStore` on the CLI's format, `host_disk_write` (or flushed overlays), NVRAM and TPM state, presets and validation shared with the web page in Rust. Exit: install Alpine to a disk on iOS, quit the app, boot the installed disk.
 - **M5 — Network.** The Swift Wisp relay, the in-app segment between machines. Exit: `apk update` in the demo on iOS through `WebKitEngine` (the check `hack/wasm/wisp.mjs` does under Node).
 - **Later:** visionOS (WebKit engine, tier-3 Rust for native), tvOS (native interpreter only: tvOS has no WebKit), guest 3D (`25-gpu-3d.md`) through Metal instead of WebGL2, App Store review notes (the app downloads and runs operating systems the user picks: the same position as UTM SE, which ships interpreted only).
+
+## M0 results (2026-11-14)
+
+`WEB_DEMO=1 hack/web.sh`, then `hack/apple/m0.sh`: it builds `apple/M0Spike`, runs it on the booted simulator with `-autorun` and prints the probe and boot results. The boot is the Alpine demo (`hack/web/demo.py`), direct (`--firmware none`), 256 MiB, one vCPU, `earlycon=uart8250,io,0x3f8` appended, timed from the boot message to the worker until the console shows the text. The WKWebView rows are four runs of the JIT and two interpreted; a first JIT run at 17.3 s is left out: a stale launch of an earlier build was still booting in the same simulator. iPhone 17 Pro simulator (iOS 27.0 runtime; WebKit's user agent says 18_7), Xcode 27.2, an Apple Silicon Mac; every row ran on that same Mac, one at a time.
+
+| engine | `Run /init` | demo shell |
+|---|---|---|
+| native CLI, aarch64 JIT (what macOS gets) | 1.3 s | 1.4 s |
+| Node 26 / V8, wasm JIT with the compile worker (`boot.mjs`) | 3.6 s | 4.2 s |
+| Node 26 / V8, wasm JIT, `--no-compile-worker` | 5.0 s | 5.8 s |
+| **WKWebView / JSC, wasm JIT (`WebKitEngine`)** | **6.6 to 7.1 s** | **8.2 to 8.8 s** |
+| native CLI, `--disable-jit` (what `NativeEngine` gets on iOS) | 46.0 s | 48.4 s |
+| WKWebView / JSC, wasm interpreted | 58.0 to 59.6 s | 61.1 to 62.8 s |
+| Node 26 / V8, wasm interpreted | 67.1 s | 70.7 s |
+
+- **Verdict: build `WebKitEngine`.** It boots 6.5× faster than the native interpreter, which is all an App Store build gets otherwise, and within 1.4× of V8 without its compile worker. Against V8 with the worker it is 1.9×, so JSC's per-module cost is what is left to close (above).
+- Isolation: no `SharedArrayBuffer` on a custom scheme even with `crossOriginIsolated` true; loopback HTTP has it, and shared wasm memory too. This moved the engine off `WKURLSchemeHandler`.
+- Hidden: the web view ran both boots while 1×1 at opacity 0 in the hierarchy. Not tested yet: what happens when the app goes to the background (iOS suspends the app and its WebContent process; that hits `NativeEngine` the same way, and is the app's problem, not the engine's).
+- Memory: a worker grew a wasm memory, touching every page, to 2560 MiB before `Out of memory`. On the simulator this is WebKit's own limit, not a device's jetsam limit.
+- Still to do on a real iPhone and iPad (needs a signing team): the same table, the memory ceiling under jetsam, and the oldest iOS that has wasm tail calls. The simulator runs macOS's WebKit on the Mac's cores, so its absolute times flatter a phone; the ratios between rows are what carries over.
 
 ## Open questions
 
