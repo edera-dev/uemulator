@@ -24,6 +24,8 @@ final class WebKitEngine: NSObject, MachineEngine {
     private let files: LoopbackFiles
     private let http: LoopbackHTTPServer
     private let sockets: LoopbackSocketServer
+    // The guest's internet: the page's Wisp WebSocket comes here (Wisp.swift).
+    private let wisp: WispSocketServer
     private var run = 0
     private var socket: BridgeSocket?
     // The boot message for the current run until its page connects.
@@ -80,6 +82,7 @@ final class WebKitEngine: NSObject, MachineEngine {
         files = LoopbackFiles(root: Bundle.main.resourceURL!.appendingPathComponent("web"))
         http = LoopbackHTTPServer(files: files)
         sockets = LoopbackSocketServer(token: files.token)
+        wisp = WispSocketServer(token: files.token)
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .nonPersistent()
         webView = WKWebView(frame: CGRect(x: 0, y: 0, width: 1, height: 1), configuration: configuration)
@@ -133,6 +136,7 @@ final class WebKitEngine: NSObject, MachineEngine {
             "memoryMib": settings.memoryMib,
             "cpus": settings.cpus,
             "options": settings.options,
+            "network": settings.network,
             "cols": settings.cols,
             "rows": settings.rows,
         ]
@@ -140,9 +144,10 @@ final class WebKitEngine: NSObject, MachineEngine {
         Task {
             let httpPort = await http.port()
             let socketPort = await sockets.port()
+            let wispPort = await wisp.port()
             // A stop or another start may have come first.
             guard run == self.run, active else { return }
-            let page = "http://127.0.0.1:\(httpPort)/\(files.token)/engine.html?socket=\(socketPort)&run=\(run)"
+            let page = "http://127.0.0.1:\(httpPort)/\(files.token)/engine.html?socket=\(socketPort)&wisp=\(wispPort)&run=\(run)"
             webView.load(URLRequest(url: URL(string: page)!))
         }
     }

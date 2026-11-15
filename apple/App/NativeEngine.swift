@@ -38,11 +38,72 @@ final class NativeEngine: MachineEngine, @unchecked Sendable {
     private struct Teardown: @unchecked Sendable {
         let machine: OpaquePointer
         let context: UnsafeMutableRawPointer
+        let network: NetworkLink?
         func run() {
+            // The session stops calling into the machine first; ua_destroy stops the client's
+            // thread, after which nothing calls the link's sender.
+            network?.detach()
             ua_destroy(machine)
+            network?.release()
             Unmanaged<Run>.fromOpaque(context).release()
         }
     }
+
+    // The machine's network: its Wisp client (Rust, `ua_network_start`) talks to a WispSession here,
+    // in-process. The session answers on its own queue, possibly after the machine is gone, so it
+    // reaches the machine only through `deliver`, which `detach` turns off under the lock.
+    private final class NetworkLink: @unchecked Sendable {
+        private let lock = NSLock()
+        private var machine: OpaquePointer?
+        private(set) var session: WispSession!
+        // Retained for the C side from ua_network_start until ua_destroy has returned.
+        private var retained: Unmanaged<NetworkLink>?
+
+        init(machine: OpaquePointer) {
+            self.machine = machine
+            session = WispSession { [weak self] packet in self?.deliver(packet) }
+        }
+
+        func start() -> Bool {
+            guard let machine else { return false }
+            let context = Unmanaged.passRetained(self)
+            retained = context
+            guard ua_network_start(machine, NetworkLink.sendCallback, context.toOpaque()) == Int32(UA_RESULT_DONE) else {
+                return false
+            }
+            ua_wisp_connecting(machine)
+            session.start()
+            return true
+        }
+
+        private func deliver(_ packet: Data) {
+            lock.lock()
+            defer { lock.unlock() }
+            guard let machine else { return }
+            _ = packet.withUnsafeBytes { ua_wisp_message(machine, $0.bindMemory(to: UInt8.self).baseAddress, $0.count) }
+        }
+
+        func detach() {
+            lock.lock()
+            machine = nil
+            lock.unlock()
+            session.close()
+        }
+
+        func release() {
+            retained?.release()
+            retained = nil
+        }
+
+        // The client's packets, on the network's thread: copied, then handed to the session.
+        private static let sendCallback: ua_wisp_send_fn = { context, packet, len in
+            guard let context, let packet else { return }
+            let link = Unmanaged<NetworkLink>.fromOpaque(context).takeUnretainedValue()
+            link.session.receive(Data(bytes: packet, count: len))
+        }
+    }
+
+    private var network: NetworkLink?
 
     // Main actor only.
     private var machine: OpaquePointer?
@@ -77,7 +138,8 @@ final class NativeEngine: MachineEngine, @unchecked Sendable {
         let runId = nextRunId
         let context = Unmanaged.passRetained(Run(engine: self, id: runId)).toOpaque()
         var error = [CChar](repeating: 0, count: NativeEngine.errorCapacity)
-        let options = settings.options
+        var options = settings.options
+        if settings.network { options |= UInt32(UA_OPTION_NETWORK) }
         // C strings for the disks' paths, alive until ua_create has copied them.
         let paths = settings.disks.map { strdup($0.url.path) }
         let nvram = settings.nvram.map { strdup($0.path) } ?? nil
@@ -116,6 +178,10 @@ final class NativeEngine: MachineEngine, @unchecked Sendable {
         currentRunId = runId
         lock.unlock()
         let jit = ua_jit_active(created) != 0
+        if settings.network {
+            let link = NetworkLink(machine: created)
+            if link.start() { network = link }
+        }
         ua_start(created)
         if ua_has_display(created) != 0 {
             screen?.reset()
@@ -142,7 +208,8 @@ final class NativeEngine: MachineEngine, @unchecked Sendable {
         screenTimer?.invalidate()
         screenTimer = nil
         ua_stop(machine)
-        let teardown = Teardown(machine: machine, context: context)
+        let teardown = Teardown(machine: machine, context: context, network: network)
+        network = nil
         DispatchQueue.global(qos: .userInitiated).async { teardown.run() }
         onState?(.stopped("Stopped"))
     }

@@ -23,6 +23,9 @@
 #define UA_OPTION_TPM (1u << 11)
 // The firmware enforces Secure Boot, enrolling its keys into the NVRAM store on first use.
 #define UA_OPTION_SECURE_BOOT (1u << 12)
+// A virtio NIC behind the library's gateway (10.0.2.0/24, DHCP, NAT), carried over Wisp v1 to the
+// app: start it with ua_network_start. The app's own bit, clear of the web build's OPTION_*.
+#define UA_OPTION_NETWORK (1u << 16)
 
 // ua_cursor_fn kinds: the guest has no pointer of its own (show the host's), hid it, or drew one.
 #define UA_CURSOR_HOST 0
@@ -147,6 +150,17 @@ int32_t ua_machine_save(const char *path, const char *changes, char *error, size
 void ua_string_free(char *text);
 // A new, empty, sparse udisk image of `size_mib` at `path`; never replaces a file. 0, or -1.
 int32_t ua_disk_create(const char *path, uint64_t size_mib, char *error, size_t error_capacity);
+// One Wisp v1 packet from the machine's client, for the app's Wisp server. Runs on the network's
+// thread; `packet` is valid only during the call.
+typedef void (*ua_wisp_send_fn)(void *context, const uint8_t *packet, size_t len);
+// Starts the network of a machine built with UA_OPTION_NETWORK; `send` gets the client's packets.
+// UA_RESULT_NO_DEVICE without a NIC, UA_RESULT_NOTHING_NEW when it already runs.
+int32_t ua_network_start(const ua_machine *machine, ua_wisp_send_fn send, void *context);
+// The server's side, in order: the connection opened, each message (none skipped or reordered),
+// the connection lost. Any thread.
+int32_t ua_wisp_connecting(const ua_machine *machine);
+int32_t ua_wisp_message(const ua_machine *machine, const uint8_t *bytes, size_t len);
+int32_t ua_wisp_lost(const ua_machine *machine);
 // Stops the guest, waits for its threads and frees the machine. No callback runs after it returns.
 void ua_destroy(ua_machine *machine);
 

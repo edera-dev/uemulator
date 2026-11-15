@@ -34,6 +34,14 @@ struct MachineDefinition {
     var secureBoot = false
     var cmdlineAppend = ""
     var disks: [DiskImage] = []
+    // A NIC: the CLI's `[[networks]]`, kept as they were (the app only knows on or off).
+    var networks: [[String: Any]] = []
+    var network: Bool {
+        get { !networks.isEmpty }
+        set {
+            if !newValue { networks = [] } else if networks.isEmpty { networks = [MachineStore.userNetwork] }
+        }
+    }
     // app.json
     var engine: EngineKind?
     var bootsKernel = false
@@ -66,6 +74,8 @@ final class MachineStore: ObservableObject {
     private static let displayNames: [DisplayChoice: String] = [.terminal: "serial", .screen: "framebuffer", .both: "both"]
     // What the CLI's machine names allow (machines.rs `validate_name`).
     private static let maxNameLength = 64
+    // What `uemulator quick create` writes for its NAT NIC.
+    nonisolated static let userNetwork: [String: Any] = ["model": "virtio", "link": "user"]
 
     init() {
         root = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
@@ -123,6 +133,7 @@ final class MachineStore: ObservableObject {
         definition.tpm = table["tpm"] as? Bool ?? false
         definition.secureBoot = table["secure_boot"] as? Bool ?? false
         definition.cmdlineAppend = table["append"] as? String ?? ""
+        definition.networks = table["networks"] as? [[String: Any]] ?? []
         for disk in table["disks"] as? [[String: Any]] ?? [] {
             guard let path = disk["path"] as? String else { continue }
             var url = URL(fileURLWithPath: path)
@@ -155,6 +166,7 @@ final class MachineStore: ObservableObject {
             "secure_boot": definition.secureBoot,
             "append": definition.cmdlineAppend.isEmpty ? NSNull() : definition.cmdlineAppend,
             "disks": definition.disks.map { ["path": $0.url.path, "read_only": $0.readOnly] },
+            "networks": definition.networks,
         ]
         let json = String(decoding: try JSONSerialization.data(withJSONObject: changes), as: UTF8.self)
         var error = [CChar](repeating: 0, count: Self.errorCapacity)
@@ -180,7 +192,7 @@ final class MachineStore: ObservableObject {
         case empty
     }
 
-    func create(_ name: String, source: Source, diskMib: UInt64, memoryMib: Int, display: DisplayChoice) throws {
+    func create(_ name: String, source: Source, diskMib: UInt64, memoryMib: Int, display: DisplayChoice, network: Bool = true) throws {
         if let problem = Self.validate(name) { throw MachineStoreError.failed(problem) }
         let folder = directory(name)
         guard !FileManager.default.fileExists(atPath: folder.path) else {
@@ -189,6 +201,7 @@ final class MachineStore: ObservableObject {
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         do {
             var definition = MachineDefinition(memoryMib: memoryMib, display: display)
+            definition.network = network
             if diskMib > 0 {
                 // The CLI's name for a machine's first disk.
                 let disk = folder.appendingPathComponent("disk-0.udisk")

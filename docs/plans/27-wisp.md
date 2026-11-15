@@ -28,6 +28,8 @@ A browser cannot open sockets, and `fetch()` needs CORS, which none of Alpine's 
 - No change to how guests on the segment reach each other, or to the DHCP handover between tabs.
 - Never drop or reorder Wisp stream data anywhere between the WebSocket and the gateway. Ethernet frames may be dropped (the guest's TCP recovers); a stream's bytes may not (there is no retransmission on the Wisp side).
 
+The Apple app (`docs/plans/28-apple.md`, M5) has a third server, `apple/App/Wisp.swift` on Network.framework, which both of its engines use; it follows `serve.py`'s behaviour.
+
 ## Architecture
 
 ### The gateway (library, `crates/uemulator/src/gateway/`)

@@ -22,7 +22,14 @@
 //                             {"type": "log", text}
 import {
   CONTROL_BYTES, CTRL, EVENT_OFFSET, EVENT_RECORDS, EVENT_WORDS, FRAME_READY, RING_BYTES, RING_OFFSET,
+  WISP_OFFSET, WISP_RING_BYTES,
 } from "./protocol.js";
+import { randomMac, randomTab } from "./segment.js";
+import { connectWisp } from "./wisp.js";
+
+// Where the guest's DNS goes through Wisp (main.js's WISP_RESOLVER: 1.1.1.1:53).
+const WISP_RESOLVER = 0x01010101;
+const WISP_RESOLVER_PORT = 53;
 
 const TO_PAGE = { KEYS: 1, EVENTS: 2 };
 const TO_APP = { OUTPUT: 1, FRAME: 2, CURSOR: 3 };
@@ -37,6 +44,9 @@ let control = null;
 let ring = null;
 let events = null;
 let worker = null;
+// The guest's internet: a WebSocket to the app's Wisp server (connectWisp), when the machine has a
+// network.
+let wisp = null;
 
 const sendText = (message) => {
   if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
@@ -122,6 +132,20 @@ async function boot(settings) {
   control[CTRL.COLS] = settings.cols;
   control[CTRL.ROWS] = settings.rows;
   control[CTRL.FRAME_ACK] = FRAME_READY.YES;
+  let network = null;
+  if (settings.network) {
+    // The only machine on its segment (no other tab shares this page's BroadcastChannel), so it
+    // is the segment's server: its agent answers DHCP (segment.js; the web page takes a lock).
+    Atomics.store(control, CTRL.NET_SERVING, 1);
+    network = { mac: randomMac(), tab: randomTab() };
+    wisp = connectWisp({
+      control,
+      ring: new Uint8Array(shared, WISP_OFFSET, WISP_RING_BYTES),
+      url: `ws://127.0.0.1:${params.get("wisp")}/`,
+      // The app's server takes only the launch token (apple/App/Wisp.swift).
+      protocols: [token],
+    });
+  }
   worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
   worker.onmessage = ({ data }) => {
     if (data.type === "output") {
@@ -137,6 +161,13 @@ async function boot(settings) {
       sendText({ type: "exit", code: data.code, message: data.message });
     } else if (data.type === "log") {
       sendText({ type: "log", text: data.text });
+    } else if (data.type === "wisp") {
+      wisp?.send(data.messages);
+    } else if (data.type === "wisp-status") {
+      // Both its backoff and its handshake timeout depend on hearing these (wisp.js).
+      wisp?.status(data.state);
+    } else if (data.type === "network") {
+      sendText({ type: "log", text: `network: address ${data.address >>> 0}, ${data.peers} peers` });
     }
   };
   worker.onerror = (error) => sendText({ type: "exit", code: -3, message: String(error.message ?? error) });
@@ -153,6 +184,8 @@ async function boot(settings) {
     cols: settings.cols,
     rows: settings.rows,
     options: settings.options,
+    network,
+    wisp: network ? { resolver: WISP_RESOLVER, port: WISP_RESOLVER_PORT } : null,
     // worker.js reads them with synchronous range requests, which the app's loopback server
     // answers; a writable disk writes through to the app's file with synchronous POSTs to the
     // same URL.
@@ -188,5 +221,6 @@ socket.onmessage = ({ data }) => {
 // The app went away (or closed this run): nothing may keep running unseen.
 socket.onclose = () => {
   stop();
+  wisp?.close();
   worker?.terminate();
 };

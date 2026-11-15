@@ -9,6 +9,7 @@
 #![cfg(target_vendor = "apple")]
 
 mod machine_file;
+mod network;
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::Mutex;
@@ -36,6 +37,15 @@ const OPTION_SCREEN_CONSOLE: u32 = 1 << 10;
 const OPTION_TPM: u32 = 1 << 11;
 /// The firmware enforces Secure Boot, enrolling its keys into the NVRAM store on first use.
 const OPTION_SECURE_BOOT: u32 = 1 << 12;
+/// A virtio NIC behind the library's gateway, carried over Wisp to the app (`network.rs`). The
+/// app's own bit: the web build configures its network with `uw_set_network` instead, so the
+/// value is chosen clear of its OPTION_* bits.
+const OPTION_NETWORK: u32 = 1 << 16;
+/// Bytes in a MAC address.
+const MAC_BYTES: usize = 6;
+/// The first octet of the NIC's MAC: locally administered, unicast (bits 1 and 0 of the first
+/// octet), so it never claims a vendor's address.
+const LOCAL_UNICAST_MAC_PREFIX: u8 = 0x52;
 
 // `ua_cursor_fn` kinds, the library's `Cursor`: the web build's CURSOR_* values. Mirrored in
 // include/uemulator.h.
@@ -231,6 +241,13 @@ impl Settings {
             .input(has(OPTION_INPUT))
             .tpm(has(OPTION_TPM))
             .secure_boot(has(OPTION_SECURE_BOOT));
+        if has(OPTION_NETWORK) {
+            let mut mac = [0u8; MAC_BYTES];
+            machine_file::random_bytes(&mut mac)
+                .map_err(|e| Error::BadConfig(format!("a MAC address: {e}")))?;
+            mac[0] = LOCAL_UNICAST_MAC_PREFIX;
+            config = config.net(mac);
+        }
         if let Some(path) = &self.nvram_path {
             // Opened per machine build: `create`'s JIT fallback builds twice, and the store keeps
             // its file open, so the first build's copy is dropped before the second opens it.
@@ -260,6 +277,9 @@ pub struct Machine {
     /// Only the app's thread that draws calls those, so the locks are never contended.
     mirror: Mutex<ScreenMirror>,
     cursor_generation: Mutex<Option<u64>>,
+    net: Option<uemulator::NetHandle>,
+    /// Started by `ua_network_start`, stopped by `ua_destroy` before the machine goes.
+    network: Mutex<Option<network::Network>>,
     stop: StopHandle,
     jit: bool,
     exit: ExitFn,
@@ -330,6 +350,8 @@ pub unsafe extern "C" fn ua_create(
         input: machine.input(),
         mirror: Mutex::new(ScreenMirror::new()),
         cursor_generation: Mutex::new(None),
+        net: machine.net(),
+        network: Mutex::new(None),
         pending: Mutex::new(Some(machine)),
         runner: Mutex::new(None),
         console,
@@ -407,6 +429,10 @@ pub unsafe extern "C" fn ua_destroy(machine: *mut Machine) {
         return;
     }
     let machine = unsafe { Box::from_raw(machine) };
+    // Before the machine: the pump calls the app's sender, which must not run after this returns.
+    if let Some(network) = machine.network.lock().unwrap().take() {
+        network.stop();
+    }
     machine.stop.stop();
     // The runner's exit callback is the last one; after the join none can run.
     if let Some(runner) = machine.runner.lock().unwrap().take() {
@@ -591,6 +617,84 @@ pub unsafe extern "C" fn ua_request_size(machine: *const Machine, width: u32, he
             RESULT_DONE
         }
     }
+}
+
+/// Starts the network of a machine built with `OPTION_NETWORK`: from here `send` gets the Wisp
+/// client's packets (on the network's own thread) and the server's go in through `ua_wisp_*`.
+/// `RESULT_NO_DEVICE` without a NIC, `RESULT_NOTHING_NEW` if it already runs.
+///
+/// # Safety
+/// `machine` came from `ua_create` and was not destroyed; `context` stays valid until
+/// `ua_destroy` returns.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ua_network_start(
+    machine: *const Machine,
+    send: network::WispSendFn,
+    context: *mut c_void,
+) -> i32 {
+    let machine = unsafe { &*machine };
+    let Some(net) = &machine.net else {
+        return RESULT_NO_DEVICE;
+    };
+    let mut slot = machine.network.lock().unwrap();
+    if slot.is_some() {
+        return RESULT_NOTHING_NEW;
+    }
+    // The sequence numbers only keep connections apart; any value does.
+    let mut seed = [0u8; 4];
+    let _ = machine_file::random_bytes(&mut seed);
+    *slot = Some(network::Network::start(
+        net.clone(),
+        send,
+        network::SendContext(context),
+        u32::from_le_bytes(seed),
+    ));
+    RESULT_DONE
+}
+
+fn with_network(machine: *const Machine, deliver: impl FnOnce(&network::Network)) -> i32 {
+    match unsafe { &*machine }.network.lock().unwrap().as_ref() {
+        Some(network) => {
+            deliver(network);
+            RESULT_DONE
+        }
+        None => RESULT_NO_DEVICE,
+    }
+}
+
+/// The app opened a Wisp connection for this machine (the client starts its handshake clock).
+///
+/// # Safety
+/// `machine` came from `ua_create` and was not destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ua_wisp_connecting(machine: *const Machine) -> i32 {
+    with_network(machine, network::Network::connecting)
+}
+
+/// One message from the Wisp server, in order: none may be skipped or reordered.
+///
+/// # Safety
+/// `machine` came from `ua_create` and was not destroyed; `bytes` has `len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ua_wisp_message(
+    machine: *const Machine,
+    bytes: *const u8,
+    len: usize,
+) -> i32 {
+    if bytes.is_null() {
+        return RESULT_NOTHING_NEW;
+    }
+    let message = unsafe { std::slice::from_raw_parts(bytes, len) };
+    with_network(machine, |network| network.message(message))
+}
+
+/// The Wisp connection is gone: the client resets its streams.
+///
+/// # Safety
+/// `machine` came from `ua_create` and was not destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ua_wisp_lost(machine: *const Machine) -> i32 {
+    with_network(machine, network::Network::lost)
 }
 
 /// # Safety
@@ -855,6 +959,59 @@ mod tests {
             unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy()
         );
         unsafe { ua_destroy(machine) };
+    }
+
+    extern "C" fn count_packets(context: *mut c_void, _: *const u8, _: usize) {
+        unsafe { &*context.cast::<std::sync::atomic::AtomicUsize>() }
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // The network starts once, takes the server's events, and stops with the machine: no callback
+    // after `ua_destroy` (the context here is dropped right after it). A machine without a NIC
+    // says so.
+    #[test]
+    fn network_starts_once_and_stops_with_the_machine() {
+        /// Wisp v1's opening CONTINUE: type 3, stream 0, 128 packets of credit.
+        const SERVER_HELLO: [u8; 9] = [0x03, 0, 0, 0, 0, 128, 0, 0, 0];
+        let kernel = halting_kernel();
+        let packets = std::sync::atomic::AtomicUsize::new(0);
+        let context = (&raw const packets).cast_mut().cast();
+
+        let without = create(&kernel, OPTION_ACPI);
+        unsafe {
+            assert_eq!(
+                ua_network_start(without, count_packets, context),
+                RESULT_NO_DEVICE
+            );
+            assert_eq!(ua_wisp_connecting(without), RESULT_NO_DEVICE);
+            ua_destroy(without);
+        }
+
+        let machine = create(&kernel, OPTION_ACPI | OPTION_NETWORK);
+        unsafe {
+            assert_eq!(
+                ua_network_start(machine, count_packets, context),
+                RESULT_DONE
+            );
+            assert_eq!(
+                ua_network_start(machine, count_packets, context),
+                RESULT_NOTHING_NEW
+            );
+            assert_eq!(ua_wisp_connecting(machine), RESULT_DONE);
+            assert_eq!(
+                ua_wisp_message(machine, SERVER_HELLO.as_ptr(), SERVER_HELLO.len()),
+                RESULT_DONE
+            );
+            assert_eq!(ua_wisp_lost(machine), RESULT_DONE);
+            ua_destroy(machine);
+        }
+        let after = packets.load(std::sync::atomic::Ordering::Relaxed);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(
+            packets.load(std::sync::atomic::Ordering::Relaxed),
+            after,
+            "a packet after ua_destroy"
+        );
     }
 
     // What the app shows when a file is not a kernel: NULL and the library's own message.

@@ -17,7 +17,8 @@ struct UemulatorApp: App {
 //   -autostart                start the selected machine
 //   -new-machine NAME         create it first if it does not exist, from -new-source demo (the
 //                             default), cdrom:FILE (in Documents) or empty, with a disk of
-//                             -new-disk-mib MIB (default none), -new-memory-mib, -new-display
+//                             -new-disk-mib MIB (default none), -new-memory-mib, -new-display,
+//                             -new-network NO (a NIC unless NO)
 //   -engine native|webkit, -debug-log FILE   see MachineModel
 struct LibraryView: View {
     @StateObject private var store = MachineStore()
@@ -80,9 +81,10 @@ struct LibraryView: View {
             }
             let display = DisplayChoice(rawValue: defaults.string(forKey: "new-display") ?? "") ?? .terminal
             let memory = defaults.integer(forKey: "new-memory-mib")
+            let network = defaults.string(forKey: "new-network").map { !["no", "0", "false", "off"].contains($0) } ?? true
             do {
                 try store.create(name, source: source, diskMib: UInt64(max(0, defaults.integer(forKey: "new-disk-mib"))),
-                                 memoryMib: memory > 0 ? memory : MachineModel.demoMemoryMib, display: display)
+                                 memoryMib: memory > 0 ? memory : MachineModel.demoMemoryMib, display: display, network: network)
             } catch {
                 problem = error.localizedDescription
             }
@@ -146,6 +148,7 @@ struct NewMachineSheet: View {
     @State private var memoryMib = MachineModel.cdromMemoryMib
     @State private var diskGib = 8
     @State private var display = DisplayChoice.screen
+    @State private var network = true
     @State private var problem: String?
 
     private static let memoryChoices = [256, 512, 1024, 2048, 3072, 4096]
@@ -175,6 +178,7 @@ struct NewMachineSheet: View {
                 Picker("Display", selection: $display) {
                     ForEach(DisplayChoice.allCases) { Text($0.title).tag($0) }
                 }
+                Toggle("Network (internet through the app)", isOn: $network)
                 if let problem {
                     Text(problem).foregroundStyle(.red)
                 }
@@ -215,7 +219,7 @@ struct NewMachineSheet: View {
                 machineSource = .cdrom(.bookmark(try MachineStore.bookmark(for: cdrom)))
             }
             try store.create(name, source: machineSource, diskMib: UInt64(diskGib) * Self.mibPerGib,
-                             memoryMib: memoryMib, display: display)
+                             memoryMib: memoryMib, display: display, network: network)
             onCreated(name)
         } catch {
             problem = error.localizedDescription

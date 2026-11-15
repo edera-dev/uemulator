@@ -82,7 +82,9 @@ export function wispRingHasRecords(control) {
 // starts when the socket is created (a server that is not a Wisp server never sends the first
 // CONTINUE, or the socket took that long to open), so the socket is closed and another tried
 // after the usual wait; the client would ignore anything this one still brought.
-export function connectWisp({ control, ring, url, onStatus = () => {} }) {
+// `protocols` are the WebSocket subprotocols offered, for a server that needs one: the Apple
+// app's checks its launch token that way (apple/App/Wisp.swift); the web page offers none.
+export function connectWisp({ control, ring, url, protocols, onStatus = () => {} }) {
   // Records that did not fit yet, in order: nothing may overtake them.
   const pending = [];
   let retryTimer = null;
@@ -107,7 +109,7 @@ export function connectWisp({ control, ring, url, onStatus = () => {} }) {
   const connect = () => {
     reconnectTimer = null;
     if (closed) return;
-    const current = new globalThis.WebSocket(url);
+    const current = new globalThis.WebSocket(url, protocols);
     current.binaryType = "arraybuffer";
     socket = current;
     acknowledged = false;

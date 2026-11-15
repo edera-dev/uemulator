@@ -99,6 +99,8 @@ struct MachineSettings {
     var display = DisplayChoice.terminal
     var tpm = false
     var secureBoot = false
+    // A NIC behind the gateway (DHCP, NAT to the internet through the app's Wisp server).
+    var network = false
     var cols: UInt16 = 80
     var rows: UInt16 = 25
 
@@ -111,6 +113,8 @@ struct MachineSettings {
         if display == .screen { options |= Option.screenConsole }
         if tpm { options |= Option.tpm }
         if secureBoot { options |= Option.secureBoot }
+        // No network bit: the native engine adds UA_OPTION_NETWORK, an app-only bit, and the web
+        // build sets its NIC up with uw_set_network from the boot message's `network`.
         return options
     }
 

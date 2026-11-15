@@ -128,9 +128,13 @@ pub unsafe extern "C" fn ua_string_free(text: *mut c_char) {
     }
 }
 
+pub(crate) fn random_bytes(out: &mut [u8]) -> std::io::Result<()> {
+    fs::File::open(RANDOM_DEVICE)?.read_exact(out)
+}
+
 fn random_image_id() -> std::io::Result<[u8; IMAGE_ID_BYTES]> {
     let mut id = [0u8; IMAGE_ID_BYTES];
-    fs::File::open(RANDOM_DEVICE)?.read_exact(&mut id)?;
+    random_bytes(&mut id)?;
     Ok(id)
 }
 

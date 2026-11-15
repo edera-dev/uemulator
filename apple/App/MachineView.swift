@@ -117,6 +117,11 @@ final class MachineModel: ObservableObject, ScreenInput {
         state = .stopped("")
     }
 
+    func setNetwork(_ on: Bool) {
+        guard on != definition.network else { return }
+        update { $0.network = on }
+    }
+
     func select(_ newDisplay: DisplayChoice) {
         guard newDisplay != definition.display else { return }
         update { $0.display = newDisplay }
@@ -165,6 +170,7 @@ final class MachineModel: ObservableObject, ScreenInput {
             tpm: definition.tpm, secureBoot: definition.secureBoot,
             cols: UInt16(clamping: size.cols), rows: UInt16(clamping: size.rows))
         settings.cmdlineAppend = definition.cmdlineAppend
+        settings.network = definition.network
         if definition.firmware != "none" {
             settings.firmware = try? Data(contentsOf: Bundle.main.resourceURL!.appendingPathComponent("uemulator-firmware.bin"))
             guard settings.firmware != nil else {
@@ -333,6 +339,8 @@ struct MachineView: View {
                     Picker("Display", selection: Binding(get: { model.definition.display }, set: { model.select($0) })) {
                         ForEach(DisplayChoice.allCases) { Text($0.title).tag($0) }
                     }
+                    Toggle("Network", systemImage: "network",
+                           isOn: Binding(get: { model.definition.network }, set: { model.setNetwork($0) }))
                     if model.definition.display.hasScreen {
                         Button("Resize Guest to Fit", systemImage: "arrow.up.left.and.arrow.down.right") {
                             model.fitScreen(to: viewSize, scale: displayScale)
