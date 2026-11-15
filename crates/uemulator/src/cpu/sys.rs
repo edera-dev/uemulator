@@ -61,7 +61,7 @@ const CR0_CD: u64 = 1 << 30;
 
 pub(crate) const CR4_TSD: u64 = 1 << 2;
 pub(crate) const CR4_DE: u64 = 1 << 3;
-/// Machine-check enable: advertised with the (inert) machine-check architecture in `mca.rs`.
+/// Machine-check enable: without it a machine check shuts the processor down (`mca.rs`).
 pub(crate) const CR4_MCE: u64 = 1 << 6;
 pub(crate) const CR4_PSE: u64 = 1 << 4;
 pub(crate) const CR4_PGE: u64 = 1 << 7;
@@ -247,6 +247,7 @@ impl Cpu {
             MSR_PAT => self.pat,
             _ if mtrr::Mtrr::owns(msr) => self.mtrr.read(msr).unwrap_or(0),
             _ if mca::Mca::owns(msr) => self.mca.read(msr).unwrap_or(0),
+            _ if rdt::Rdt::owns(msr) => self.rdt.read(msr).unwrap_or(0),
             MSR_EFER => self.efer,
             MSR_STAR => self.star,
             MSR_LSTAR => self.lstar,
@@ -326,7 +327,16 @@ impl Cpu {
                 }
             }
             _ if mca::Mca::owns(msr) => {
-                if !self.mca.write(msr, v) {
+                let hwcr = self.msr_misc.get(&mca::MSR_HWCR).copied().unwrap_or(0);
+                let context = mca::WriteContext {
+                    status_writable: hwcr & mca::HWCR_MC_STATUS_WRITE_ENABLE != 0,
+                };
+                if !self.mca.write(msr, v, context) {
+                    return Err(Exception::general_protection(0));
+                }
+            }
+            _ if rdt::Rdt::owns(msr) => {
+                if !self.rdt.write(msr, v) {
                     return Err(Exception::general_protection(0));
                 }
             }
@@ -1916,11 +1926,43 @@ mod sys_tests {
         #[test]
         fn machine_check_banks_accept_initialization_and_never_report() {
             let mut h = blank();
-            assert_eq!(h.cpu.rdmsr(0x179).unwrap() & 0xff, 6);
+            assert_eq!(h.cpu.rdmsr(0x179).unwrap() & 0xff, 24);
             h.cpu.wrmsr(0x17b, u64::MAX).unwrap();
             h.cpu.wrmsr(0x400, u64::MAX).unwrap();
             h.cpu.wrmsr(0x401, 0).unwrap();
             assert_eq!(h.cpu.rdmsr(0x401).unwrap(), 0);
+            // the legacy registers are the SMCA bank's
+            assert_eq!(h.cpu.rdmsr(0xc000_2000).unwrap(), u64::MAX);
+        }
+
+        #[test]
+        fn machine_check_status_takes_a_nonzero_value_only_with_hwcr_mc_status_write_enable() {
+            const MSR_HWCR: u32 = 0xc001_0015;
+            const HWCR_MC_STATUS_WRITE_ENABLE: u64 = 1 << 18;
+            const BANK_2_STATUS: u32 = 0xc000_2021;
+            let mut h = blank();
+            assert_gp0(h.cpu.wrmsr(BANK_2_STATUS, 1 << 63));
+            let hwcr = h.cpu.rdmsr(MSR_HWCR).unwrap();
+            h.cpu
+                .wrmsr(MSR_HWCR, hwcr | HWCR_MC_STATUS_WRITE_ENABLE)
+                .unwrap();
+            h.cpu.wrmsr(BANK_2_STATUS, 1 << 63).unwrap();
+            assert_eq!(h.cpu.rdmsr(0x409).unwrap(), 1 << 63);
+        }
+
+        #[test]
+        fn quality_of_service_msrs_validate_what_they_store() {
+            let mut h = blank();
+            h.cpu.wrmsr(0xc8f, 3 << 32 | 7).unwrap();
+            assert_eq!(h.cpu.rdmsr(0xc8f).unwrap(), 3 << 32 | 7);
+            assert_gp0(h.cpu.wrmsr(0xc8f, 16 << 32));
+            h.cpu.wrmsr(0xc8d, 7 << 32 | 2).unwrap();
+            assert_eq!(h.cpu.rdmsr(0xc8e).unwrap(), 0);
+            assert_gp0(h.cpu.wrmsr(0xc8e, 0));
+            h.cpu.wrmsr(0xc95, 0x00f0).unwrap();
+            assert_eq!(h.cpu.rdmsr(0xc95).unwrap(), 0x00f0);
+            h.cpu.wrmsr(0xc000_0205, 0x100).unwrap();
+            assert_eq!(h.cpu.rdmsr(0xc000_0205).unwrap(), 0x100);
         }
 
         #[test]
@@ -1939,7 +1981,9 @@ mod sys_tests {
                 0x1,
                 0x8c,
                 0x4b56_4d00,
-                0xc000_0200,
+                // just past the L3 bandwidth limits and the Scalable MCA banks
+                0xc000_0210,
+                0xc000_2180,
                 0xdead_beef,
                 0x4000_0000,
                 0xffff_ffff,
