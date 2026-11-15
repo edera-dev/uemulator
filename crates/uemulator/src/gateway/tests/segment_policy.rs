@@ -193,24 +193,29 @@ fn once_refused_every_later_query_goes_straight_to_tcp() {
 }
 
 #[test]
-fn dns_over_tcp_answers_are_matched_by_id_only() {
-    let (mut gateway, _remote, tcp) = fallen_back();
-    ask(&mut gateway, 6000, 7, 1);
-    ask(&mut gateway, 6001, 7, 1);
-    let waiting = gateway.to_remote(tcp).len();
-    gateway.consumed(tcp, waiting);
-    let mut bytes = length_prefixed(&dns_answer(99));
-    bytes.extend(length_prefixed(&dns_answer(7)));
-    bytes.extend(length_prefixed(&dns_answer(7)));
-    gateway.remote_data(tcp, &bytes);
-    gateway.poll(1);
-    let frames = drain(&mut gateway);
-    assert_eq!(frames.len(), 2);
-    let ports: Vec<u16> = frames
-        .iter()
-        .map(|f| udp_view(core::slice::from_ref(f)).dport)
-        .collect();
-    assert_eq!(ports, [6000, 6001]);
+fn dns_over_tcp_routes_reordered_colliding_ids_to_their_requesters() {
+    let (mut gateway, mut remote, tcp) = fallen_back();
+    let first = dns_query(7);
+    let mut second = dns_query(7);
+    second[13..20].copy_from_slice(b"another");
+    gateway.from_guest(&udp_frame_to_gateway(6000, DNS_PORT, &first), 1);
+    gateway.from_guest(&udp_frame_to_gateway(6001, DNS_PORT, &second), 1);
+    let sent = remote.take_written(&mut gateway, tcp);
+    let second_start = 2 + first.len();
+    let first_id = be_u16(&sent[2..4]);
+    let second_id = be_u16(&sent[second_start + 2..second_start + 4]);
+    assert_ne!(first_id, second_id, "one upstream ID per query");
+    second[..2].copy_from_slice(&second_id.to_be_bytes());
+    second[2] = DNS_ANSWER_FLAG;
+    gateway.remote_data(tcp, &length_prefixed(&second));
+    let reply = udp_view(&drain(&mut gateway));
+    second[..2].copy_from_slice(&7u16.to_be_bytes());
+    assert_eq!(reply.dport, 6001);
+    assert_eq!(reply.data, second, "restore the guest's ID");
+    gateway.remote_data(tcp, &length_prefixed(&dns_answer(first_id)));
+    let reply = udp_view(&drain(&mut gateway));
+    assert_eq!(reply.dport, 6000);
+    assert_eq!(reply.data, dns_answer(7));
 }
 
 #[test]
@@ -405,4 +410,70 @@ fn a_working_tcp_fallback_keeps_later_queries_on_tcp() {
             )),
         "still TCP"
     );
+}
+
+#[test]
+fn expired_dns_query_cannot_steal_a_new_query_with_the_same_id() {
+    let (mut gateway, mut remote, tcp) = fallen_back();
+    ask(&mut gateway, 6000, 7, 1);
+    remote.take_written(&mut gateway, tcp);
+    gateway.poll(1 + DNS_TCP_QUERY_TIMEOUT_MS);
+    ask(&mut gateway, 6001, 7, 2 + DNS_TCP_QUERY_TIMEOUT_MS);
+    let sent = remote.take_written(&mut gateway, tcp);
+    let upstream_id = be_u16(&sent[2..4]);
+    assert_ne!(upstream_id, 7);
+    gateway.remote_data(tcp, &length_prefixed(&dns_answer(7)));
+    assert!(drain(&mut gateway).is_empty(), "late reply is ignored");
+    gateway.remote_data(tcp, &length_prefixed(&dns_answer(upstream_id)));
+    let reply = udp_view(&drain(&mut gateway));
+    assert_eq!(reply.dport, 6001);
+    assert_eq!(reply.data, dns_answer(7));
+}
+
+#[test]
+fn dns_id_exhaustion_reopens_the_stream_after_pending_queries_finish() {
+    let (mut gateway, mut remote, tcp) = fallen_back();
+    // `fallen_back` has already used ID 1 on this stream.
+    for id in (0..=u16::MAX).filter(|id| *id != 1) {
+        ask(&mut gateway, QUERY_PORT, id, 1);
+        let sent = remote.take_written(&mut gateway, tcp);
+        assert_eq!(be_u16(&sent[2..4]), id);
+        if id != u16::MAX {
+            gateway.remote_data(tcp, &length_prefixed(&dns_answer(id)));
+            drain(&mut gateway);
+        }
+    }
+    ask(&mut gateway, QUERY_PORT, 7, 1);
+    assert!(
+        remote.requests(&mut gateway).is_empty(),
+        "keep the pending query"
+    );
+    assert!(gateway.to_remote(tcp).is_empty());
+    gateway.remote_data(tcp, &length_prefixed(&dns_answer(u16::MAX)));
+    drain(&mut gateway);
+    ask(&mut gateway, QUERY_PORT, 7, 2);
+    let requests = remote.requests(&mut gateway);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], GatewayRequest::Close { stream: tcp });
+    let GatewayRequest::Open {
+        stream: next,
+        kind: StreamKind::Tcp,
+        ..
+    } = requests[1]
+    else {
+        panic!("expected a replacement TCP stream");
+    };
+    assert_ne!(tcp, next);
+    gateway.opened(next);
+    assert_eq!(
+        remote.take_written(&mut gateway, next),
+        length_prefixed(&dns_query(7))
+    );
+    gateway.remote_data(tcp, &length_prefixed(&dns_answer(7)));
+    assert!(
+        drain(&mut gateway).is_empty(),
+        "old stream replies are ignored"
+    );
+    gateway.remote_data(next, &length_prefixed(&dns_answer(7)));
+    assert_eq!(udp_view(&drain(&mut gateway)).data, dns_answer(7));
 }

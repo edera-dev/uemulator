@@ -711,3 +711,59 @@ fn udp_data_too_long_for_a_datagram_is_dropped() {
     });
     assert_eq!(drain(&mut rig.gateway).len(), 1, "the stream still works");
 }
+
+#[test]
+fn refused_tcp_dns_fallback_reports_unreachable_and_retries_udp() {
+    let mut rig = Rig::ready(PLENTY_OF_CREDIT);
+    rig.gateway.from_guest(
+        &udp_frame(GUEST_PORT, GATEWAY_IP, DNS_PORT, &dns_query(QUERY_ID)),
+        NOW_MS,
+    );
+    let sent = rig.pump();
+    let Some(&WispPacket::Connect { stream: udp, .. }) = sent.first() else {
+        panic!("expected UDP CONNECT: {sent:?}");
+    };
+    rig.server(WispPacket::Close {
+        stream: udp,
+        reason: CLOSE_REFUSED,
+    });
+    let sent = rig.pump();
+    let Some(&WispPacket::Connect {
+        stream: tcp,
+        kind: StreamKind::Tcp,
+        ..
+    }) = sent.first()
+    else {
+        panic!("expected TCP fallback: {sent:?}");
+    };
+    rig.server(WispPacket::Close {
+        stream: tcp,
+        reason: CLOSE_REFUSED,
+    });
+    let replies = drain(&mut rig.gateway);
+    assert_eq!(replies.len(), 1, "failed fallback reports unreachable");
+    const IPV4_PROTOCOL_OFFSET: usize = 23;
+    const ICMP_OFFSET: usize = 14 + 20;
+    const IP_PROTO_ICMP: u8 = 1;
+    const ICMP_PORT_UNREACHABLE: [u8; 2] = [3, 3];
+    assert_eq!(replies[0][IPV4_PROTOCOL_OFFSET], IP_PROTO_ICMP);
+    assert_eq!(
+        &replies[0][ICMP_OFFSET..ICMP_OFFSET + 2],
+        &ICMP_PORT_UNREACHABLE
+    );
+    assert!(!rig.gateway.has_stream(tcp));
+    rig.gateway.from_guest(
+        &udp_frame(GUEST_PORT, GATEWAY_IP, DNS_PORT, &dns_query(QUERY_ID + 1)),
+        NOW_MS + 1,
+    );
+    assert!(
+        matches!(
+            rig.pump().first(),
+            Some(WispPacket::Connect {
+                kind: StreamKind::Udp,
+                ..
+            })
+        ),
+        "retry UDP after a failed fallback"
+    );
+}

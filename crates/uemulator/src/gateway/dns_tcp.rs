@@ -2,7 +2,7 @@
 //! the guest's resolver speaks UDP to 10.0.2.2:53, so once a UDP stream to the resolver has
 //! failed the gateway carries every query over one TCP stream of its own, with the two-byte
 //! length prefix, and turns each answer back into a datagram. The choice is kept for the
-//! gateway's lifetime: probing UDP again would cost every query a failed open.
+//! gateway's lifetime unless TCP also fails, in which case the next query tries UDP again.
 //!
 //! The stream has no guest TCP flow behind it. The driver feeds it through the same calls as
 //! any TCP stream (`opened`, `to_remote`, `consumed`, `remote_data`, ...), which dispatch here
@@ -10,6 +10,8 @@
 
 #[cfg(freestanding)]
 use crate::prelude::*;
+
+use alloc::collections::BTreeSet;
 
 use super::wire::{IP_PROTO_UDP, UDP_PAYLOAD_MAX, be_u16, udp_segment};
 use super::{DNS_PORT, GATEWAY_IP, Gateway, GatewayPolicy, GatewayRequest, StreamId, StreamKind};
@@ -40,6 +42,7 @@ pub(super) struct DnsQuery {
     guest_port: u16,
     /// Set from the query's own bytes when it is queued.
     id: u16,
+    upstream_id: u16,
     asked_ms: u64,
     /// The datagram's IPv4 header and first 8 payload bytes, which an ICMP error must quote.
     quote: Vec<u8>,
@@ -51,6 +54,7 @@ impl DnsQuery {
             guest_ip,
             guest_port,
             id: 0,
+            upstream_id: 0,
             asked_ms: 0,
             quote,
         }
@@ -67,6 +71,9 @@ pub(super) struct DnsTcp {
     /// Resolver bytes that do not yet make a whole message.
     incoming: Vec<u8>,
     outstanding: Vec<DnsQuery>,
+    /// Never reuse an ID on this stream: even an expired query can receive a late reply.
+    used_ids: BTreeSet<u16>,
+    next_id: u16,
     last_activity_ms: u64,
 }
 
@@ -79,6 +86,8 @@ impl DnsTcp {
             outgoing: Vec::new(),
             incoming: Vec::new(),
             outstanding: Vec::new(),
+            used_ids: BTreeSet::new(),
+            next_id: 0,
             last_activity_ms: 0,
         }
     }
@@ -101,6 +110,8 @@ impl DnsTcp {
         self.opened = false;
         self.outgoing.clear();
         self.incoming.clear();
+        self.used_ids.clear();
+        self.next_id = 0;
         core::mem::take(&mut self.outstanding)
     }
 }
@@ -116,6 +127,17 @@ impl Gateway {
         {
             return;
         }
+        // Once every ID has been used, retire the stream after its live queries finish.
+        // Late replies on the old stream cannot then be mistaken for new queries.
+        if self.dns_tcp.used_ids.len() == usize::from(u16::MAX) + 1 {
+            if !self.dns_tcp.outstanding.is_empty() {
+                return;
+            }
+            if let Some(stream) = self.dns_tcp.stream {
+                self.requests.push(GatewayRequest::Close { stream });
+            }
+            self.dns_tcp.reset();
+        }
         if self.dns_tcp.stream.is_none() {
             let stream = self.allocate_stream();
             self.dns_tcp.stream = Some(stream);
@@ -128,12 +150,23 @@ impl Gateway {
             }
         }
         let dns = &mut self.dns_tcp;
+        let id = be_u16(&data[..DNS_ID_LEN]);
+        let mut upstream_id = id;
+        if !dns.used_ids.insert(upstream_id) {
+            while !dns.used_ids.insert(dns.next_id) {
+                dns.next_id = dns.next_id.wrapping_add(1);
+            }
+            upstream_id = dns.next_id;
+            dns.next_id = dns.next_id.wrapping_add(1);
+        }
         dns.last_activity_ms = self.now_ms;
         dns.outgoing
             .extend_from_slice(&(data.len() as u16).to_be_bytes());
-        dns.outgoing.extend_from_slice(data);
+        dns.outgoing.extend_from_slice(&upstream_id.to_be_bytes());
+        dns.outgoing.extend_from_slice(&data[DNS_ID_LEN..]);
         dns.outstanding.push(DnsQuery {
-            id: be_u16(&data[..DNS_ID_LEN]),
+            id,
+            upstream_id,
             asked_ms: self.now_ms,
             ..query
         });
@@ -192,30 +225,34 @@ impl Gateway {
             if incoming.len() < end {
                 return;
             }
-            let message: Vec<u8> = self
+            let mut message: Vec<u8> = self
                 .dns_tcp
                 .incoming
                 .drain(..end)
                 .skip(LENGTH_PREFIX_LEN)
                 .collect();
-            self.dns_tcp_answer(&message);
+            self.dns_tcp_answer(&mut message);
         }
     }
 
     /// Turns one answer into a datagram for the query it matches; unmatched ones are dropped.
-    fn dns_tcp_answer(&mut self, message: &[u8]) {
+    fn dns_tcp_answer(&mut self, message: &mut [u8]) {
         // A TCP answer may be up to 65 535 bytes, more than a datagram carries; the guest's
         // resolver retries, as it would over UDP with the answer truncated away.
         if message.len() < DNS_ID_LEN || message.len() > UDP_PAYLOAD_MAX {
             return;
         }
         let id = be_u16(&message[..DNS_ID_LEN]);
-        // Several queries may share an ID (different source ports); the first outstanding one
-        // takes the answer, and a repeated answer finds the next.
-        let Some(position) = self.dns_tcp.outstanding.iter().position(|q| q.id == id) else {
+        let Some(position) = self
+            .dns_tcp
+            .outstanding
+            .iter()
+            .position(|q| q.upstream_id == id)
+        else {
             return;
         };
         let query = self.dns_tcp.outstanding.remove(position);
+        message[..DNS_ID_LEN].copy_from_slice(&query.id.to_be_bytes());
         let datagram = udp_segment(
             GATEWAY_IP,
             query.guest_ip,
