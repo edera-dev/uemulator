@@ -391,7 +391,7 @@ impl Cpu {
             // Linear is guest-physical; a nested-paging guest's addresses still go through nCR3.
             PagingMode::Off => {
                 let (page_pa, nested) =
-                    self.nested_translate_with_rights(linear & !PAGE_OFFSET_MASK, access, false)?;
+                    self.nested_translate_with_rights(linear & !PAGE_OFFSET_MASK, access, user)?;
                 Ok((
                     page_pa,
                     restrict_to_nested(TLB_FLAG_WRITABLE | TLB_FLAG_USER | TLB_FLAG_DIRTY, nested),
@@ -586,7 +586,7 @@ impl Cpu {
                 let leaf_base = pte & PTE_ADDRESS_MASK & !leaf_offset_mask;
                 let guest_page = leaf_base | (linear & leaf_offset_mask & !PAGE_OFFSET_MASK);
                 let (page_pa, nested) =
-                    self.nested_translate_with_rights(guest_page, access, false)?;
+                    self.nested_translate_with_rights(guest_page, access, user)?;
                 if level > 0 {
                     self.large_page_insert(
                         linear,
@@ -691,7 +691,7 @@ impl Cpu {
                 let (page_pa, nested) = self.nested_translate_with_rights(
                     leaf_base | page_offset_in_leaf,
                     access,
-                    false,
+                    user,
                 )?;
                 return Ok((
                     page_pa,

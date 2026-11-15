@@ -370,21 +370,33 @@ impl Cpu {
     /// Logs `error` and, when it is signaled, raises #MC (vector 18, no error code). MCG_STATUS
     /// gets MCIP, EIPV and, unless the error corrupted the context (PCC), RIPV. A machine check
     /// with CR4.MCE clear, or while MCIP is still set from the last one, shuts the processor down
-    /// (APM vol. 2 sec. 9.3.4), which the run loop reports as a triple fault. `Some` ends the run.
+    /// (APM vol. 2 sec. 9.3.4), which the run loop reports as a triple fault. In an SVM guest the
+    /// #MC intercept and HOST_MCE_OVERRIDE come first (`svm_machine_check_exit`), and a shutdown
+    /// is the guest's (`svm_shutdown_exit`). `Some` ends the run.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn machine_check(&mut self, error: MachineCheck) -> Option<ExitReason> {
         if !self.mca.log(error.bank, error.status, error.address) {
             return None;
         }
-        if self.cr4 & CR4_MCE == 0 || self.mca.global_status & MCG_STATUS_MCIP != 0 {
-            return Some(ExitReason::TripleFault);
+        let shutdown =
+            |cpu: &mut Cpu| (!cpu.svm_shutdown_exit()).then_some(ExitReason::TripleFault);
+        if self.mca.global_status & MCG_STATUS_MCIP != 0 {
+            return shutdown(self);
         }
         let restartable = if error.status & STATUS_CONTEXT_CORRUPT == 0 {
             MCG_STATUS_RIPV
         } else {
             0
         };
-        self.mca.global_status = MCG_STATUS_MCIP | MCG_STATUS_EIPV | restartable;
+        let signaled = MCG_STATUS_MCIP | MCG_STATUS_EIPV | restartable;
+        if self.svm_machine_check_exit() {
+            self.mca.global_status = signaled;
+            return None;
+        }
+        if self.cr4 & CR4_MCE == 0 {
+            return shutdown(self);
+        }
+        self.mca.global_status = signaled;
         self.deliver_event(VECTOR_MACHINE_CHECK, None, false)
     }
 }

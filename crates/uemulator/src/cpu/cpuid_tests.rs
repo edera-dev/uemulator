@@ -467,12 +467,14 @@ fn leaf_0x8000000a_describes_svm() {
     assert_eq!((revision, asids, ecx), (1, 32768, 0));
     // nested paging, LBR virtualization, SVM lock, next-RIP save, the TSC ratio MSR, VMCB clean
     // bits, flush by ASID, decode assists, the pause filter and its threshold, AVIC, virtual
-    // VMLOAD/VMSAVE, vGIF, x2AVIC, SPEC_CTRL virtualization, vNMI and the SVM instruction address
-    // check order (tested in svm.rs); GMET, ROGPT, host MCE override and the rest are not
-    // implemented
+    // VMLOAD/VMSAVE, vGIF, GMET, x2AVIC, SPEC_CTRL virtualization, ROGPT, the host MCE override,
+    // TlbiCtl (the INVLPGB enable), vNMI and the SVM instruction address check order (tested in
+    // svm.rs); SSSCheck, IBS virtualization and the rest are not implemented
     assert_eq!(
         features,
-        bits(&[0, 1, 2, 3, 4, 5, 6, 7, 10, 12, 13, 15, 16, 18, 20, 25, 28])
+        bits(&[
+            0, 1, 2, 3, 4, 5, 6, 7, 10, 12, 13, 15, 16, 17, 18, 20, 21, 23, 24, 25, 28
+        ])
     );
 }
 

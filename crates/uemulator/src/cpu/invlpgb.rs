@@ -8,8 +8,17 @@
 //! (`catch_up_tlb_shootdowns`). Dropping more than asked is always allowed for a TLB, and the
 //! soft TLB keeps neither PCIDs nor global bits apart, so the PCID and global filters only ever
 //! widen what goes; the ASID decides between the running and the parked TLB.
+//!
+//! An SVM guest may run them when its VMCB enables them (0x90 bit 7, CPUID 0x8000_000A EDX bit
+//! 24 TlbiCtl), else they are #UD there; the intercepts come first either way. A guest's
+//! INVLPGB reaches only its own ASID, whatever EDX and rAX[2] say, and only its own linear
+//! translations: never the host's, and never the nested-table leaves, which are the
+//! hypervisor's to invalidate (its INVLPGB or TLB_CONTROL). The soft TLB holds guest-linear to
+//! host-physical translations whole, so with nested paging the pages named are dropped together
+//! with whatever nested translation they were made through.
 
 use super::exception::Exception;
+use super::svm::GuestTlbs;
 use super::sys::{RAX, RCX, RDX};
 use super::*;
 
@@ -43,9 +52,11 @@ struct Shootdown {
     /// pages become: the soft TLB caches 4 KiB pages, and 512 invlpgs per page cost more than a
     /// flush.
     pages: Option<(u64, u64)>,
-    /// The host's translations, a guest's, or both.
+    /// The host's translations, and which guests'.
     host: bool,
-    guest: bool,
+    guests: GuestTlbs,
+    /// The cached nested-table leaves too: the host may have changed the nested tables.
+    nested: bool,
 }
 
 impl Cpu {
@@ -56,11 +67,15 @@ impl Cpu {
     }
 
     /// The checks INVLPGB and TLBSYNC share. Real and virtual-8086 mode have no use for them
-    /// and get #UD, CPL > 0 gets #GP(0). In a guest, only an intercept (`svm_intercept`, taken
-    /// before this) would let them do anything: guest use is not enabled (no VMCB enable bit is
-    /// emulated), so they are #UD there.
+    /// and get #UD, CPL > 0 gets #GP(0). In a guest (whose intercepts `svm_intercept` took
+    /// first) they are #UD unless the VMCB enables them.
     fn broadcast_tlb_checks(&self) -> ExecResult<()> {
-        if self.cr0 & CR0_PE == 0 || self.eflags & flags::VM != 0 || self.svm.guest.is_some() {
+        let guest_disabled = self
+            .svm
+            .guest
+            .as_ref()
+            .is_some_and(|guest| !guest.invlpgb_enabled);
+        if self.cr0 & CR0_PE == 0 || self.eflags & flags::VM != 0 || guest_disabled {
             return Err(Exception::invalid_opcode());
         }
         self.need_cpl0()
@@ -83,12 +98,32 @@ impl Cpu {
             (first, (ecx & ECX_EXTRA_PAGES_MASK) as u64 + 1)
         });
         let asid = self.gpr[RDX] & EDX_ASID_MASK;
-        let (host, guest) = if flags & ASID_VALID == 0 {
-            (true, true)
-        } else {
-            (asid == HOST_ASID, asid != HOST_ASID)
+        let shootdown = match self.svm.guest.as_ref().map(|guest| guest.asid) {
+            Some(own) => Shootdown {
+                pages,
+                host: false,
+                guests: GuestTlbs::Asid(own),
+                nested: false,
+            },
+            None if flags & ASID_VALID == 0 => Shootdown {
+                pages,
+                host: true,
+                guests: GuestTlbs::All,
+                nested: true,
+            },
+            None if asid == HOST_ASID => Shootdown {
+                pages,
+                host: true,
+                guests: GuestTlbs::None,
+                nested: false,
+            },
+            None => Shootdown {
+                pages,
+                host: false,
+                guests: GuestTlbs::Asid(asid as u32),
+                nested: true,
+            },
         };
-        let shootdown = Shootdown { pages, host, guest };
         self.apply_shootdown(&shootdown);
         if self.threads.is_some() {
             self.with_exclusive(|cpu| {
@@ -111,11 +146,9 @@ impl Cpu {
     }
 
     fn apply_shootdown(&mut self, shootdown: &Shootdown) {
-        let running_is_guest = self.svm.guest.is_some();
-        let running_hit = if running_is_guest {
-            shootdown.guest
-        } else {
-            shootdown.host
+        let running_hit = match self.svm.guest.as_ref() {
+            Some(guest) => shootdown.guests.covers(guest.asid),
+            None => shootdown.host,
         };
         if running_hit {
             match shootdown.pages {
@@ -127,7 +160,7 @@ impl Cpu {
                 None => self.flush_tlb(),
             }
         }
-        self.drop_parked_tlb(shootdown.host, shootdown.guest);
+        self.drop_parked_tlb(shootdown.host, shootdown.guests, shootdown.nested);
     }
 
     /// A time-shared vCPU about to run: if INVLPGB ran on another vCPU since it last ran, its
@@ -138,7 +171,7 @@ impl Cpu {
         }
         self.tlb_shootdown_seen = self.tlb_shootdown_epoch;
         self.flush_tlb();
-        self.drop_parked_tlb(true, true);
+        self.drop_parked_tlb(true, GuestTlbs::All, true);
     }
 }
 

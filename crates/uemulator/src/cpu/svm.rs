@@ -17,7 +17,7 @@ use super::decode::Insn;
 use super::exception::Exception;
 use super::flags::*;
 use super::mem::AccessKind;
-use super::sys::{CR0_TS, EFER_AIBRSE, EFER_SCE, RAX, RCX, RDX};
+use super::sys::{CR0_TS, CR4_MCE, EFER_AIBRSE, EFER_SCE, RAX, RCX, RDX};
 use super::*;
 
 #[path = "svm_avic.rs"]
@@ -329,7 +329,19 @@ const TLB_CONTROL_FLUSH_GUEST: u64 = 3;
 const TLB_CONTROL_FLUSH_GUEST_NON_GLOBAL: u64 = 7;
 
 const INTERRUPT_SHADOW: u64 = 1;
+// VMCB 0x90: nested paging and the controls beside it (bits 1, 2 and 5 are SEV's).
 const NP_ENABLE: u64 = 1;
+/// GMET: under nested paging a guest supervisor access is a supervisor access in the nested
+/// tables too, with SMEP's rule for fetches (`nested_walk`).
+const GMET_ENABLE: u64 = 1 << 3;
+/// ROGPT: a guest page-table access is a nested write only when it sets an Accessed or Dirty
+/// bit (`nested_walk`).
+const ROGPT_ENABLE: u64 = 1 << 6;
+/// INVLPGB and TLBSYNC may run in the guest (else they are #UD there, intercepts aside).
+const INVLPGB_ENABLE: u64 = 1 << 7;
+/// The VMCB 0x90 controls that change what a nested walk allows, so a guest TLB made under
+/// others is not kept (`GuestAddressSpace`).
+const NESTED_WALK_CONTROLS: u64 = GMET_ENABLE | ROGPT_ENABLE;
 const VECTOR_INTERCEPT_BITMAP_BITS: u32 = 32;
 const VECTOR_BREAKPOINT_EXCEPTION: u8 = 3;
 const CR0_SELECTIVE_IGNORED: u64 = CR0_TS | 2;
@@ -377,8 +389,15 @@ const SVM_FEATURE_PAUSE_FILTER_THRESHOLD: u32 = 1 << 12;
 const SVM_FEATURE_AVIC: u32 = 1 << 13;
 const SVM_FEATURE_V_VMSAVE_VMLOAD: u32 = 1 << 15;
 const SVM_FEATURE_VGIF: u32 = 1 << 16;
+const SVM_FEATURE_GMET: u32 = 1 << 17;
 const SVM_FEATURE_X2AVIC: u32 = 1 << 18;
 const SVM_FEATURE_SPEC_CTRL: u32 = 1 << 20;
+const SVM_FEATURE_ROGPT: u32 = 1 << 21;
+/// A machine check in a guest with CR4.MCE clear, while the host's is set, is a #VMEXIT(#MC)
+/// instead of a shutdown (`svm_machine_check_exit`).
+const SVM_FEATURE_HOST_MCE_OVERRIDE: u32 = 1 << 23;
+/// TlbiCtl: the VMCB's INVLPGB enable (and the TLBSYNC intercept); `invlpgb.rs`.
+const SVM_FEATURE_TLBI_CONTROL: u32 = 1 << 24;
 const SVM_FEATURE_VNMI: u32 = 1 << 25;
 /// SVME_ADDR_CHK: a guest's VMRUN/VMLOAD/VMSAVE intercept is checked before rAX is (an address
 /// the processor refuses is #GP only when the instruction is not intercepted); without the bit
@@ -400,8 +419,12 @@ pub(crate) const SVM_FEATURES: u32 = SVM_FEATURE_NESTED_PAGING
     | SVM_FEATURE_AVIC
     | SVM_FEATURE_V_VMSAVE_VMLOAD
     | SVM_FEATURE_VGIF
+    | SVM_FEATURE_GMET
     | SVM_FEATURE_X2AVIC
     | SVM_FEATURE_SPEC_CTRL
+    | SVM_FEATURE_ROGPT
+    | SVM_FEATURE_HOST_MCE_OVERRIDE
+    | SVM_FEATURE_TLBI_CONTROL
     | SVM_FEATURE_VNMI
     | SVM_FEATURE_SVME_ADDR_CHK;
 
@@ -437,7 +460,7 @@ struct Host {
 /// change them while the guest runs) and the host state to return to.
 pub(crate) struct Guest {
     vmcb: u64,
-    asid: u32,
+    pub(super) asid: u32,
     intercept_cr: u32,
     intercept_dr: u32,
     intercept_exceptions: u32,
@@ -449,6 +472,10 @@ pub(crate) struct Guest {
     tsc_offset: u64,
     /// Nested page table root, when nested paging is on.
     pub(crate) nested_cr3: Option<u64>,
+    /// GMET and ROGPT, from VMCB 0x90 (only with nested paging).
+    nested_walk_controls: u64,
+    /// INVLPGB and TLBSYNC are allowed in the guest (VMCB 0x90 bit 7).
+    pub(super) invlpgb_enabled: bool,
     host: Host,
     /// Virtual interrupt (V_IRQ): vector, priority, and whether the guest's CR8 is ignored.
     virtual_irq: bool,
@@ -591,6 +618,24 @@ pub(crate) struct ParkedTlb {
     owner: TlbOwner,
 }
 
+/// Which guests' translations an invalidation reaches, by ASID.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum GuestTlbs {
+    None,
+    All,
+    Asid(u32),
+}
+
+impl GuestTlbs {
+    pub(crate) fn covers(self, asid: u32) -> bool {
+        match self {
+            GuestTlbs::None => false,
+            GuestTlbs::All => true,
+            GuestTlbs::Asid(target) => target == asid,
+        }
+    }
+}
+
 /// Whose translations a `ParkedTlb` holds.
 #[derive(Clone, Copy, PartialEq)]
 enum TlbOwner {
@@ -608,6 +653,7 @@ enum TlbOwner {
 struct GuestAddressSpace {
     asid: u32,
     nested_cr3: Option<u64>,
+    nested_walk_controls: u64,
     cr0: u64,
     cr3: u64,
     cr4: u64,
@@ -640,7 +686,23 @@ struct NestedLeaf {
     host_base: u64,
     /// log2 of the leaf size.
     shift: u32,
-    rights: NestedRights,
+    /// Writable at every level and Dirty already.
+    store: bool,
+    /// Not no-execute at any level (or NX off in the host's EFER).
+    executable: bool,
+    /// User at every level. Without GMET every access needs it; with GMET only user ones do,
+    /// and a supervisor fetch needs it clear.
+    user: bool,
+}
+
+impl NestedLeaf {
+    /// What the leaf allows an access of the given privilege (`supervisor` only under GMET).
+    fn rights(&self, supervisor: bool) -> NestedRights {
+        NestedRights {
+            store: self.store,
+            fetch: self.executable && !(supervisor && self.user),
+        }
+    }
 }
 
 /// Never a leaf's aligned guest-physical base.
@@ -649,7 +711,9 @@ const EMPTY_NESTED_LEAF: NestedLeaf = NestedLeaf {
     guest_base: NO_NESTED_LEAF,
     host_base: 0,
     shift: NPT_PAGE_SHIFT,
-    rights: ALL_NESTED_RIGHTS,
+    store: true,
+    executable: true,
+    user: true,
 };
 
 impl NestedLeafCache {
@@ -667,13 +731,15 @@ impl NestedLeafCache {
     }
 
     /// The cached leaf covering `guest_physical` under `root`, unless the access needs the walk:
-    /// a store the leaf does not allow yet (not writable, or Dirty still to be set) or a fetch
-    /// it forbids. The walk then sets the bit or raises the nested fault.
+    /// a store the leaf does not allow yet (not writable, or Dirty still to be set), a fetch it
+    /// forbids, or a user access to a supervisor leaf. The walk then sets the bit or raises the
+    /// nested fault. `supervisor` is a guest supervisor access under GMET.
     fn lookup(
         &self,
         root: u64,
         guest_physical: u64,
         access: super::mem::AccessKind,
+        supervisor: bool,
     ) -> Option<(u64, NestedRights)> {
         if self.root != root {
             return None;
@@ -685,16 +751,17 @@ impl NestedLeafCache {
         let leaf = Some(&self.small[Self::small_slot(guest_physical)])
             .filter(covers)
             .or_else(|| self.large.iter().find(covers))?;
+        let rights = leaf.rights(supervisor);
         let allowed = match access {
-            super::mem::AccessKind::Write => leaf.rights.store,
-            super::mem::AccessKind::Exec => leaf.rights.fetch,
+            super::mem::AccessKind::Write => rights.store,
+            super::mem::AccessKind::Exec => rights.fetch,
             super::mem::AccessKind::Read => true,
         };
-        if !allowed {
+        if !allowed || !(supervisor || leaf.user) {
             return None;
         }
         let offset = guest_physical & ((1u64 << leaf.shift) - 1);
-        Some((leaf.host_base | offset, leaf.rights))
+        Some((leaf.host_base | offset, rights))
     }
 
     fn insert(&mut self, root: u64, leaf: NestedLeaf) {
@@ -957,21 +1024,22 @@ impl Cpu {
         Ok(())
     }
 
-    /// Makes the parked TLB unusable if it holds the host's translations (`host`) or a guest's
-    /// (`guest`): the next world switch starts that side empty. For INVLPGB, which may drop more
-    /// than it was asked to.
-    pub(super) fn drop_parked_tlb(&mut self, host: bool, guest: bool) {
+    /// Makes the parked TLB unusable if it holds the host's translations (`host`) or those of a
+    /// guest `guests` covers: the next world switch starts that side empty. With `nested` the
+    /// cached nested-table leaves go too (only the hypervisor can have changed those). For
+    /// INVLPGB, which may drop more than it was asked to.
+    pub(super) fn drop_parked_tlb(&mut self, host: bool, guests: GuestTlbs, nested: bool) {
         if let Some(parked) = self.svm.parked_tlb.as_deref_mut() {
             let matches = match parked.owner {
                 TlbOwner::Nobody => false,
                 TlbOwner::Host => host,
-                TlbOwner::Guest(_) => guest,
+                TlbOwner::Guest(space) => guests.covers(space.asid),
             };
             if matches {
                 parked.owner = TlbOwner::Nobody;
             }
         }
-        if guest {
+        if nested && guests != GuestTlbs::None {
             self.forget_nested_leaves();
         }
     }
@@ -1096,7 +1164,8 @@ impl Cpu {
             shadow_stack: [self.cet.s_cet, self.cet.ssp, self.cet.isst_addr],
         };
         let v_intr = self.vmcb_read(vmcb, VMCB_V_INTR, 8);
-        let nested = self.vmcb_read(vmcb, VMCB_NP_ENABLE, 8) & NP_ENABLE != 0;
+        let nested_controls = self.vmcb_read(vmcb, VMCB_NP_ENABLE, 8);
+        let nested = nested_controls & NP_ENABLE != 0;
         let virtual_extensions = self.vmcb_read(vmcb, VMCB_VIRTUAL_EXTENSIONS, 8);
         let lbr_virtualization = virtual_extensions & LBR_VIRTUALIZATION_ENABLE != 0;
         let pause_filter_count = self.vmcb_read(vmcb, VMCB_PAUSE_FILTER_COUNT, 2) as u16;
@@ -1119,6 +1188,12 @@ impl Cpu {
             msrpm: self.vmcb_read(vmcb, VMCB_MSRPM_BASE, 8),
             tsc_offset: self.vmcb_read(vmcb, VMCB_TSC_OFFSET, 8),
             nested_cr3: nested.then(|| self.vmcb_read(vmcb, VMCB_N_CR3, 8)),
+            nested_walk_controls: if nested {
+                nested_controls & NESTED_WALK_CONTROLS
+            } else {
+                0
+            },
+            invlpgb_enabled: nested_controls & INVLPGB_ENABLE != 0,
             host,
             virtual_irq: v_intr & V_IRQ != 0,
             virtual_vector: (v_intr >> V_VECTOR_SHIFT) as u8,
@@ -1198,6 +1273,7 @@ impl Cpu {
         let space = GuestAddressSpace {
             asid: guest.asid,
             nested_cr3: guest.nested_cr3,
+            nested_walk_controls: guest.nested_walk_controls,
             cr0: self.cr0,
             cr3: self.cr3,
             cr4: self.cr4,
@@ -1282,6 +1358,7 @@ impl Cpu {
         let space = GuestAddressSpace {
             asid: guest.asid,
             nested_cr3: guest.nested_cr3,
+            nested_walk_controls: guest.nested_walk_controls,
             cr0,
             cr3,
             cr4,
@@ -1516,6 +1593,31 @@ impl Cpu {
             next,
         );
         true
+    }
+
+    /// A machine check while a guest runs: a #VMEXIT(#MC) when the guest intercepts #MC, or,
+    /// with HOST_MCE_OVERRIDE, when the guest has CR4.MCE clear and the host has it set (APM
+    /// 15.12.x: the host keeps machine checks a guest would otherwise turn into a shutdown).
+    /// Returns true when it exited.
+    pub(crate) fn svm_machine_check_exit(&mut self) -> bool {
+        let Some(guest) = &self.svm.guest else {
+            return false;
+        };
+        let overridden = guest.host.cr4 & CR4_MCE != 0 && self.cr4 & CR4_MCE == 0;
+        if self.svm_exception_exit(super::exception::VECTOR_MACHINE_CHECK, None, false) {
+            return true;
+        }
+        if overridden {
+            let next = self.rip;
+            self.vmexit(
+                VMEXIT_EXCEPTION + super::exception::VECTOR_MACHINE_CHECK as u64,
+                0,
+                0,
+                next,
+            );
+            return true;
+        }
+        false
     }
 
     /// A triple fault inside a guest that intercepts shutdown is a #VMEXIT, not a machine reset.
@@ -1978,29 +2080,31 @@ pub(crate) const ALL_NESTED_RIGHTS: NestedRights = NestedRights {
 impl Cpu {
     /// Guest-physical to host-physical through the nested page tables; the identity outside a
     /// guest or without nested paging. A fault is a #VMEXIT(NPF), reported as `Exception::Vmexit`.
-    /// The nested tables always treat the access as a user-mode access, so the User bit must be
-    /// set at every level.
+    /// For the guest's page-table walks (`guest_table_walk`) and the processor's own accesses
+    /// (VMLOAD/VMSAVE), which are supervisor accesses; `nested_translate_with_rights` takes the
+    /// privilege of the guest's own.
     pub(crate) fn nested_translate(
         &mut self,
         guest_physical: u64,
         access: super::mem::AccessKind,
         guest_table_walk: bool,
     ) -> ExecResult<u64> {
-        self.nested_translate_with_rights(guest_physical, access, guest_table_walk)
+        self.nested_walk(guest_physical, access, guest_table_walk, false)
             .map(|(address, _)| address)
     }
 
-    /// `nested_translate` of the page a guest walk ends at, with what the nested leaf allows.
-    /// Under AVIC the APIC BAR page, once the nested tables allow the access, is the backing
-    /// page's window (`AVIC_MMIO_WINDOW`) instead.
+    /// `nested_translate` of the page a guest access ends at (`user` if the guest made it as a
+    /// user access), with what the nested leaf allows. Under AVIC the APIC BAR page, once the
+    /// nested tables allow the access, is the backing page's window (`AVIC_MMIO_WINDOW`)
+    /// instead.
     pub(crate) fn nested_translate_with_rights(
         &mut self,
         guest_physical: u64,
         access: super::mem::AccessKind,
-        guest_table_walk: bool,
+        user: bool,
     ) -> ExecResult<(u64, NestedRights)> {
-        let translated = self.nested_walk(guest_physical, access, guest_table_walk)?;
-        if !guest_table_walk && self.avic_mmio_page() == Some(guest_physical & !(PAGE_SIZE - 1)) {
+        let translated = self.nested_walk(guest_physical, access, false, user)?;
+        if self.avic_mmio_page() == Some(guest_physical & !(PAGE_SIZE - 1)) {
             return Ok((
                 AVIC_MMIO_WINDOW | (guest_physical & (PAGE_SIZE - 1)),
                 translated.1,
@@ -2009,20 +2113,45 @@ impl Cpu {
         Ok(translated)
     }
 
+    /// The nested walk proper. Without GMET every access is a user access in the nested tables
+    /// (the User bit must be set at every level); with GMET a guest supervisor access (`user`
+    /// clear, and every guest page-table access) is a supervisor one, which may use a page
+    /// whose leaf is not User but may not fetch from one that is: SMEP in the nested tables, the
+    /// way the APM describes GMET ("guest mode execute trap") for hypervisors that keep the
+    /// guest kernel from running code out of user pages. My reading: the APM does not spell out
+    /// what a supervisor data access to a supervisor nested page does; letting it through is
+    /// what makes such pages usable for the kernel code they are meant to hold.
+    ///
+    /// A guest page-table access is a write in the nested tables, which must be writable and
+    /// get Dirty, whether or not the guest entry's Accessed and Dirty bits need setting (as KVM's
+    /// walker treats it, `PFERR_WRITE_MASK` in `paging_tmpl.h`). ROGPT relaxes that to a read
+    /// unless an A/D update is due: the walkers in `mem.rs` already ask for a write only then.
     fn nested_walk(
         &mut self,
         guest_physical: u64,
         access: super::mem::AccessKind,
         guest_table_walk: bool,
+        user: bool,
     ) -> ExecResult<(u64, NestedRights)> {
-        let Some(root) = self.svm.guest.as_ref().and_then(|guest| guest.nested_cr3) else {
+        let Some((root, controls)) = self
+            .svm
+            .guest
+            .as_ref()
+            .and_then(|guest| Some((guest.nested_cr3?, guest.nested_walk_controls)))
+        else {
             return Ok((guest_physical, ALL_NESTED_RIGHTS));
         };
+        let access = if guest_table_walk && controls & ROGPT_ENABLE == 0 {
+            super::mem::AccessKind::Write
+        } else {
+            access
+        };
+        let supervisor = controls & GMET_ENABLE != 0 && !user;
         if let Some(hit) = self
             .svm
             .nested_leaves
             .as_deref()
-            .and_then(|cache| cache.lookup(root, guest_physical, access))
+            .and_then(|cache| cache.lookup(root, guest_physical, access, supervisor))
         {
             return Ok(hit);
         }
@@ -2049,7 +2178,7 @@ impl Cpu {
             }
             let info = (if present { NPF_PRESENT } else { 0 })
                 | (if write { NPF_WRITE } else { 0 })
-                | NPF_USER
+                | (if supervisor { 0 } else { NPF_USER })
                 | (if reserved { NPF_RESERVED } else { 0 })
                 | (if fetch { NPF_FETCH } else { 0 })
                 | if guest_table_walk {
@@ -2062,6 +2191,7 @@ impl Cpu {
         let mut table = root & NPT_ADDRESS_MASK;
         let mut writable = true;
         let mut no_execute = false;
+        let mut user_leaf = true;
         for level in (0..levels).rev() {
             let shift = NPT_PAGE_SHIFT + NPT_INDEX_BITS * level;
             let index = (guest_physical >> shift) & ((1 << NPT_INDEX_BITS) - 1);
@@ -2081,13 +2211,17 @@ impl Cpu {
             {
                 return fault(self, true, true);
             }
-            if entry & NPT_USER == 0 {
+            if entry & NPT_USER == 0 && !supervisor {
                 return fault(self, true, false);
             }
             writable &= entry & NPT_WRITABLE != 0;
             no_execute |= entry & NPT_NO_EXECUTE != 0;
+            user_leaf &= entry & NPT_USER != 0;
             if leaf {
-                if (write && !writable) || (fetch && no_execute && nx_enabled) {
+                if (write && !writable)
+                    || (fetch && no_execute && nx_enabled)
+                    || (fetch && supervisor && user_leaf)
+                {
                     return fault(self, true, false);
                 }
                 let updated = entry | NPT_ACCESSED | if write { NPT_DIRTY } else { 0 };
@@ -2096,33 +2230,32 @@ impl Cpu {
                     // Dirty for dirty logging, say): update it as hardware does, and walk again
                     // if it changed under us.
                     if !self.update_ram_u64(entry_address, entry, updated) {
-                        return self.nested_walk(guest_physical, access, guest_table_walk);
+                        return self.nested_walk(guest_physical, access, guest_table_walk, user);
                     }
                     entry = updated;
                 }
                 let base = entry & NPT_ADDRESS_MASK & !alignment_mask;
-                let rights = NestedRights {
+                let cached = NestedLeaf {
+                    guest_base: guest_physical & !alignment_mask,
+                    host_base: base,
+                    shift,
                     store: writable && entry & NPT_DIRTY != 0,
-                    fetch: !(no_execute && nx_enabled),
+                    executable: !(no_execute && nx_enabled),
+                    user: user_leaf,
                 };
                 self.svm
                     .nested_leaves
                     .get_or_insert_with(NestedLeafCache::empty)
-                    .insert(
-                        root,
-                        NestedLeaf {
-                            guest_base: guest_physical & !alignment_mask,
-                            host_base: base,
-                            shift,
-                            rights,
-                        },
-                    );
-                return Ok((base | (guest_physical & alignment_mask), rights));
+                    .insert(root, cached);
+                return Ok((
+                    base | (guest_physical & alignment_mask),
+                    cached.rights(supervisor),
+                ));
             }
             if entry & NPT_ACCESSED == 0
                 && !self.update_ram_u64(entry_address, entry, entry | NPT_ACCESSED)
             {
-                return self.nested_walk(guest_physical, access, guest_table_walk);
+                return self.nested_walk(guest_physical, access, guest_table_walk, user);
             }
             table = entry & NPT_ADDRESS_MASK;
         }
@@ -4906,5 +5039,326 @@ mod tests {
         assert_eq!(get(&h, SAVE_DR7, 8), GUEST_DR7);
         assert_eq!(h.cpu.dr[7], 0x400, "the host's DR7 is back");
         assert_eq!(h.cpu.dr[6], 0xffff_0ff0);
+    }
+
+    // ---- GMET, ROGPT, HOST_MCE_OVERRIDE, INVLPGB in a guest ----
+
+    /// The nested PD entry of the 2 MiB region holding `guest_physical`, an identity large leaf
+    /// with `flags` (present 1, writable 2, user 4).
+    fn set_nested_region(h: &mut Harness, guest_physical: u64, flags: u64) {
+        let region = guest_physical & !0x1f_ffff;
+        assert_ne!(
+            region, NESTED_REMAPPED_GPA,
+            "that region is split into 4 KiB pages"
+        );
+        let entry = region | flags | NPT_PAGE_SIZE;
+        h.write(NPT + 0x2000 + (region >> 21) * 8, &entry.to_le_bytes());
+    }
+
+    const NPT_PRESENT_WRITABLE: u64 = 3;
+    const NPT_PRESENT_USER: u64 = 5;
+
+    #[test]
+    fn gmet_makes_a_supervisor_fetch_from_a_user_nested_page_a_nested_fault() {
+        let mut h = nested_rig(ASM_CPUID);
+        put(&mut h, VMCB_NP_ENABLE, 8, NP_ENABLE | GMET_ENABLE);
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_NPF);
+        assert_eq!(get(&h, VMCB_EXITINFO2, 8) & !0xfff, GUEST_CODE & !0xfff);
+        let info = get(&h, VMCB_EXITINFO1, 8);
+        assert_eq!(
+            info & (NPF_PRESENT | NPF_WRITE | NPF_USER | NPF_FETCH | NPF_FINAL_ADDRESS),
+            NPF_PRESENT | NPF_FETCH | NPF_FINAL_ADDRESS,
+            "a supervisor fetch, refused: {info:#x}"
+        );
+        assert_eq!(get(&h, SAVE_RIP, 8), GUEST_CODE);
+    }
+
+    /// Under GMET the guest kernel runs (and reads, and walks its tables) from nested pages that
+    /// are not User; without GMET those pages are closed to it like to anything else.
+    #[test]
+    fn under_gmet_supervisor_code_runs_from_a_supervisor_nested_page() {
+        for (controls, expected) in [
+            (NP_ENABLE | GMET_ENABLE, VMEXIT_CPUID),
+            (NP_ENABLE, VMEXIT_NPF),
+        ] {
+            let mut h = nested_rig(ASM_CPUID);
+            set_nested_region(&mut h, GUEST_CODE, NPT_PRESENT_WRITABLE);
+            put(&mut h, VMCB_NP_ENABLE, 8, controls);
+            run(&mut h);
+            assert_eq!(get(&h, VMCB_EXITCODE, 8), expected, "{controls:#x}");
+        }
+    }
+
+    /// A read caches the User page under GMET; the jump into it must still be refused, on either
+    /// engine (the soft TLB keeps one entry per page for reads and fetches).
+    #[test]
+    fn under_gmet_a_fetch_after_a_read_of_a_user_page_still_faults() {
+        fn check() {
+            // mov rax, [0x800000]; mov rax, 0x800000; jmp rax
+            let mut h = nested_rig(&[
+                0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x80, 0x00, 0x48, 0xc7, 0xc0, 0x00, 0x00, 0x80,
+                0x00, 0xff, 0xe0,
+            ]);
+            set_nested_region(&mut h, GUEST_CODE, NPT_PRESENT_WRITABLE);
+            put(&mut h, VMCB_NP_ENABLE, 8, NP_ENABLE | GMET_ENABLE);
+            h.write(NESTED_REMAPPED_HPA, ASM_CPUID);
+            run(&mut h);
+            assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_NPF);
+            assert_eq!(get(&h, VMCB_EXITINFO2, 8), NESTED_REMAPPED_GPA);
+            let info = get(&h, VMCB_EXITINFO1, 8);
+            assert_ne!(info & NPF_FETCH, 0);
+            assert_eq!(info & NPF_USER, 0);
+        }
+        check();
+        under_jit(check);
+    }
+
+    /// Sets Accessed in every guest page-table entry on the way to `linear` (the guest runs on
+    /// the host's tables, 4-level).
+    fn mark_accessed_along(h: &mut Harness, linear: u64) {
+        const ACCESSED: u64 = 1 << 5;
+        let mut table = h.cpu.cr3 & NPT_ADDRESS_MASK;
+        for level in (0..NPT_LEVELS).rev() {
+            let address = table + ((linear >> (12 + 9 * level)) & 0x1ff) * 8;
+            let entry = u64::from_le_bytes(h.read(address, 8).try_into().unwrap());
+            h.write(address, &(entry | ACCESSED).to_le_bytes());
+            if level == 0 || entry & NPT_PAGE_SIZE != 0 {
+                return;
+            }
+            table = entry & NPT_ADDRESS_MASK;
+        }
+    }
+
+    /// The guest's top-level table lies in a 2 MiB region the nested tables map read-only (the
+    /// code is fetched from it too, which reading allows).
+    fn rig_with_read_only_guest_tables(controls: u64) -> Harness {
+        let mut h = nested_rig(ASM_CPUID);
+        let tables = h.cpu.cr3 & NPT_ADDRESS_MASK;
+        set_nested_region(&mut h, tables, NPT_PRESENT_USER);
+        put(&mut h, VMCB_NP_ENABLE, 8, controls);
+        h
+    }
+
+    #[test]
+    fn without_rogpt_a_guest_table_walk_needs_writable_nested_pages() {
+        let mut h = rig_with_read_only_guest_tables(NP_ENABLE);
+        mark_accessed_along(&mut h, GUEST_CODE);
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_NPF);
+        let info = get(&h, VMCB_EXITINFO1, 8);
+        assert_eq!(
+            info & (NPF_PRESENT | NPF_WRITE | NPF_GUEST_TABLE_WALK),
+            NPF_PRESENT | NPF_WRITE | NPF_GUEST_TABLE_WALK,
+            "{info:#x}"
+        );
+        assert_eq!(
+            get(&h, VMCB_EXITINFO2, 8) & !0xfff,
+            h.cpu.cr3 & NPT_ADDRESS_MASK
+        );
+    }
+
+    #[test]
+    fn with_rogpt_a_guest_table_walk_writes_only_to_set_accessed() {
+        let mut h = rig_with_read_only_guest_tables(NP_ENABLE | ROGPT_ENABLE);
+        mark_accessed_along(&mut h, GUEST_CODE);
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_CPUID);
+        // The same, with the top-level entry's Accessed bit still to set. The host's own fetch of
+        // vmrun walks the same tables, so the bit is cleared once the guest runs.
+        let mut h = rig_with_read_only_guest_tables(NP_ENABLE | ROGPT_ENABLE);
+        mark_accessed_along(&mut h, GUEST_CODE);
+        enter_guest(&mut h);
+        let pml4_entry = (h.cpu.cr3 & NPT_ADDRESS_MASK) + ((GUEST_CODE >> 39) & 0x1ff) * 8;
+        let entry = u64::from_le_bytes(h.read(pml4_entry, 8).try_into().unwrap());
+        h.write(pml4_entry, &(entry & !(1 << 5)).to_le_bytes());
+        h.cpu.flush_tlb();
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_NPF);
+        let info = get(&h, VMCB_EXITINFO1, 8);
+        assert_ne!(info & NPF_WRITE, 0);
+        assert_ne!(info & NPF_GUEST_TABLE_WALK, 0);
+    }
+
+    #[test]
+    fn host_mce_override_and_the_machine_check_intercept() {
+        use crate::cpu::mca::MachineCheck;
+        const MSR_MCG_CTL: u32 = 0x17b;
+        const MSR_SMCA_BANK2_CTL: u32 = 0xc000_2020;
+        const STATUS_UNCORRECTED_ENABLED: u64 = 1 << 61 | 1 << 60;
+        const VECTOR_MACHINE_CHECK: u8 = 18;
+        let error = MachineCheck {
+            bank: 2,
+            status: STATUS_UNCORRECTED_ENABLED,
+            address: 0,
+        };
+        enum Outcome {
+            Exit(u64),
+            Delivered,
+            Shutdown,
+        }
+        // (host CR4.MCE, guest CR4.MCE, #MC intercepted, shutdown intercepted)
+        for (host_mce, guest_mce, intercepted, shutdown_intercepted, outcome) in [
+            (
+                true,
+                false,
+                false,
+                false,
+                Outcome::Exit(VMEXIT_EXCEPTION + 18),
+            ),
+            (
+                true,
+                true,
+                true,
+                false,
+                Outcome::Exit(VMEXIT_EXCEPTION + 18),
+            ),
+            (
+                false,
+                true,
+                true,
+                false,
+                Outcome::Exit(VMEXIT_EXCEPTION + 18),
+            ),
+            (true, true, false, false, Outcome::Delivered),
+            (false, false, false, true, Outcome::Exit(VMEXIT_SHUTDOWN)),
+            (false, false, false, false, Outcome::Shutdown),
+        ] {
+            let mut h = rig(ASM_CPUID);
+            let handler = GUEST_CODE + 0x100;
+            let cs = h.cpu.seg[SEG_CS].sel;
+            install_idt_gate(&mut h, VECTOR_MACHINE_CHECK, handler, cs);
+            put(&mut h, SAVE_IDTR + SEGMENT_LIMIT, 4, 0x4ff);
+            put(&mut h, SAVE_IDTR + SEGMENT_BASE, 8, IDT);
+            h.cpu.wrmsr(MSR_MCG_CTL, u64::MAX).unwrap();
+            h.cpu.wrmsr(MSR_SMCA_BANK2_CTL, u64::MAX).unwrap();
+            let mce = |on: bool| if on { CR4_MCE } else { 0 };
+            h.cpu.cr4 = (h.cpu.cr4 & !CR4_MCE) | mce(host_mce);
+            let guest_cr4 = get(&h, SAVE_CR4, 8);
+            put(&mut h, SAVE_CR4, 8, (guest_cr4 & !CR4_MCE) | mce(guest_mce));
+            put(
+                &mut h,
+                VMCB_INTERCEPT_EXCEPTIONS,
+                4,
+                if intercepted {
+                    1 << VECTOR_MACHINE_CHECK
+                } else {
+                    0
+                },
+            );
+            if shutdown_intercepted {
+                let intercept3 = get(&h, VMCB_INTERCEPT3, 4);
+                put(
+                    &mut h,
+                    VMCB_INTERCEPT3,
+                    4,
+                    intercept3 | INTERCEPT_SHUTDOWN as u64,
+                );
+            }
+            enter_guest(&mut h);
+            let reason = h.cpu.machine_check(error);
+            let case = (host_mce, guest_mce, intercepted, shutdown_intercepted);
+            match outcome {
+                Outcome::Exit(code) => {
+                    assert!(reason.is_none(), "{case:?}");
+                    assert!(h.cpu.svm.guest.is_none(), "{case:?}");
+                    assert_eq!(get(&h, VMCB_EXITCODE, 8), code, "{case:?}");
+                }
+                Outcome::Delivered => {
+                    assert!(reason.is_none(), "{case:?}");
+                    assert!(h.cpu.svm.guest.is_some(), "{case:?}");
+                    assert_eq!(h.cpu.rip, handler, "{case:?}");
+                }
+                Outcome::Shutdown => {
+                    assert_eq!(reason, Some(ExitReason::TripleFault), "{case:?}")
+                }
+            }
+        }
+    }
+
+    const STALE_VIRTUAL: u64 = 0x0000_2000_0003_5000;
+    const OLD_PAGE: u64 = SCRATCH + 0x4000;
+    const NEW_PAGE: u64 = SCRATCH + 0x8000;
+    const OLD_VALUE: u32 = 0x11;
+    const NEW_VALUE: u32 = 0x22;
+    // mov edx, [rbx]; vmrun; mov edx, [rbx]; hlt
+    const HOST_LOAD_AROUND_VMRUN: &[u8] = &[0x8b, 0x13, 0x0f, 0x01, 0xd8, 0x8b, 0x13, 0xf4];
+    // mov edx, [rbx]; mov [rdi], rsi; invlpgb; tlbsync; mov ecx, [rbx]; cpuid (ecx must be 0 at
+    // invlpgb: it counts the extra pages)
+    const GUEST_REMAP_THEN_INVLPGB: &[u8] = &[
+        0x8b, 0x13, 0x48, 0x89, 0x37, 0x0f, 0x01, 0xfe, 0x0f, 0x01, 0xff, 0x8b, 0x0b, 0x0f, 0xa2,
+    ];
+    // the same with six nops instead of invlpgb; tlbsync
+    const GUEST_REMAP_WITHOUT_INVLPGB: &[u8] = &[
+        0x8b, 0x13, 0x48, 0x89, 0x37, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x8b, 0x0b, 0x0f, 0xa2,
+    ];
+
+    /// Host and guest share 4-level tables mapping `STALE_VIRTUAL` to `OLD_PAGE`. The host loads
+    /// it before VMRUN and again after the #VMEXIT (into edx); the guest loads it (caching the
+    /// translation), points the entry at `NEW_PAGE` (rdi, rsi), runs `guest_code`'s middle and
+    /// loads it again (into ecx). Returns (the guest's second load, the host's second load).
+    fn guest_remaps_a_page(guest_code: &[u8], controls: u64, nested: bool) -> (u64, u64) {
+        use crate::cpu::test_support::{GDT_BASE, PTE_PRESENT_WRITABLE_USER, PageTables};
+        use crate::testkit::{RDI, RSI};
+        let flags = PTE_PRESENT_WRITABLE_USER;
+        let (mut h, entry) = rig_prepared(guest_code, |h| {
+            let mut tables = PageTables::new(&mut h.cpu);
+            let code_page = CODE_BASE & !0xfff;
+            for page in [code_page, code_page + 0x1000, GDT_BASE & !0xfff] {
+                tables.map_4k(&mut h.cpu, page, page, flags);
+            }
+            let entry = tables.map_4k(&mut h.cpu, STALE_VIRTUAL, OLD_PAGE, flags);
+            // the guest rewrites the entry through an identity mapping of its table
+            tables.map_4k(&mut h.cpu, entry & !0xfff, entry & !0xfff, flags);
+            h.write(OLD_PAGE, &OLD_VALUE.to_le_bytes());
+            h.write(NEW_PAGE, &NEW_VALUE.to_le_bytes());
+            h.cpu.flush_tlb();
+            entry
+        });
+        if nested {
+            build_nested_tables(&mut h);
+            put(&mut h, VMCB_N_CR3, 8, NPT);
+            put(&mut h, SAVE_G_PAT, 8, 0x0007_0406_0007_0406);
+        }
+        put(&mut h, VMCB_NP_ENABLE, 8, controls);
+        h.write(CODE_BASE, HOST_LOAD_AROUND_VMRUN);
+        h.cpu.gpr[RBX] = STALE_VIRTUAL;
+        h.cpu.gpr[RDI] = entry;
+        h.cpu.gpr[RSI] = NEW_PAGE | flags;
+        h.cpu.gpr[RCX] = 0;
+        put(&mut h, SAVE_RAX, 8, STALE_VIRTUAL | 1);
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_CPUID);
+        (h.cpu.gpr[RCX], h.cpu.gpr[RDX])
+    }
+
+    #[test]
+    fn invlpgb_in_a_guest_drops_its_own_translation_and_leaves_the_hosts() {
+        for nested in [false, true] {
+            let controls = INVLPGB_ENABLE | if nested { NP_ENABLE } else { 0 };
+            assert_eq!(
+                guest_remaps_a_page(GUEST_REMAP_WITHOUT_INVLPGB, controls, nested),
+                (OLD_VALUE as u64, OLD_VALUE as u64),
+                "nested {nested}: both translations are stale without it"
+            );
+            assert_eq!(
+                guest_remaps_a_page(GUEST_REMAP_THEN_INVLPGB, controls, nested),
+                (NEW_VALUE as u64, OLD_VALUE as u64),
+                "nested {nested}: the guest's goes, the host's stays"
+            );
+        }
+    }
+
+    #[test]
+    fn invlpgb_in_a_guest_is_ud_unless_the_vmcb_enables_it() {
+        // invlpgb; tlbsync; cpuid
+        const BOTH: &[u8] = &[0x0f, 0x01, 0xfe, 0x0f, 0x01, 0xff, 0x0f, 0xa2];
+        for (controls, expected) in [(INVLPGB_ENABLE, VMEXIT_CPUID), (0, VMEXIT_EXCEPTION + 6)] {
+            let mut h = rig(BOTH);
+            put(&mut h, VMCB_NP_ENABLE, 8, controls);
+            put(&mut h, VMCB_INTERCEPT_EXCEPTIONS, 4, 1 << 6);
+            run(&mut h);
+            assert_eq!(get(&h, VMCB_EXITCODE, 8), expected, "{controls:#x}");
+        }
     }
 }
