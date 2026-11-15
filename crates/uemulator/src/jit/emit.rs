@@ -3431,7 +3431,7 @@ mod tests {
             VS => f.v,
             VC => !f.v,
             HI => f.c && !f.z,
-            LS => !(f.c && !f.z),
+            LS => !f.c || f.z,
             GE => f.n == f.v,
             LT => f.n != f.v,
             GT => !f.z && f.n == f.v,

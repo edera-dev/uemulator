@@ -2104,6 +2104,10 @@ impl Cpu {
                     let saved = self.save_flags();
                     self.set_eflags_arith(f);
                     self.store_result(loc, osz, i, r, saved)?;
+                } else {
+                    // A masked-zero count keeps the flags but still writes the destination:
+                    // r32 clears its upper half, and memory must pass write permission checks.
+                    self.store_operand(loc, osz, i, a)?;
                 }
             }
             // group 15 (fences, fxsave, ldmxcsr, ...)
@@ -2142,8 +2146,17 @@ impl Cpu {
                 let src = self.read_gpr(i.reg, size, rex);
                 let saved = self.save_flags();
                 let sum = self.alu(ALU_ADD, dest, src, size);
-                self.store_result(loc, size, i, sum, saved)?;
-                self.write_gpr(i.reg, size, rex, dest);
+                if let Loc::Reg(register) = loc {
+                    // XADD assigns the source first and destination last: with identical
+                    // registers the sum must win (including AH/CH/DH/BH aliases).
+                    self.write_gpr(i.reg, size, rex, dest);
+                    self.write_gpr(register, size, rex, sum);
+                } else {
+                    // A memory destination can fault; do not change the source until
+                    // that store succeeds. `loc` already captured its effective address.
+                    self.store_result(loc, size, i, sum, saved)?;
+                    self.write_gpr(i.reg, size, rex, dest);
+                }
             }
             // movnti
             0x1c3 => {
@@ -2195,6 +2208,10 @@ impl Cpu {
                     self.store_operand(Loc::Mem(a), 8, i, replacement)?;
                     self.set_eflags_arith(f | ZF);
                 } else {
+                    // CMPXCHG8B performs a write cycle even when the comparison fails.
+                    // Complete it before changing EDX:EAX or flags, so a fault or CAS
+                    // retry leaves the instruction restartable (and finishes a LOCK).
+                    self.store_operand(Loc::Mem(a), 8, i, current)?;
                     self.set_edx_eax(current);
                     self.set_eflags_arith(f & !ZF);
                 }
@@ -6909,7 +6926,7 @@ mod exec_tests {
     }
 
     #[test]
-    fn double_shift_count_is_masked_and_zero_changes_nothing() {
+    fn double_shift_count_is_masked_and_zero_preserves_flags() {
         for (code, size) in [
             (code::SHLD_EAX_EBX_CL, 4u8),
             (code::SHRD_EAX_EBX_CL, 4),
@@ -6929,13 +6946,60 @@ mod exec_tests {
                 h.cpu.gpr[RCX] = modulus; // masks to zero
                 flags_before(h);
             });
-            assert_eq!(pair.reg(RAX), 0x1111_2222_3333_4444, "size {size} count 0");
+            let expected = if size == 4 {
+                0x3333_4444
+            } else {
+                0x1111_2222_3333_4444
+            };
+            assert_eq!(pair.reg(RAX), expected, "size {size} count 0");
             assert_flags(
                 pair.flags(),
                 ALL_ARITH,
                 CF | ZF | SF | PF | AF | OF,
                 "count 0",
             );
+        }
+    }
+
+    #[test]
+    fn zero_count_double_shift_memory_still_requires_write_permission() {
+        for size in [2u8, 4, 8] {
+            for opcode in [0xa4u8, 0xa5, 0xac, 0xad] {
+                for count in [0u8, if size == 8 { 64 } else { 32 }] {
+                    let mut snippet = Vec::new();
+                    if size == 2 {
+                        snippet.push(0x66);
+                    }
+                    if size == 8 {
+                        snippet.push(0x48);
+                    }
+                    // shld/shrd [rdi], dx/edx/rdx, imm8/cl; hlt
+                    snippet.extend_from_slice(&[0x0f, opcode, 0x17]);
+                    if opcode & 1 == 0 {
+                        snippet.push(count);
+                    }
+                    snippet.push(HLT);
+                    let mut pair = Pair::new(&snippet);
+                    let stop = pair.run(|h| {
+                        h.write_u64(HOLE, 7);
+                        write_protect_huge_page(h, HOLE);
+                        h.cpu.gpr[RDI] = HOLE;
+                        h.cpu.gpr[RDX] = 3;
+                        h.cpu.gpr[RCX] = u64::from(count);
+                        h.cpu.set_eflags_arith(ALL_ARITH);
+                    });
+                    assert_eq!(stop, fault(VECTOR_PAGE_FAULT, Some(PF_PROTECTION_WRITE)));
+                    assert_eq!(pair.cpu().rip, CODE_BASE);
+                    assert_eq!(pair.interp.read_u64(HOLE), 7);
+                    assert_eq!(pair.reg(RDX), 3);
+                    assert_flags(
+                        pair.flags(),
+                        ALL_ARITH,
+                        ALL_ARITH,
+                        "faulting zero-count double shift",
+                    );
+                }
+            }
         }
     }
 
@@ -10200,6 +10264,41 @@ mod exec_tests {
     }
 
     #[test]
+    fn xadd_aliasing_registers_leave_the_sum_in_the_destination() {
+        // xadd rax/ eax/ ax/ al, itself; hlt
+        for (size, snippet) in [
+            (8, &[0x48, 0x0f, 0xc1, 0xc0, HLT][..]),
+            (4, &[0x0f, 0xc1, 0xc0, HLT][..]),
+            (2, &[0x66, 0x0f, 0xc1, 0xc0, HLT][..]),
+            (1, &[0x0f, 0xc0, 0xc0, HLT][..]),
+        ] {
+            let m = mask(size);
+            for value in [7, m, 1 << (size * 8 - 2)] {
+                let initial = (OPERAND_JUNK & !m) | value;
+                let expected = alu_reference(ALU_ADD, size, value, value, 0);
+                let pair = run_regs(snippet, &[(RAX, initial)]);
+                let want = if size >= 4 {
+                    expected.result
+                } else {
+                    (initial & !m) | expected.result
+                };
+                assert_eq!(pair.reg(RAX), want, "size {size}, value {value:#x}");
+                assert_flags(
+                    pair.flags(),
+                    ALL_ARITH,
+                    expected.flags,
+                    "aliased xadd flags",
+                );
+            }
+        }
+        // AH aliases itself, but AL and AH are distinct byte operands in the same GPR.
+        for (modrm, expected_ax) in [(0xe4, 0x0e03), (0xe0, 0x030a), (0xc4, 0x0a07)] {
+            let pair = run_regs(&[0x0f, 0xc0, modrm, HLT], &[(RAX, 0x0703)]);
+            assert_eq!(pair.reg(RAX), expected_ax);
+        }
+    }
+
+    #[test]
     fn xadd_stores_the_sum_and_returns_the_old_destination() {
         let xadd: [SnippetFamily; 4] = [
             (8, code::XADD_MEM_8, code::XADD_REG_8, code::LOCK_XADD_MEM_8),
@@ -10315,6 +10414,57 @@ mod exec_tests {
         });
         assert_eq!(pair.interp.read_u64(DATA), 0x3333_3333_4444_4444);
         assert_flags(pair.flags(), ZF, ZF, "match");
+    }
+
+    #[test]
+    fn cmpxchg8b_mismatch_on_read_only_memory_preserves_registers_and_flags() {
+        for snippet in [code::CMPXCHG8B_RDI, code::LOCK_CMPXCHG8B_RDI] {
+            for ordered in [false, true] {
+                let mut pair = Pair::new(snippet);
+                let stop = pair.run(|h| {
+                    h.write_u64(HOLE, 5);
+                    write_protect_huge_page(h, HOLE);
+                    h.cpu.ordered_memory = ordered;
+                    h.cpu.gpr[RDI] = HOLE;
+                    h.cpu.gpr[RAX] = 0xffff_ffff_0000_0006;
+                    h.cpu.gpr[RDX] = 0xffff_ffff_0000_0000;
+                    h.cpu.set_eflags_arith(ALL_ARITH);
+                });
+                assert_eq!(stop, fault(VECTOR_PAGE_FAULT, Some(PF_PROTECTION_WRITE)));
+                assert_eq!(pair.cpu().rip, CODE_BASE);
+                assert_eq!(pair.reg(RAX), 0xffff_ffff_0000_0006);
+                assert_eq!(pair.reg(RDX), 0xffff_ffff_0000_0000);
+                assert_eq!(pair.interp.read_u64(HOLE), 5);
+                assert_flags(
+                    pair.flags(),
+                    ALL_ARITH,
+                    ALL_ARITH,
+                    "faulting cmpxchg8b mismatch",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn locked_cmpxchg8b_mismatch_completes_the_atomic_write_cycle() {
+        let mut pair = Pair::new(code::LOCK_CMPXCHG8B_RDI);
+        pair.halted(|h| {
+            h.cpu.ordered_memory = true;
+            h.write_u64(DATA, 0x1111_1111_2222_2222);
+            h.cpu.gpr[RDI] = DATA;
+            h.cpu.gpr[RAX] = 6;
+            h.cpu.gpr[RDX] = 0;
+            h.cpu.set_eflags_arith(ALL_ARITH);
+        });
+        assert_eq!(pair.reg(RAX), 0x2222_2222);
+        assert_eq!(pair.reg(RDX), 0x1111_1111);
+        assert_eq!(pair.interp.read_u64(DATA), 0x1111_1111_2222_2222);
+        assert_flags(
+            pair.flags(),
+            ALL_ARITH,
+            ALL_ARITH & !ZF,
+            "atomic cmpxchg8b mismatch",
+        );
     }
 
     #[test]

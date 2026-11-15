@@ -754,12 +754,38 @@ fn shld_shrd_by_immediate_and_cl() {
 }
 
 #[test]
-fn shld_shrd_with_zero_count_change_nothing() {
+fn shld_shrd_with_zero_count_preserve_flags() {
     // shld rax, rdx, 0; shrd rcx, rdx, 0; stc; shld r9d, r10d, 0; adc rbx, 0; hlt
     check(&[
         0x48, 0x0f, 0xa4, 0xd0, 0x00, 0x48, 0x0f, 0xac, 0xd1, 0x00, 0xf9, 0x45, 0x0f, 0xa4, 0xd1,
         0x00, 0x48, 0x83, 0xd3, 0x00, 0xf4,
     ]);
+}
+
+#[test]
+fn zero_count_double_shift_clears_the_upper_register_half() {
+    const INITIAL: u64 = 0xffff_ffff_1234_5678;
+    for opcode in [0xa4u8, 0xa5, 0xac, 0xad] {
+        for count in [0u8, 32] {
+            // shld/shrd eax, edx, imm8/cl; hlt
+            let mut code = vec![0x0f, opcode, 0xd0];
+            if opcode & 1 == 0 {
+                code.push(count);
+            }
+            code.push(0xf4);
+            let result = check_with(&code, |h| {
+                seed_registers_and_memory(h);
+                h.cpu.gpr[0] = INITIAL;
+                h.cpu.gpr[1] = u64::from(count);
+                h.cpu.set_eflags_arith(crate::cpu::flags::ARITH);
+            });
+            assert_eq!(result.interpreter.cpu.gpr[0], INITIAL as u32 as u64);
+            assert_eq!(
+                result.interpreter.cpu.eflags_full() & crate::cpu::flags::ARITH,
+                crate::cpu::flags::ARITH
+            );
+        }
+    }
 }
 
 #[test]
@@ -1324,6 +1350,16 @@ fn lock_prefixed_instructions_run_like_plain_ones() {
         0x48, 0x8b, 0x03, 0xf0, 0x48, 0x0f, 0xb1, 0x0b, 0xf0, 0x48, 0x01, 0x43, 0x08, 0xf0, 0x48,
         0xff, 0x43, 0x10, 0xf0, 0x48, 0x0f, 0xc1, 0x43, 0x18, 0xf0, 0xff, 0x4b, 0x20, 0xf0, 0x80,
         0x4b, 0x24, 0x01, 0xf4,
+    ]);
+}
+
+#[test]
+fn xadd_with_identical_and_overlapping_registers() {
+    // xadd rax,rax; xadd eax,eax; xadd ax,ax; xadd al,al
+    // xadd ah,ah; xadd al,ah; xadd ah,al; hlt
+    check(&[
+        0x48, 0x0f, 0xc1, 0xc0, 0x0f, 0xc1, 0xc0, 0x66, 0x0f, 0xc1, 0xc0, 0x0f, 0xc0, 0xc0, 0x0f,
+        0xc0, 0xe4, 0x0f, 0xc0, 0xe0, 0x0f, 0xc0, 0xc4, 0xf4,
     ]);
 }
 

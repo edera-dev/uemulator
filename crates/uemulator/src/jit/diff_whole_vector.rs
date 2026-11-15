@@ -90,7 +90,7 @@ fn every_form_between_registers_matches_the_interpreter() {
             .into_iter()
             .enumerate()
         {
-            let imm = has_imm.then_some(0x1b + 0x35 * index as u8);
+            let imm = has_imm.then_some(0x1bu8.wrapping_add(0x35u8.wrapping_mul(index as u8)));
             code.extend(register_form(p66, map, opcode, reg, rm, imm));
         }
         check_with(&with_hlt(code), sse_setup);

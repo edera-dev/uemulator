@@ -56,7 +56,7 @@ pub(super) fn parallel_deposit(source: u64, mask: u64) -> u64 {
     let mut remaining = mask;
     let mut next_source_bit = 0;
     while remaining != 0 {
-        let lowest = remaining.isolate_lowest_one();
+        let lowest = remaining & remaining.wrapping_neg();
         if source & (1 << next_source_bit) != 0 {
             result |= lowest;
         }
@@ -72,7 +72,7 @@ pub(super) fn parallel_extract(source: u64, mask: u64) -> u64 {
     let mut remaining = mask;
     let mut next_result_bit = 0;
     while remaining != 0 {
-        let lowest = remaining.isolate_lowest_one();
+        let lowest = remaining & remaining.wrapping_neg();
         if source & lowest != 0 {
             result |= 1 << next_result_bit;
         }
@@ -115,7 +115,7 @@ impl Cpu {
                 let (result, carry) = match i.reg & 7 {
                     GROUP17_BLSR => (source & source.wrapping_sub(1), source == 0),
                     GROUP17_BLSMSK => (source ^ source.wrapping_sub(1), source == 0),
-                    GROUP17_BLSI => (source.isolate_lowest_one(), source != 0),
+                    GROUP17_BLSI => (source & source.wrapping_neg(), source != 0),
                     _ => return Err(Exception::invalid_opcode()),
                 };
                 let result = result & operand_mask;
@@ -338,6 +338,19 @@ mod tests {
     }
 
     #[test]
+    fn bit_deposit_and_extract_cover_every_single_bit_and_zero() {
+        assert_eq!(parallel_deposit(u64::MAX, 0), 0);
+        assert_eq!(parallel_extract(u64::MAX, 0), 0);
+        for bit in 0..u64::BITS {
+            let mask = 1u64 << bit;
+            assert_eq!(parallel_deposit(1, mask), mask);
+            assert_eq!(parallel_deposit(2, mask), 0);
+            assert_eq!(parallel_extract(mask, mask), 1);
+            assert_eq!(parallel_extract(!mask, mask), 0);
+        }
+    }
+
+    #[test]
     fn blsr_blsmsk_blsi_match_their_definitions_and_flags() {
         for &c in &VALUES {
             let h = run(BLSR64, 0, c, 0);
@@ -354,7 +367,14 @@ mod tests {
             assert_eq!(flags(&h) & ZF, 0);
 
             let h = run(BLSI64, 0, c, 0);
-            assert_eq!(rax(&h), c.isolate_lowest_one());
+            assert_eq!(
+                rax(&h),
+                if c == 0 {
+                    0
+                } else {
+                    1u64 << c.trailing_zeros()
+                }
+            );
             assert_eq!(flags(&h) & CF != 0, c != 0);
 
             let h = run(BLSR32, 0, c, 0);
