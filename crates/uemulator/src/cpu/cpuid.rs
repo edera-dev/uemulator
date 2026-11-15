@@ -96,13 +96,14 @@ const LEAF_TLB_1G: u32 = 0x8000_0019;
 const LEAF_CACHE_PROPERTIES: u32 = 0x8000_001d;
 const LEAF_EXTENDED_APIC_ID: u32 = 0x8000_001e;
 const LEAF_EXT_FEATURES_2: u32 = 0x8000_0021;
+const LEAF_PERFMON_DEBUG: u32 = 0x8000_0022;
 const LEAF_EXTENDED_TOPOLOGY_AMD: u32 = 0x8000_0026;
 
 /// Highest standard leaf. Zen stops at 0x10 (the quality-of-service leaves 0xF and 0x10 read
 /// as zero here); 2-4, 8-0xA, 0xC, 0xE are within range and zero, as on AMD.
 const MAX_STANDARD_LEAF: u32 = 0x10;
-/// Leaves 0x8000_0022..=0x8000_0025 (PerfMonV2, memory encryption, platform QoS) are in range and
-/// read as zero: nothing behind them is implemented.
+/// Leaves 0x8000_0023..=0x8000_0025 (memory encryption, platform QoS) are in range and read as
+/// zero: nothing behind them is implemented.
 const MAX_EXTENDED_LEAF: u32 = LEAF_EXTENDED_TOPOLOGY_AMD;
 
 /// Vendor string "AuthenticAMD" is returned in EBX, EDX, ECX order.
@@ -394,8 +395,16 @@ const EXT_FEATURE_ABM: u32 = 1 << 5;
 /// PREFETCH and PREFETCHW (`0F 0D`, hints that execute as no-ops). Windows 8.1 and later refuse
 /// to start without it.
 const EXT_FEATURE_PREFETCHW: u32 = 1 << 8;
+/// The extended APIC register space (feature register, extended LVT entries; `dev/apic.rs`).
+const EXT_FEATURE_EXTAPIC: u32 = 1 << 3;
 /// Leaves 0x8000_001D and 0x8000_001E (cache properties, extended APIC id and core topology).
 const EXT_FEATURE_TOPOEXT: u32 = 1 << 22;
+/// Six core performance counters at 0xC001_0200 (`pmu.rs`).
+const EXT_FEATURE_PERFCTR_CORE: u32 = 1 << 23;
+/// Data-fabric counters at 0xC001_0240 and L3 counters at 0xC001_0230. They are programmable
+/// and readable (by rdmsr and rdpmc 6-15) but never count.
+const EXT_FEATURE_PERFCTR_NB: u32 = 1 << 24;
+const EXT_FEATURE_PERFCTR_LLC: u32 = 1 << 28;
 // Leaf 0x8000_0001 EDX, besides the aliases of leaf 1.
 const EXT_FEATURE_SYSCALL: u32 = 1 << 11;
 const EXT_FEATURE_NX: u32 = 1 << 20;
@@ -672,6 +681,19 @@ const EXT_FEATURES_2_EAX: u32 = EXT_FEATURES_2_NO_NESTED_DATA_BP
     | EXT_FEATURES_2_IBPB_BRTYPE
     | EXT_FEATURES_2_SRSO_NO
     | EXT_FEATURES_2_SRSO_USER_KERNEL_NO;
+// Leaf 0x8000_0022 (`pmu.rs`).
+/// EAX: PerfMonV2 (the global control and status MSRs at 0xC000_0300) and the LBR v2 stack.
+/// LbrAndPmcFreeze (bit 2) stays clear: nothing freezes on a PMI.
+const PERFMON_V2: u32 = 1 << 0;
+const PERFMON_LBR_STACK: u32 = 1 << 1;
+/// EBX: core counters (3:0), LBR stack entries (9:4), data-fabric counters (15:10); no UMC
+/// counters (21:16), so ECX (the active UMC mask) is zero.
+const PERFMON_LBR_ENTRIES_SHIFT: u32 = 4;
+const PERFMON_NORTHBRIDGE_COUNTERS_SHIFT: u32 = 10;
+const PERFMON_EBX: u32 = super::pmu::CORE_COUNTERS as u32
+    | (super::pmu::LBR_ENTRIES as u32) << PERFMON_LBR_ENTRIES_SHIFT
+    | (super::pmu::NORTHBRIDGE_COUNTERS as u32) << PERFMON_NORTHBRIDGE_COUNTERS_SHIFT;
+
 /// Leaf 0x8000_0021 ECX: the "not affected" bits for Transient Scheduler Attacks (store-queue and
 /// L1 variants). Linux's list of affected families stops at 19h and on bare metal it sets these
 /// itself for anything newer; they matter to a consumer that sees the CPU as virtualised.
@@ -783,7 +805,11 @@ impl Cpu {
                     | EXT_FEATURE_SVM
                     | EXT_FEATURE_ABM
                     | EXT_FEATURE_PREFETCHW
-                    | EXT_FEATURE_TOPOEXT,
+                    | EXT_FEATURE_TOPOEXT
+                    | EXT_FEATURE_EXTAPIC
+                    | EXT_FEATURE_PERFCTR_CORE
+                    | EXT_FEATURE_PERFCTR_NB
+                    | EXT_FEATURE_PERFCTR_LLC,
                 EXT_FEATURE_SYSCALL
                     | EXT_FEATURE_NX
                     | EXT_FEATURE_PDPE1GB
@@ -843,6 +869,7 @@ impl Cpu {
                 EXT_FEATURES_2_TSA_SQ_NO | EXT_FEATURES_2_TSA_L1_NO,
                 0,
             ),
+            LEAF_PERFMON_DEBUG => (PERFMON_V2 | PERFMON_LBR_STACK, PERFMON_EBX, 0, 0),
             // EAX: shift to the next level's id (4:0); the heterogeneous-core and efficiency
             // fields stay clear. EBX: logical processors at this level. ECX: type and number, as
             // in leaf 0xB. EDX: the x2APIC id on every subleaf (Linux warns on a mismatch).

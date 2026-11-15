@@ -837,6 +837,8 @@ impl Cpu {
             efer: self.efer,
         };
         self.svm.guest = Some(Box::new(guest));
+        // Counters with HostOnly or GuestOnly set switch sides with the CPU.
+        self.pmu_mode_changed();
         let tlb_control = self.vmcb_read(vmcb, VMCB_TLB_CONTROL, 1);
         self.enter_guest_tlb(space, tlb_control);
         self.flush_decode();

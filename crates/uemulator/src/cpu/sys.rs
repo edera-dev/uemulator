@@ -23,12 +23,6 @@ pub(crate) const MSR_KERNEL_GS_BASE: u32 = 0xc000_0102;
 pub(crate) const MSR_TSC_AUX: u32 = 0xc000_0103;
 /// The cache line size CLZERO clears, and leaf 1 EBX reports in units of 8 bytes.
 const CLZERO_LINE_BYTES: u64 = 64;
-/// The legacy AMD performance counters, PERFCTR0-3 (0xC0010004-7), which `rdpmc` reads by index.
-/// They hold whatever was written and never count; see `Cpu::new`.
-pub(crate) const MSR_K7_PERFCTR0: u32 = 0xc001_0004;
-const K7_PERF_COUNTERS: u32 = 4;
-/// The counters are 48 bits wide.
-const PERF_COUNTER_MASK: u64 = (1 << 48) - 1;
 /// IA32_XSS: which supervisor state components xsaves/xrstors handle (none here).
 pub(crate) const MSR_XSS: u32 = 0xda0;
 pub(crate) const MSR_SPEC_CTRL: u32 = 0x48;
@@ -243,6 +237,7 @@ impl Cpu {
             MSR_PAT => self.pat,
             _ if mtrr::Mtrr::owns(msr) => self.mtrr.read(msr).unwrap_or(0),
             _ if mca::Mca::owns(msr) => self.mca.read(msr).unwrap_or(0),
+            _ if pmu::Pmu::owns(msr) => self.pmu_rdmsr(msr)?,
             MSR_EFER => self.efer,
             MSR_STAR => self.star,
             MSR_LSTAR => self.lstar,
@@ -321,6 +316,7 @@ impl Cpu {
                     return Err(Exception::general_protection(0));
                 }
             }
+            _ if pmu::Pmu::owns(msr) => self.pmu_wrmsr(msr, v)?,
             MSR_EFER => {
                 // SVME cannot be set while the firmware has disabled SVM in VM_CR
                 if v & !EFER_WRMSR_ALLOWED != 0
@@ -334,6 +330,8 @@ impl Cpu {
                     return Err(Exception::general_protection(0));
                 }
                 self.efer = (self.efer & !EFER_WRMSR_STORED) | (v & EFER_WRMSR_STORED);
+                // HostOnly/GuestOnly counters stop or start with SVME.
+                self.pmu_mode_changed();
             }
             MSR_STAR => self.star = v,
             MSR_LSTAR => self.lstar = v,
@@ -1157,15 +1155,17 @@ impl Cpu {
         Ok(())
     }
 
-    /// 0F 33: ECX selects a counter. Allowed at CPL > 0 only with CR4.PCE; a counter that does not
-    /// exist is #GP(0). Linux's AMD PMU driver reads the counters it has enabled with this (also at
-    /// shutdown, from `perf_reboot`), so it must exist whenever the counter MSRs do.
+    /// 0F 33: ECX selects a counter (`Cpu::pmu_rdpmc` numbers them). Allowed at CPL > 0 only with
+    /// CR4.PCE; a counter that does not exist is #GP(0). Linux's AMD PMU driver reads the counters
+    /// it has enabled with this (also at shutdown, from `perf_reboot`), and `amd_uncore` its
+    /// data-fabric and L3 counters.
     pub(super) fn rdpmc(&mut self) -> ExecResult<()> {
-        let counter = self.gpr[RCX] as u32;
-        if (self.cr4 & CR4_PCE == 0 && self.cpl != 0) || counter >= K7_PERF_COUNTERS {
+        if self.cr4 & CR4_PCE == 0 && self.cpl != 0 {
             return Err(Exception::general_protection(0));
         }
-        let value = self.rdmsr(MSR_K7_PERFCTR0 + counter)? & PERF_COUNTER_MASK;
+        let Some(value) = self.pmu_rdpmc(self.gpr[RCX] as u32) else {
+            return Err(Exception::general_protection(0));
+        };
         self.set_edx_eax(value);
         Ok(())
     }
@@ -1873,7 +1873,8 @@ mod sys_tests {
             let mut h = blank();
             assert_gp0(h.cpu.rdmsr(X2APIC_VERSION));
             h.cpu.wrmsr(TEST_MSR_APIC_BASE, 0xfee0_0d00).unwrap();
-            assert_eq!(h.cpu.rdmsr(X2APIC_VERSION).unwrap(), 0x0006_0014);
+            // bit 31: the AMD extended register space
+            assert_eq!(h.cpu.rdmsr(X2APIC_VERSION).unwrap(), 0x8006_0014);
         }
 
         #[test]
@@ -2241,7 +2242,8 @@ mod sys_tests {
         #[test]
         fn rdpmc_needs_an_existing_counter_and_cr4_pce_outside_cpl_0() {
             const RDPMC: &[u8] = &[0x0f, 0x33, 0xf4];
-            assert_general_protection_zero(RDPMC, |h| h.cpu.gpr[RCX] = 4);
+            // 0-5 core, 6-9 data fabric, 10-15 L3
+            assert_general_protection_zero(RDPMC, |h| h.cpu.gpr[RCX] = 16);
             assert_general_protection_zero(RDPMC, |h| h.cpu.gpr[RCX] = 1 << 31);
             // at CPL 3 without CR4.PCE it faults on the instruction; with PCE only the hlt does
             assert_general_protection_zero(RDPMC, user_mode);

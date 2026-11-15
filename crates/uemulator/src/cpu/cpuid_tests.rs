@@ -260,12 +260,13 @@ fn extended_leaf_1_ecx_has_lahf_svm_abm_prefetchw_and_topoext() {
     let mut h = blank();
     let [_, ebx, ecx, _] = cpuid(&mut h, 0x8000_0001, 0);
     assert_eq!(ebx, 0);
-    // LAHF_LM SVM ABM 3DNOWPREFETCH TOPOEXT; no SSE4A, XOP, FMA4, IBS, LWP, PERFCTR_CORE
-    assert_eq!(ecx, bits(&[0, 2, 5, 8, 22]));
+    // LAHF_LM SVM EXTAPIC ABM 3DNOWPREFETCH TOPOEXT PERFCTR_CORE PERFCTR_NB PERFCTR_LLC; no
+    // SSE4A, XOP, FMA4, IBS, LWP
+    assert_eq!(ecx, bits(&[0, 2, 3, 5, 8, 22, 23, 24, 28]));
     let mut h = with_topology(2, 2, 0);
     assert_eq!(
         cpuid(&mut h, 0x8000_0001, 0)[2],
-        bits(&[0, 1, 2, 5, 8, 22]),
+        bits(&[0, 1, 2, 3, 5, 8, 22, 23, 24, 28]),
         "CMP_LEGACY"
     );
 }
@@ -507,7 +508,6 @@ fn leaves_past_the_last_extended_leaf_and_the_unused_ones_are_zero() {
         0x8000_001c,
         0x8000_001f,
         0x8000_0020,
-        0x8000_0022,
         0x8000_0023,
         0x8000_0024,
         0x8000_0025,

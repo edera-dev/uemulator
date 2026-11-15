@@ -669,10 +669,12 @@ impl Cpu {
             }
             if iterations >= REP_ITERATIONS_PER_SLICE && count != 0 {
                 self.icount += iterations;
+                self.pmu.unretired += iterations + 1;
                 return Ok(());
             }
         }
         self.icount += iterations;
+        self.pmu.unretired += iterations;
         self.rip = next;
         Ok(())
     }
@@ -737,10 +739,12 @@ impl Cpu {
             iterations += 1;
             if iterations >= REP_ITERATIONS_PER_SLICE && count != 0 {
                 self.icount += iterations;
+                self.pmu.unretired += iterations + 1;
                 return Ok(());
             }
         }
         self.icount += iterations;
+        self.pmu.unretired += iterations;
         self.rip = next;
         Ok(())
     }

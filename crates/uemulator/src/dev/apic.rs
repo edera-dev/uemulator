@@ -50,13 +50,28 @@ const REG_TIMER_CURRENT: u32 = 0x390;
 const REG_TIMER_DIVIDE: u32 = 0x3e0;
 /// x2APIC only: the self-IPI register.
 const REG_SELF_IPI: u32 = 0x3f0;
-/// AMD extended APIC space (feature register at 0x400); not implemented, reads as zero.
+/// AMD extended APIC space (APM vol. 2 sec. 16.4.5; CPUID 0x8000_0001 ECX EXTAPIC): the
+/// feature register, the control register, and the extended LVT entries at 0x500 + 0x10 * n,
+/// whose offsets the firmware hands out to IBS and the MCA error thresholds. The rest of the
+/// space (specific EOI, interrupt enable registers) belongs to capabilities the feature register
+/// does not claim, and reads as zero.
 const REG_EXTENDED_FEATURE: u32 = 0x400;
-const REG_EXTENDED_LAST: u32 = 0x530;
+const REG_EXTENDED_CONTROL: u32 = 0x410;
+const REG_EXTENDED_LVT_FIRST: u32 = 0x500;
+const EXTENDED_LVT_COUNT: usize = 4;
+const REG_EXTENDED_LVT_LAST: u32 = REG_EXTENDED_LVT_FIRST + 0x10 * (EXTENDED_LVT_COUNT as u32 - 1);
+const REG_EXTENDED_LAST: u32 = REG_EXTENDED_LVT_LAST;
+/// Feature register: the extended LVT count in bits 23:16; IER, SEOI and ExtApicId (bits 0-2)
+/// clear, so the control register has nothing to enable.
+const EXTENDED_FEATURE_VALUE: u32 = (EXTENDED_LVT_COUNT as u32) << 16;
+/// Extended LVT entries: vector, message type (10:8, the LVT delivery modes) and mask.
+const EXTENDED_LVT_WRITABLE: u32 = 0x0001_07ff;
 
 /// Version register: version 0x14 (integrated APIC), maximum LVT entry 6 (so LVT entries up to
-/// CMCI are valid), and the EOI-broadcast-suppression bit clear.
-const VERSION_VALUE: u32 = 0x14 | (6 << 16);
+/// CMCI are valid), the EOI-broadcast-suppression bit clear, and bit 31 saying the AMD extended
+/// register space at 0x400 exists.
+const VERSION_EXTENDED_APIC_SPACE: u32 = 1 << 31;
+const VERSION_VALUE: u32 = 0x14 | (6 << 16) | VERSION_EXTENDED_APIC_SPACE;
 
 const SVR_SOFTWARE_ENABLE: u32 = 1 << 8;
 const SVR_WRITABLE: u32 = 0x1ff | (1 << 12);
@@ -168,6 +183,7 @@ pub(crate) struct Lapic {
     lvt_lint0: u32,
     lvt_lint1: u32,
     lvt_error: u32,
+    extended_lvt: [u32; EXTENDED_LVT_COUNT],
     icr_high: u32,
     timer_initial: u32,
     divide_config: u32,
@@ -232,6 +248,7 @@ impl Lapic {
             lvt_lint0: DELIVERY_EXTINT << LVT_DELIVERY_SHIFT,
             lvt_lint1: (DELIVERY_NMI << LVT_DELIVERY_SHIFT) | LVT_MASKED,
             lvt_error: LVT_RESET,
+            extended_lvt: [LVT_RESET; EXTENDED_LVT_COUNT],
             icr_high: 0,
             timer_initial: 0,
             divide_config: DIVIDE_RESET,
@@ -491,6 +508,12 @@ impl Lapic {
         self.accept(&interrupt)
     }
 
+    /// A performance counter overflowed: the LVT performance entry fires. Unlike Intel, AMD does
+    /// not set the entry's mask bit when it does (Linux's PerfMonV2 handler never unmasks it).
+    pub fn performance_interrupt(&mut self) -> Delivered {
+        self.lvt_deliver(self.lvt_performance)
+    }
+
     fn timer_mode(&self) -> u32 {
         (self.lvt_timer & LVT_TIMER_MODE_MASK) >> LVT_TIMER_MODE_SHIFT
     }
@@ -624,6 +647,11 @@ impl Lapic {
             REG_TIMER_INITIAL => self.timer_initial,
             REG_TIMER_CURRENT => self.timer_current_count(now),
             REG_TIMER_DIVIDE => self.divide_config,
+            REG_EXTENDED_FEATURE => EXTENDED_FEATURE_VALUE,
+            REG_EXTENDED_CONTROL => 0,
+            REG_EXTENDED_LVT_FIRST..=REG_EXTENDED_LVT_LAST if offset & 0xf == 0 => {
+                self.extended_lvt[((offset - REG_EXTENDED_LVT_FIRST) >> 4) as usize]
+            }
             REG_EXTENDED_FEATURE..=REG_EXTENDED_LAST if !self.x2apic() => 0,
             _ => return None,
         })
@@ -676,7 +704,10 @@ impl Lapic {
                         &mut self.lvt_lint0,
                         &mut self.lvt_lint1,
                         &mut self.lvt_error,
-                    ] {
+                    ]
+                    .into_iter()
+                    .chain(&mut self.extended_lvt)
+                    {
                         *lvt |= LVT_MASKED;
                     }
                 }
@@ -724,6 +755,12 @@ impl Lapic {
                     logical: false,
                 };
                 self.accept(&interrupt);
+            }
+            // nothing to enable (see `EXTENDED_FEATURE_VALUE`)
+            REG_EXTENDED_CONTROL => {}
+            REG_EXTENDED_LVT_FIRST..=REG_EXTENDED_LVT_LAST if offset & 0xf == 0 => {
+                self.extended_lvt[((offset - REG_EXTENDED_LVT_FIRST) >> 4) as usize] =
+                    value & EXTENDED_LVT_WRITABLE;
             }
             REG_EXTENDED_FEATURE..=REG_EXTENDED_LAST if !self.x2apic() => {}
             _ => return Err(()),
@@ -1147,6 +1184,54 @@ mod tests {
         assert!(apic.set_base_msr(APIC_DEFAULT_BASE | APIC_BASE_ENABLE | APIC_BASE_X2APIC));
         assert_eq!(apic.read_register(REG_ID, 0), Some(0));
         assert_eq!(apic.read_register(REG_LDR, 0), Some(1));
+    }
+
+    #[test]
+    fn extended_apic_space_has_four_extended_lvt_entries_in_both_modes() {
+        let mut apic = enabled();
+        assert_ne!(
+            apic.read_register(REG_VERSION, 0).unwrap() & (1 << 31),
+            0,
+            "EXTAPIC"
+        );
+        assert_eq!(apic.read_register(0x400, 0), Some(4 << 16));
+        for entry in 0..4 {
+            let offset = 0x500 + 0x10 * entry;
+            assert_eq!(apic.read_register(offset, 0), Some(LVT_MASKED));
+            // NMI message type, unmasked; the delivery-status and other bits do not stick
+            apic.write_register(offset, 0xffff_e400 | entry, 0).unwrap();
+            assert_eq!(apic.read_register(offset, 0), Some(0x0001_0400 | entry));
+            apic.write_register(offset, 0x0400 | entry, 0).unwrap();
+        }
+        // software disable masks them with the rest of the LVT
+        apic.write_register(REG_SVR, 0xff, 0).unwrap();
+        assert_eq!(apic.read_register(0x530, 0), Some(LVT_MASKED | 0x403));
+
+        let mut apic = Lapic::new(0);
+        apic.set_base_msr(APIC_DEFAULT_BASE | APIC_BASE_ENABLE | APIC_BASE_X2APIC);
+        assert_eq!(apic.read_register(0x400, 0), Some(4 << 16));
+        assert!(apic.write_register(0x400, 0, 0).is_err(), "read-only");
+        apic.write_register(0x510, 0x400, 0).unwrap();
+        assert_eq!(apic.read_register(0x510, 0), Some(0x400));
+        assert_eq!(apic.read_register(0x540, 0), None, "past the last entry");
+        assert_eq!(apic.read_register(0x420, 0), None, "no specific EOI");
+    }
+
+    #[test]
+    fn performance_interrupt_delivers_through_the_lvt_and_leaves_it_unmasked() {
+        let mut apic = enabled();
+        assert_eq!(apic.performance_interrupt(), Delivered::Nothing, "masked");
+        apic.write_register(REG_LVT_PERFORMANCE, DELIVERY_NMI << LVT_DELIVERY_SHIFT, 0)
+            .unwrap();
+        assert_eq!(apic.performance_interrupt(), Delivered::Nmi);
+        assert!(apic.take_nmi());
+        assert_eq!(
+            apic.read_register(REG_LVT_PERFORMANCE, 0),
+            Some(DELIVERY_NMI << LVT_DELIVERY_SHIFT)
+        );
+        apic.write_register(REG_LVT_PERFORMANCE, 0xee, 0).unwrap();
+        apic.performance_interrupt();
+        assert_eq!(apic.pending_vector(), Some(0xee));
     }
 
     #[test]

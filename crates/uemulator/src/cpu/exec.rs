@@ -1030,6 +1030,7 @@ impl Cpu {
                     }
                     if iterations >= slice {
                         self.icount += iterations;
+                        self.pmu.unretired += iterations + 1;
                         return Ok(());
                     }
                     continue;
@@ -1102,10 +1103,12 @@ impl Cpu {
             if iterations >= slice && self.gpr[GPR_RCX] & amask != 0 {
                 // RIP stays on the instruction; the run loop re-executes it after servicing events.
                 self.icount += iterations;
+                self.pmu.unretired += iterations + 1;
                 return Ok(());
             }
         }
         self.icount += iterations;
+        self.pmu.unretired += iterations;
         self.rip = next;
         Ok(())
     }
@@ -14420,10 +14423,19 @@ mod exec_tests {
         // prefetch/prefetchw are executed as hints in sys.rs's `prefetchw_is_a_hint_that_never_faults`
         const PREFETCHW: u64 = 1 << 8;
         const TOPOEXT: u64 = 1 << 22;
+        // the extended APIC space and the performance counters are tested in pmu_tests.rs
+        const EXTAPIC: u64 = 1 << 3;
+        const PERFCTR_CORE_NB_LLC: u64 = (1 << 23) | (1 << 24) | (1 << 28);
         assert_eq!(
-            ecx & !(LAHF_SAHF | LZCNT_ABM | SVM | PREFETCHW | TOPOEXT),
+            ecx & !(LAHF_SAHF
+                | LZCNT_ABM
+                | SVM
+                | PREFETCHW
+                | TOPOEXT
+                | EXTAPIC
+                | PERFCTR_CORE_NB_LLC),
             0,
-            "nothing beyond lahf, svm, abm, prefetchw and the topology leaves"
+            "nothing beyond lahf, svm, abm, prefetchw, the topology leaves and the PMU"
         );
     }
 
