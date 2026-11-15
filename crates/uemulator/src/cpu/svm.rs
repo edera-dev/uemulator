@@ -72,9 +72,11 @@ const VMCB_PAUSE_FILTER_COUNT: u64 = 0x3e;
 const VMCB_INTERCEPT5: u64 = 0x14;
 const INTERCEPT_INVLPGB: u32 = 1 << 0;
 const INTERCEPT_INVLPGB_ILLEGAL: u32 = 1 << 1;
+const INTERCEPT_MCOMMIT: u32 = 1 << 3;
 const INTERCEPT_TLBSYNC: u32 = 1 << 4;
 const VMEXIT_INVLPGB: u64 = 0xa0;
 const VMEXIT_INVLPGB_ILLEGAL: u64 = 0xa1;
+const VMEXIT_MCOMMIT: u64 = 0xa3;
 const VMEXIT_TLBSYNC: u64 = 0xa4;
 const VMCB_IOPM_BASE: u64 = 0x40;
 const VMCB_MSRPM_BASE: u64 = 0x48;
@@ -1882,6 +1884,11 @@ impl Cpu {
                 super::invlpgb::MODRM_TLBSYNC => {
                     let v5 = self.svm.guest.as_ref().map_or(0, |guest| guest.intercept5);
                     simple(VMEXIT_TLBSYNC, v5 & INTERCEPT_TLBSYNC != 0)
+                }
+                // F3 0F 01 FA is mcommit; the intercept comes before its EFER.MCOMMIT #UD
+                0xfa => {
+                    let v5 = self.svm.guest.as_ref().map_or(0, |guest| guest.intercept5);
+                    simple(VMEXIT_MCOMMIT, v5 & INTERCEPT_MCOMMIT != 0)
                 }
                 _ => None,
             },
@@ -4687,6 +4694,27 @@ mod tests {
         x2avic_serves_the_x2apic_msrs_from_the_backing_page,
         with_v_intr_masking_the_guests_cr8_is_its_virtual_tpr,
     );
+    #[test]
+    fn mcommit_exits_when_intercepted_and_is_ud_without_efer_mcommit_otherwise() {
+        // mcommit; cpuid
+        const MCOMMIT: &[u8] = &[0xf3, 0x0f, 0x01, 0xfa, 0x0f, 0xa2];
+        for (intercept5, guest_efer_mcommit, expected) in [
+            (INTERCEPT_MCOMMIT, false, VMEXIT_MCOMMIT),
+            (0, false, VMEXIT_EXCEPTION + 6),
+            (0, true, VMEXIT_CPUID),
+        ] {
+            let mut h = rig(MCOMMIT);
+            put(&mut h, VMCB_INTERCEPT5, 4, intercept5 as u64);
+            put(&mut h, VMCB_INTERCEPT_EXCEPTIONS, 4, 1 << 6);
+            if guest_efer_mcommit {
+                let efer = get(&h, SAVE_EFER, 8);
+                put(&mut h, SAVE_EFER, 8, efer | crate::cpu::sys::EFER_MCOMMIT);
+            }
+            run(&mut h);
+            assert_eq!(get(&h, VMCB_EXITCODE, 8), expected, "{intercept5:#x}");
+        }
+    }
+
     #[test]
     fn invlpgb_and_tlbsync_exit_when_intercepted_and_are_ud_in_a_guest_otherwise() {
         // invlpgb / tlbsync, then cpuid
