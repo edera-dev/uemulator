@@ -230,6 +230,10 @@ final class MachineStore: ObservableObject {
         reload()
     }
 
+    func removeKernel(_ name: String) throws {
+        try FileManager.default.removeItem(at: kernel(name).deletingLastPathComponent())
+    }
+
     func delete(_ name: String) throws {
         models.removeValue(forKey: name)?.stop()
         try FileManager.default.removeItem(at: directory(name))

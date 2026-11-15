@@ -147,6 +147,17 @@ final class MachineModel: ObservableObject, ScreenInput {
         update { $0.cdrom = nil }
     }
 
+    // After an install from a kernel-booted machine (the demo): the firmware boots the disk next,
+    // since a kernel given to the firmware is always tried first (docs/plans/19-uefi-firmware.md).
+    func removeKernel() {
+        do {
+            try store.removeKernel(name)
+            definition = try store.load(name)
+        } catch {
+            problem = error.localizedDescription
+        }
+    }
+
     // Asks the guest for a screen the size of the view, in pixels.
     func fitScreen(to size: CGSize, scale: CGFloat) {
         engine.requestSize(width: Int(size.width * scale), height: Int(size.height * scale))
@@ -330,6 +341,10 @@ struct MachineView: View {
                 Menu {
                     if let cd = model.cdromName {
                         Button("Eject \(cd)", systemImage: "eject") { model.ejectCD() }
+                    }
+                    if model.definition.bootsKernel && !model.definition.disks.isEmpty {
+                        Button("Boot From Disk (Remove Kernel)", systemImage: "internaldrive") { model.removeKernel() }
+                            .disabled(model.isRunning)
                     }
                     Button("Insert CD Image…", systemImage: "opticaldisc") { choosingISO = true }
                     Divider()
