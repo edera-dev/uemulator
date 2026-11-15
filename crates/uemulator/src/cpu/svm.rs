@@ -1053,9 +1053,9 @@ impl Cpu {
             || (guest_cr0 & CR0_CD_BIT == 0 && guest_cr0 & CR0_NW_BIT != 0)
             || guest_cr0 >> 32 != 0
             || guest_cr3 & super::sys::CR3_RESERVED_BITS != 0
-            || guest_cr4 & !super::sys::CR4_SUPPORTED_BITS != 0
+            || guest_cr4 & !self.cr4_supported() != 0
             || (guest_cr4 & super::cet::CR4_CET != 0 && guest_cr0 & CR0_WP == 0)
-            || guest_s_cet & !super::cet::CET_CONTROL_WRITABLE != 0
+            || (self.has_shadow_stacks() && guest_s_cet & !super::cet::CET_CONTROL_WRITABLE != 0)
             || guest_dr6 & DR_HIGH_BITS != 0
             || guest_dr7 & DR_HIGH_BITS != 0
             || intercept4 & INTERCEPT_VMRUN == 0
@@ -1171,9 +1171,12 @@ impl Cpu {
         self.rip = self.vmcb_read(vmcb, SAVE_RIP, 8);
         self.gpr[GPR_RSP] = self.vmcb_read(vmcb, SAVE_RSP, 8);
         self.gpr[RAX] = self.vmcb_read(vmcb, SAVE_RAX, 8);
-        self.cet.s_cet = guest_s_cet;
-        self.cet.ssp = self.vmcb_read(vmcb, SAVE_SSP, 8);
-        self.cet.isst_addr = self.vmcb_read(vmcb, SAVE_ISST_ADDR, 8);
+        // Without shadow stacks these VMCB fields are not CPU state, as on a part without CET.
+        if self.has_shadow_stacks() {
+            self.cet.s_cet = guest_s_cet;
+            self.cet.ssp = self.vmcb_read(vmcb, SAVE_SSP, 8);
+            self.cet.isst_addr = self.vmcb_read(vmcb, SAVE_ISST_ADDR, 8);
+        }
         if nested {
             self.pat = self.vmcb_read(vmcb, SAVE_G_PAT, 8);
         }
@@ -1298,9 +1301,11 @@ impl Cpu {
         self.vmcb_write(vmcb, SAVE_RIP, 8, self.rip);
         self.vmcb_write(vmcb, SAVE_RSP, 8, self.gpr[GPR_RSP]);
         self.vmcb_write(vmcb, SAVE_RAX, 8, self.gpr[RAX]);
-        self.vmcb_write(vmcb, SAVE_S_CET, 8, self.cet.s_cet);
-        self.vmcb_write(vmcb, SAVE_SSP, 8, self.cet.ssp);
-        self.vmcb_write(vmcb, SAVE_ISST_ADDR, 8, self.cet.isst_addr);
+        if self.has_shadow_stacks() {
+            self.vmcb_write(vmcb, SAVE_S_CET, 8, self.cet.s_cet);
+            self.vmcb_write(vmcb, SAVE_SSP, 8, self.cet.ssp);
+            self.vmcb_write(vmcb, SAVE_ISST_ADDR, 8, self.cet.isst_addr);
+        }
         if guest.nested_cr3.is_some() {
             self.vmcb_write(vmcb, SAVE_G_PAT, 8, self.pat);
         }
@@ -2290,7 +2295,11 @@ mod tests {
     #[test]
     fn vmrun_loads_the_guest_shadow_stack_state_and_vmexit_gives_the_host_its_own_back() {
         // rdsspq rax; cpuid; hlt
-        let mut h = rig(&[0xf3, 0x48, 0x0f, 0x1e, 0xc8, 0x0f, 0xa2, 0xf4]);
+        let mut h = rig_prepared(
+            &[0xf3, 0x48, 0x0f, 0x1e, 0xc8, 0x0f, 0xa2, 0xf4],
+            Harness::enable_shadow_stacks,
+        )
+        .0;
         let (cr0, cr4) = (get(&h, SAVE_CR0, 8), get(&h, SAVE_CR4, 8));
         put(&mut h, SAVE_CR0, 8, cr0 | CR0_WP);
         put(&mut h, SAVE_CR4, 8, cr4 | super::super::cet::CR4_CET);
@@ -2307,10 +2316,44 @@ mod tests {
         assert_eq!(h.cpu.cet.s_cet, 0);
         assert_eq!(h.cpu.cet.isst_addr, 0);
 
-        let mut h = rig(&[0x0f, 0xa2, 0xf4]);
+        let mut h = rig_prepared(&[0x0f, 0xa2, 0xf4], Harness::enable_shadow_stacks).0;
         put(&mut h, SAVE_S_CET, 8, 1 << 2);
         run(&mut h);
         assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_INVALID, "an IBT bit");
+    }
+
+    /// Without shadow stacks the VMCB's CET fields are not state the CPU has: VMRUN neither checks
+    /// nor loads them and #VMEXIT leaves them as they were, and a guest CR4.CET is a reserved bit.
+    #[test]
+    fn without_shadow_stacks_vmrun_ignores_the_cet_fields() {
+        // rdsspq rax; cpuid; hlt (rdssp is a nop without a shadow stack)
+        let mut h = rig(&[0xf3, 0x48, 0x0f, 0x1e, 0xc8, 0x0f, 0xa2, 0xf4]);
+        put(
+            &mut h,
+            SAVE_S_CET,
+            8,
+            super::super::cet::CET_SH_STK_EN | 1 << 2,
+        );
+        put(&mut h, SAVE_SSP, 8, 0x1234_5000);
+        put(&mut h, SAVE_ISST_ADDR, 8, 0x5000);
+        put(&mut h, SAVE_RAX, 8, 0x77);
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_CPUID);
+        assert_eq!(get(&h, SAVE_RAX, 8), 0x77, "no SSP to read");
+        assert_eq!(
+            get(&h, SAVE_S_CET, 8),
+            super::super::cet::CET_SH_STK_EN | 1 << 2
+        );
+        assert_eq!(get(&h, SAVE_SSP, 8), 0x1234_5000);
+        assert_eq!(get(&h, SAVE_ISST_ADDR, 8), 0x5000);
+        assert_eq!(h.cpu.cet, super::super::cet::Cet::default());
+
+        let mut h = rig(&[0x0f, 0xa2, 0xf4]);
+        let (cr0, cr4) = (get(&h, SAVE_CR0, 8), get(&h, SAVE_CR4, 8));
+        put(&mut h, SAVE_CR0, 8, cr0 | CR0_WP);
+        put(&mut h, SAVE_CR4, 8, cr4 | super::super::cet::CR4_CET);
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_INVALID, "CR4.CET");
     }
 
     #[test]

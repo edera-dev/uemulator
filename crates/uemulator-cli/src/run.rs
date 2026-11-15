@@ -186,7 +186,8 @@ fn build_config(
         .reboot(!settings.no_reboot)
         .iommu(settings.iommu)
         .tpm(settings.tpm)
-        .secure_boot(settings.secure_boot);
+        .secure_boot(settings.secure_boot)
+        .shadow_stacks(settings.shadow_stacks);
     if let Some(cpus) = settings.cpus {
         cfg = cfg.cpus(cpus);
     }

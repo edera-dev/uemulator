@@ -10,6 +10,9 @@
 //! delivery save CS, the linear return address and the old SSP there. Supervisor shadow stacks
 //! are claimed through a token at their top whose bit 0 says "busy".
 //!
+//! A machine has all of this only with `MachineConfig::shadow_stacks` (`Cpu::has_shadow_stacks`);
+//! without it CR4.CET is reserved and the MSRs #GP, so none of the paths below can switch on.
+//!
 //! The JIT does not know about any of this: `Cpu::uses_jit` keeps the run loop on the
 //! interpreter while a shadow stack is in use at the current CPL. What can switch one on (a CPL
 //! change, mov to CR4, wrmsr, VMRUN and #VMEXIT) always ends a block and goes back to the run
@@ -19,7 +22,7 @@
 use super::decode::Insn;
 use super::exception::Exception;
 use super::flags::{CF, VM};
-use super::sys::is_canonical;
+use super::sys::{CR4_SUPPORTED_BITS, is_canonical};
 use super::*;
 
 pub(crate) const MSR_U_CET: u32 = 0x6a0;
@@ -100,6 +103,21 @@ fn control_protection(code: u32) -> Exception {
 }
 
 impl Cpu {
+    /// Whether this CPU has shadow stacks at all (`CpuTopology::shadow_stacks`). Without them
+    /// CR4.CET is reserved, so nothing else here can switch on.
+    pub(crate) fn has_shadow_stacks(&self) -> bool {
+        self.topology.shadow_stacks
+    }
+
+    /// CR4 bits mov to CR4 and VMRUN accept: CR4.CET only on a CPU with shadow stacks.
+    pub(super) fn cr4_supported(&self) -> u64 {
+        if self.has_shadow_stacks() {
+            CR4_SUPPORTED_BITS
+        } else {
+            CR4_SUPPORTED_BITS & !CR4_CET
+        }
+    }
+
     /// Whether the shadow stack is enabled for privilege level `cpl` by CR4.CET and U_CET/S_CET.
     /// Callers that ask about the running code also need protected mode outside virtual-8086
     /// mode (`shadow_stack_active`); a transfer into a handler asks about the level it enters.
@@ -117,8 +135,12 @@ impl Cpu {
         self.eflags & VM == 0 && self.shadow_stack_enabled_at(self.cpl)
     }
 
-    /// The CET MSRs, or `None` for any other MSR.
+    /// The CET MSRs, or `None` for any other MSR (and for them too without shadow stacks, so
+    /// they are #GP like any MSR the CPU lacks).
     pub(super) fn cet_msr(&self, msr: u32) -> Option<u64> {
+        if !self.has_shadow_stacks() {
+            return None;
+        }
         Some(match msr {
             MSR_U_CET => self.cet.u_cet,
             MSR_S_CET => self.cet.s_cet,
@@ -128,9 +150,12 @@ impl Cpu {
         })
     }
 
-    /// Writes a CET MSR; `Ok(false)` for any other MSR. Reserved bits, a non-canonical address
-    /// and a misaligned SSP are #GP(0).
+    /// Writes a CET MSR; `Ok(false)` for any other MSR, and for every one without shadow
+    /// stacks. Reserved bits, a non-canonical address and a misaligned SSP are #GP(0).
     pub(super) fn write_cet_msr(&mut self, msr: u32, value: u64) -> ExecResult<bool> {
+        if !self.has_shadow_stacks() {
+            return Ok(false);
+        }
         match msr {
             MSR_U_CET | MSR_S_CET => {
                 if value & !CET_CONTROL_WRITABLE != 0 {

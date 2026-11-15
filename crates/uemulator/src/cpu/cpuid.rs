@@ -31,8 +31,9 @@ use super::sys::{
 };
 use super::{Cpu, mca, rdt, xsave};
 
-/// Where this logical processor sits, and the brand of the part (`profile.rs` builds it from the
-/// machine's vCPU count and SMT choice). The local APIC id has to be the same `x2apic_id`.
+/// Where this logical processor sits, the brand of the part and whether it has shadow stacks
+/// (`profile.rs` builds it from the machine's vCPU count, SMT and shadow-stack choices). The local
+/// APIC id has to be the same `x2apic_id`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CpuTopology {
     /// Logical processors in the package, 1 to `profile::MAX_LOGICAL_PROCESSORS`. Above 255 the
@@ -45,6 +46,12 @@ pub(crate) struct CpuTopology {
     pub x2apic_id: u32,
     /// Leaves 0x8000_0002..=0x8000_0004, NUL padded; shorter than `profile::BRAND_BYTES`.
     pub brand: &'static str,
+    /// CET_SS (`cet.rs`), off unless `MachineConfig::shadow_stacks` asks for it. Off, the CPU
+    /// looks like one without the feature: no CPUID bit, no XSS components 11 and 12, CR4.CET and
+    /// the CET MSRs are #GP, and VMRUN neither checks nor loads the VMCB's CET fields. Shadowed
+    /// code runs on the interpreter only (`Cpu::uses_jit`), and Xen turns supervisor shadow
+    /// stacks on whenever CPUID offers them, which made its boot about 3x slower.
+    pub shadow_stacks: bool,
 }
 
 impl CpuTopology {
@@ -895,6 +902,11 @@ impl Cpu {
                     STRUCTURED_MAX_SUBLEAF,
                     STRUCTURED_EBX,
                     STRUCTURED_ECX
+                        & if self.has_shadow_stacks() {
+                            u32::MAX
+                        } else {
+                            !STRUCTURED_ECX_CET_SS
+                        }
                         | if self.cr4 & CR4_PKE != 0 {
                             STRUCTURED_ECX_OSPKE
                         } else {
@@ -949,14 +961,14 @@ impl Cpu {
                         | XSTATE_FEATURE_XGETBV1
                         | XSTATE_FEATURE_XSAVES,
                     xsave::compacted_area_size(self.xcr0 | self.xss),
-                    xsave::XSS_SUPPORTED as u32,
-                    (xsave::XSS_SUPPORTED >> 32) as u32,
+                    self.xss_supported() as u32,
+                    (self.xss_supported() >> 32) as u32,
                 ),
                 // Components 11 and 12 (CET_U, CET_S): supervisor (ECX bit 0), compacted only, so
                 // no standard-format offset.
                 _ if let Some(part) = xsave::SUPERVISOR_COMPONENTS
                     .iter()
-                    .find(|part| part.index == subleaf) =>
+                    .find(|part| part.index == subleaf && part.bit & self.xss_supported() != 0) =>
                 {
                     (part.size as u32, 0, XSTATE_COMPONENT_SUPERVISOR, 0)
                 }

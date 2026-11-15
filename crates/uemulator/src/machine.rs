@@ -197,6 +197,7 @@ pub struct MachineConfig {
     memory_mib: usize,
     cpus: usize,
     smt: bool,
+    shadow_stacks: bool,
     disks: Vec<Disk>,
     net_macs: Vec<[u8; 6]>,
     consoles: Vec<ConsoleKind>,
@@ -242,6 +243,7 @@ impl Default for MachineConfig {
             memory_mib: DEFAULT_MEMORY_MIB,
             cpus: MIN_CPUS,
             smt: true,
+            shadow_stacks: false,
             disks: Vec::new(),
             net_macs: Vec::new(),
             consoles: Vec::new(),
@@ -504,6 +506,15 @@ impl MachineConfig {
         self
     }
 
+    /// CET shadow stacks (CPUID.7.0:ECX bit 7, CR4.CET, the CET MSRs and XSS components), off by
+    /// default: off, the CPU looks like one without them. Code running on a shadow stack stays on
+    /// the interpreter, and Xen turns supervisor shadow stacks on whenever CPUID offers them, so
+    /// leaving them on makes a Xen boot about 3x slower. Turn them on to test CET in a guest.
+    pub fn shadow_stacks(mut self, on: bool) -> Self {
+        self.shadow_stacks = on;
+        self
+    }
+
     /// Chooses between a host thread per vCPU and taking turns (see `SmpMode`). Only matters with
     /// more than one vCPU.
     pub fn smp(mut self, mode: SmpMode) -> Self {
@@ -750,6 +761,7 @@ struct RebootImage {
     iommu: bool,
     cpus: usize,
     smt: bool,
+    shadow_stacks: bool,
     acpi: Option<AcpiConfig>,
     key_value_store: Option<SharedKeyValueStore>,
     rng: Option<RngSource>,
@@ -957,6 +969,7 @@ fn mirrored_devices(main: &mut DevConfig, main_uart: &ConsoleHandle) -> (DevConf
         }),
         cpus: main.cpus,
         smt: main.smt,
+        shadow_stacks: main.shadow_stacks,
         // Verification always runs on a seeded stream, so cloning gives the twin the same bytes.
         rng: main.rng.clone(),
         // Seeded under verify, like the rng: the twin's TPM answers GetRandom with the same bytes.
@@ -1078,6 +1091,7 @@ impl Vcpu {
                 key_value_store: image.key_value_store.clone(),
                 cpus: image.cpus,
                 smt: image.smt,
+                shadow_stacks: image.shadow_stacks,
                 rng: image.rng.clone(),
                 tpm: image.tpm.clone(),
                 display,
@@ -1582,6 +1596,7 @@ impl EmulatedMachine {
             key_value_store: cfg.key_value_store.clone(),
             cpus: cfg.cpus,
             smt: cfg.smt,
+            shadow_stacks: cfg.shadow_stacks,
             rng: rng.clone(),
             tpm: tpm.clone(),
             display: display_devices(
@@ -1615,6 +1630,7 @@ impl EmulatedMachine {
                     iommu: cfg.iommu,
                     cpus: cfg.cpus,
                     smt: cfg.smt,
+                    shadow_stacks: cfg.shadow_stacks,
                     acpi,
                     key_value_store: cfg.key_value_store,
                     rng: devcfg.rng.clone(),

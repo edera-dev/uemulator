@@ -109,14 +109,22 @@ fn make_shadow_stack_region(h: &mut Harness, linear: u64, user: bool) {
     h.cpu.flush_tlb();
 }
 
+/// A CPU with shadow stacks, which machines get only when they ask (`CpuTopology::shadow_stacks`).
+fn harness(code: &[u8]) -> Harness {
+    let mut h = Harness::new(code);
+    h.enable_shadow_stacks();
+    h
+}
+
 fn enable_cet(h: &mut Harness) {
+    h.enable_shadow_stacks();
     h.cpu.cr0 |= CR0_WP;
     h.cpu.cr4 |= CR4_CET;
 }
 
 /// Kernel shadow stacks on, SSP at `SHADOW_TOP` on a supervisor shadow-stack page.
 fn kernel_shadow_stack(code: &[u8]) -> Harness {
-    let mut h = Harness::new(code);
+    let mut h = harness(code);
     enable_cet(&mut h);
     make_shadow_stack_region(&mut h, SHADOW_REGION, false);
     h.cpu.cet.s_cet = CET_SH_STK_EN;
@@ -132,7 +140,7 @@ fn put_token(h: &mut Harness, address: u64, busy: bool) {
 mod identity {
     use super::*;
 
-    fn cpuid(h: &mut Harness, leaf: u32, subleaf: u32) -> [u32; 4] {
+    pub(super) fn cpuid(h: &mut Harness, leaf: u32, subleaf: u32) -> [u32; 4] {
         h.cpu.gpr[RAX] = leaf as u64;
         h.cpu.gpr[RCX] = subleaf as u64;
         h.cpu.cpuid();
@@ -141,7 +149,7 @@ mod identity {
 
     #[test]
     fn leaf_7_has_shadow_stacks_and_no_indirect_branch_tracking() {
-        let mut h = Harness::new(&[HLT]);
+        let mut h = harness(&[HLT]);
         let [_, _, ecx, edx] = cpuid(&mut h, 7, 0);
         assert_ne!(ecx & (1 << 7), 0, "CET_SS");
         assert_eq!(edx & (1 << 20), 0, "no CET_IBT on Zen");
@@ -149,7 +157,7 @@ mod identity {
 
     #[test]
     fn leaf_0xd_describes_the_cet_supervisor_components() {
-        let mut h = Harness::new(&[HLT]);
+        let mut h = harness(&[HLT]);
         assert_eq!(cpuid(&mut h, 0xd, 11), [16, 0, 1, 0]);
         assert_eq!(cpuid(&mut h, 0xd, 12), [24, 0, 1, 0]);
         assert_eq!(cpuid(&mut h, 0xd, 1)[2], (XSS_CET_U | XSS_CET_S) as u32);
@@ -160,15 +168,91 @@ mod identity {
     }
 }
 
+/// The default: a CPU without CET_SS, as if the part had none.
+mod switched_off {
+    use super::*;
+    use crate::cpu::xsave::XSS_SUPPORTED;
+
+    const MSR_XSS: u32 = 0xda0;
+
+    fn without(code: &[u8]) -> Harness {
+        let h = Harness::new(code);
+        assert!(!h.cpu.topology.shadow_stacks, "off unless asked for");
+        h
+    }
+
+    #[test]
+    fn cpuid_reports_no_shadow_stacks_and_no_cet_components() {
+        let mut h = without(&[HLT]);
+        assert_eq!(identity::cpuid(&mut h, 7, 0)[2] & (1 << 7), 0, "CET_SS");
+        let [_, _, ecx, edx] = identity::cpuid(&mut h, 0xd, 1);
+        assert_eq!(ecx as u64 & (XSS_CET_U | XSS_CET_S), 0);
+        assert_eq!(edx, 0);
+        assert_eq!(identity::cpuid(&mut h, 0xd, 11), [0; 4]);
+        assert_eq!(identity::cpuid(&mut h, 0xd, 12), [0; 4]);
+        // the bits the rest of XSS_SUPPORTED might grow stay reported
+        assert_eq!(ecx as u64, XSS_SUPPORTED & !(XSS_CET_U | XSS_CET_S));
+    }
+
+    #[test]
+    fn xss_refuses_the_cet_components() {
+        let mut h = without(&[HLT]);
+        for bits in [XSS_CET_U, XSS_CET_S, XSS_CET_U | XSS_CET_S] {
+            assert_eq!(
+                fault_of(h.cpu.wrmsr(MSR_XSS, bits)),
+                (VECTOR_GENERAL_PROTECTION, Some(0)),
+                "{bits:#x}"
+            );
+        }
+        h.cpu.wrmsr(MSR_XSS, 0).unwrap();
+        assert_eq!(h.cpu.xss, 0);
+    }
+
+    #[test]
+    fn cr4_cet_is_reserved() {
+        let mut h = without(MOV_CR4);
+        h.cpu.cr0 |= CR0_WP;
+        h.cpu.gpr[RAX] = h.cpu.cr4 | CR4_CET;
+        assert_eq!(h.run(10), fault(VECTOR_GENERAL_PROTECTION, Some(0)));
+        assert_eq!(h.cpu.cr4 & CR4_CET, 0);
+    }
+
+    #[test]
+    fn the_cet_msrs_do_not_exist() {
+        let mut h = without(&[HLT]);
+        for msr in [
+            MSR_U_CET,
+            MSR_S_CET,
+            MSR_PL0_SSP,
+            MSR_PL0_SSP + 1,
+            MSR_PL0_SSP + 2,
+            MSR_PL3_SSP,
+            MSR_ISST_ADDR,
+        ] {
+            assert_eq!(
+                fault_of(h.cpu.rdmsr(msr)),
+                (VECTOR_GENERAL_PROTECTION, Some(0)),
+                "rdmsr {msr:#x}"
+            );
+            assert_eq!(
+                fault_of(h.cpu.wrmsr(msr, 0)),
+                (VECTOR_GENERAL_PROTECTION, Some(0)),
+                "wrmsr {msr:#x}"
+            );
+        }
+        assert_eq!(h.cpu.cet, Cet::default());
+    }
+}
+
 mod control_registers_and_msrs {
     use super::*;
 
     #[test]
     fn cr4_cet_needs_cr0_wp() {
-        let mut h = Harness::new(MOV_CR4);
+        let mut h = harness(MOV_CR4);
         h.cpu.gpr[RAX] = h.cpu.cr4 | CR4_CET;
         assert_eq!(h.run(10), fault(VECTOR_GENERAL_PROTECTION, Some(0)));
-        let mut h = Harness::new(MOV_CR4);
+        let mut h = harness(MOV_CR4);
         h.cpu.cr0 |= CR0_WP;
         h.cpu.gpr[RAX] = h.cpu.cr4 | CR4_CET;
         assert_eq!(h.run(10), Stop::Halted);
@@ -177,7 +261,7 @@ mod control_registers_and_msrs {
 
     #[test]
     fn cr0_wp_cannot_be_cleared_under_cr4_cet() {
-        let mut h = Harness::new(MOV_CR0);
+        let mut h = harness(MOV_CR0);
         enable_cet(&mut h);
         h.cpu.gpr[RAX] = h.cpu.cr0 & !CR0_WP;
         assert_eq!(h.run(10), fault(VECTOR_GENERAL_PROTECTION, Some(0)));
@@ -186,7 +270,7 @@ mod control_registers_and_msrs {
 
     #[test]
     fn the_msrs_reject_ibt_bits_and_bad_addresses_and_keep_the_rest() {
-        let mut h = Harness::new(&[HLT]);
+        let mut h = harness(&[HLT]);
         for (msr, value) in [
             (MSR_U_CET, 1 << 2),
             (MSR_S_CET, 1 << 10),
@@ -221,7 +305,7 @@ mod control_registers_and_msrs {
 
     #[test]
     fn xss_accepts_exactly_the_cet_components() {
-        let mut h = Harness::new(&[HLT]);
+        let mut h = harness(&[HLT]);
         h.cpu.wrmsr(0xda0, XSS_CET_U | XSS_CET_S).unwrap();
         assert_eq!(h.cpu.rdmsr(0xda0).unwrap(), XSS_CET_U | XSS_CET_S);
         assert!(h.cpu.wrmsr(0xda0, 1 << 8).is_err());
@@ -347,7 +431,7 @@ mod near_transfers {
 
     #[test]
     fn without_cet_nothing_touches_ssp() {
-        let mut h = Harness::new(CALL_THEN_STOP);
+        let mut h = harness(CALL_THEN_STOP);
         h.cpu.cet.s_cet = CET_SH_STK_EN;
         h.cpu.cet.ssp = SCRATCH;
         assert_eq!(h.run(10), Stop::Halted);
@@ -376,7 +460,7 @@ mod instructions {
 
     #[test]
     fn rdssp_is_a_nop_without_a_shadow_stack() {
-        let mut h = Harness::new(RDSSPQ);
+        let mut h = harness(RDSSPQ);
         h.cpu.cet.ssp = 0x5000;
         h.cpu.gpr[RAX] = 0x1234;
         assert_eq!(h.run(10), Stop::Halted);
@@ -396,7 +480,7 @@ mod instructions {
 
     #[test]
     fn incssp_skips_entries_and_needs_a_shadow_stack() {
-        let mut h = Harness::new(INCSSPQ);
+        let mut h = harness(INCSSPQ);
         assert_eq!(h.run(10), fault(VECTOR_INVALID_OPCODE, None));
         let mut h = kernel_shadow_stack(INCSSPQ);
         h.cpu.cet.ssp = SHADOW_TOP - 32;
@@ -438,7 +522,7 @@ mod instructions {
 
     #[test]
     fn wruss_writes_a_user_shadow_stack_from_the_kernel_only() {
-        let mut h = Harness::new(WRUSSQ);
+        let mut h = harness(WRUSSQ);
         h.cpu.gpr[RAX] = SHADOW_TOP - 8;
         assert_eq!(
             h.run(10),
@@ -446,7 +530,7 @@ mod instructions {
             "needs CR4.CET"
         );
         // Linux: CR4.CET with no kernel shadow stack, writing a user one.
-        let mut h = Harness::new(WRUSSQ);
+        let mut h = harness(WRUSSQ);
         enable_cet(&mut h);
         make_shadow_stack_region(&mut h, SHADOW_REGION, true);
         h.cpu.gpr[RAX] = SHADOW_TOP - 8;
@@ -467,7 +551,7 @@ mod instructions {
 
     #[test]
     fn wruss_from_user_mode_is_general_protection() {
-        let mut h = Harness::new(&[HLT]);
+        let mut h = harness(&[HLT]);
         enable_cet(&mut h);
         enter_user_mode(&mut h);
         assert_eq!(
@@ -508,7 +592,7 @@ mod instructions {
 
     #[test]
     fn token_instructions_need_ring_0_and_a_kernel_shadow_stack() {
-        let mut h = Harness::new(SETSSBSY);
+        let mut h = harness(SETSSBSY);
         enable_cet(&mut h);
         assert_eq!(h.run(10), fault(VECTOR_INVALID_OPCODE, None));
         let mut h = kernel_shadow_stack(&[HLT]);
@@ -784,7 +868,7 @@ mod xsaves_state {
     const CET_S_OFFSET: u64 = 592;
 
     fn with_xsaves(code: &[u8]) -> Harness {
-        let mut h = Harness::new(code);
+        let mut h = harness(code);
         h.cpu.cr4 |= CR4_OSXSAVE_BIT;
         h.cpu.xcr0 = XCR0_X87 | XCR0_SSE;
         h.cpu.xss = XSS_CET_U | XSS_CET_S;
@@ -850,7 +934,7 @@ mod jit {
         let mut h = kernel_shadow_stack(&[HLT]);
         h.enable_jit();
         assert!(!h.cpu.uses_jit());
-        let mut h = Harness::new(&[HLT]);
+        let mut h = harness(&[HLT]);
         let jit = h.enable_jit();
         enable_cet(&mut h);
         h.cpu.cet.u_cet = CET_SH_STK_EN;
