@@ -111,6 +111,13 @@ impl Image {
             (0, 0)
         };
         let sections_at = optional + optional_size;
+        let headers_size = u32_at(file, optional + OPT_SIZE_OF_HEADERS)?;
+        if sections_at
+            .checked_add(section_count * SECTION_HEADER_BYTES)
+            .is_none_or(|end| end > headers_size as usize)
+        {
+            return Err(PeError::Corrupt);
+        }
         let sections = (0..section_count)
             .map(|index| {
                 let at = sections_at + index * SECTION_HEADER_BYTES;
@@ -128,7 +135,7 @@ impl Image {
             section_alignment: u32_at(file, optional + OPT_SECTION_ALIGNMENT)?,
             entry_point: u32_at(file, optional + OPT_ENTRY_POINT)?,
             subsystem: u16_at(file, optional + OPT_SUBSYSTEM)?,
-            headers_size: u32_at(file, optional + OPT_SIZE_OF_HEADERS)?,
+            headers_size,
             sections,
             relocations,
         };
@@ -150,7 +157,10 @@ impl Image {
                 return Err(PeError::Corrupt);
             }
         }
-        if self.entry_point >= self.size_of_image {
+        // Authenticode excludes CheckSum and the certificate-directory entry from the
+        // header digest. They are copied into memory, so executing from the headers would
+        // let those mutable bytes become the image's first instructions.
+        if self.entry_point < self.headers_size || self.entry_point >= self.size_of_image {
             return Err(PeError::Corrupt);
         }
         let (rva, length) = self.relocations;
@@ -232,6 +242,43 @@ mod tests {
     const SIZE_OF_IMAGE: u32 = 0x3000;
     const FILE_ALIGN: usize = 0x200;
     const OPTIONAL_SIZE: usize = OPT_DIRECTORIES + 16 * DATA_DIRECTORY_BYTES;
+
+    #[test]
+    fn section_table_must_fit_in_size_of_headers() {
+        let mut file = build(MACHINE_AMD64);
+        let pe = u32_at(&file, DOS_PE_OFFSET_FIELD).unwrap() as usize;
+        let optional = pe + 4 + COFF_HEADER_BYTES;
+        let sections = optional + OPTIONAL_SIZE;
+        file[optional + OPT_SIZE_OF_HEADERS..][..4]
+            .copy_from_slice(&(sections as u32).to_le_bytes());
+        assert_eq!(Image::parse(&file).unwrap_err(), PeError::Corrupt);
+    }
+
+    #[test]
+    fn entry_point_must_not_run_unhashed_header_bytes() {
+        let mut file = build(MACHINE_AMD64);
+        let pe = u32_at(&file, DOS_PE_OFFSET_FIELD).unwrap() as usize;
+        let optional = pe + 4 + COFF_HEADER_BYTES;
+        // Authenticode deliberately excludes CheckSum. It must never be executable entry code.
+        let checksum = (optional + 64) as u32;
+        file[optional + OPT_ENTRY_POINT..][..4].copy_from_slice(&checksum.to_le_bytes());
+        let before = uemulator_crypto::authenticode::digest(
+            &file,
+            uemulator_crypto::sha::HashAlgorithm::Sha256,
+        )
+        .unwrap();
+        file[checksum as usize] ^= 0x5a;
+        assert_eq!(
+            uemulator_crypto::authenticode::digest(
+                &file,
+                uemulator_crypto::sha::HashAlgorithm::Sha256
+            )
+            .unwrap(),
+            before,
+            "the would-be entry code is outside the signed digest"
+        );
+        assert_eq!(Image::parse(&file).unwrap_err(), PeError::Corrupt);
+    }
 
     /// A two-section PE: `.text` holds a pointer to the image's own entry point at offset 8 and
     /// `.reloc` has one DIR64 entry for it.

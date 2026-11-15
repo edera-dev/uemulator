@@ -116,6 +116,14 @@ impl Layout {
             return Err(Error::Malformed);
         }
         let section_table = optional + optional_size;
+        // Section headers choose where the hashed section bytes land in memory. If they
+        // sit past SizeOfHeaders, their RVAs can change without changing this digest.
+        if section_table
+            .checked_add(section_count * SECTION_HEADER_BYTES)
+            .is_none_or(|end| end > size_of_headers)
+        {
+            return Err(Error::Malformed);
+        }
         let mut sections = Vec::new();
         for index in 0..section_count {
             let header = section_table + index * SECTION_HEADER_BYTES;
@@ -259,6 +267,19 @@ mod tests {
     const SIGNED_IMAGE: &[u8] = include_bytes!("testdata/signed.efi");
     const UNSIGNED_IMAGE: &[u8] = include_bytes!("testdata/unsigned.efi");
     const IMAGE_SHA256: &[u8] = include_bytes!("testdata/image.sha256");
+
+    #[test]
+    fn section_table_must_be_inside_the_hashed_headers() {
+        let mut file = UNSIGNED_IMAGE.to_vec();
+        let pe = u32_at(&file, DOS_PE_OFFSET_FIELD).unwrap() as usize;
+        let optional = pe + 4 + COFF_HEADER_BYTES;
+        let sections =
+            optional + u16_at(&file, pe + 4 + COFF_SIZE_OF_OPTIONAL_HEADER).unwrap() as usize;
+        assert!(sections > optional + OPTIONAL_CHECKSUM + 4);
+        file[optional + OPTIONAL_SIZE_OF_HEADERS..][..4]
+            .copy_from_slice(&(sections as u32).to_le_bytes());
+        assert_eq!(digest(&file, HashAlgorithm::Sha256), Err(Error::Malformed));
+    }
 
     #[test]
     fn the_digest_matches_the_independent_one() {
