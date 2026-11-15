@@ -633,27 +633,39 @@ impl Cpu {
     /// scheduler enters the vCPU, threads when the device bit says so).
     ///
     /// INIT is held pending while GIF is clear, and a guest that intercepts it exits instead
-    /// (which clears GIF), so the hypervisor sees the exit before the reset (APM 15.17).
-    pub(super) fn apply_start_signals(&mut self) {
+    /// (which clears GIF), so the hypervisor sees the exit before the reset (APM 15.17). With
+    /// VM_CR.R_INIT it is #SX instead of a reset (APM 15.29), which a guest may intercept like
+    /// any exception. `Some` only when that #SX ends the run (a triple fault).
+    pub(super) fn apply_start_signals(&mut self) -> Option<ExitReason> {
         let index = self.cpu_index as usize;
         if self.svm_init_exit() {
-            return;
+            return None;
         }
         let hold_init = !self.svm.gif;
+        let redirect_init = self.svm.vm_cr & super::svm::VM_CR_R_INIT != 0;
         let (init, startup) = {
             let mut devices = self.dev.lock();
             let lapic = devices.lapic_of(index);
             if !lapic.start_signal_pending() {
-                return;
+                return None;
             }
             let init = !hold_init && lapic.take_init();
             let startup = lapic.take_startup();
-            if init {
+            if init && !redirect_init {
                 lapic.init_reset();
             }
             (init, startup)
         };
-        if init {
+        if init && redirect_init {
+            self.halted = false;
+            let redirected = Exception::fault(
+                super::svm::VECTOR_SECURITY_EXCEPTION,
+                Some(super::svm::SX_INIT_REDIRECTED),
+            );
+            if let Some(reason) = self.after_step(Err(redirected)) {
+                return Some(reason);
+            }
+        } else if init {
             self.init();
         }
         // A start-up IPI to a vCPU that is already running is ignored (SDM 10.4.7.3).
@@ -662,6 +674,7 @@ impl Cpu {
         {
             self.start_at(vector);
         }
+        None
     }
 
     /// `pause` on a threaded vCPU: tell the host core it is spinning, and offer the slice now and

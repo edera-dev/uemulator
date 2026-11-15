@@ -418,9 +418,14 @@ fn leaf_0x8000000a_describes_svm() {
     let [revision, asids, ecx, features] = cpuid(&mut h, 0x8000_000a, 0);
     assert_eq!((revision, asids, ecx), (1, 32768, 0));
     // nested paging, LBR virtualization, SVM lock, next-RIP save, the TSC ratio MSR, VMCB clean
-    // bits, flush by ASID, the pause filter and its threshold (tested in svm.rs); decode assists,
-    // AVIC, V_GIF, vNMI and the rest are not implemented
-    assert_eq!(features, bits(&[0, 1, 2, 3, 4, 5, 6, 10, 12]));
+    // bits, flush by ASID, decode assists, the pause filter and its threshold, AVIC, virtual
+    // VMLOAD/VMSAVE, vGIF, x2AVIC, SPEC_CTRL virtualization, vNMI and the SVM instruction address
+    // check order (tested in svm.rs); GMET, ROGPT, host MCE override and the rest are not
+    // implemented
+    assert_eq!(
+        features,
+        bits(&[0, 1, 2, 3, 4, 5, 6, 7, 10, 12, 13, 15, 16, 18, 20, 25, 28])
+    );
 }
 
 /// One subleaf of leaf 0x8000_001D as type, level, sharing threads, ways, sets, line size.

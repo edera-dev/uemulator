@@ -44,9 +44,9 @@ Rules from `CLAUDE.md` hold for all of it: a CPUID bit goes on in the same commi
 
 ### C. Virtualisation (SVM) completeness
 
-`svm::SVM_FEATURES` today: nested paging, next-RIP save, VMCB clean bits, flush-by-ASID (all in their "reload and flush everything" form), LBR virtualization, SVM lock, the TSC ratio MSR, the pause filter and its threshold; 32768 ASIDs; the NMI, INIT, SMI (never raised) and task-switch intercepts (`docs/plans/03-cpu.md`, "SVM"). Zen 4 reports more in 0x8000_000A EDX; audit the list against the APM and add what a hypervisor will use, each with a guest test in `hack/kvm/run.sh`'s style or a fake kernel:
-- `vGIF` (virtual GIF, `STGI`/`CLGI` without exit), `V_VMSAVE_VMLOAD`, decode assists (`DecodeAssists` fills the VMCB instruction bytes on #PF/INVLPG exits), `GMET`, and the host-visible `VIRT_SPEC_CTRL`. Done: TSC rate MSR, pause filter (count and threshold), SVM lock and `SVM_KEY`, LBR virtualization.
-- AVIC/x2AVIC (hardware-virtualised local APIC) is the large one; skip unless a guest hypervisor needs it, and then design it with the multi-APIC model in `docs/plans/03-cpu.md`.
+`svm::SVM_FEATURES` today: nested paging, next-RIP save, VMCB clean bits, flush-by-ASID (all in their "reload and flush everything" form), LBR virtualization, SVM lock, the TSC ratio MSR, the pause filter and its threshold, decode assists, virtual VMLOAD/VMSAVE, vGIF, vNMI, SPEC_CTRL virtualization, SVME_ADDR_CHK, AVIC and x2AVIC; 32768 ASIDs; the NMI, INIT, SMI (never raised) and task-switch intercepts (`docs/plans/03-cpu.md`, "SVM"). Zen 4 reports more in 0x8000_000A EDX; audit the list against the APM and add what a hypervisor will use, each with a guest test in `hack/kvm/run.sh`'s style or a fake kernel:
+- `GMET`, `ROGPT` and the host-visible `VIRT_SPEC_CTRL` remain (GMET and ROGPT are not specified closely enough to emulate without hardware to compare). Done: TSC rate MSR, pause filter (count and threshold), SVM lock and `SVM_KEY`, LBR virtualization, vGIF, vNMI, `V_VMSAVE_VMLOAD`, decode assists, SPEC_CTRL virtualization, SVME_ADDR_CHK, VM_CR.R_INIT.
+- AVIC/x2AVIC are done (`cpu/svm_avic.rs`; `docs/plans/03-cpu.md`, "SVM"), without the IOMMU's guest APIC mode and with the broadcast shorthands and x2APIC logical IPIs left to the hypervisor.
 - SEV, SEV-ES, SEV-SNP: not on client Ryzen; not planned.
 
 ### D. Counters and monitoring a guest can program
@@ -120,7 +120,7 @@ Performance monitoring (`cpu/pmu.rs`, tests in `cpu/pmu_tests.rs`): PERFCTR_CORE
 
 Platform identity (`docs/plans/07-devices.md`): the PCI root complex is Turin's (1022:153A) with the SMN pair, node 0's data fabric sits at 00:18.0-7 (1022:12C0-12C7; amd_nb and k10temp bind), the IOMMU is 1022:153B with NXSup, the DSDT has an `ACPI0007` device per CPU with `_CPC` over the CPPC MSRs (0xC001_02B0-B4, leaf 0x8000_0008 EBX bit 27; amd_pstate loads), SRAT/SLIT describe one NUMA node (leaf 0x8000_001E keeps node id 0, one node per processor), SPCR names COM1, and SMBIOS type 4 says socket SP5 with type 7 structures for L1/L2/L3 summed over the socket from leaf 0x8000_001D. Not modelled: the FCH functions, HSMP, the UMC registers amd64_edac wants, APEI.
 
-Present on Turin, not advertised (not implemented): LA57, PKU/OSPKE, CET shadow stacks, SSE4A, MMXEXT, FFXSR, MWAITX/MONITORX, RDPRU, INVLPGB/TLBSYNC, OSVW, CR8_LEGACY, IBS, SRSO_BP_SPEC_REDUCE (needs the BP_CFG bit KVM toggles), ERAPS, NO_SMM_CTL_MSR, the extended SVM features (vGIF, vNMI, V_VMSAVE_VMLOAD, decode assists, AVIC/x2AVIC; TSC scaling, the pause filter, LBR virtualization and SVM lock are advertised), SEV/SEV-ES/SEV-SNP, RAPL, 52/57 address bits. AMD_SSB_NO and IBRS_ALWAYS_ON stay clear because Turin does not report them.
+Present on Turin, not advertised (not implemented): LA57, PKU/OSPKE, CET shadow stacks, SSE4A, MMXEXT, FFXSR, MWAITX/MONITORX, RDPRU, INVLPGB/TLBSYNC, OSVW, CR8_LEGACY, IBS, SRSO_BP_SPEC_REDUCE (needs the BP_CFG bit KVM toggles), ERAPS, NO_SMM_CTL_MSR, the extended SVM features GMET, ROGPT and the host MCE override (everything else Turin has in 0x8000_000A EDX outside SEV is advertised), SEV/SEV-ES/SEV-SNP, RAPL, 52/57 address bits. AMD_SSB_NO and IBRS_ALWAYS_ON stay clear because Turin does not report them.
 
 ## Order
 

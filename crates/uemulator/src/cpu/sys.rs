@@ -231,6 +231,9 @@ impl Cpu {
             MSR_TSC => self.tsc(),
             MSR_APIC_BASE => self.dev.lock().lapic().base_msr(),
             apic::X2APIC_MSR_FIRST..=apic::X2APIC_MSR_LAST => {
+                if let Some(result) = self.avic_x2apic_read(msr) {
+                    return result;
+                }
                 let now = self.now_ns();
                 match self.dev.lock().apic_msr_read(msr, now) {
                     Some(value) => value,
@@ -302,6 +305,9 @@ impl Cpu {
                 }
             }
             apic::X2APIC_MSR_FIRST..=apic::X2APIC_MSR_LAST => {
+                if let Some(result) = self.avic_x2apic_write(msr, v) {
+                    return result;
+                }
                 let now = self.now_ns();
                 if !self.dev.lock().apic_msr_write(msr, v, now) {
                     return Err(Exception::general_protection(0));
@@ -374,6 +380,9 @@ impl Cpu {
             }
             super::svm::MSR_VM_CR => self.write_vm_cr(v)?,
             super::svm::MSR_SVM_KEY => self.svm.write_key(v),
+            // Write-only (a read is #GP). It would make the vCPU with that host APIC id look at
+            // its backing page; a vCPU in an AVIC guest looks at every boundary anyway.
+            super::svm::MSR_AVIC_DOORBELL => {}
             super::svm::MSR_TSC_RATIO => self.svm.write_tsc_ratio(v)?,
             super::svm::MSR_LAST_BRANCH_FROM_IP..=super::svm::MSR_LAST_EXCEPTION_TO_IP => {
                 return Err(Exception::general_protection(0));
@@ -432,7 +441,10 @@ impl Cpu {
                     2 => self.cr2,
                     3 => self.cr3,
                     4 => self.cr4,
-                    8 => (self.dev.lock().lapic().tpr() >> CR8_TPR_SHIFT) as u64,
+                    8 => match self.svm_guest_cr8() {
+                        Some(cr8) => cr8,
+                        None => (self.dev.lock().lapic().tpr() >> CR8_TPR_SHIFT) as u64,
+                    },
                     _ => return Err(Exception::invalid_opcode()),
                 };
                 // Outside IA-32e mode the access is 32 bits wide and clears the upper half.
@@ -476,10 +488,12 @@ impl Cpu {
                         if v & !CR8_MASK != 0 {
                             return Err(Exception::general_protection(0));
                         }
-                        self.dev
-                            .lock()
-                            .lapic_mut()
-                            .set_tpr((v as u8) << CR8_TPR_SHIFT);
+                        if !self.svm_set_guest_cr8(v) {
+                            self.dev
+                                .lock()
+                                .lapic_mut()
+                                .set_tpr((v as u8) << CR8_TPR_SHIFT);
+                        }
                     }
                     _ => return Err(Exception::invalid_opcode()),
                 }

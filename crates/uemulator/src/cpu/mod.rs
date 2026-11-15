@@ -1065,10 +1065,15 @@ impl Cpu {
     /// Whether an NMI is pending and would be taken at this boundary (GIF aside), without taking
     /// it: the SVM NMI intercept exits on exactly the NMI `take_pending_nmi` would deliver.
     pub(crate) fn nmi_recognized(&mut self) -> bool {
+        !self.nmi_blocked && self.nmi_arrived()
+    }
+
+    /// An NMI is pending at a boundary that takes one, whatever the NMI mask says (the SVM NMI
+    /// intercept looks at the host's mask, not the guest's).
+    pub(crate) fn nmi_arrived(&mut self) -> bool {
         // A threaded vCPU asks the device lock only when the device model says something is
         // waiting for it (`vcpus::ATTENTION_NMI`).
-        !(self.nmi_blocked
-            || self.interrupt_shadow
+        !(self.interrupt_shadow
             || (self.threads.is_some() && self.attention() & vcpus::ATTENTION_NMI == 0)
             || !self.dev.lock().nmi_pending())
     }
@@ -1080,8 +1085,13 @@ impl Cpu {
             if let Some(reason) = self.thread_attention() {
                 return BeforeStep::Exit(reason);
             }
-            if self.attention() & vcpus::ATTENTION_START != 0 {
-                self.apply_start_signals();
+            // An INIT held while GIF is clear keeps the bit set: looking at it again before `stgi`
+            // would only take the device lock on every step for nothing.
+            if self.attention() & vcpus::ATTENTION_START != 0
+                && (self.svm.gif || self.wait_for_sipi)
+                && let Some(reason) = self.apply_start_signals()
+            {
+                return BeforeStep::Exit(reason);
             }
         }
         if self.icount >= self.next_event {
