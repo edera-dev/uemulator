@@ -148,12 +148,13 @@ pub const MIN_CPUS: usize = 1;
 /// vCPU in a `u64`.
 pub const MAX_CPUS: usize = 64;
 pub const MIN_MEMORY_MIB: usize = 64;
-/// The most RAM the guest can address: its physical address space is 40 bits (CPUID
-/// MAXPHYADDR), and the 1 GiB PCI hole below 4 GiB is not RAM. RAM past 3 GiB is placed from
-/// 4 GiB up (`ram::flat_bytes`), so the last byte lands at 1 TiB when the hole is subtracted.
+/// The most RAM a machine gets: the first TiB of physical address space (the CPU decodes 52 bits,
+/// but the direct-boot identity map in `boot.rs` stops at 1 TiB), less the 1 GiB PCI hole below
+/// 4 GiB, which is not RAM. RAM past 3 GiB is placed from 4 GiB up (`ram::flat_bytes`), so the
+/// last byte lands at 1 TiB when the hole is subtracted.
 /// Memory is committed lazily, so the host needs the RAM only as far as the guest touches it.
 pub const MAX_MEMORY_MIB: usize = (1 << (40 - BYTES_PER_MIB_SHIFT)) - HOLE_MIB;
-/// The PCI hole in MiB: `MAX_MEMORY_MIB` loses it from the 40-bit address space.
+/// The PCI hole in MiB: `MAX_MEMORY_MIB` loses it from the first TiB.
 const HOLE_MIB: usize =
     ((crate::ram::PCI_HOLE_END - crate::ram::PCI_HOLE_START) >> BYTES_PER_MIB_SHIFT) as usize;
 const DEFAULT_MEMORY_MIB: usize = 512;

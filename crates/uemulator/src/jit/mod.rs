@@ -151,6 +151,8 @@ mod diff_misc;
 #[cfg(test)]
 mod diff_mov;
 #[cfg(test)]
+mod diff_paging;
+#[cfg(test)]
 mod diff_random;
 #[cfg(test)]
 mod diff_registers;

@@ -161,13 +161,24 @@ fn leaf_7_subleaf_0_features() {
     let ebx = bits(&[
         0, 3, 5, 7, 8, 9, 10, 16, 17, 18, 19, 20, 21, 23, 24, 28, 29, 30, 31,
     ]);
-    // AVX512_VBMI UMIP AVX512_VBMI2 GFNI VAES VPCLMULQDQ AVX512_VNNI AVX512_BITALG
-    // AVX512_VPOPCNTDQ RDPID MOVDIRI MOVDIR64B; no PKU, LA57, CET_SS
-    let ecx = bits(&[1, 2, 6, 8, 9, 10, 11, 12, 14, 22, 27, 28]);
+    // AVX512_VBMI UMIP PKU AVX512_VBMI2 GFNI VAES VPCLMULQDQ AVX512_VNNI AVX512_BITALG
+    // AVX512_VPOPCNTDQ LA57 RDPID MOVDIRI MOVDIR64B; no CET_SS, and OSPKE only follows CR4
+    let ecx = bits(&[1, 2, 3, 6, 8, 9, 10, 11, 12, 14, 16, 22, 27, 28]);
     // FSRM and AVX512_VP2INTERSECT; the speculation controls are in the AMD leaves
     let edx = bits(&[4, 8]);
     // EAX is the highest subleaf
     assert_eq!(cpuid(&mut h, 7, 0), [1, ebx, ecx, edx]);
+}
+
+#[test]
+fn leaf_7_ospke_mirrors_cr4_pke() {
+    const OSPKE: u32 = 1 << 4;
+    const CR4_PKE: u64 = 1 << 22;
+    let mut h = blank();
+    h.cpu.cr4 |= CR4_PKE;
+    assert_ne!(cpuid(&mut h, 7, 0)[2] & OSPKE, 0);
+    h.cpu.cr4 &= !CR4_PKE;
+    assert_eq!(cpuid(&mut h, 7, 0)[2] & OSPKE, 0);
 }
 
 #[test]
@@ -213,14 +224,18 @@ fn leaf_0xb_follows_the_configured_topology() {
 #[test]
 fn leaf_0xd_describes_the_xsave_area() {
     let mut h = blank();
-    // supported XCR0 bits (x87, SSE, AVX, opmask, ZMM_Hi256, Hi16_ZMM), size for the enabled set,
-    // size for all supported
-    assert_eq!(cpuid(&mut h, 0xd, 0), [0xe7, 576, 2688, 0]);
+    // supported XCR0 bits (x87, SSE, AVX, opmask, ZMM_Hi256, Hi16_ZMM, PKRU), size for the
+    // enabled set, size for all supported
+    assert_eq!(cpuid(&mut h, 0xd, 0), [0x2e7, 576, 2696, 0]);
     h.cpu.xcr0 = 7;
-    assert_eq!(cpuid(&mut h, 0xd, 0), [0xe7, 832, 2688, 0]);
+    assert_eq!(cpuid(&mut h, 0xd, 0), [0x2e7, 832, 2696, 0]);
     h.cpu.xcr0 = 0xe7;
-    assert_eq!(cpuid(&mut h, 0xd, 0), [0xe7, 2688, 2688, 0]);
+    assert_eq!(cpuid(&mut h, 0xd, 0), [0x2e7, 2688, 2696, 0]);
+    h.cpu.xcr0 = 0x2e7;
+    assert_eq!(cpuid(&mut h, 0xd, 0), [0x2e7, 2696, 2696, 0]);
     // xsaveopt, xsavec, xgetbv1, xsaves; EBX is the compacted size for the enabled set
+    assert_eq!(cpuid(&mut h, 0xd, 1), [0xf, 2440, 0, 0]);
+    h.cpu.xcr0 = 0xe7;
     assert_eq!(cpuid(&mut h, 0xd, 1), [0xf, 2432, 0, 0]);
     h.cpu.xcr0 = 7;
     assert_eq!(cpuid(&mut h, 0xd, 1), [0xf, 832, 0, 0]);
@@ -234,6 +249,9 @@ fn leaf_0xd_describes_the_xsave_area() {
     assert_eq!(cpuid(&mut h, 0xd, 6), [512, 1152, 0, 0]);
     assert_eq!(cpuid(&mut h, 0xd, 7), [1024, 1664, 0, 0]);
     assert_eq!(cpuid(&mut h, 0xd, 8), [0, 0, 0, 0]);
+    // PKRU: 8 bytes at 2688, a user component without alignment needs
+    assert_eq!(cpuid(&mut h, 0xd, 9), [8, 2688, 0, 0]);
+    assert_eq!(cpuid(&mut h, 0xd, 10), [0, 0, 0, 0]);
 }
 
 #[test]
@@ -341,11 +359,11 @@ fn advanced_power_leaf_marks_the_tsc_invariant_and_nothing_else() {
 }
 
 #[test]
-fn address_size_leaf_reports_40_physical_and_48_virtual_bits_and_the_extensions() {
+fn address_size_leaf_reports_52_physical_and_57_virtual_bits_and_the_extensions() {
     let mut h = blank();
     let [eax, ebx, ecx, edx] = cpuid(&mut h, 0x8000_0008, 0);
-    assert_eq!(eax & 0xff, 40);
-    assert_eq!((eax >> 8) & 0xff, 48);
+    assert_eq!(eax & 0xff, 52);
+    assert_eq!((eax >> 8) & 0xff, 57);
     assert_eq!(eax >> 16, 0);
     // CLZERO XSAVEERPTR WBNOINVD IBPB IBRS STIBP STIBP_ALWAYS_ON IBRS_SAME_MODE EFER_LMSLE_MBZ
     // SSBD PSFD BTC_NO IBPB_RET; no AMD_SSB_NO, VIRT_SSBD, PPIN, IBRS_ALWAYS_ON

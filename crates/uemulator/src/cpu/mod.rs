@@ -26,6 +26,7 @@ pub(crate) mod mca;
 pub(crate) mod mem;
 pub(crate) mod modes;
 pub(crate) mod mtrr;
+mod pku;
 mod protection;
 pub(crate) mod smp;
 #[cfg(test)]
@@ -306,6 +307,8 @@ pub(crate) struct LargePage {
     pub no_execute: bool,
     /// The leaf already has Dirty set, so a store needs no walk.
     pub dirty: bool,
+    /// The leaf's protection key (bits 62:59), checked against PKRU at each hit.
+    pub protection_key: u8,
 }
 
 pub(crate) const LARGE_PAGE_EMPTY: LargePage = LargePage {
@@ -316,6 +319,7 @@ pub(crate) const LARGE_PAGE_EMPTY: LargePage = LargePage {
     user_allowed: false,
     no_execute: false,
     dirty: false,
+    protection_key: 0,
 };
 
 /// Never equals a page-aligned address, so an empty tag always misses.
@@ -334,6 +338,9 @@ pub(crate) const TLB_FLAG_USER: u8 = 2;
 pub(crate) const TLB_FLAG_NO_EXECUTE: u8 = 4;
 /// The leaf PTE already has its dirty bit, so a store can skip the walk that would set it.
 pub(crate) const TLB_FLAG_DIRTY: u8 = 8;
+/// Bits 7:4 carry the leaf's protection key (0 outside IA-32e paging), for `translate` to
+/// withhold the tags PKRU restricts.
+pub(crate) const TLB_FLAG_PROTECTION_KEY_SHIFT: u32 = 4;
 pub(crate) const TLB_INDEX_BITS: usize = 10;
 /// `Cpu::tlb` holds two halves of this many entries: supervisor first, then user. They are
 /// separate because the same page can be accessible to one privilege and not the other, and a
@@ -439,6 +446,9 @@ pub(crate) struct Cpu {
     pub spec_ctrl: u64,
     /// XCR0, the enabled extended-state components (xgetbv/xsetbv). Bit 0 (x87) is always set.
     pub xcr0: u64,
+    /// PKRU, two bits per protection key (`pku.rs`). Change it through `set_pkru`, which empties
+    /// the TLB.
+    pub pkru: u32,
     /// AMD SVM: host/guest switching state (see `svm.rs`).
     pub svm: svm::Svm,
     /// MONITOR address and whether a monitor is armed for the next MWAIT.
@@ -812,6 +822,7 @@ impl Cpu {
             },
             spec_ctrl: 0,
             xcr0: xsave::XCR0_X87,
+            pkru: 0,
             svm: svm::Svm::new(),
             monitor_address: 0,
             monitor_armed: false,
@@ -1315,6 +1326,7 @@ impl Cpu {
             ("cr3", self.cr3, other.cr3),
             ("cr4", self.cr4, other.cr4),
             ("efer", self.efer, other.efer),
+            ("pkru", self.pkru as u64, other.pkru as u64),
             ("icount", self.icount, other.icount),
         ] {
             if ours != theirs {

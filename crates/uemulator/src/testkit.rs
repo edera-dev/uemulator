@@ -320,6 +320,7 @@ pub(crate) struct Snapshot {
     pub segment_selectors: [u16; 6],
     pub cpl: u8,
     pub icount: u64,
+    pub pkru: u32,
 }
 
 impl Harness {
@@ -342,6 +343,7 @@ impl Harness {
             segment_selectors: std::array::from_fn(|i| cpu.seg[i].sel),
             cpl: cpu.cpl,
             icount: cpu.icount,
+            pkru: cpu.pkru,
         }
     }
 }

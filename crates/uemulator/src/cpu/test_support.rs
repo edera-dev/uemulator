@@ -55,17 +55,33 @@ pub(crate) fn capture_log(cpu: &mut Cpu) -> Arc<Mutex<Vec<String>>> {
     messages
 }
 
-/// 4-level guest page tables built in harness RAM. `new` switches the CPU to an empty PML4.
+/// IA-32e guest page tables built in harness RAM, 4-level (`new`) or 5-level (`new_five_level`,
+/// which also sets CR4.LA57). `new` switches the CPU to an empty top-level table.
 pub(crate) struct PageTables {
     pub pml4: u64,
     next_free: u64,
+    levels: u32,
 }
+
+/// CR4.LA57, restated: 5-level paging with 57-bit linear addresses.
+pub(crate) const CR4_LA57_BIT: u64 = 1 << 12;
 
 impl PageTables {
     pub fn new(cpu: &mut Cpu) -> Self {
+        Self::with_levels(cpu, 4)
+    }
+
+    /// `pml4` is then the PML5.
+    pub fn new_five_level(cpu: &mut Cpu) -> Self {
+        cpu.cr4 |= CR4_LA57_BIT;
+        Self::with_levels(cpu, 5)
+    }
+
+    fn with_levels(cpu: &mut Cpu, levels: u32) -> Self {
         let mut tables = PageTables {
             pml4: 0,
             next_free: TABLE_POOL,
+            levels,
         };
         tables.pml4 = tables.alloc(cpu);
         cpu.cr3 = tables.pml4;
@@ -81,15 +97,16 @@ impl PageTables {
         page
     }
 
-    /// Maps `linear` to `phys`. `flags` lists the entry flags top down: four entries make a
-    /// 4 KiB page, three a 2 MiB leaf (PS is added), two a 1 GiB leaf. Intermediate tables
-    /// that already exist keep their entries (and flags); only missing ones are created.
+    /// Maps `linear` to `phys`. `flags` lists the entry flags top down: one per level makes a
+    /// 4 KiB page, one fewer a 2 MiB leaf (PS is added), two fewer a 1 GiB leaf. Intermediate
+    /// tables that already exist keep their entries (and flags); only missing ones are created.
     /// Returns the physical address of the leaf entry.
     pub fn map(&mut self, cpu: &mut Cpu, linear: u64, phys: u64, flags: &[u64]) -> u64 {
-        assert!((2..=4).contains(&flags.len()));
+        let levels = self.levels as usize;
+        assert!((levels - 2..=levels).contains(&flags.len()));
         let mut table = self.pml4;
         for (i, &entry_flags) in flags.iter().enumerate() {
-            let level = 3 - i as u32;
+            let level = self.levels - 1 - i as u32;
             let index = (linear >> (12 + 9 * level)) & 0x1ff;
             let entry_address = table + index * 8;
             if i == flags.len() - 1 {
@@ -111,13 +128,15 @@ impl PageTables {
 
     /// 4 KiB mapping with the same flags at every level.
     pub fn map_4k(&mut self, cpu: &mut Cpu, linear: u64, phys: u64, flags: u64) -> u64 {
-        self.map(cpu, linear, phys, &[flags, flags, flags, flags])
+        let all_levels = vec![flags; self.levels as usize];
+        self.map(cpu, linear, phys, &all_levels)
     }
 
-    /// Address of the entry for `linear` at `level` (3 = PML4 .. 0 = PT), if the path exists.
+    /// Address of the entry for `linear` at `level` (3 = PML4, 4 = PML5 .. 0 = PT), if the path
+    /// exists.
     pub fn entry_address(&self, cpu: &Cpu, linear: u64, level: u32) -> u64 {
         let mut table = self.pml4;
-        for walk_level in (level..=3).rev() {
+        for walk_level in (level..self.levels).rev() {
             let index = (linear >> (12 + 9 * walk_level)) & 0x1ff;
             let entry_address = table + index * 8;
             if walk_level == level {

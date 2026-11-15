@@ -50,7 +50,7 @@ impl Cpu {
         if low & INVPCID_DESCRIPTOR_RESERVED != 0 {
             return Err(Exception::general_protection(0));
         }
-        if kind == INVPCID_TYPE_INDIVIDUAL_ADDRESS && !super::sys::is_canonical(linear) {
+        if kind == INVPCID_TYPE_INDIVIDUAL_ADDRESS && !self.is_canonical_linear(linear) {
             return Err(Exception::general_protection(0));
         }
         self.flush_tlb();

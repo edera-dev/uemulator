@@ -20,9 +20,12 @@ pub(super) const XCR0_ZMM_HI256: u64 = 1 << 6;
 pub(super) const XCR0_HI16_ZMM: u64 = 1 << 7;
 /// The three AVX-512 components; xsetbv accepts all of them or none.
 pub(crate) const XCR0_AVX512: u64 = XCR0_OPMASK | XCR0_ZMM_HI256 | XCR0_HI16_ZMM;
+/// PKRU (`Cpu::pkru`, `pku.rs`). Restoring it changes what memory is accessible, so xrstor goes
+/// through `Cpu::set_pkru`.
+pub(crate) const XCR0_PKRU: u64 = 1 << 9;
 /// Components xsetbv accepts. Extending this also means extending CPUID leaf 0xD and the save
 /// area layout below, or the kernel will size its buffers for state the instructions skip.
-pub(crate) const XCR0_SUPPORTED: u64 = XCR0_X87 | XCR0_SSE | XCR0_AVX | XCR0_AVX512;
+pub(crate) const XCR0_SUPPORTED: u64 = XCR0_X87 | XCR0_SSE | XCR0_AVX | XCR0_AVX512 | XCR0_PKRU;
 
 /// The XSAVE area is the legacy image plus a 64-byte header: XSTATE_BV (8 bytes), XCOMP_BV (8)
 /// and 48 reserved bytes, all of which xrstor requires to be zero except XSTATE_BV.
@@ -50,7 +53,11 @@ const ZMM_HI256_STATE_OFFSET: u64 = 1152;
 const ZMM_HI256_STATE_SIZE: u64 = 512;
 const HI16_ZMM_STATE_OFFSET: u64 = 1664;
 const HI16_ZMM_STATE_SIZE: u64 = 1024;
-pub(super) const COMPONENTS: [Component; 4] = [
+/// PKRU right after Hi16_ZMM, where Intel and Zen 4/5 put it (component 8, PT, is supervisor
+/// state and takes no room here). The 8 bytes hold PKRU in the low 4 and zeros.
+const PKRU_STATE_OFFSET: u64 = 2688;
+const PKRU_STATE_SIZE: u64 = 8;
+pub(super) const COMPONENTS: [Component; 5] = [
     Component {
         bit: XCR0_AVX,
         index: 2,
@@ -74,6 +81,12 @@ pub(super) const COMPONENTS: [Component; 4] = [
         index: 7,
         offset: HI16_ZMM_STATE_OFFSET,
         size: HI16_ZMM_STATE_SIZE,
+    },
+    Component {
+        bit: XCR0_PKRU,
+        index: 9,
+        offset: PKRU_STATE_OFFSET,
+        size: PKRU_STATE_SIZE,
     },
 ];
 const YMM_HIGH_STRIDE: u64 = 16;
@@ -187,6 +200,9 @@ impl Cpu {
         }
         if self.zmm_extra.iter().flatten().any(|&lane| lane != 0) {
             in_use |= XCR0_HI16_ZMM;
+        }
+        if self.pkru != 0 {
+            in_use |= XCR0_PKRU;
         }
         in_use
     }
@@ -310,6 +326,7 @@ impl Cpu {
             opmask: self.opmask,
             zmm_hi: self.zmm_hi,
             zmm_extra: self.zmm_extra,
+            pkru: self.pkru,
         };
         for part in &COMPONENTS {
             match component(part.bit) {
@@ -323,6 +340,7 @@ impl Cpu {
         self.opmask = pending.opmask;
         self.zmm_hi = pending.zmm_hi;
         self.zmm_extra = pending.zmm_extra;
+        self.set_pkru(pending.pkru);
         Ok(())
     }
 
@@ -399,6 +417,10 @@ impl Cpu {
                 }
             }
         }
+        if requested & XCR0_PKRU != 0 {
+            let at = address + layout.offset(&COMPONENTS[4]);
+            self.write(at, PKRU_STATE_SIZE as u8, self.pkru as u64)?;
+        }
         Ok(())
     }
 
@@ -427,6 +449,7 @@ impl Cpu {
                     pending.zmm_hi[k] = [self.read128(at)?, self.read128(at + 16)?];
                 }
             }
+            XCR0_PKRU => pending.pkru = self.read(base, 4)? as u32,
             _ => {
                 for k in 0..pending.zmm_extra.len() {
                     let at = base + k as u64 * HI16_ZMM_STRIDE;
@@ -447,11 +470,13 @@ struct VectorState {
     opmask: [u64; 8],
     zmm_hi: [[u128; 2]; 16],
     zmm_extra: [[u128; 4]; 16],
+    pkru: u32,
 }
 
 impl VectorState {
     fn initialize(&mut self, bit: u64) {
         match bit {
+            XCR0_PKRU => self.pkru = 0,
             XCR0_AVX => self.ymm_hi = [0; 16],
             XCR0_OPMASK => self.opmask = [0; 8],
             XCR0_ZMM_HI256 => self.zmm_hi = [[0; 2]; 16],
@@ -839,10 +864,12 @@ mod tests {
         assert_eq!(u128_at(COMPACT_ZMM_HI256 + 32 * 7), pattern(207));
         assert_eq!(u128_at(COMPACT_ZMM_HI256 + 32 * 7 + 16), pattern(307));
         assert_eq!(u128_at(COMPACT_HI16_ZMM + 64 * 15 + 48), pattern(715));
+        // PKRU (zero here) closes the area
+        assert_eq!(h.read_u64(AREA + COMPACT_HI16_ZMM + HI16_ZMM_STATE_SIZE), 0);
         // and the standard format would have used more room
         assert_eq!(
             compacted_area_size(ALL_COMPONENTS) as u64,
-            COMPACT_HI16_ZMM + HI16_ZMM_STATE_SIZE
+            COMPACT_HI16_ZMM + HI16_ZMM_STATE_SIZE + PKRU_STATE_SIZE
         );
         assert!(compacted_area_size(ALL_COMPONENTS) < enabled_area_size(ALL_COMPONENTS));
     }
@@ -1036,7 +1063,10 @@ mod tests {
             h.cpu.gpr[RAX] as u32, 0xf,
             "xsaveopt, xsavec, xgetbv1, xsaves"
         );
-        assert_eq!(h.cpu.gpr[RBX], COMPACT_HI16_ZMM + HI16_ZMM_STATE_SIZE);
+        assert_eq!(
+            h.cpu.gpr[RBX],
+            COMPACT_HI16_ZMM + HI16_ZMM_STATE_SIZE + PKRU_STATE_SIZE
+        );
         assert_eq!((h.cpu.gpr[RCX], h.cpu.gpr[RDX]), (0, 0), "no IA32_XSS bits");
         h.cpu.xcr0 = XCR0_X87 | XCR0_SSE;
         h.cpu.gpr[RAX] = 0xd;

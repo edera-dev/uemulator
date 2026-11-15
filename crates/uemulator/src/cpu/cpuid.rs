@@ -22,9 +22,10 @@
 //!   and no Intel leaf 7 EDX bits or IA32_ARCH_CAPABILITIES. Linux then reports Spectre v2 as
 //!   "Enhanced / Automatic IBRS", speculative store bypass as "disabled via prctl" (Turin has no
 //!   SSB_NO) and VMSCAPE as "IBPB before exit to userspace" (only after running a KVM guest).
-//! - 40 physical and 48 virtual address bits, not 52 and 57.
 
-use super::sys::{CR4_OSXSAVE, PHYSICAL_ADDRESS_BITS, RAX, RBX, RCX, RDX, VIRTUAL_ADDRESS_BITS};
+use super::sys::{
+    CR4_OSXSAVE, CR4_PKE, PHYSICAL_ADDRESS_BITS, RAX, RBX, RCX, RDX, VIRTUAL_ADDRESS_BITS,
+};
 use super::{Cpu, xsave};
 
 /// Where this logical processor sits. The defaults describe a machine with one CPU. SMP is not
@@ -306,6 +307,9 @@ const STRUCTURED_EBX: u32 = STRUCTURED_FEATURE_FSGSBASE
 // Leaf 7 subleaf 0 ECX. GFNI, VAES and VPCLMULQDQ also cover the legacy and VEX encodings.
 const STRUCTURED_ECX_AVX512_VBMI: u32 = 1 << 1;
 const STRUCTURED_ECX_UMIP: u32 = 1 << 2;
+/// Protection keys for user pages and rdpkru/wrpkru (`pku.rs`); OSPKE (bit 4) follows CR4.PKE.
+const STRUCTURED_ECX_PKU: u32 = 1 << 3;
+const STRUCTURED_ECX_OSPKE: u32 = 1 << 4;
 const STRUCTURED_ECX_AVX512_VBMI2: u32 = 1 << 6;
 const STRUCTURED_ECX_GFNI: u32 = 1 << 8;
 const STRUCTURED_ECX_VAES: u32 = 1 << 9;
@@ -313,6 +317,8 @@ const STRUCTURED_ECX_VPCLMULQDQ: u32 = 1 << 10;
 const STRUCTURED_ECX_AVX512_VNNI: u32 = 1 << 11;
 const STRUCTURED_ECX_AVX512_BITALG: u32 = 1 << 12;
 const STRUCTURED_ECX_AVX512_VPOPCNTDQ: u32 = 1 << 14;
+/// 5-level paging and 57-bit linear addresses (CR4.LA57). Linux turns it on by itself.
+const STRUCTURED_ECX_LA57: u32 = 1 << 16;
 /// rdpid: IA32_TSC_AUX into a register.
 const STRUCTURED_ECX_RDPID: u32 = 1 << 22;
 /// movdiri and movdir64b (Zen 5): direct stores of a register and of 64 bytes (`sse_ext.rs`).
@@ -320,6 +326,7 @@ const STRUCTURED_ECX_MOVDIRI: u32 = 1 << 27;
 const STRUCTURED_ECX_MOVDIR64B: u32 = 1 << 28;
 const STRUCTURED_ECX: u32 = STRUCTURED_ECX_AVX512_VBMI
     | STRUCTURED_ECX_UMIP
+    | STRUCTURED_ECX_PKU
     | STRUCTURED_ECX_AVX512_VBMI2
     | STRUCTURED_ECX_GFNI
     | STRUCTURED_ECX_VAES
@@ -327,6 +334,7 @@ const STRUCTURED_ECX: u32 = STRUCTURED_ECX_AVX512_VBMI
     | STRUCTURED_ECX_AVX512_VNNI
     | STRUCTURED_ECX_AVX512_BITALG
     | STRUCTURED_ECX_AVX512_VPOPCNTDQ
+    | STRUCTURED_ECX_LA57
     | STRUCTURED_ECX_RDPID
     | STRUCTURED_ECX_MOVDIRI
     | STRUCTURED_ECX_MOVDIR64B;
@@ -715,7 +723,12 @@ impl Cpu {
                 0 => (
                     STRUCTURED_MAX_SUBLEAF,
                     STRUCTURED_EBX,
-                    STRUCTURED_ECX,
+                    STRUCTURED_ECX
+                        | if self.cr4 & CR4_PKE != 0 {
+                            STRUCTURED_ECX_OSPKE
+                        } else {
+                            0
+                        },
                     STRUCTURED_EDX,
                 ),
                 1 => (
@@ -768,7 +781,8 @@ impl Cpu {
                     xsave::XSS_SUPPORTED as u32,
                     (xsave::XSS_SUPPORTED >> 32) as u32,
                 ),
-                // Components 2 (AVX) and 5-7 (AVX-512): size and offset in the standard format
+                // Components 2 (AVX), 5-7 (AVX-512) and 9 (PKRU): size and offset in the
+                // standard format
                 _ => match xsave::COMPONENTS.iter().find(|part| part.index == subleaf) {
                     Some(part) => (part.size as u32, part.offset as u32, 0, 0),
                     None => (0, 0, 0, 0),
