@@ -602,6 +602,9 @@ const EXT_ADDRESS_IBRS_SAME_MODE: u32 = 1 << 19;
 const EXT_ADDRESS_EFER_LMSLE_MBZ: u32 = 1 << 20;
 /// IA32_SPEC_CTRL bit 2.
 const EXT_ADDRESS_SSBD: u32 = 1 << 24;
+/// MSR-based CPPC (`cppc.rs`, 0xC001_02B0..=0xC001_02B4), which the `_CPC` of every processor
+/// device points at. Without it Linux's amd_pstate looks for shared-memory CPPC instead.
+const EXT_ADDRESS_CPPC: u32 = 1 << 27;
 /// IA32_SPEC_CTRL bit 7, predictive store forwarding disable.
 const EXT_ADDRESS_PSFD: u32 = 1 << 28;
 /// Not affected by branch type confusion (Retbleed on AMD); Linux would otherwise consult its
@@ -619,6 +622,7 @@ const EXT_ADDRESS_EBX: u32 = EXT_ADDRESS_CLZERO
     | EXT_ADDRESS_IBRS_SAME_MODE
     | EXT_ADDRESS_EFER_LMSLE_MBZ
     | EXT_ADDRESS_SSBD
+    | EXT_ADDRESS_CPPC
     | EXT_ADDRESS_PSFD
     | EXT_ADDRESS_BTC_NO
     | EXT_ADDRESS_IBPB_RET;

@@ -1,13 +1,17 @@
 //! The DSDT, assembled term by term from `aml`. What it holds is the smallest namespace Linux
 //! (and Windows) need on this machine: the PCI root bridge with its interrupt routing and `_OSC`, the legacy
 //! devices a PC has, a system-resources device that claims the ports and the ECAM window the
-//! other tables mention, and `\_S5` for power-off.
+//! other tables mention, one processor device per vCPU with its `_CPC`, and `\_S5` for
+//! power-off.
 #[cfg(freestanding)]
 use crate::prelude::*;
 
 use super::aml::{self, resource};
+use crate::cpu::cppc;
 use crate::dev::acpi_pm::{PM_LAST_PORT, PM1_EVENT_BASE, SLEEP_TYPE_S5};
-use crate::dev::pci::{ECAM_BASE, ECAM_BYTES_PER_BUS, MMIO_BASE, PCI_MMIO_WINDOW_BYTES};
+use crate::dev::pci::{
+    ECAM_BASE, ECAM_BYTES_PER_BUS, MMIO_BASE, PCI_MMIO_WINDOW_BYTES, virtio_slot,
+};
 use crate::dev::tpm::{TPM_CRB_BASE, TPM_CRB_SIZE};
 
 const DSDT_REVISION: u8 = 2;
@@ -27,9 +31,9 @@ const VGA_WINDOW_FIRST: u32 = 0xa_0000;
 const VGA_WINDOW_LAST: u32 = 0xb_ffff;
 const PCI_ROOT_BUS: u8 = 0;
 
-const COM1_PORT: u16 = 0x3f8;
+pub(super) const COM1_PORT: u16 = 0x3f8;
 const COM1_PORTS: u8 = 8;
-const COM1_IRQ: u8 = 4;
+pub(super) const COM1_IRQ: u8 = 4;
 const RTC_PORT: u16 = 0x70;
 const RTC_PORTS: u8 = 2;
 const PIC_PORTS: [(u16, u8); 2] = [(0x20, 2), (0xa0, 2)];
@@ -79,7 +83,7 @@ fn pci_routing_table(irq_of_slot: &[u8]) -> Vec<u8> {
         .iter()
         .enumerate()
         .map(|(index, irq)| {
-            let slot = index as u32 + 1;
+            let slot = virtio_slot(index) as u32;
             aml::package(&[
                 aml::integer((slot << PCI_SLOT_SHIFT | ADDRESS_ALL_FUNCTIONS) as u64),
                 aml::integer(PIN_INTA),
@@ -231,8 +235,116 @@ fn tpm() -> Vec<u8> {
     aml::device("TPM", &body)
 }
 
-/// `irq_of_slot[i]` is the GSI of the function in slot `i + 1`.
-pub(super) fn dsdt(irq_of_slot: &[u8], has_tpm: bool) -> Vec<u8> {
+/// Address space ids of a Generic Address Structure: system memory (with everything else zero,
+/// the "null register" `_CPC` uses for what is not implemented) and functional fixed hardware,
+/// which on x86 Linux reads as an MSR (`cpc_read_ffh`: address = MSR number, bit offset and
+/// width = the field).
+const SPACE_SYSTEM_MEMORY: u8 = 0;
+const SPACE_FIXED_HARDWARE: u8 = 0x7f;
+/// Access size 4 (qword) on every FFH register, as AMD firmware writes them.
+const ACCESS_QWORD: u8 = 4;
+const BITS_PER_MSR: u8 = 64;
+/// The counters `_CPC` names as reference (counts at the nominal rate) and delivered
+/// performance. Implemented elsewhere (IA32_MPERF / IA32_APERF); only referenced by number here.
+const MSR_MPERF: u64 = 0xe7;
+const MSR_APERF: u64 = 0xe8;
+/// `_CPC` revision 3 (ACPI 6.2 and later): 23 entries counting NumEntries and Revision.
+const CPC_REVISION: u64 = 3;
+const CPC_ENTRIES: u64 = 23;
+/// "The platform picks the level between minimum and maximum" while desired performance is 0,
+/// which is what REQUEST holds out of reset.
+const CPC_AUTONOMOUS_SELECTION: u64 = 1;
+/// Counter wraparound time 0: unknown (the 64-bit counters do not wrap in practice).
+const CPC_COUNTER_WRAPAROUND_UNKNOWN: u64 = 0;
+/// One `Device (Cxxx)` per processor, named by its UID in hex.
+const PROCESSOR_NAME_LIMIT: u32 = 0x1000;
+const PROCESSOR_HID: &str = "ACPI0007";
+/// The shared `_CPC` package every processor's method returns.
+const CPC_PACKAGE_PATH: &str = "\\_SB.CPCT";
+const CPC_PACKAGE_NAME: &str = "CPCT";
+
+fn register_buffer(space: u8, bit_width: u8, bit_offset: u8, address: u64, access: u8) -> Vec<u8> {
+    aml::buffer(&resource::template(&[resource::register(
+        space, bit_width, bit_offset, address, access,
+    )]))
+}
+
+fn null_register() -> Vec<u8> {
+    register_buffer(SPACE_SYSTEM_MEMORY, 0, 0, 0, 0)
+}
+
+fn msr_field(msr: u32, shift: u8, bits: u8) -> Vec<u8> {
+    register_buffer(SPACE_FIXED_HARDWARE, bits, shift, msr as u64, ACCESS_QWORD)
+}
+
+/// The `_CPC` package (ACPI 6.5 8.4.6.1), in entry order. Every register is a field of the CPPC
+/// MSRs (`cpu/cppc.rs`); MSRs are per processor by nature, so one package serves them all.
+/// Linux's `acpi_cppc_processor_probe` accepts revision 3 only with exactly 23 entries, and
+/// without a `\_SB._OSC` it accepts the table because CPUID advertises MSR CPPC.
+fn cpc_package() -> Vec<u8> {
+    let capability = |shift| {
+        msr_field(
+            cppc::MSR_CPPC_CAPABILITY_1,
+            shift,
+            cppc::PERFORMANCE_FIELD_BITS,
+        )
+    };
+    let request = |shift| msr_field(cppc::MSR_CPPC_REQUEST, shift, cppc::PERFORMANCE_FIELD_BITS);
+    let counter =
+        |msr: u64| register_buffer(SPACE_FIXED_HARDWARE, BITS_PER_MSR, 0, msr, ACCESS_QWORD);
+    let entries = [
+        aml::integer(CPC_ENTRIES),
+        aml::integer(CPC_REVISION),
+        capability(cppc::HIGHEST_SHIFT),
+        capability(cppc::NOMINAL_SHIFT),
+        capability(cppc::LOWEST_NONLINEAR_SHIFT),
+        capability(cppc::LOWEST_SHIFT),
+        null_register(), // guaranteed performance
+        request(cppc::REQUEST_DESIRED_SHIFT),
+        request(cppc::REQUEST_MINIMUM_SHIFT),
+        request(cppc::REQUEST_MAXIMUM_SHIFT),
+        null_register(), // performance reduction tolerance
+        null_register(), // time window
+        aml::integer(CPC_COUNTER_WRAPAROUND_UNKNOWN),
+        counter(MSR_MPERF),
+        counter(MSR_APERF),
+        null_register(), // performance limited
+        msr_field(cppc::MSR_CPPC_ENABLE, 0, 1),
+        aml::integer(CPC_AUTONOMOUS_SELECTION),
+        null_register(), // autonomous activity window
+        request(cppc::REQUEST_ENERGY_PREFERENCE_SHIFT),
+        null_register(), // reference performance: the nominal level
+        aml::integer(cppc::LOWEST_FREQUENCY_MHZ as u64),
+        aml::integer(cppc::NOMINAL_FREQUENCY_MHZ as u64),
+    ];
+    debug_assert_eq!(entries.len() as u64, CPC_ENTRIES);
+    aml::package(&entries)
+}
+
+/// `Device (Cxxx) { Name (_HID, "ACPI0007") Name (_UID, uid) Method (_CPC) { Return (CPCT) } }`
+/// for every processor. The UID is the ACPI processor UID of its MADT entry (the processor's
+/// index, `tables::madt`), which is how Linux pairs the device with its CPU.
+fn processors(cpus: u32) -> Vec<u8> {
+    assert!(
+        cpus <= PROCESSOR_NAME_LIMIT,
+        "processor names are three hex digits"
+    );
+    let mut out = aml::named(CPC_PACKAGE_NAME, &cpc_package());
+    for uid in 0..cpus {
+        let mut body = aml::named("_HID", &aml::string(PROCESSOR_HID));
+        body.extend(aml::named("_UID", &aml::integer(uid as u64)));
+        body.extend(aml::method(
+            "_CPC",
+            0,
+            &aml::return_value(&aml::name_ref(CPC_PACKAGE_PATH)),
+        ));
+        out.extend(aml::device(&format!("C{uid:03X}"), &body));
+    }
+    out
+}
+
+/// `irq_of_slot[i]` is the GSI of the `i`-th virtio function (`pci::virtio_slot(i)`).
+pub(super) fn dsdt(irq_of_slot: &[u8], cpus: u32, has_tpm: bool) -> Vec<u8> {
     let mut system_bus = pci_root_bridge(irq_of_slot);
     system_bus.extend(legacy_device(
         "COM1",
@@ -262,6 +374,7 @@ pub(super) fn dsdt(irq_of_slot: &[u8], has_tpm: bool) -> Vec<u8> {
     if has_tpm {
         system_bus.extend(tpm());
     }
+    system_bus.extend(processors(cpus));
     let mut body = aml::scope("\\_SB", &system_bus);
     body.extend(sleep_states());
     super::tables::table(b"DSDT", DSDT_REVISION, &body)

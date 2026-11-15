@@ -93,7 +93,12 @@ fn every_table_has_a_valid_checksum_and_length_and_both_roots_agree() {
         .collect();
     let tables = xsdt_tables(&ram);
     let names: Vec<&str> = tables.iter().map(|(name, _)| name.as_str()).collect();
-    assert_eq!(names, ["FACP", "APIC", "MCFG", "HPET", "IVRS"]);
+    assert_eq!(
+        names,
+        [
+            "FACP", "APIC", "MCFG", "HPET", "SRAT", "SLIT", "SPCR", "IVRS"
+        ]
+    );
     assert_eq!(rsdt_entries.len(), tables.len());
     for (_, table) in &tables {
         assert!(checksum_ok(table), "{:?}", &table[..4]);
@@ -107,7 +112,11 @@ fn every_table_has_a_valid_checksum_and_length_and_both_roots_agree() {
 
 #[test]
 fn tables_stay_inside_the_region_and_do_not_overlap() {
-    let image = build(&config(255, 31, true)).unwrap();
+    let image = build(
+        &config(255, crate::dev::pci::MAX_VIRTIO_FUNCTIONS, true),
+        REGION_BASE + REGION_BYTES,
+    )
+    .unwrap();
     assert!(image.len() as u64 <= REGION_BYTES);
 }
 
@@ -157,6 +166,7 @@ fn fadt_describes_the_pm_blocks_reset_register_and_starts_acpi_enabled() {
     let fadt = find(&ram, "FACP");
     assert_eq!(fadt.len(), 276);
     assert_eq!(fadt[8], 6, "revision");
+    assert_eq!(fadt[45], 4, "preferred PM profile: enterprise server");
     assert_eq!(
         u32_at(fadt, 48),
         0,
@@ -561,4 +571,223 @@ fn a_tpm_adds_the_tpm2_table_and_its_device() {
             "{expected} in {names:?}"
         );
     }
+}
+
+#[test]
+fn ivrs_and_prt_skip_the_fch_and_data_fabric_slots() {
+    let functions = 0x17;
+    let ram = ram_with_tables(&config(1, functions, true));
+    let ivrs = find(&ram, "IVRS");
+    let select = |devfn: u16| {
+        let mut entry = vec![0x02];
+        entry.extend_from_slice(&devfn.to_le_bytes());
+        entry.push(0);
+        ivrs.windows(4).any(|window| window == entry)
+    };
+    assert!(select(0x17 << 3));
+    assert!(!select(0x18 << 3), "00:18.0 is the data fabric");
+    assert!(select(0x19 << 3), "the 23rd virtio function");
+    let fadt = find(&ram, "FACP");
+    let dsdt = table_at(&ram, u32_at(fadt, 40) as u64);
+    let prt_address = |slot: u32| {
+        let mut entry = vec![0x0c];
+        entry.extend_from_slice(&(slot << 16 | 0xffff).to_le_bytes());
+        dsdt.windows(5).any(|window| window == entry)
+    };
+    assert!(prt_address(0x17) && prt_address(0x19));
+    assert!(!prt_address(0x14) && !prt_address(0x18));
+}
+
+fn srat_entries(srat: &[u8]) -> Vec<(u8, &[u8])> {
+    let mut entries = Vec::new();
+    let mut at = HEADER_LENGTH + 12;
+    while at < srat.len() {
+        let length = srat[at + 1] as usize;
+        entries.push((srat[at], &srat[at..at + length]));
+        at += length;
+    }
+    assert_eq!(at, srat.len());
+    entries
+}
+
+fn entries_of_kind<'a>(entries: &[(u8, &'a [u8])], kind: u8) -> Vec<&'a [u8]> {
+    entries
+        .iter()
+        .filter(|(entry_kind, _)| *entry_kind == kind)
+        .map(|(_, entry)| *entry)
+        .collect()
+}
+
+#[test]
+fn srat_puts_every_processor_and_all_ram_in_node_zero() {
+    let ram = ram_with_tables(&config(3, 0, false));
+    let srat = find(&ram, "SRAT");
+    assert_eq!(srat[8], 3, "revision");
+    assert_eq!(u32_at(srat, HEADER_LENGTH), 1, "reserved, must be 1");
+    let entries = srat_entries(srat);
+    let processors = entries_of_kind(&entries, 0);
+    assert_eq!(processors.len(), 3);
+    for (cpu, entry) in processors.iter().enumerate() {
+        assert_eq!(entry.len(), 16);
+        assert_eq!(entry[2], 0, "domain bits 7:0");
+        assert_eq!(entry[3] as usize, cpu, "APIC id as in the MADT");
+        assert_eq!(u32_at(entry, 4), 1, "enabled");
+        assert_eq!(&entry[9..12], [0, 0, 0], "domain bits 31:8");
+    }
+    let memory = entries_of_kind(&entries, 1);
+    assert_eq!(memory.len(), 1, "no RAM above 4 GiB in this test");
+    assert_eq!(memory[0].len(), 40);
+    assert_eq!(u32_at(memory[0], 2), 0, "domain");
+    assert_eq!(u64_at(memory[0], 8), 0, "base");
+    assert_eq!(u64_at(memory[0], 16), ram.len() as u64, "length");
+    assert_eq!(u32_at(memory[0], 28), 1, "enabled, not hot-pluggable");
+}
+
+#[test]
+fn srat_covers_the_ram_on_both_sides_of_the_pci_hole_and_x2apic_processors() {
+    let flat_len = crate::ram::flat_bytes(4 << 30);
+    let image = build(&config(300, 0, false), flat_len).unwrap();
+    let srat_at = image.windows(4).position(|w| w == b"SRAT").unwrap();
+    let srat = &image[srat_at..srat_at + u32_at(&image, srat_at + 4) as usize];
+    assert!(checksum_ok(srat));
+    let entries = srat_entries(srat);
+    let memory: Vec<(u64, u64)> = entries_of_kind(&entries, 1)
+        .iter()
+        .map(|entry| (u64_at(entry, 8), u64_at(entry, 16)))
+        .collect();
+    let hole = crate::ram::PCI_HOLE_START;
+    assert_eq!(memory, [(0, hole), (1 << 32, (4 << 30) - hole)]);
+    let x2apic = entries_of_kind(&entries, 2);
+    assert_eq!(x2apic.len(), 300 - 255);
+    assert_eq!(x2apic[0].len(), 24);
+    assert_eq!(u32_at(x2apic[0], 4), 0, "domain");
+    assert_eq!(u32_at(x2apic[0], 8), 255, "x2APIC id");
+    assert_eq!(u32_at(x2apic[0], 12), 1, "enabled");
+}
+
+#[test]
+fn slit_has_the_local_distance_for_the_one_node() {
+    let ram = ram_with_tables(&config(1, 0, false));
+    let slit = find(&ram, "SLIT");
+    assert_eq!(slit.len(), HEADER_LENGTH + 8 + 1);
+    assert_eq!(u64_at(slit, HEADER_LENGTH), 1);
+    assert_eq!(slit[HEADER_LENGTH + 8], 10);
+}
+
+#[test]
+fn spcr_describes_com1() {
+    let ram = ram_with_tables(&config(1, 0, false));
+    let spcr = find(&ram, "SPCR");
+    assert_eq!(spcr.len(), 80);
+    assert_eq!(spcr[8], 2, "revision");
+    assert_eq!(spcr[36], 0, "16550");
+    assert_eq!(
+        &spcr[40..44],
+        [1, 8, 0, 1],
+        "system I/O, 8 bits, byte access"
+    );
+    assert_eq!(u64_at(spcr, 44), 0x3f8);
+    assert_eq!(spcr[52], 0b11, "8259 and I/O APIC");
+    assert_eq!(spcr[53], 4, "IRQ");
+    assert_eq!(u32_at(spcr, 54), 4, "GSI");
+    assert_eq!(spcr[58], 7, "115200 baud");
+    assert_eq!(spcr[60], 1, "one stop bit");
+    assert_eq!(u16_at(spcr, 64), 0xffff, "not a PCI device");
+}
+
+#[test]
+fn every_processor_has_a_device_with_its_madt_uid_and_a_cpc() {
+    let names = dsdt_names_of(&config(3, 0, false));
+    for cpu in 0..3 {
+        for object in ["_HID", "_UID", "_CPC"] {
+            let expected = format!("._SB_.C{cpu:03X}.{object}");
+            assert!(names.contains(&expected), "{expected} in {names:?}");
+        }
+    }
+    assert!(!names.iter().any(|name| name.starts_with("._SB_.C003")));
+    assert!(names.iter().any(|name| name == "._SB_.CPCT"));
+    let ram = ram_with_tables(&config(3, 0, false));
+    let fadt = find(&ram, "FACP");
+    let dsdt = table_at(&ram, u32_at(fadt, 40) as u64);
+    let contains = |needle: &[u8]| dsdt.windows(needle.len()).any(|window| window == needle);
+    // Device (C002) { Name (_HID, "ACPI0007") Name (_UID, 2) ...
+    assert!(contains(b"C002\x08_HID\x0dACPI0007\x00\x08_UID\x0a\x02"));
+    // Method (_CPC, 0) { Return (\_SB.CPCT) }
+    assert!(contains(b"_CPC\x00\xa4\\\x2e_SB_CPCT"));
+}
+
+/// The elements of the package `\_SB.CPCT`, each as its encoded bytes.
+fn cpc_elements(dsdt: &[u8]) -> Vec<&[u8]> {
+    let name = dsdt.windows(5).position(|w| w == b"\x08CPCT").unwrap();
+    let at = name + 5;
+    assert_eq!(dsdt[at], 0x12, "a package");
+    let (_, prefix) = package_length(dsdt, at + 1);
+    let count = dsdt[at + 1 + prefix] as usize;
+    let mut cursor = at + 2 + prefix;
+    let mut elements = Vec::new();
+    for _ in 0..count {
+        let length = data_length(dsdt, cursor);
+        elements.push(&dsdt[cursor..cursor + length]);
+        cursor += length;
+    }
+    elements
+}
+
+/// The Generic Register descriptor inside a `Buffer` element: (space, width, offset, access,
+/// address).
+fn register_of(element: &[u8]) -> (u8, u8, u8, u8, u64) {
+    assert_eq!(element[0], 0x11, "a buffer");
+    let descriptor = element
+        .windows(3)
+        .position(|w| w == [0x82, 0x0c, 0x00])
+        .unwrap();
+    let r = &element[descriptor + 3..];
+    (r[0], r[1], r[2], r[3], u64_at(r, 4))
+}
+
+#[test]
+fn cpc_is_revision_3_and_points_at_the_cppc_msrs() {
+    use crate::cpu::cppc::*;
+    const FFH: u8 = 0x7f;
+    let ram = ram_with_tables(&config(1, 0, false));
+    let fadt = find(&ram, "FACP");
+    let dsdt = table_at(&ram, u32_at(fadt, 40) as u64);
+    let elements = cpc_elements(dsdt);
+    assert_eq!(elements.len(), 23);
+    assert_eq!(elements[0], [0x0a, 23], "NumEntries");
+    assert_eq!(elements[1], [0x0a, 3], "Revision");
+    let field = |msr: u32, offset: u8, width: u8| (FFH, width, offset, 4, msr as u64);
+    let capability = MSR_CPPC_CAPABILITY_1;
+    let request = MSR_CPPC_REQUEST;
+    let cases = [
+        (2, field(capability, 24, 8), "highest"),
+        (3, field(capability, 16, 8), "nominal"),
+        (4, field(capability, 8, 8), "lowest nonlinear"),
+        (5, field(capability, 0, 8), "lowest"),
+        (7, field(request, 16, 8), "desired"),
+        (8, field(request, 8, 8), "minimum"),
+        (9, field(request, 0, 8), "maximum"),
+        (13, (FFH, 64, 0, 4, 0xe7), "reference: MPERF"),
+        (14, (FFH, 64, 0, 4, 0xe8), "delivered: APERF"),
+        (16, field(MSR_CPPC_ENABLE, 0, 1), "enable"),
+        (19, field(request, 24, 8), "energy preference"),
+    ];
+    for (index, register, what) in cases {
+        assert_eq!(register_of(elements[index]), register, "{what}");
+    }
+    // Unimplemented registers are the null register Linux's IS_NULL_REG recognizes.
+    for unsupported in [6, 10, 11, 15, 18, 20] {
+        assert_eq!(
+            register_of(elements[unsupported]),
+            (0, 0, 0, 0, 0),
+            "{unsupported}"
+        );
+    }
+    let integer = |element: &[u8]| match element[0] {
+        0x0a => element[1] as u64,
+        0x0b => u16_at(element, 1) as u64,
+        other => panic!("integer opcode {other:#x}"),
+    };
+    assert_eq!(integer(elements[21]), LOWEST_FREQUENCY_MHZ as u64);
+    assert_eq!(integer(elements[22]), NOMINAL_FREQUENCY_MHZ as u64);
 }

@@ -3,6 +3,7 @@ use crate::prelude::*;
 pub(crate) mod acpi_pm;
 pub(crate) mod apic;
 pub(crate) mod bootfb;
+pub(crate) mod data_fabric;
 pub(crate) mod guestmem;
 pub(crate) mod handle;
 pub(crate) mod hpet;
@@ -148,9 +149,9 @@ const CMOS_STATUS_D_VALUE: u8 = 0x80;
 /// Requester ids the IOMMU sees for interrupts that do not come from a PCI function. Linux's
 /// AMD IOMMU driver insists on finding an I/O APIC at the "southbridge" id 00:14.0 in the IVRS
 /// (`IOAPIC_SB_DEVID`) and turns interrupt remapping off otherwise; the HPET gets the next
-/// function. A virtio function in slot 0x14 (the 20th) would share the IOAPIC's table entry,
-/// which still works because both only need the same interrupt table. Must match the IVRS
-/// special-device entries (`acpi`).
+/// function. Slot 0x14 holds no PCI function (`pci::virtio_slot` skips it), so these ids have
+/// their device table entries to themselves. Must match the IVRS special-device entries
+/// (`acpi`).
 pub(crate) const IOAPIC_REQUESTER: u16 = 0x00a0;
 pub(crate) const HPET_REQUESTER: u16 = 0x00a1;
 
@@ -207,7 +208,7 @@ pub(crate) struct DevConfig {
     pub input: Option<InputHandle>,
 }
 
-/// Most virtio functions one machine can hold (PCI slots 1..=31).
+/// Most virtio functions one machine can hold (PCI slots 1..=31 but the reserved ones).
 pub(crate) const MAX_VIRTIO_FUNCTIONS: usize = pci::MAX_VIRTIO_FUNCTIONS;
 /// The BARs the virtio functions are given, for the firmware's memory map.
 pub(crate) const PCI_MMIO_BASE: u64 = pci::MMIO_BASE;
@@ -1961,7 +1962,7 @@ mod tests {
     fn pci_config_space_is_reachable_through_the_ports() {
         let mut dev = bus_with_pci();
         out(&mut dev, PCI_CONFIG_PORT_FIRST, 4, pci_address(0, 0));
-        assert_eq!(inp(&mut dev, 0xcfc, 4), 0x1237_8086);
+        assert_eq!(inp(&mut dev, 0xcfc, 4), 0x153a_1022);
         out(&mut dev, PCI_CONFIG_PORT_FIRST, 4, pci_address(1, 0));
         assert_eq!(inp(&mut dev, CONFIG_DATA_PORT, 2), VIRTIO_VENDOR);
         assert_eq!(inp(&mut dev, CONFIG_DATA_PORT + 2, 2), 0x1043);
@@ -2601,7 +2602,7 @@ mod tests {
                 "slot {slot} register {register:#x}"
             );
         }
-        assert_eq!(dev.mmio_read(pci::ECAM_BASE, 2), Some(0x8086));
+        assert_eq!(dev.mmio_read(pci::ECAM_BASE, 2), Some(0x1022));
         assert_eq!(
             dev.mmio_read(pci::ECAM_BASE + (1 << 15), 2),
             Some(VIRTIO_VENDOR as u64)

@@ -4,7 +4,8 @@
 //! 0xE0000..0xFFFFF).
 //!
 //! The set is RSDP (rev 2), RSDT, XSDT, FACS, FADT (rev 6, full hardware, no SMI_CMD so ACPI
-//! starts enabled), DSDT, MADT, MCFG, HPET and, with the IOMMU, IVRS, and with the TPM, TPM2. `docs/plans/18-xen-dom0.md` and
+//! starts enabled), DSDT, MADT, MCFG, HPET, SRAT and SLIT (one NUMA node), SPCR and, with the
+//! IOMMU, IVRS, and with the TPM, TPM2. `docs/plans/18-xen-dom0.md` and
 //! `docs/plans/07-devices.md` describe the devices the tables point at.
 #[cfg(freestanding)]
 use crate::prelude::*;
@@ -16,7 +17,7 @@ mod tables;
 mod tests;
 
 use crate::dev::iommu::{self, IvrsTopology, SpecialDevice};
-use crate::dev::pci::{ECAM_BASE, ECAM_BYTES_PER_BUS, LEGACY_IRQS};
+use crate::dev::pci::{ECAM_BASE, ECAM_BYTES_PER_BUS, LEGACY_IRQS, virtio_slot};
 use crate::dev::{HPET_REQUESTER, IOAPIC_REQUESTER, ioapic::IOAPIC_ID};
 use crate::machine::Error;
 use crate::ram::RamSpan;
@@ -32,7 +33,10 @@ const TABLE_ALIGNMENT: usize = 16;
 const FACS_ALIGNMENT: usize = 64;
 const PCI_HOST_BRIDGE_DEVFN: u16 = 0;
 const PCI_SLOT_SHIFT: u32 = 3;
-const FIRST_VIRTIO_SLOT: u16 = 1;
+/// Proximity domains in SRAT and SLIT. Every processor and all RAM are in node 0, which is also
+/// what CPUID 0x8000_001E ECX (node id 0, one node per processor) says.
+const NUMA_NODES: usize = 1;
+const NODE_OF_EVERYTHING: u32 = 0;
 
 /// What the tables describe about this machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,7 +93,7 @@ fn pci_interrupt_gsis(functions: usize) -> Vec<u8> {
 fn ivrs(config: &AcpiConfig) -> Vec<u8> {
     let mut pci_devices = vec![PCI_HOST_BRIDGE_DEVFN, iommu::REQUESTER_ID];
     pci_devices.extend(
-        (0..config.pci_functions).map(|index| (FIRST_VIRTIO_SLOT + index as u16) << PCI_SLOT_SHIFT),
+        (0..config.pci_functions).map(|index| (virtio_slot(index) as u16) << PCI_SLOT_SHIFT),
     );
     // Linux sizes the IOMMU's device table from the highest device id in the select and range
     // entries only, not the special ones: without these two the table would end below the
@@ -108,14 +112,28 @@ fn ivrs(config: &AcpiConfig) -> Vec<u8> {
     })
 }
 
-/// The whole region as it must appear at `REGION_BASE`, RSDP first.
-pub(crate) fn build(config: &AcpiConfig) -> Result<Vec<u8>, Error> {
+/// The RAM of a guest whose flat buffer is `flat_len` bytes, as SRAT memory ranges: below the
+/// PCI hole and from 4 GiB up.
+fn memory_affinity(flat_len: u64) -> Vec<(u32, u64, u64)> {
+    let mut ranges = vec![(NODE_OF_EVERYTHING, 0, crate::ram::low_ram_end(flat_len))];
+    let high_end = crate::ram::high_ram_end(flat_len);
+    if high_end != 0 {
+        let high_start = crate::ram::PCI_HOLE_END;
+        ranges.push((NODE_OF_EVERYTHING, high_start, high_end - high_start));
+    }
+    ranges
+}
+
+/// The whole region as it must appear at `REGION_BASE`, RSDP first, for a guest whose RAM
+/// buffer is `flat_len` bytes.
+pub(crate) fn build(config: &AcpiConfig, flat_len: u64) -> Result<Vec<u8>, Error> {
     let mut region = Region {
         image: vec![0; tables::RSDP_LENGTH],
     };
     let facs = region.place_aligned(&tables::facs(), FACS_ALIGNMENT);
     let dsdt = region.place(&dsdt::dsdt(
         &pci_interrupt_gsis(config.pci_functions),
+        config.cpus,
         config.tpm,
     ));
     let fadt = region.place(&tables::fadt(dsdt, facs));
@@ -126,6 +144,13 @@ pub(crate) fn build(config: &AcpiConfig) -> Result<Vec<u8>, Error> {
     entries.push(region.place(&tables::madt(config.cpus, &level_irqs)));
     entries.push(region.place(&tables::mcfg(ECAM_BASE, 0, 0)));
     entries.push(region.place(&tables::hpet()));
+    entries.push(region.place(&tables::srat(
+        config.cpus,
+        |_| NODE_OF_EVERYTHING,
+        &memory_affinity(flat_len),
+    )));
+    entries.push(region.place(&tables::slit(NUMA_NODES)));
+    entries.push(region.place(&tables::spcr(dsdt::COM1_PORT, dsdt::COM1_IRQ)));
     if config.iommu {
         entries.push(region.place(&ivrs(config)));
     }
@@ -147,7 +172,7 @@ pub(crate) fn build(config: &AcpiConfig) -> Result<Vec<u8>, Error> {
 /// Writes the tables into `ram` and returns the RSDP's physical address.
 pub(crate) fn install<'r>(ram: impl Into<RamSpan<'r>>, config: &AcpiConfig) -> Result<u64, Error> {
     let mut ram = ram.into();
-    let image = build(config)?;
+    let image = build(config, ram.len() as u64)?;
     let start = REGION_BASE as usize;
     ram.get_mut(start..start + image.len())
         .ok_or_else(|| Error::BadConfig("guest memory too small for the ACPI tables".into()))?

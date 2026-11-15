@@ -1,3 +1,4 @@
+use super::data_fabric::{self, RootComplex};
 use super::guestmem::GuestMem;
 use super::iommu::{self, InterruptRequest, Iommu};
 use super::size_mask;
@@ -51,9 +52,17 @@ const CONFIG_ADDRESS_DEVFN_SHIFT: u32 = 8;
 const CONFIG_ADDRESS_REGISTER_MASK: u32 = 0xfc;
 /// devfn = slot << 3 | function.
 const DEVFN_SLOT_SHIFT: u32 = 3;
-/// Slot 0 is the host bridge, virtio functions start at slot 1 and fill slots 1..=31.
+/// Slot 0 is the root complex; virtio functions take the slots from 1 up, in order, except the
+/// reserved ones (`virtio_slot`).
 const FIRST_VIRTIO_SLOT: u8 = 1;
-pub(crate) const MAX_VIRTIO_FUNCTIONS: usize = 31;
+const SLOTS_PER_BUS: usize = 32;
+/// Where AMD puts the FCH: no function answers there, but the I/O APIC and HPET requester ids
+/// (`IOAPIC_REQUESTER` 00:14.0, `HPET_REQUESTER` 00:14.1) are in it, as on hardware, so no
+/// virtio function may share their IOMMU device table entries.
+const FCH_SLOT: u8 = 0x14;
+const RESERVED_SLOTS: [u8; 2] = [FCH_SLOT, data_fabric::DATA_FABRIC_SLOT];
+pub(crate) const MAX_VIRTIO_FUNCTIONS: usize =
+    SLOTS_PER_BUS - FIRST_VIRTIO_SLOT as usize - RESERVED_SLOTS.len();
 const CONFIG_SPACE_SIZE: usize = 256;
 
 /// Standard config header offsets.
@@ -65,8 +74,6 @@ const CFG_STATUS: usize = 0x06;
 const CFG_REVISION: usize = 0x08;
 const CFG_SUBCLASS: usize = 0x0a;
 const CFG_CLASS: usize = 0x0b;
-const CFG_HEADER_TYPE: usize = 0x0e;
-const HEADER_TYPE_MULTIFUNCTION: u8 = 0x80;
 const CFG_BAR0: usize = 0x10;
 const CFG_BAR0_LAST_BYTE: usize = CFG_BAR0 + 3;
 const CFG_SUBSYSTEM_VENDOR_ID: usize = 0x2c;
@@ -80,13 +87,6 @@ const COMMAND_INTX_DISABLE: u16 = 1 << 10;
 const STATUS_CAPABILITIES_LIST: u16 = 1 << 4;
 /// Interrupt pin register value for INTA#.
 const INTERRUPT_PIN_INTA: u8 = 1;
-
-const VENDOR_INTEL: u16 = 0x8086;
-/// 440FX host bridge (QEMU's default), only needs to exist and have class 0x0600 so the
-/// kernel's `pci_sanity_check` accepts config mechanism #1.
-const DEVICE_I440FX_HOST: u16 = 0x1237;
-const CLASS_BRIDGE: u8 = 0x06;
-const SUBCLASS_HOST_BRIDGE: u8 = 0x00;
 
 const VENDOR_VIRTIO: u16 = 0x1af4;
 /// Modern (non-transitional) PCI device id is this plus the virtio device type.
@@ -163,6 +163,20 @@ pub(crate) struct PciHost {
     funcs: Vec<PciFunction>,
     /// The AMD IOMMU function at 00:00.2 and the translation of every function's DMA.
     iommu: Option<Iommu>,
+    /// 00:00.0, which also carries the SMN index/data pair.
+    root: RootComplex,
+}
+
+/// The slot of the `index`-th virtio function: 1 and up, stepping over `RESERVED_SLOTS`
+/// (sorted). The ACPI `_PRT` and IVRS use the same numbering.
+pub(crate) fn virtio_slot(index: usize) -> u8 {
+    let mut slot = FIRST_VIRTIO_SLOT + index as u8;
+    for reserved in RESERVED_SLOTS {
+        if slot >= reserved {
+            slot += 1;
+        }
+    }
+    slot
 }
 
 /// Fills in one virtio vendor capability at `at`; `next` is the config-space offset of the
@@ -353,7 +367,7 @@ impl PciHost {
             .enumerate()
             .map(|(i, transport)| PciFunction {
                 transport,
-                devfn: ((i as u8 + FIRST_VIRTIO_SLOT) << DEVFN_SLOT_SHIFT),
+                devfn: virtio_slot(i) << DEVFN_SLOT_SHIFT,
                 bar0: (MMIO_BASE + i as u64 * BAR_SIZE) as u32,
                 command: 0,
                 int_line: LEGACY_IRQS[i % LEGACY_IRQS.len()],
@@ -363,6 +377,7 @@ impl PciHost {
             config_address: 0,
             funcs,
             iommu: None,
+            root: RootComplex::default(),
         }
     }
 
@@ -394,20 +409,6 @@ impl PciHost {
         })
     }
 
-    fn host_bridge(&self) -> [u8; CONFIG_SPACE_SIZE] {
-        let mut b = [0u8; CONFIG_SPACE_SIZE];
-        // The IOMMU is function 2 of the host bridge's slot, which the OS only scans if
-        // function 0 says it is multifunction.
-        if self.iommu.is_some() {
-            b[CFG_HEADER_TYPE] = HEADER_TYPE_MULTIFUNCTION;
-        }
-        b[CFG_VENDOR_ID..CFG_VENDOR_ID + 2].copy_from_slice(&VENDOR_INTEL.to_le_bytes());
-        b[CFG_DEVICE_ID..CFG_DEVICE_ID + 2].copy_from_slice(&DEVICE_I440FX_HOST.to_le_bytes());
-        b[CFG_SUBCLASS] = SUBCLASS_HOST_BRIDGE;
-        b[CFG_CLASS] = CLASS_BRIDGE;
-        b
-    }
-
     /// `byte` is the byte lane within the dword (low two bits of the data port). Absent
     /// devices read all ones.
     fn config_read(&self, addr: u32, size: usize, byte: usize) -> u32 {
@@ -421,7 +422,9 @@ impl PciHost {
             return ones;
         }
         let config = if devfn == 0 {
-            self.host_bridge()
+            self.root.config(self.iommu.is_some())
+        } else if data_fabric::is_data_fabric(devfn) {
+            data_fabric::data_fabric_config(devfn)
         } else if let (Some(iommu), iommu::PCI_DEVFN) = (&self.iommu, devfn) {
             *iommu.config()
         } else if let Some(f) = self.funcs.iter().find(|f| f.devfn == devfn) {
@@ -465,7 +468,9 @@ impl PciHost {
     }
 
     fn config_write(&mut self, devfn: u8, reg: usize, bytes: usize, val: u32) {
-        if let (Some(iommu), iommu::PCI_DEVFN) = (&mut self.iommu, devfn) {
+        if devfn == 0 {
+            self.root.config_write(reg, bytes, val);
+        } else if let (Some(iommu), iommu::PCI_DEVFN) = (&mut self.iommu, devfn) {
             iommu.config_write(reg, bytes, val);
         } else if let Some(f) = self.funcs.iter_mut().find(|f| f.devfn == devfn) {
             f.write_config(reg, bytes, val);
@@ -515,6 +520,7 @@ impl PciHost {
 
     fn function_exists(&self, devfn: u8) -> bool {
         devfn == 0
+            || data_fabric::is_data_fabric(devfn)
             || (self.iommu.is_some() && devfn == iommu::PCI_DEVFN)
             || self.funcs.iter().any(|f| f.devfn == devfn)
     }
@@ -737,14 +743,18 @@ mod tests {
         assert_eq!(
             present,
             vec![
-                (
-                    0,
-                    0,
-                    VENDOR_INTEL as u32 | (DEVICE_I440FX_HOST as u32) << 16
-                ),
+                (0, 0, 0x1022 | 0x153a << 16),
                 (1, 0, VENDOR_VIRTIO as u32 | 0x1043 << 16),
                 (2, 0, VENDOR_VIRTIO as u32 | 0x1042 << 16),
                 (3, 0, VENDOR_VIRTIO as u32 | 0x1041 << 16),
+                (0x18, 0, 0x1022 | 0x12c0 << 16),
+                (0x18, 1, 0x1022 | 0x12c1 << 16),
+                (0x18, 2, 0x1022 | 0x12c2 << 16),
+                (0x18, 3, 0x1022 | 0x12c3 << 16),
+                (0x18, 4, 0x1022 | 0x12c4 << 16),
+                (0x18, 5, 0x1022 | 0x12c5 << 16),
+                (0x18, 6, 0x1022 | 0x12c6 << 16),
+                (0x18, 7, 0x1022 | 0x12c7 << 16),
             ]
         );
     }
@@ -812,25 +822,67 @@ mod tests {
     }
 
     #[test]
-    fn host_bridge_identifies_as_intel_440fx_host_bridge() {
+    fn host_bridge_identifies_as_the_turin_root_complex() {
         let mut h = host();
-        assert_eq!(
-            cfg_read(&mut h, 0, CFG_VENDOR_ID as u32, 2),
-            VENDOR_INTEL as u32
-        );
-        assert_eq!(
-            cfg_read(&mut h, 0, CFG_DEVICE_ID as u32, 2),
-            DEVICE_I440FX_HOST as u32
-        );
-        assert_eq!(
-            cfg_read(&mut h, 0, CFG_CLASS as u32, 1),
-            CLASS_BRIDGE as u32
-        );
-        assert_eq!(
-            cfg_read(&mut h, 0, CFG_SUBCLASS as u32, 1),
-            SUBCLASS_HOST_BRIDGE as u32
-        );
+        assert_eq!(cfg_read(&mut h, 0, CFG_VENDOR_ID as u32, 2), 0x1022);
+        assert_eq!(cfg_read(&mut h, 0, CFG_DEVICE_ID as u32, 2), 0x153a);
+        // class 06h, subclass 00h: what amd_smn's `get_next_root` looks for at devfn 0
         assert_eq!(cfg_read32(&mut h, 0, CFG_REVISION as u32) >> 16, 0x0600);
+    }
+
+    #[test]
+    fn smn_is_reached_through_the_root_complex_index_and_data_registers() {
+        let mut h = host();
+        let index = data_fabric::SMN_INDEX as u32;
+        cfg_write(&mut h, 0, index, 4, data_fabric::SMN_REPORTED_TEMPERATURE);
+        assert_eq!(
+            cfg_read32(&mut h, 0, index),
+            data_fabric::SMN_REPORTED_TEMPERATURE
+        );
+        let raw = cfg_read32(&mut h, 0, data_fabric::SMN_DATA as u32);
+        assert_eq!(raw >> 21, data_fabric::REPORTED_DEGREES_CELSIUS * 8);
+        // The same pair through ECAM, which Linux uses once MCFG is accepted.
+        let ecam = |register: usize| ECAM_BASE + register as u64;
+        h.ecam_write(ecam(data_fabric::SMN_INDEX), 4, 0x0005_0000);
+        assert_eq!(h.ecam_read(ecam(data_fabric::SMN_INDEX), 4), 0x0005_0000);
+        assert_eq!(h.ecam_read(ecam(data_fabric::SMN_DATA), 4), 0);
+    }
+
+    #[test]
+    fn data_fabric_answers_at_slot_0x18_through_both_mechanisms() {
+        let mut h = PciHost::new(Vec::new());
+        for function in 0..8u32 {
+            h.io_out(CONFIG_ADDRESS_PORT, 4, address(0x18, function, 0));
+            assert_eq!(
+                h.io_in(CONFIG_DATA_PORT, 4),
+                0x1022 | (0x12c0 + function) << 16
+            );
+            let ecam = ECAM_BASE + ((0x18 << 3 | function as u64) << 12);
+            assert_eq!(h.ecam_read(ecam, 2), 0x1022);
+            // extended space exists and reads zero (DF4's CfgAddressCntl: root on bus 0)
+            assert_eq!(h.ecam_read(ecam + 0xc04, 4), 0);
+        }
+        assert_eq!(cfg_read(&mut h, 0x18, HEADER_TYPE_OFFSET as u32, 1), 0x80);
+    }
+
+    #[test]
+    fn virtio_functions_step_over_the_fch_and_data_fabric_slots() {
+        assert_eq!(virtio_slot(0), 1);
+        assert_eq!(virtio_slot(0x12), 0x13);
+        assert_eq!(virtio_slot(0x13), 0x15);
+        assert_eq!(virtio_slot(0x15), 0x17);
+        assert_eq!(virtio_slot(0x16), 0x19);
+        assert_eq!(virtio_slot(MAX_VIRTIO_FUNCTIONS - 1), 31);
+        let h = PciHost::new(
+            (0..MAX_VIRTIO_FUNCTIONS)
+                .map(|_| console_transport())
+                .collect(),
+        );
+        let slots: Vec<u8> = h.funcs.iter().map(|f| f.devfn >> 3).collect();
+        for reserved in [0, 0x14, 0x18] {
+            assert!(!slots.contains(&reserved), "slot {reserved:#x}");
+        }
+        assert_eq!(slots.len(), 29);
     }
 
     #[test]
@@ -847,20 +899,14 @@ mod tests {
         cfg_write(&mut h, 0, CFG_COMMAND as u32, 2, 0xffff);
         cfg_write(&mut h, 0, CFG_VENDOR_ID as u32, 4, 0);
         assert_eq!(cfg_read(&mut h, 0, CFG_COMMAND as u32, 2), 0);
-        assert_eq!(
-            cfg_read(&mut h, 0, CFG_VENDOR_ID as u32, 2),
-            VENDOR_INTEL as u32
-        );
+        assert_eq!(cfg_read(&mut h, 0, CFG_VENDOR_ID as u32, 2), 0x1022);
     }
 
     #[test]
     fn host_bridge_is_present_even_with_no_virtio_devices() {
         let mut h = PciHost::new(Vec::new());
         assert!(h.is_empty());
-        assert_eq!(
-            cfg_read(&mut h, 0, CFG_VENDOR_ID as u32, 2),
-            VENDOR_INTEL as u32
-        );
+        assert_eq!(cfg_read(&mut h, 0, CFG_VENDOR_ID as u32, 2), 0x1022);
         assert_eq!(cfg_read32(&mut h, 1, CFG_VENDOR_ID as u32), u32::MAX);
     }
 
@@ -1743,10 +1789,7 @@ mod tests {
     #[test]
     fn enumerate_and_size_bar() {
         let mut h = host();
-        assert_eq!(
-            rd(&mut h, 0, CFG_VENDOR_ID as u32) & 0xffff,
-            VENDOR_INTEL as u32
-        );
+        assert_eq!(rd(&mut h, 0, CFG_VENDOR_ID as u32) & 0xffff, 0x1022);
         // Dword at 8 is revision, prog_if, subclass, class: the upper half is the class code.
         assert_eq!(rd(&mut h, 0, CFG_REVISION as u32) >> 16, 0x0600);
         assert_eq!(
@@ -1834,21 +1877,20 @@ mod tests {
     }
 
     #[test]
-    fn the_last_slot_holds_the_thirty_first_function() {
+    fn the_last_slot_holds_the_last_function() {
         let mut host = many_functions(MAX_VIRTIO_FUNCTIONS);
-        let slot = MAX_VIRTIO_FUNCTIONS as u32;
+        let slot = PCI_SLOTS - 1;
         enable_memory_space(&mut host, slot);
         assert_eq!(
             cfg_read32(&mut host, slot, CFG_VENDOR_ID as u32) & 0xffff,
             VENDOR_VIRTIO as u32
         );
         let bar = bar_base(&mut host, slot);
-        assert_eq!(bar, MMIO_BASE + (slot as u64 - 1) * BAR_SIZE);
-        assert!(host.mmio_read(bar + 0x12, 2).is_some());
         assert_eq!(
-            cfg_read32(&mut host, slot + 1, CFG_VENDOR_ID as u32),
-            NO_DEVICE_DWORD
+            bar,
+            MMIO_BASE + (MAX_VIRTIO_FUNCTIONS as u64 - 1) * BAR_SIZE
         );
+        assert!(host.mmio_read(bar + 0x12, 2).is_some());
     }
 
     #[test]

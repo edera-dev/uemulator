@@ -243,6 +243,7 @@ impl Cpu {
             MSR_PAT => self.pat,
             _ if mtrr::Mtrr::owns(msr) => self.mtrr.read(msr).unwrap_or(0),
             _ if mca::Mca::owns(msr) => self.mca.read(msr).unwrap_or(0),
+            _ if cppc::Cppc::owns(msr) => self.cppc.read(msr).unwrap_or(0),
             MSR_EFER => self.efer,
             MSR_STAR => self.star,
             MSR_LSTAR => self.lstar,
@@ -318,6 +319,11 @@ impl Cpu {
             }
             _ if mca::Mca::owns(msr) => {
                 if !self.mca.write(msr, v) {
+                    return Err(Exception::general_protection(0));
+                }
+            }
+            _ if cppc::Cppc::owns(msr) => {
+                if !self.cppc.write(msr, v) {
                     return Err(Exception::general_protection(0));
                 }
             }
