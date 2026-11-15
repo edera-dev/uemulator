@@ -139,6 +139,11 @@ const SAVE_SYSENTER_EIP: u64 = 0x638;
 const SAVE_CR2: u64 = 0x640;
 const SAVE_RSP: u64 = 0x5d8;
 const SAVE_RAX: u64 = 0x5f8;
+/// The supervisor CET state VMRUN loads and #VMEXIT saves (`cet.rs`); U_CET and the PLn_SSP
+/// MSRs are not in the VMCB, a hypervisor switches them itself (KVM through xsaves).
+const SAVE_S_CET: u64 = 0x5e0;
+const SAVE_SSP: u64 = 0x5e8;
+const SAVE_ISST_ADDR: u64 = 0x5f0;
 const SAVE_G_PAT: u64 = 0x668;
 /// DEBUGCTL and the four branch record MSRs, in `MSR_LAST_BRANCH_FROM_IP` order: swapped only
 /// under LBR virtualization.
@@ -424,6 +429,8 @@ struct Host {
     /// injected into it must not mask the host's, nor the host's NMI handler the guest's.
     nmi_blocked: bool,
     spec_ctrl: u64,
+    /// S_CET, SSP and ISST_ADDR.
+    shadow_stack: [u64; 3],
 }
 
 /// The guest being run: the intercepts read from its VMCB at `vmrun` time (the hypervisor cannot
@@ -1036,6 +1043,7 @@ impl Cpu {
         let guest_cr4 = self.vmcb_read(vmcb, SAVE_CR4, 8);
         let guest_dr6 = self.vmcb_read(vmcb, SAVE_DR6, 8);
         let guest_dr7 = self.vmcb_read(vmcb, SAVE_DR7, 8);
+        let guest_s_cet = self.vmcb_read(vmcb, SAVE_S_CET, 8);
         let asid = self.vmcb_read(vmcb, VMCB_ASID, 4);
         let cs = self.vmcb_segment(vmcb, SAVE_CS);
         let long_mode_paging = guest_efer & EFER_LME != 0 && guest_cr0 & CR0_PG_BIT != 0;
@@ -1046,6 +1054,8 @@ impl Cpu {
             || guest_cr0 >> 32 != 0
             || guest_cr3 & super::sys::CR3_RESERVED_BITS != 0
             || guest_cr4 & !super::sys::CR4_SUPPORTED_BITS != 0
+            || (guest_cr4 & super::cet::CR4_CET != 0 && guest_cr0 & CR0_WP == 0)
+            || guest_s_cet & !super::cet::CET_CONTROL_WRITABLE != 0
             || guest_dr6 & DR_HIGH_BITS != 0
             || guest_dr7 & DR_HIGH_BITS != 0
             || intercept4 & INTERCEPT_VMRUN == 0
@@ -1083,6 +1093,7 @@ impl Cpu {
             last_branches: self.svm.last_branches,
             nmi_blocked: self.nmi_blocked,
             spec_ctrl: self.spec_ctrl,
+            shadow_stack: [self.cet.s_cet, self.cet.ssp, self.cet.isst_addr],
         };
         let v_intr = self.vmcb_read(vmcb, VMCB_V_INTR, 8);
         let nested = self.vmcb_read(vmcb, VMCB_NP_ENABLE, 8) & NP_ENABLE != 0;
@@ -1160,6 +1171,9 @@ impl Cpu {
         self.rip = self.vmcb_read(vmcb, SAVE_RIP, 8);
         self.gpr[GPR_RSP] = self.vmcb_read(vmcb, SAVE_RSP, 8);
         self.gpr[RAX] = self.vmcb_read(vmcb, SAVE_RAX, 8);
+        self.cet.s_cet = guest_s_cet;
+        self.cet.ssp = self.vmcb_read(vmcb, SAVE_SSP, 8);
+        self.cet.isst_addr = self.vmcb_read(vmcb, SAVE_ISST_ADDR, 8);
         if nested {
             self.pat = self.vmcb_read(vmcb, SAVE_G_PAT, 8);
         }
@@ -1284,6 +1298,9 @@ impl Cpu {
         self.vmcb_write(vmcb, SAVE_RIP, 8, self.rip);
         self.vmcb_write(vmcb, SAVE_RSP, 8, self.gpr[GPR_RSP]);
         self.vmcb_write(vmcb, SAVE_RAX, 8, self.gpr[RAX]);
+        self.vmcb_write(vmcb, SAVE_S_CET, 8, self.cet.s_cet);
+        self.vmcb_write(vmcb, SAVE_SSP, 8, self.cet.ssp);
+        self.vmcb_write(vmcb, SAVE_ISST_ADDR, 8, self.cet.isst_addr);
         if guest.nested_cr3.is_some() {
             self.vmcb_write(vmcb, SAVE_G_PAT, 8, self.pat);
         }
@@ -1361,6 +1378,7 @@ impl Cpu {
         self.rip = host.rip;
         self.gpr[GPR_RSP] = host.rsp;
         self.gpr[RAX] = host.rax;
+        [self.cet.s_cet, self.cet.ssp, self.cet.isst_addr] = host.shadow_stack;
         self.interrupt_shadow = false;
         self.halted = false;
         self.svm.gif = false;
@@ -2267,6 +2285,32 @@ mod tests {
         );
         assert_ne!(get(&h, SAVE_EFER, 8) & EFER_AIBRSE, 0);
         assert_eq!(h.cpu.efer & EFER_AIBRSE, 0, "the host's EFER comes back");
+    }
+
+    #[test]
+    fn vmrun_loads_the_guest_shadow_stack_state_and_vmexit_gives_the_host_its_own_back() {
+        // rdsspq rax; cpuid; hlt
+        let mut h = rig(&[0xf3, 0x48, 0x0f, 0x1e, 0xc8, 0x0f, 0xa2, 0xf4]);
+        let (cr0, cr4) = (get(&h, SAVE_CR0, 8), get(&h, SAVE_CR4, 8));
+        put(&mut h, SAVE_CR0, 8, cr0 | CR0_WP);
+        put(&mut h, SAVE_CR4, 8, cr4 | super::super::cet::CR4_CET);
+        put(&mut h, SAVE_S_CET, 8, super::super::cet::CET_SH_STK_EN);
+        put(&mut h, SAVE_SSP, 8, 0x1234_5000);
+        put(&mut h, SAVE_ISST_ADDR, 8, 0x5000);
+        h.cpu.cet.ssp = 0x9990;
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_CPUID);
+        assert_eq!(get(&h, SAVE_RAX, 8), 0x1234_5000, "the guest read its SSP");
+        assert_eq!(get(&h, SAVE_SSP, 8), 0x1234_5000);
+        assert_eq!(get(&h, SAVE_ISST_ADDR, 8), 0x5000);
+        assert_eq!(h.cpu.cet.ssp, 0x9990);
+        assert_eq!(h.cpu.cet.s_cet, 0);
+        assert_eq!(h.cpu.cet.isst_addr, 0);
+
+        let mut h = rig(&[0x0f, 0xa2, 0xf4]);
+        put(&mut h, SAVE_S_CET, 8, 1 << 2);
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_INVALID, "an IBT bit");
     }
 
     #[test]

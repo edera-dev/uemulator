@@ -210,6 +210,7 @@ impl Cpu {
         self.tr = Seg::default();
         self.rip = RESET_IP;
         self.halted = false;
+        self.cet.ssp = 0;
         self.set_cpl(0);
     }
 

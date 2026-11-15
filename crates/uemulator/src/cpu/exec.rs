@@ -1256,15 +1256,20 @@ impl Cpu {
         let ss = self.read_stack(sp.wrapping_add(FRAME_SS), 8)? as u16;
         let new_cpl = (cs & SELECTOR_RPL_MASK) as u8;
         let new_ss = self.checked_data_seg(SEG_SS, ss, new_cpl)?;
+        let mut returning_to = new_cs;
+        returning_to.sel = cs;
+        let new_ssp = self.shadow_stack_return(new_cpl, &returning_to, rip, true)?;
         let old_cpl = self.cpl;
+        self.cet.ssp = new_ssp;
         self.seg[SEG_CS] = new_cs;
         self.seg[SEG_SS] = new_ss;
         // set_cpl also switches to the user or supervisor half of the soft TLB.
         self.set_cpl(new_cpl);
-        // IF and IOPL are gated by the CPL iretq started at, not the one it returns to.
-        // RF is loaded too (popf never loads it): a #DB handler sets it in the frame to step
-        // over the instruction breakpoint it returns to.
-        let loadable = self.loadable_eflags(old_cpl) | RF;
+        // IF and IOPL are gated by the CPL iretq started at, not the one it returns to; VIF and
+        // VIP only change from ring 0. RF is loaded too (popf never loads it): a #DB handler sets
+        // it in the frame to step over the instruction breakpoint it returns to.
+        let loadable =
+            self.loadable_eflags(old_cpl) | RF | if old_cpl == 0 { VIF | VIP } else { 0 };
         let current = self.eflags_full();
         self.eflags = ((current & !loadable) | (new_rflags & loadable)) | RESERVED_ONE;
         self.lazy_op = LazyFlagsOp::Eflags;
@@ -1295,13 +1300,17 @@ impl Cpu {
         let new_cs = self.checked_return_code_seg(cs)?;
         Self::check_compatibility_target(&new_cs, rip)?;
         let new_cpl = (cs & SELECTOR_RPL_MASK) as u8;
+        let mut returning_to = new_cs;
+        returning_to.sel = cs;
         if new_cpl == self.cpl {
+            self.cet.ssp = self.shadow_stack_return(new_cpl, &returning_to, rip, false)?;
             self.seg[SEG_CS] = new_cs;
             self.gpr[GPR_RSP] = sp.wrapping_add(FRAME_RSP).wrapping_add(imm);
         } else {
             let new_rsp = self.read_stack(sp.wrapping_add(FRAME_RSP).wrapping_add(imm), 8)?;
             let ss = self.read_stack(sp.wrapping_add(FRAME_SS).wrapping_add(imm), 8)? as u16;
             let new_ss = self.checked_data_seg(SEG_SS, ss, new_cpl)?;
+            self.cet.ssp = self.shadow_stack_return(new_cpl, &returning_to, rip, false)?;
             self.seg[SEG_CS] = new_cs;
             self.seg[SEG_SS] = new_ss;
             self.set_cpl(new_cpl);
@@ -1658,6 +1667,7 @@ impl Cpu {
             0xc2 | 0xc3 => {
                 let target = self.read_stack(self.gpr[GPR_RSP], 8)?;
                 let extra = if op == 0xc2 { i.imm as u64 } else { 0 };
+                self.cet.ssp = self.shadow_stack_near_return(target)?;
                 self.gpr[GPR_RSP] = self.gpr[GPR_RSP].wrapping_add(8 + extra);
                 self.rip = target;
                 return Ok(());
@@ -1721,6 +1731,9 @@ impl Cpu {
             }
             // int imm8
             0xcd => {
+                if self.redirect_software_interrupt(i.imm as u8, next)? {
+                    return Ok(());
+                }
                 self.rip = next;
                 return Err(Exception::Fault {
                     vector: i.imm as u8,
@@ -1771,7 +1784,7 @@ impl Cpu {
             0x6c..=0x6f => return self.string_io(i, next),
             // call rel32
             0xe8 => {
-                self.push(8, next)?;
+                self.push_return_address(8, next, i.imm != 0)?;
                 self.rip = next.wrapping_add(i.imm as u64);
                 return Ok(());
             }
@@ -1834,12 +1847,11 @@ impl Cpu {
                 let f = self.eflags_full();
                 self.set_eflags_arith(f | CF);
             }
-            // cli / sti: need CPL <= IOPL (VME/PVI are not emulated)
+            // cli / sti: need CPL <= IOPL, or VME/PVI, which make them work on VIF instead
             0xfa | 0xfb => {
                 if self.cpl > self.iopl() {
-                    return Err(Exception::general_protection(0));
-                }
-                if op == 0xfa {
+                    self.virtual_cli_sti(op == 0xfb)?;
+                } else if op == 0xfa {
                     self.eflags &= !IF;
                 } else {
                     // Only the transition from IF=0 opens the one-instruction interrupt shadow.
@@ -1873,7 +1885,7 @@ impl Cpu {
                     GROUP5_CALL_NEAR if op == 0xff => {
                         // The target is read before the push so `call [rsp+x]` sees the old GPR_RSP.
                         let target = self.load_operand(loc, 8, i)?;
-                        self.push(8, next)?;
+                        self.push_return_address(8, next, true)?;
                         self.rip = target;
                         return Ok(());
                     }
@@ -2014,6 +2026,10 @@ impl Cpu {
             0x108 | 0x109 => self.need_cpl0()?,
             // ud2
             0x10b => return Err(Exception::invalid_opcode()),
+            // rdsspd/rdsspq (F3 0F 1E /1, register form): a nop without a shadow stack
+            0x11e if i.rep == 1 && i.md == 3 && i.reg & 7 == 1 => {
+                self.rdssp(i.rm, if osz == 8 { 8 } else { 4 });
+            }
             // prefetch and the reserved hint-nop space (includes multi-byte nop, endbr64)
             0x10d | 0x118..=0x11f => {}
             // mov to/from cr and dr
@@ -2026,6 +2042,10 @@ impl Cpu {
             }
             // invpcid
             0x282 if i.p66 => return self.invpcid(i, next),
+            // wrssd/wrssq (0F 38 F6) and wrussd/wrussq (66 0F 38 F5), memory destination only; the
+            // other prefixes of F6 are adcx/adox
+            0x2f6 if i.rep == 0 && !i.p66 => self.write_shadow_stack_operand(i, next, false)?,
+            0x2f5 if i.rep == 0 && i.p66 => self.write_shadow_stack_operand(i, next, true)?,
             // rdtsc
             0x131 => {
                 if self.cr4 & CR4_TSD != 0 && self.cpl != 0 {

@@ -13,6 +13,9 @@ pub(crate) const NT: u64 = 1 << 14;
 pub(crate) const RF: u64 = 1 << 16;
 pub(crate) const VM: u64 = 1 << 17;
 pub(crate) const AC: u64 = 1 << 18;
+/// Virtual interrupt flag and virtual interrupt pending (`vme.rs`).
+pub(crate) const VIF: u64 = 1 << 19;
+pub(crate) const VIP: u64 = 1 << 20;
 /// Bit 1 reads as 1 in every EFLAGS value.
 pub(crate) const RESERVED_ONE: u64 = 1 << 1;
 /// The six status flags that `LazyFlagsOp` can defer; everything else in EFLAGS is kept eagerly.

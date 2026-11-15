@@ -75,9 +75,11 @@ pub(crate) const CR4_PKE: u64 = 1 << 22;
 /// 5-level paging and 57-bit linear addresses once IA-32e mode is entered. It can only change
 /// outside IA-32e mode (APM 5.3.6): Linux's trampoline leaves long mode to flip it.
 pub(crate) const CR4_LA57: u64 = 1 << 12;
-/// CR4 bits a guest may set. Everything else (VME, PVI, CET...) is rejected with #GP because
-/// CPUID does not advertise it.
-const CR4_SUPPORTED: u64 = CR4_TSD
+/// CR4 bits a guest may set. Everything else is rejected with #GP because CPUID does not
+/// advertise it.
+const CR4_SUPPORTED: u64 = super::vme::CR4_VME
+    | super::vme::CR4_PVI
+    | CR4_TSD
     | CR4_DE
     | CR4_PSE
     | CR4_PAE
@@ -93,7 +95,8 @@ const CR4_SUPPORTED: u64 = CR4_TSD
     | CR4_SMEP
     | CR4_SMAP
     | CR4_LA57
-    | CR4_PKE;
+    | CR4_PKE
+    | super::cet::CR4_CET;
 
 pub(super) const CR4_SUPPORTED_BITS: u64 = CR4_SUPPORTED;
 
@@ -181,7 +184,8 @@ const EFLAGS_ID: u64 = 1 << 21;
 /// Bit 1 of EFLAGS always reads as 1.
 const EFLAGS_ALWAYS_ONE: u64 = 2;
 /// Flags sysret restores from r11. IOPL, RF and VM are deliberately not restored.
-const SYSRET_RESTORED_FLAGS: u64 = CF | PF | AF | ZF | SF | TF | IF | DF | OF | NT | AC | EFLAGS_ID;
+const SYSRET_RESTORED_FLAGS: u64 =
+    CF | PF | AF | ZF | SF | TF | IF | DF | OF | NT | AC | VIF | VIP | EFLAGS_ID;
 
 /// Low two bits of a segment selector.
 const SELECTOR_RPL_MASK: u16 = 3;
@@ -311,7 +315,10 @@ impl Cpu {
             MSR_GS_BASE => self.seg[SEG_GS].base,
             MSR_KERNEL_GS_BASE => self.kgsbase,
             MSR_TSC_AUX => self.tsc_aux,
-            MSR_XSS => xsave::XSS_SUPPORTED,
+            MSR_XSS => self.xss,
+            super::cet::MSR_U_CET..=super::cet::MSR_ISST_ADDR if self.cet_msr(msr).is_some() => {
+                self.cet_msr(msr).unwrap_or_default()
+            }
             super::svm::MSR_VM_CR => self.svm.vm_cr,
             super::svm::MSR_VM_HSAVE_PA => self.svm.hsave_pa,
             super::svm::MSR_SVM_KEY => 0,
@@ -432,12 +439,13 @@ impl Cpu {
             MSR_GS_BASE => self.seg[SEG_GS].base = v,
             MSR_KERNEL_GS_BASE => self.kgsbase = v,
             MSR_TSC_AUX => self.tsc_aux = v,
-            // no supervisor state component is implemented, so the only value is "none"
             MSR_XSS => {
                 if v & !xsave::XSS_SUPPORTED != 0 {
                     return Err(Exception::general_protection(0));
                 }
+                self.xss = v;
             }
+            super::cet::MSR_U_CET..=super::cet::MSR_ISST_ADDR if self.write_cet_msr(msr, v)? => {}
             super::svm::MSR_VM_CR => self.write_vm_cr(v)?,
             super::svm::MSR_SVM_KEY => self.svm.write_key(v),
             // Write-only (a read is #GP). It would make the vCPU with that host APIC id look at
@@ -541,6 +549,7 @@ impl Cpu {
                         if v & !CR4_SUPPORTED != 0
                             || (long_mode && v & CR4_PAE == 0)
                             || (long_mode && (v ^ self.cr4) & CR4_LA57 != 0)
+                            || (v & super::cet::CR4_CET != 0 && self.cr0 & CR0_WP == 0)
                             || (v & CR4_PCIDE != 0
                                 && (!long_mode
                                     || (self.cr4 & CR4_PCIDE == 0 && self.cr3 & 0xfff != 0)))
@@ -608,6 +617,7 @@ impl Cpu {
             && self.seg[SEG_CS].long();
         // PCIDs only exist in IA-32e mode.
         let leaving_paging_with_pcid = !paging && self.cr4 & CR4_PCIDE != 0;
+        let write_protect_off_under_cet = v & CR0_WP == 0 && self.cr4 & super::cet::CR4_CET != 0;
         if upper_half_set
             || not_write_through_without_cache_disable
             || paging_without_protection
@@ -615,6 +625,7 @@ impl Cpu {
             || entering_long_mode_without_pae
             || entering_long_mode_from_64bit_code
             || leaving_paging_with_pcid
+            || write_protect_off_under_cet
         {
             return Err(Exception::general_protection(0));
         }
@@ -740,6 +751,7 @@ impl Cpu {
         }
         let from_compatibility_mode = !self.is_long64();
         let rflags = self.eflags_full();
+        self.shadow_stack_before_fast_entry();
         self.gpr[RCX] = next;
         self.gpr[R11] = rflags & !RF;
         let selector_base = (self.star >> STAR_SYSCALL_SELECTOR_SHIFT) as u16 & !SELECTOR_RPL_MASK;
@@ -758,6 +770,7 @@ impl Cpu {
         self.eflags = (rflags & !self.sfmask & !RF) | EFLAGS_ALWAYS_ONE;
         self.lazy_op = LazyFlagsOp::Eflags;
         self.set_cpl(0);
+        self.shadow_stack_after_fast_entry();
         self.rip = if from_compatibility_mode {
             self.cstar
         } else {
@@ -780,6 +793,7 @@ impl Cpu {
             return Err(Exception::general_protection(0));
         }
         let selector = cs as u16 & !SELECTOR_RPL_MASK;
+        self.shadow_stack_before_fast_entry();
         self.seg[SEG_CS] = Seg {
             sel: selector,
             base: 0,
@@ -795,6 +809,7 @@ impl Cpu {
         self.materialize_lazy_flags();
         self.eflags &= !(VM | IF | RF);
         self.set_cpl(0);
+        self.shadow_stack_after_fast_entry();
         self.gpr[GPR_RSP] = esp & 0xffff_ffff;
         self.rip = eip & 0xffff_ffff;
         Ok(())
@@ -814,6 +829,7 @@ impl Cpu {
             return Err(Exception::general_protection(0));
         }
         let selector = cs as u16 & !SELECTOR_RPL_MASK;
+        let user_ssp = self.shadow_stack_fast_return(false)?;
         self.seg[SEG_CS] = Seg {
             sel: (selector + SYSEXIT_CODE_OFFSET) | SELECTOR_RPL_USER,
             base: 0,
@@ -827,6 +843,9 @@ impl Cpu {
             flags: USER_DATA_FLAGS,
         };
         self.set_cpl(3);
+        if let Some(ssp) = user_ssp {
+            self.cet.ssp = ssp;
+        }
         self.rip = self.gpr[RDX] & 0xffff_ffff;
         self.gpr[GPR_RSP] = self.gpr[RCX] & 0xffff_ffff;
         Ok(())
@@ -850,6 +869,7 @@ impl Cpu {
                 self.gpr[RCX] & 0xffff_ffff,
             )
         };
+        let user_ssp = self.shadow_stack_fast_return(i.opsize == 8)?;
         self.seg[SEG_CS] = Seg {
             sel: code_selector | SELECTOR_RPL_USER,
             base: 0,
@@ -866,6 +886,9 @@ impl Cpu {
         self.eflags = (r11 & SYSRET_RESTORED_FLAGS) | EFLAGS_ALWAYS_ONE;
         self.lazy_op = LazyFlagsOp::Eflags;
         self.set_cpl(3);
+        if let Some(ssp) = user_ssp {
+            self.cet.ssp = ssp;
+        }
         self.rip = target;
         Ok(())
     }
@@ -1106,6 +1129,10 @@ impl Cpu {
         use super::invlpgb::{MODRM_INVLPGB, MODRM_TLBSYNC};
         const MODRM_RDPKRU: u8 = 0xee;
         const MODRM_WRPKRU: u8 = 0xef;
+        // F3 0F 01 E8 and F3 0F 01 EA (CET shadow stacks).
+        const MODRM_SETSSBSY: u8 = 0xe8;
+        const MODRM_SAVEPREVSSP: u8 = 0xea;
+        const GROUP7_RSTORSSP: u8 = 5;
         let reg = i.reg & 7;
         if i.op == OP_GROUP6 {
             let loc = self.modrm_location(i, next)?;
@@ -1182,6 +1209,8 @@ impl Cpu {
                 MODRM_RDPRU => self.rdpru()?,
                 MODRM_RDPKRU => self.rdpkru()?,
                 MODRM_WRPKRU => self.wrpkru()?,
+                MODRM_SETSSBSY if i.rep == REP_F3 => self.setssbsy()?,
+                MODRM_SAVEPREVSSP if i.rep == REP_F3 => self.saveprevssp()?,
                 // Same CR4.TSD rule as rdtsc; ECX = IA32_TSC_AUX (zero-extended), EDX:EAX = TSC.
                 MODRM_RDTSCP => {
                     if self.cr4 & CR4_TSD != 0 && self.cpl != 0 {
@@ -1259,6 +1288,12 @@ impl Cpu {
                 } else {
                     return Err(Exception::invalid_opcode());
                 }
+            }
+            GROUP7_RSTORSSP if i.rep == REP_F3 => {
+                let Loc::Mem(addr) = loc else {
+                    return Err(Exception::invalid_opcode());
+                };
+                self.rstorssp(addr)?;
             }
             _ => return Err(Exception::invalid_opcode()),
         }
@@ -1374,10 +1409,15 @@ impl Cpu {
     /// and write the FS and GS bases.
     pub fn group_ae(&mut self, i: &Insn, next: u64) -> ExecResult<()> {
         const REP_REPE: u8 = 1;
+        const GROUP_AE_INCSSP: u8 = 5;
+        const GROUP_AE_CLRSSBSY: u8 = 6;
         let reg = i.reg & 7;
         if i.md == 3 {
             if i.rep == REP_REPE && reg < 4 {
                 self.fs_gs_base(i)?;
+            } else if i.rep == REP_REPE && reg == GROUP_AE_INCSSP {
+                let size = if i.opsize == 8 { 8 } else { 4 };
+                self.incssp(i.rm, size)?;
             } else if i.rep != 0 || !(5..=7).contains(&reg) {
                 return Err(Exception::invalid_opcode());
             }
@@ -1389,6 +1429,7 @@ impl Cpu {
             }
             let addr = self.linear_address(i, self.effective_address(i, next))?;
             match reg {
+                GROUP_AE_CLRSSBSY if i.rep == REP_REPE => self.clrssbsy(addr)?,
                 0 => self.fxsave(addr)?,
                 1 => self.fxrstor(addr)?,
                 // xsave, xrstor, xsaveopt (REX.W selects the 64-bit pointer layout, identical here)
@@ -3163,6 +3204,8 @@ mod sys_tests {
         #[test]
         fn cr4_accepts_the_supported_bits() {
             for (bit, name) in [
+                (0, "VME"),
+                (1, "PVI"),
                 (2, "TSD"),
                 (3, "DE"),
                 (4, "PSE"),
@@ -3182,8 +3225,6 @@ mod sys_tests {
         #[test]
         fn cr4_unsupported_bits_are_gp0_and_leave_cr4_alone() {
             for (bit, name) in [
-                (0, "VME"),
-                (1, "PVI"),
                 // LA57 is supported but cannot change in long mode (la57_tests.rs)
                 (12, "LA57"),
                 (13, "VMXE"),
@@ -5073,8 +5114,8 @@ mod sys_tests {
             h.cpu.gpr[RCX] = USER_CODE;
             h.cpu.gpr[R11] = u64::MAX;
             assert_eq!(h.run(1), Stop::Limit);
-            // CF PF AF ZF SF TF IF DF OF NT AC ID, plus the always-set bit 1.
-            let restored = [0, 2, 4, 6, 7, 8, 9, 10, 11, 14, 18, 21]
+            // CF PF AF ZF SF TF IF DF OF NT AC VIF VIP ID, plus the always-set bit 1.
+            let restored = [0, 2, 4, 6, 7, 8, 9, 10, 11, 14, 18, 19, 20, 21]
                 .iter()
                 .fold(2u64, |mask, bit| mask | 1 << bit);
             assert_eq!(h.cpu.eflags_full(), restored);

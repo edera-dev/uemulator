@@ -92,6 +92,29 @@ impl Cpu {
         Ok(())
     }
 
+    /// Near call outside 64-bit mode: pushes the return address (on the shadow stack too, with
+    /// `shadow`) and branches. A fault anywhere, the branch's limit check included, leaves RSP
+    /// and SSP alone.
+    fn near_call_legacy(
+        &mut self,
+        i: &Insn,
+        target: u64,
+        next: u64,
+        shadow: bool,
+    ) -> ExecResult<()> {
+        let osz = i.opsize;
+        let saved_rsp = self.gpr[GPR_RSP];
+        let saved_ssp = self.cet.ssp;
+        let result = self
+            .push_return_address(osz, next & mask(osz), shadow)
+            .and_then(|()| self.branch_near(i, target));
+        if result.is_err() {
+            self.gpr[GPR_RSP] = saved_rsp;
+            self.cet.ssp = saved_ssp;
+        }
+        result
+    }
+
     pub(super) fn push_legacy(&mut self, size: u8, value: u64) -> ExecResult<()> {
         let sp = self.stack_pointer().wrapping_sub(size as u64) & self.stack_mask();
         let linear = self.stack_linear(sp)?;
@@ -256,15 +279,16 @@ impl Cpu {
             }
             0x9c => {
                 if self.eflags & VM != 0 && self.iopl() < USER_CPL {
-                    return Err(Exception::general_protection(0));
+                    self.pushf_virtual_8086(sz)?;
+                } else {
+                    let flags = self.eflags_full() & !(RF | VM);
+                    self.push(sz, flags)?;
                 }
-                let flags = self.eflags_full() & !(RF | VM);
-                self.push(sz, flags)?;
+            }
+            0x9d if self.eflags & VM != 0 && self.iopl() < USER_CPL => {
+                self.popf_virtual_8086(sz)?
             }
             0x9d => {
-                if self.eflags & VM != 0 && self.iopl() < USER_CPL {
-                    return Err(Exception::general_protection(0));
-                }
                 let value = self.pop(sz)?;
                 let mut loadable = self.loadable_eflags(self.cpl);
                 if sz == 2 {
@@ -380,7 +404,9 @@ impl Cpu {
                 let sp = self.stack_pointer();
                 let linear = self.stack_linear(sp)?;
                 let target = self.read_stack(linear, osz)?;
+                let new_ssp = self.shadow_stack_near_return(target)?;
                 self.branch_near(i, target)?;
+                self.cet.ssp = new_ssp;
                 let new_sp = sp.wrapping_add(osz as u64).wrapping_add(extra) & self.stack_mask();
                 self.set_stack_pointer(new_sp);
                 return Ok(true);
@@ -450,17 +476,15 @@ impl Cpu {
                     .map(|()| true);
             }
             0xe8 => {
-                self.push(osz, next & mask(osz))?;
                 return self
-                    .branch_near(i, next.wrapping_add(i.imm as u64))
+                    .near_call_legacy(i, next.wrapping_add(i.imm as u64), next, i.imm != 0)
                     .map(|()| true);
             }
             0xff => match i.reg & 7 {
                 2 => {
                     let loc = self.modrm_location(i, next)?;
                     let target = self.load_operand(loc, osz, i)?;
-                    self.push(osz, next & mask(osz))?;
-                    return self.branch_near(i, target).map(|()| true);
+                    return self.near_call_legacy(i, target, next, true).map(|()| true);
                 }
                 4 => {
                     let loc = self.modrm_location(i, next)?;

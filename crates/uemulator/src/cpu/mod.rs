@@ -9,6 +9,9 @@ mod bios;
 #[cfg(not(freestanding))]
 mod bios_keys;
 mod bmi;
+pub(crate) mod cet;
+#[cfg(test)]
+mod cet_tests;
 pub(crate) mod cppc;
 mod cpuid;
 pub(crate) mod debug;
@@ -46,6 +49,7 @@ mod sys;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub(crate) mod vcpus;
+mod vme;
 mod wall_clock;
 pub(crate) mod xsave;
 
@@ -318,6 +322,8 @@ pub(crate) struct LargePage {
     pub dirty: bool,
     /// The leaf's protection key (bits 62:59), checked against PKRU at each hit.
     pub protection_key: u8,
+    /// The leaf is a shadow-stack page (`TLB_FLAG_SHADOW_STACK`).
+    pub shadow_stack: bool,
 }
 
 pub(crate) const LARGE_PAGE_EMPTY: LargePage = LargePage {
@@ -329,6 +335,7 @@ pub(crate) const LARGE_PAGE_EMPTY: LargePage = LargePage {
     no_execute: false,
     dirty: false,
     protection_key: 0,
+    shadow_stack: false,
 };
 
 /// Never equals a page-aligned address, so an empty tag always misses.
@@ -341,15 +348,21 @@ pub(crate) const TLB_EMPTY: TlbEntry = TlbEntry {
 };
 
 /// Permissions of a page-walk result, ANDed across all levels (`walk` in `mem.rs`). They are
-/// not stored in `TlbEntry`; `translate` folds them into the per-access tags.
-pub(crate) const TLB_FLAG_WRITABLE: u8 = 1;
-pub(crate) const TLB_FLAG_USER: u8 = 2;
-pub(crate) const TLB_FLAG_NO_EXECUTE: u8 = 4;
+/// not stored in `TlbEntry`; `translate` folds them into the per-access tags. Sixteen bits: the
+/// four permissions, the protection key and the shadow-stack bit do not fit in eight.
+pub(crate) type TlbFlags = u16;
+pub(crate) const TLB_FLAG_WRITABLE: TlbFlags = 1;
+pub(crate) const TLB_FLAG_USER: TlbFlags = 2;
+pub(crate) const TLB_FLAG_NO_EXECUTE: TlbFlags = 4;
 /// The leaf PTE already has its dirty bit, so a store can skip the walk that would set it.
-pub(crate) const TLB_FLAG_DIRTY: u8 = 8;
+pub(crate) const TLB_FLAG_DIRTY: TlbFlags = 8;
 /// Bits 7:4 carry the leaf's protection key (0 outside IA-32e paging), for `translate` to
-/// withhold the tags PKRU restricts.
+/// withhold the tags PKRU restricts. Mask after shifting: the shadow-stack bit sits above it.
 pub(crate) const TLB_FLAG_PROTECTION_KEY_SHIFT: u32 = 4;
+pub(crate) const TLB_FLAG_PROTECTION_KEY_MASK: TlbFlags = 0xf;
+/// The page is a shadow-stack page (`cet.rs`): the leaf is read-only and dirty and every level
+/// above it writable. Only shadow-stack accesses look at it, and they always walk.
+pub(crate) const TLB_FLAG_SHADOW_STACK: TlbFlags = 1 << 8;
 pub(crate) const TLB_INDEX_BITS: usize = 10;
 /// `Cpu::tlb` holds two halves of this many entries: supervisor first, then user. They are
 /// separate because the same page can be accessible to one privilege and not the other, and a
@@ -460,6 +473,10 @@ pub(crate) struct Cpu {
     /// PKRU, two bits per protection key (`pku.rs`). Change it through `set_pkru`, which empties
     /// the TLB.
     pub pkru: u32,
+    /// IA32_XSS, the supervisor state components xsaves/xrstors handle (`xsave::XSS_SUPPORTED`).
+    pub xss: u64,
+    /// SSP and the CET MSRs (`cet.rs`).
+    pub cet: cet::Cet,
     /// AMD SVM: host/guest switching state (see `svm.rs`).
     pub svm: svm::Svm,
     /// Performance counters and the branch record (see `pmu.rs`).
@@ -843,6 +860,8 @@ impl Cpu {
             spec_ctrl: 0,
             xcr0: xsave::XCR0_X87,
             pkru: 0,
+            xss: 0,
+            cet: cet::Cet::default(),
             svm: svm::Svm::new(),
             pmu: pmu::Pmu::new(),
             monitor_address: 0,
@@ -986,11 +1005,16 @@ impl Cpu {
     }
 
     /// Whether the next step runs a JIT block: 64-bit code with a JIT, unless a performance
-    /// counter or the branch record has to see every instruction (`pmu.rs`) or something may
-    /// raise a #DB (`debug.rs`). The one predicate for interpreter or JIT: `dispatch_step` and
-    /// `--verify` decide by it.
+    /// counter or the branch record has to see every instruction (`pmu.rs`), something may raise
+    /// a #DB (`debug.rs`), or the current privilege level has a shadow stack, which generated
+    /// near calls and returns would skip (`cet.rs`). The one predicate for interpreter or JIT:
+    /// `dispatch_step` and `--verify` decide by it.
     pub(crate) fn uses_jit(&self) -> bool {
-        self.jit.is_some() && self.is_long64() && !self.pmu.precise && !self.debug_slow_path()
+        self.jit.is_some()
+            && self.is_long64()
+            && !self.pmu.precise
+            && !self.debug_slow_path()
+            && !self.shadow_stack_active()
     }
 
     pub fn now_ns(&self) -> u64 {

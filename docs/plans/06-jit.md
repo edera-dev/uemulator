@@ -80,6 +80,10 @@ With one host thread per vCPU (`docs/plans/22-smp-threads.md`) the code cache is
 
 jump-cache lookup inline in generated code (`x-tblookup`), cold-path separation (`x-tblayout`), inline MMIO fast paths (`x-iofast`), exit-request checks on cycle edges only (`x-edgesys`), slow-path thunks (`x-slowthunk`), SSE FP on the host FPU instead of softfloat (`x-ssefp`; aarch64 host FPU semantics differ in NaN/denormal handling, verify), guest-register caching, NEON for SSE2 integer ops.
 
+## CET shadow stacks
+
+Generated near `call`/`ret` do not touch the shadow stack, so the run loop does not enter JIT code while one is in use at the current CPL (`Cpu::uses_jit`, `cpu/cet.rs`); with CET off nothing in the generated code changed. Everything that can switch one on (a CPL change, mov to CR4, wrmsr, VMRUN, #VMEXIT) already ends a block and returns to the run loop, so a chain never runs into one.
+
 ## Fallback behavior
 
 Any translation the JIT cannot handle (an uop without a lowering) → emit a call to an interpreter-equivalent helper for that uop so coverage grows incrementally; the differential harness (08) tracks lowered vs helper-backed uops.

@@ -87,6 +87,8 @@ const PF_RESERVED: u32 = 1 << 3;
 const PF_INSTRUCTION_FETCH: u32 = 1 << 4;
 /// PKRU refused the access; set alongside any other reason the access was refused.
 const PF_PROTECTION_KEY: u32 = 1 << 5;
+/// Set for a fault on a shadow-stack access (`shadow_stack_translate`).
+const PF_SHADOW_STACK: u32 = 1 << 6;
 
 /// `log_once` key bases for unmapped physical accesses; the page number (at most 40 bits) is
 /// added to them. They sit in the top bits so no page number can reach another namespace, and
@@ -99,7 +101,7 @@ const LOG_KEY_UNMAPPED_WRITE: u64 = 1 << 61;
 /// (`svm::NestedRights`): without the store right the entry gets no write tag (clearing Dirty is
 /// what withholds it whatever CR0.WP says), without the fetch right no exec tag, so those
 /// accesses walk again and meet the nested fault or set the nested Dirty bit.
-fn restrict_to_nested(flags: u8, nested: super::svm::NestedRights) -> u8 {
+fn restrict_to_nested(flags: TlbFlags, nested: super::svm::NestedRights) -> TlbFlags {
     let mut flags = flags;
     if !nested.store {
         flags &= !TLB_FLAG_DIRTY;
@@ -341,6 +343,7 @@ impl Cpu {
         fault
     }
 
+    /// `upper_levels_writable`: every level above the leaf was writable (see `TLB_FLAG_SHADOW_STACK`).
     fn leaf_tlb_flags(
         &self,
         writable: bool,
@@ -348,8 +351,9 @@ impl Cpu {
         no_execute: bool,
         pte: u64,
         protection_key: u8,
-    ) -> u8 {
-        let mut tlb_flags = protection_key << TLB_FLAG_PROTECTION_KEY_SHIFT;
+        upper_levels_writable: bool,
+    ) -> TlbFlags {
+        let mut tlb_flags = (protection_key as TlbFlags) << TLB_FLAG_PROTECTION_KEY_SHIFT;
         if writable {
             tlb_flags |= TLB_FLAG_WRITABLE;
         }
@@ -361,6 +365,11 @@ impl Cpu {
         }
         if pte & PTE_DIRTY != 0 {
             tlb_flags |= TLB_FLAG_DIRTY;
+        }
+        // A shadow-stack page is read-only and dirty at the leaf, a combination ordinary stores
+        // can never produce, under levels that are all writable (APM 18.x, SDM 4.6).
+        if upper_levels_writable && pte & PTE_WRITABLE == 0 && pte & PTE_DIRTY != 0 {
+            tlb_flags |= TLB_FLAG_SHADOW_STACK;
         }
         tlb_flags
     }
@@ -374,7 +383,7 @@ impl Cpu {
     /// Long mode and PAE share one loop (same 8-byte entries; PAE just starts at the PDPT
     /// latched in `pdpte`); 32-bit paging has its own because everything about its entries is
     /// narrower.
-    fn walk(&mut self, linear: u64, access: AccessKind, user: bool) -> ExecResult<(u64, u8)> {
+    fn walk(&mut self, linear: u64, access: AccessKind, user: bool) -> ExecResult<(u64, TlbFlags)> {
         if let Some(hit) = self.large_page_lookup(linear, access, user) {
             return Ok(hit);
         }
@@ -396,7 +405,12 @@ impl Cpu {
     /// The cached large leaf holding `linear`, as `walk` would return it, unless the access must
     /// walk anyway: it is not allowed (the walk raises the right #PF), or it is a store to a leaf
     /// that is not dirty yet (the walk sets Dirty).
-    fn large_page_lookup(&self, linear: u64, access: AccessKind, user: bool) -> Option<(u64, u8)> {
+    fn large_page_lookup(
+        &self,
+        linear: u64,
+        access: AccessKind,
+        user: bool,
+    ) -> Option<(u64, TlbFlags)> {
         let cached = self.large_pages.iter().find(|leaf| {
             leaf.shift != 0 && linear >> leaf.shift == leaf.linear_base >> leaf.shift
         })?;
@@ -414,7 +428,7 @@ impl Cpu {
         }
         let offset_mask = (1u64 << cached.shift) - 1;
         let page = cached.physical_base | (linear & offset_mask & !PAGE_OFFSET_MASK);
-        let mut flags = cached.protection_key << TLB_FLAG_PROTECTION_KEY_SHIFT;
+        let mut flags = (cached.protection_key as TlbFlags) << TLB_FLAG_PROTECTION_KEY_SHIFT;
         if cached.writable {
             flags |= TLB_FLAG_WRITABLE;
         }
@@ -426,6 +440,9 @@ impl Cpu {
         }
         if cached.dirty {
             flags |= TLB_FLAG_DIRTY;
+        }
+        if cached.shadow_stack {
+            flags |= TLB_FLAG_SHADOW_STACK;
         }
         Some((page, flags))
     }
@@ -444,6 +461,7 @@ impl Cpu {
         no_execute: bool,
         dirty: bool,
         protection_key: u8,
+        shadow_stack: bool,
     ) {
         if self
             .svm
@@ -473,6 +491,7 @@ impl Cpu {
             no_execute: no_execute && self.efer & EFER_NXE != 0,
             dirty,
             protection_key,
+            shadow_stack,
         };
     }
 
@@ -482,7 +501,7 @@ impl Cpu {
         access: AccessKind,
         user: bool,
         pae: bool,
-    ) -> ExecResult<(u64, u8)> {
+    ) -> ExecResult<(u64, TlbFlags)> {
         let write = access == AccessKind::Write;
         let nxe = self.efer & EFER_NXE != 0;
         let mut table = self.cr3 & PTE_ADDRESS_MASK;
@@ -531,6 +550,8 @@ impl Cpu {
             if reserved {
                 return Err(self.page_fault(linear, access, user, true, true));
             }
+            // `writable` before the leaf's own bit is folded in, for a leaf.
+            let upper_levels_writable = writable;
             writable &= pte & PTE_WRITABLE != 0;
             user_allowed &= pte & PTE_USER != 0;
             no_execute |= pte & PTE_NO_EXECUTE != 0;
@@ -576,6 +597,7 @@ impl Cpu {
                         no_execute,
                         pte & PTE_DIRTY != 0,
                         protection_key,
+                        upper_levels_writable && pte & PTE_WRITABLE == 0 && pte & PTE_DIRTY != 0,
                     );
                 }
                 return Ok((
@@ -587,6 +609,7 @@ impl Cpu {
                             no_execute,
                             pte,
                             protection_key,
+                            upper_levels_writable,
                         ),
                         nested,
                     ),
@@ -612,7 +635,7 @@ impl Cpu {
         linear: u64,
         access: AccessKind,
         user: bool,
-    ) -> ExecResult<(u64, u8)> {
+    ) -> ExecResult<(u64, TlbFlags)> {
         let write = access == AccessKind::Write;
         let mut table = self.cr3 & LEGACY_TABLE_MASK;
         let mut writable = true;
@@ -632,6 +655,8 @@ impl Cpu {
             if large && pte & LEGACY_LARGE_RESERVED_BIT != 0 {
                 return Err(self.page_fault(linear, access, user, true, true));
             }
+            // `writable` before the leaf's own bit is folded in, for a leaf.
+            let upper_levels_writable = writable;
             writable &= pte & PTE_WRITABLE != 0;
             user_allowed &= pte & PTE_USER != 0;
             if large || level == 0 {
@@ -671,7 +696,14 @@ impl Cpu {
                 return Ok((
                     page_pa,
                     restrict_to_nested(
-                        self.leaf_tlb_flags(writable, user_allowed, false, pte, 0),
+                        self.leaf_tlb_flags(
+                            writable,
+                            user_allowed,
+                            false,
+                            pte,
+                            0,
+                            upper_levels_writable,
+                        ),
                         nested,
                     ),
                 ));
@@ -771,7 +803,10 @@ impl Cpu {
             // write tag even from supervisor stores that a clear CR0.WP allows: a slow store,
             // never a wrong one.
             let key_rights = if self.cr4 & CR4_PKE != 0 && walk_flags & TLB_FLAG_USER != 0 {
-                self.protection_key_rights(walk_flags >> TLB_FLAG_PROTECTION_KEY_SHIFT)
+                self.protection_key_rights(
+                    ((walk_flags >> TLB_FLAG_PROTECTION_KEY_SHIFT) & TLB_FLAG_PROTECTION_KEY_MASK)
+                        as u8,
+                )
             } else {
                 0
             };
@@ -801,6 +836,66 @@ impl Cpu {
             self.tlb[slot] = refilled;
         }
         Ok(page_pa | (linear & PAGE_OFFSET_MASK))
+    }
+
+    /// Physical address of a shadow-stack access (`cet.rs`) to `linear`, which must not cross a
+    /// page. Such an access is allowed only on a shadow-stack page (`TLB_FLAG_SHADOW_STACK`) of
+    /// its own privilege: `user` accesses (CPL 3, wruss) need a user page, supervisor ones a
+    /// supervisor page, and SMAP does not apply. Any fault is a #PF with the shadow-stack bit,
+    /// and the write bit for a store. Shadow-stack accesses always walk: the soft TLB keeps no
+    /// tag for them, and a page that is one has no write tag (it is read-only).
+    ///
+    /// Not modelled: a nested page must be writable for a shadow-stack access too, and a store
+    /// would set the nested Dirty bit. The walk here asks the nested tables for read access, so
+    /// a hypervisor that write-protects a guest shadow-stack page (dirty logging) misses those
+    /// stores.
+    pub(super) fn shadow_stack_translate(
+        &mut self,
+        linear: u64,
+        user: bool,
+        write: bool,
+    ) -> ExecResult<u64> {
+        let linear = if self.efer & EFER_LMA == 0 {
+            linear & LINEAR_32BIT_MASK
+        } else {
+            // 57 bits with CR4.LA57, like every other access
+            if !self.is_canonical_linear(linear) {
+                return Err(Exception::general_protection(0));
+            }
+            linear
+        };
+        let mark = |exception: Exception| match exception {
+            Exception::Fault {
+                vector: VECTOR_PAGE_FAULT,
+                error_code: Some(code),
+                software,
+            } => Exception::Fault {
+                vector: VECTOR_PAGE_FAULT,
+                error_code: Some(code | PF_SHADOW_STACK | if write { PF_WRITE } else { 0 }),
+                software,
+            },
+            other => other,
+        };
+        let access = if write {
+            AccessKind::Write
+        } else {
+            AccessKind::Read
+        };
+        if self.paging_mode() == PagingMode::Off {
+            let page = self.nested_translate(linear & !PAGE_OFFSET_MASK, access, false)?;
+            return Ok(page | (linear & PAGE_OFFSET_MASK));
+        }
+        let (page, flags) = self.walk(linear, AccessKind::Read, user).map_err(mark)?;
+        if flags & TLB_FLAG_SHADOW_STACK == 0 || (flags & TLB_FLAG_USER != 0) != user {
+            return Err(mark(self.page_fault(
+                linear,
+                AccessKind::Read,
+                user,
+                true,
+                false,
+            )));
+        }
+        Ok(page | (linear & PAGE_OFFSET_MASK))
     }
 
     pub fn flush_tlb(&mut self) {

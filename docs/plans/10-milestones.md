@@ -47,6 +47,7 @@
 - UMIP, SMEP/SMAP, PCID/INVPCID, MONITOR/MWAIT, RDTSCP done (see 03).
 
 - Turin's address widths, 5-level paging and protection keys done (see 03, "5-level paging and protection keys"): 52 physical and 57 linear bits, CR4.LA57 with the PML5 walk and 57-bit canonical checks (5-level nested paging under a host with LA57), CR4.PKE with PKRU, rdpkru/wrpkru, the PK fault bit and PKRU as XSAVE component 9. Checked: Debian's 6.12 kernel through the UEFI firmware and with `--firmware none`, 1 and 4 vCPUs, switches itself to 5-level paging (`VmallocTotal` 13743895347199 kB, CR4 0x771ef0), enables PKU (`xstate features 0x2e7, context size is 2440 bytes`), and a static test program gets SEGV_PKUERR for a read under access-disable and a write under write-disable from `pkey_alloc`/`pkey_mprotect`/`wrpkru`; Alpine's virt kernel runs 5-level too (it is built without protection keys).
+- CET shadow stacks and VME/PVI done (see 21, "Zen 5 Turin model"; `cpu/cet.rs`, `cpu/vme.rs`): CET_SS and VME advertised, user and supervisor shadow stacks with the token protocol, #CP, the CET instructions, XSAVES components 11/12 and the VMCB's S_CET/SSP/ISST_ADDR. A privilege level with a shadow stack runs on the interpreter.
 
 - VEX decoding, BMI1 and BMI2 done (see 03, "VEX and BMI").
 
