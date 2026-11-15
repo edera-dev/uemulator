@@ -164,9 +164,11 @@ impl Smp {
         let from = self.active;
         if from != target {
             let (low, high) = (from.min(target), from.max(target));
+            self.cpus[from].pmu_park();
             let (head, tail) = self.cpus.split_at_mut(high);
             head[low].swap_shared(&mut tail[0]);
             self.active = target;
+            self.cpus[target].pmu_unpark();
         }
         let running = self.cpus.iter().filter(|cpu| !cpu.halted).count() as u64;
         // The vCPU being entered counts even if it is halted now: it wakes up in its slice.

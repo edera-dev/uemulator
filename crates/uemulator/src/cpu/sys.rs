@@ -434,6 +434,10 @@ impl Cpu {
             MSR_SYSENTER_CS..=MSR_SYSENTER_EIP => {
                 self.sysenter[(msr - MSR_SYSENTER_CS) as usize] = v
             }
+            mca::MSR_HWCR => {
+                self.pmu_hwcr_written(v);
+                self.msr_misc.insert(msr, v);
+            }
             _ if self.msr_misc.contains_key(&msr) => {
                 self.msr_misc.insert(msr, v);
             }

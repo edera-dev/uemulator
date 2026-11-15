@@ -18,6 +18,14 @@
 //! `next_event`. The overflow interrupt therefore lands at the first block boundary at or after
 //! the overflow; real hardware has skid too. Branch events and the branch record need every
 //! instruction looked at, so while one is enabled the CPU runs the interpreter (`Cpu::uses_jit`).
+//!
+//! Time-shared vCPUs hand one `icount` around (`Cpu::swap_shared`), so every count here is of
+//! this vCPU's own instructions: `icount` less `Pmu::foreign`, the instructions the others retired
+//! while this one was parked (`Cpu::pmu_park`, `Cpu::pmu_unpark`). Threaded vCPUs each keep their
+//! own `icount` and never park.
+//!
+//! IRPERF (MSR 0xC000_00E9, CPUID 0x8000_0008 EBX bit 1) is a seventh, fixed counter of retired
+//! instructions that runs while HWCR.IRPerfEn is set; it syncs with the others.
 
 use super::decode::Insn;
 use super::exception::Exception;
@@ -57,6 +65,11 @@ const MSR_L3_PERF_LAST: u32 = MSR_F16H_L2I_PERF_CTL0 + 2 * L3_COUNTERS as u32 - 
 const RDPMC_BASE_NORTHBRIDGE: u32 = CORE_COUNTERS as u32;
 const RDPMC_BASE_L3: u32 = RDPMC_BASE_NORTHBRIDGE + NORTHBRIDGE_COUNTERS as u32;
 const RDPMC_END: u32 = RDPMC_BASE_L3 + L3_COUNTERS as u32;
+/// Instructions retired, read-only, 48 bits like the other counters (Linux's `msr` PMU reads it
+/// as the "irperf" event).
+const MSR_IRPERF: u32 = 0xc000_00e9;
+/// HWCR bit 30, IRPerfEn: IRPERF counts while set. Linux sets it at boot when CPUID has IRPERF.
+const HWCR_IRPERF_ENABLE: u64 = 1 << 30;
 
 /// Entries of the LBR v2 stack (leaf 0x8000_0022 EBX bits 9:4).
 pub(crate) const LBR_ENTRIES: usize = 16;
@@ -231,6 +244,12 @@ pub(crate) struct Pmu {
     /// `icount` charges that are not retired instructions: a faulting instruction, and every
     /// iteration of a rep string instruction except the one that finishes it.
     pub(crate) unretired: u64,
+    /// Instructions other time-shared vCPUs added to `icount` while this one was parked, and the
+    /// `icount` it parked at.
+    foreign: u64,
+    parked_icount: u64,
+    irperf: u64,
+    irperf_enabled: bool,
     /// Running totals only `exec_observed` advances (precise mode).
     branches: u64,
     taken_branches: u64,
@@ -258,6 +277,10 @@ impl Pmu {
             mode_sensitive: false,
             precise: false,
             unretired: 0,
+            foreign: 0,
+            parked_icount: 0,
+            irperf: 0,
+            irperf_enabled: false,
             branches: 0,
             taken_branches: 0,
             synced: Totals::default(),
@@ -282,6 +305,7 @@ impl Pmu {
                 | MSR_AMD_SAMP_BR_FROM..=MSR_AMD_SAMP_BR_LAST
                 | MSR_F15H_NB_PERF_CTL0..=MSR_NB_PERF_LAST
                 | MSR_F16H_L2I_PERF_CTL0..=MSR_L3_PERF_LAST
+                | MSR_IRPERF
         )
     }
 
@@ -346,9 +370,10 @@ fn scaled_count(select: u64, events: u64, cycles: u64) -> u64 {
 impl Cpu {
     /// The totals with `icount` taken as `icount`: see `pmu_sync_before_this_instruction`.
     fn pmu_totals(&self, icount: u64) -> Totals {
+        let own = icount.wrapping_sub(self.pmu.foreign);
         Totals {
-            cycles: icount.wrapping_mul(CYCLES_PER_ICOUNT),
-            instructions: icount.wrapping_sub(self.pmu.unretired),
+            cycles: own.wrapping_mul(CYCLES_PER_ICOUNT),
+            instructions: own.wrapping_sub(self.pmu.unretired),
             branches: self.pmu.branches,
             taken_branches: self.pmu.taken_branches,
         }
@@ -397,6 +422,9 @@ impl Cpu {
         let elapsed = now.since(self.pmu.synced);
         self.pmu.synced = now;
         let mut interrupt = false;
+        if self.pmu.irperf_enabled {
+            self.pmu.irperf = self.pmu.irperf.wrapping_add(elapsed.instructions) & COUNTER_MASK;
+        }
         for index in 0..CORE_COUNTERS {
             if self.pmu.counting & (1 << index) == 0 {
                 continue;
@@ -466,6 +494,34 @@ impl Cpu {
         }
     }
 
+    /// This time-shared vCPU hands `icount` on (`Smp::switch_to`); see the module comment.
+    pub(crate) fn pmu_park(&mut self) {
+        self.pmu.parked_icount = self.icount;
+    }
+
+    /// This vCPU holds `icount` again: what the others retired meanwhile is not its own, so the
+    /// counts, the sync point and the overflow deadline all move past it.
+    pub(crate) fn pmu_unpark(&mut self) {
+        let gap = self.icount.wrapping_sub(self.pmu.parked_icount);
+        self.pmu.foreign = self.pmu.foreign.wrapping_add(gap);
+        self.pmu.synced_icount = self.pmu.synced_icount.wrapping_add(gap);
+        if self.pmu.deadline != u64::MAX {
+            self.pmu.deadline = self.pmu.deadline.saturating_add(gap);
+            // `next_event` is the machine's; it must still stop at this vCPU's overflow.
+            self.next_event = self.next_event.min(self.pmu.deadline);
+        }
+    }
+
+    /// HWCR is about to take `value` (it is stored in `msr_misc`): IRPERF starts or stops. The
+    /// wrmsr itself counts in the window that ends here, like one that enables a core counter.
+    pub(crate) fn pmu_hwcr_written(&mut self, value: u64) {
+        let enabled = value & HWCR_IRPERF_ENABLE != 0;
+        if enabled != self.pmu.irperf_enabled {
+            self.pmu_sync();
+            self.pmu.irperf_enabled = enabled;
+        }
+    }
+
     /// The overflow deadline has passed: sync, which raises any overflow interrupt.
     pub(crate) fn pmu_deadline_reached(&mut self) {
         if self.icount >= self.pmu.deadline {
@@ -496,6 +552,10 @@ impl Cpu {
                 self.pmu.global_status
             }
             MSR_PERF_CNTR_GLOBAL_CTL => self.pmu.global_ctl,
+            MSR_IRPERF => {
+                self.pmu_sync_before_this_instruction();
+                self.pmu.irperf
+            }
             // write-only command registers
             MSR_PERF_CNTR_GLOBAL_STATUS_CLR | MSR_PERF_CNTR_GLOBAL_STATUS_SET => 0,
             MSR_AMD64_LBR_SELECT => self.pmu.lbr_select,
@@ -533,7 +593,7 @@ impl Cpu {
                 }
                 self.pmu_write_counter(index, value);
             }
-            MSR_PERF_CNTR_GLOBAL_STATUS => return gp(),
+            MSR_PERF_CNTR_GLOBAL_STATUS | MSR_IRPERF => return gp(),
             MSR_PERF_CNTR_GLOBAL_CTL => {
                 if value & !GLOBAL_CTL_ALL != 0 {
                     return gp();

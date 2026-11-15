@@ -3203,6 +3203,34 @@ mod tests {
         );
     }
 
+    /// A guest's write of the TSC lands on the one real counter, so the guest then reads what it
+    /// wrote through its ratio and offset (`Cpu::svm_host_tsc_for`).
+    #[test]
+    fn a_guest_tsc_write_is_read_back_through_the_ratio_and_offset() {
+        const WRITTEN: u64 = 0x10_0000_0000;
+        // mov ecx, TSC; xor eax, eax; mov edx, WRITTEN >> 32; wrmsr; rdtsc; mov ebx, eax;
+        // mov ecx, edx; cpuid
+        const GUEST_WRITES_TSC: &[u8] = &[
+            0xb9, 0x10, 0, 0, 0, 0x31, 0xc0, 0xba, 0x10, 0, 0, 0, 0x0f, 0x30, 0x0f, 0x31, 0x89,
+            0xc3, 0x89, 0xd1, 0x0f, 0xa2,
+        ];
+        let mut h = rig(GUEST_WRITES_TSC);
+        h.cpu.time_base_ns = ONE_SECOND_NS;
+        h.cpu.wrmsr(MSR_TSC_RATIO, 2 * TSC_RATIO_ONE).unwrap();
+        put(&mut h, VMCB_TSC_OFFSET, 8, 7 * ONE_SECOND_NS);
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_CPUID);
+        let read = (h.cpu.gpr[1] << 32) | (h.cpu.gpr[3] & 0xffff_ffff);
+        assert!((WRITTEN..WRITTEN + 100).contains(&read), "{read:#x}");
+        // the host's counter moved to where the guest's ratio and offset put it
+        let host = (WRITTEN - 7 * ONE_SECOND_NS) / 2;
+        assert!(
+            (host..host + 1000).contains(&h.cpu.tsc()),
+            "{}",
+            h.cpu.tsc()
+        );
+    }
+
     /// The guest reads DEBUGCTL into ebx and LastExceptionFromIP into esi, clears DEBUGCTL, and
     /// stops on a cpuid.
     const GUEST_USES_DEBUGCTL: &[u8] = &[
@@ -4595,6 +4623,7 @@ mod tests {
         a_page_flagged_as_code_while_the_guest_is_out_loses_the_guests_write_tags,
         an_nmi_for_the_host_exits_the_guest_when_intercepted,
         the_tsc_ratio_scales_guest_reads_before_the_offset,
+        a_guest_tsc_write_is_read_back_through_the_ratio_and_offset,
         lbr_virtualization_gives_the_guest_the_vmcbs_debugctl_and_branch_records,
         the_pause_filter_count_lets_pauses_through_until_it_runs_out,
         the_pause_filter_threshold_restarts_the_count_after_a_slow_pause,

@@ -422,13 +422,13 @@ fn address_size_leaf_reports_40_physical_and_48_virtual_bits_and_the_extensions(
     assert_eq!(eax & 0xff, 40);
     assert_eq!((eax >> 8) & 0xff, 48);
     assert_eq!(eax >> 16, 0);
-    // CLZERO RDPRU XSAVEERPTR MCOMMIT MBE WBNOINVD IBPB INT_WBINVD IBRS STIBP STIBP_ALWAYS_ON
-    // IBRS_SAME_MODE EFER_LMSLE_MBZ PPIN SSBD CPPC PSFD BTC_NO IBPB_RET; no IRPERF, AMD_SSB_NO,
-    // VIRT_SSBD, IBRS_ALWAYS_ON
+    // CLZERO IRPERF RDPRU XSAVEERPTR MCOMMIT MBE WBNOINVD IBPB INT_WBINVD IBRS STIBP
+    // STIBP_ALWAYS_ON IBRS_SAME_MODE EFER_LMSLE_MBZ PPIN SSBD CPPC PSFD BTC_NO IBPB_RET; no
+    // AMD_SSB_NO, VIRT_SSBD, IBRS_ALWAYS_ON
     assert_eq!(
         ebx,
         bits(&[
-            0, 2, 4, 6, 8, 9, 12, 13, 14, 15, 17, 19, 20, 23, 24, 27, 28, 29, 30
+            0, 1, 2, 4, 6, 8, 9, 12, 13, 14, 15, 17, 19, 20, 23, 24, 27, 28, 29, 30
         ])
     );
     // EDX 23:16: rdpru takes ECX 0 and 1

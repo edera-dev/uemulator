@@ -609,6 +609,8 @@ const ADDRESS_SIZES: u32 = (VIRTUAL_ADDRESS_BITS << 8) | PHYSICAL_ADDRESS_BITS;
 // Leaf 0x8000_0008 EBX.
 /// clzero (0F 01 FC).
 const EXT_ADDRESS_CLZERO: u32 = 1 << 0;
+/// IRPERF: MSR 0xC000_00E9 counts retired instructions while HWCR bit 30 is set (`pmu.rs`).
+const EXT_ADDRESS_IRPERF: u32 = 1 << 1;
 /// rdpru (0F 01 FD): MPERF and APERF at any CPL unless CR4.TSD (`sys.rs`).
 const EXT_ADDRESS_RDPRU: u32 = 1 << 4;
 /// mcommit (F3 0F 01 FA), enabled by EFER.MCOMMIT (bit 17).
@@ -654,6 +656,7 @@ const EXT_ADDRESS_BTC_NO: u32 = 1 << 29;
 /// IBPB also flushes the return predictor; without it Linux marks the CPU "ibpb_no_ret".
 const EXT_ADDRESS_IBPB_RET: u32 = 1 << 30;
 const EXT_ADDRESS_EBX: u32 = EXT_ADDRESS_CLZERO
+    | EXT_ADDRESS_IRPERF
     | EXT_ADDRESS_RDPRU
     | EXT_ADDRESS_XSAVEERPTR
     | EXT_ADDRESS_MCOMMIT

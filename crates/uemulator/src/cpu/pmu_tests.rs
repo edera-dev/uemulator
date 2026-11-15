@@ -538,3 +538,67 @@ fn the_reading_instruction_is_not_in_what_rdmsr_returns() {
     }
     assert_jit_matches_interpreter(&code, setup);
 }
+
+const MSR_IRPERF: u32 = 0xc000_00e9;
+const MSR_HWCR: u32 = 0xc001_0015;
+const HWCR_IRPERF_ENABLE: u64 = 1 << 30;
+
+#[test]
+fn irperf_counts_retired_instructions_only_while_hwcr_enables_it() {
+    let mut h = Harness::new(&[HLT]);
+    h.cpu.gpr[RAX] = 0x8000_0008;
+    h.cpu.cpuid();
+    assert_ne!(h.cpu.gpr[crate::cpu::sys::RBX] & 1 << 1, 0, "IRPERF");
+    h.cpu.icount += 100;
+    assert_eq!(h.cpu.rdmsr(MSR_IRPERF).unwrap(), 0, "off at reset");
+    let hwcr = h.cpu.rdmsr(MSR_HWCR).unwrap();
+    h.cpu.wrmsr(MSR_HWCR, hwcr | HWCR_IRPERF_ENABLE).unwrap();
+    h.cpu.icount += 40;
+    // a faulting instruction is charged to icount but does not retire
+    h.cpu.pmu.unretired += 3;
+    // the reading rdmsr is in icount already and does not count itself
+    h.cpu.icount += 1;
+    assert_eq!(h.cpu.rdmsr(MSR_IRPERF).unwrap(), 37);
+    h.cpu.wrmsr(MSR_HWCR, hwcr).unwrap();
+    h.cpu.icount += 50;
+    assert_eq!(
+        h.cpu.rdmsr(MSR_IRPERF).unwrap(),
+        38,
+        "the disabling wrmsr counted"
+    );
+    assert!(general_protection(h.cpu.wrmsr(MSR_IRPERF, 0)), "read-only");
+}
+
+/// Time-shared vCPUs hand one `icount` around: what the other vCPU retires while this one is
+/// parked is not this one's, for the core counters, IRPERF and the overflow deadline alike.
+#[test]
+fn a_parked_vcpu_does_not_count_what_the_others_retire() {
+    let mut this = Harness::new(&[HLT]);
+    let mut other = Harness::new(&[HLT]);
+    program(&mut this, 0, INSTRUCTIONS, COUNTER_MASK - 99);
+    program(&mut this, 1, CYCLES, 0);
+    let hwcr = this.cpu.rdmsr(MSR_HWCR).unwrap();
+    this.cpu.wrmsr(MSR_HWCR, hwcr | HWCR_IRPERF_ENABLE).unwrap();
+    this.cpu.icount += 30;
+    let deadline = this.cpu.pmu.deadline;
+
+    // `Smp::switch_to` there and back, the other vCPU retiring 1000 in between
+    this.cpu.pmu_park();
+    this.cpu.swap_shared(&mut other.cpu);
+    other.cpu.pmu_unpark();
+    other.cpu.icount += 1000;
+    other.cpu.pmu_park();
+    other.cpu.swap_shared(&mut this.cpu);
+    this.cpu.pmu_unpark();
+
+    assert_eq!(
+        this.cpu.pmu.deadline,
+        deadline + 1000,
+        "the overflow moved with the gap"
+    );
+    assert!(this.cpu.next_event <= this.cpu.pmu.deadline);
+    this.cpu.icount += 20;
+    assert_eq!(counter(&mut this, 0), COUNTER_MASK - 99 + 50);
+    assert_eq!(counter(&mut this, 1), 50 * CYCLES_PER_ICOUNT);
+    assert_eq!(this.cpu.pmu.irperf, 50);
+}
