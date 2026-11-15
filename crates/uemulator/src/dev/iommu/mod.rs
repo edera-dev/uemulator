@@ -58,7 +58,9 @@ pub(crate) const INTERRUPT_WINDOW_FIRST: u64 = 0xfee0_0000;
 pub(crate) const INTERRUPT_WINDOW_LAST: u64 = 0xfeef_ffff;
 
 const VENDOR_AMD: u16 = 0x1022;
-const DEVICE_IOMMU: u16 = 0x1419;
+/// "Turin IOMMU" in pci.ids; Linux and Xen find the IOMMU through IVRS and never match this id,
+/// but `lspci` and inventory tools show it.
+const DEVICE_IOMMU: u16 = 0x153b;
 /// Class 08h (system peripheral), subclass 06h (IOMMU).
 const CLASS_SYSTEM_PERIPHERAL: u8 = 0x08;
 const SUBCLASS_IOMMU: u8 = 0x06;
@@ -196,15 +198,20 @@ const STATUS_WRITE_ONE_TO_CLEAR: u64 =
     STATUS_EVENT_OVERFLOW | STATUS_EVENT_INTERRUPT | STATUS_COMPLETION_WAIT_INTERRUPT;
 
 /// Extended feature register: PreFSup (the prefetch command is accepted), XTSup (x2APIC: 32-bit
-/// IRTE destinations and the IntCapXT interrupt registers), IASup (invalidate all), GASup
-/// (128-bit IRTEs) and HATS = 10b (host page tables of up to six levels).
+/// IRTE destinations and the IntCapXT interrupt registers), NXSup (execute requests are checked,
+/// `Access::Execute`), IASup (invalidate all), GASup (128-bit IRTEs) and HATS = 10b (host page
+/// tables of up to six levels). Turin has more that are not implemented and so stay clear: PPR
+/// (1), GT (4), HE (8), PC (9, performance counters), GAM (21, vAPIC posting), HA/HD (52/51,
+/// access and dirty bits), EPH (50), and the v2 page table and SNP bits.
 const EFR_PREFETCH: u64 = 1 << 0;
 const EFR_X2APIC: u64 = 1 << 2;
+const EFR_NO_EXECUTE: u64 = 1 << 3;
 const EFR_INVALIDATE_ALL: u64 = 1 << 6;
 const EFR_GUEST_APIC: u64 = 1 << 7;
 const EFR_HOST_ADDRESS_TRANSLATION_SIZE_6_LEVEL: u64 = 2 << 10;
 pub(crate) const EXTENDED_FEATURES: u64 = EFR_PREFETCH
     | EFR_X2APIC
+    | EFR_NO_EXECUTE
     | EFR_INVALIDATE_ALL
     | EFR_GUEST_APIC
     | EFR_HOST_ADDRESS_TRANSLATION_SIZE_6_LEVEL;
@@ -238,6 +245,29 @@ fn read_u64(mem: &dyn PhysRead, addr: u64) -> Option<u64> {
 pub(crate) enum Access {
     Read,
     Write,
+    /// A request with execute permission (PCIe's PASID prefix Exe bit). No emulated device makes
+    /// one; it exists so what EFR.NXSup promises is implemented: the v1 host page tables have no
+    /// execute bit, so execute is allowed exactly where read is.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Execute,
+}
+
+impl Access {
+    fn allowed(self, read: bool, write: bool) -> bool {
+        match self {
+            Access::Read | Access::Execute => read,
+            Access::Write => write,
+        }
+    }
+
+    /// The IO_PAGE_FAULT flag that says what the access was.
+    fn event_flag(self) -> u16 {
+        match self {
+            Access::Read => 0,
+            Access::Write => events::FLAG_WRITE,
+            Access::Execute => events::FLAG_NO_EXECUTE,
+        }
+    }
 }
 
 /// Why a DMA access did not happen. Everything but `InterruptWindow` also queued an event.
@@ -796,20 +826,13 @@ impl Iommu {
             phys: phys_page | offset,
             bytes_left: PAGE_BYTES - offset,
         };
-        let rw_flag = if access == Access::Write {
-            events::FLAG_WRITE
-        } else {
-            0
-        };
+        let rw_flag = access.event_flag();
         let page = iova >> PAGE_SHIFT;
         if let Some(&entry) = self.iotlb.get(iotlb_slot(requester, page))
             && entry.page == page
             && entry.requester == requester
         {
-            let allowed = match access {
-                Access::Read => entry.read,
-                Access::Write => entry.write,
-            };
+            let allowed = access.allowed(entry.read, entry.write);
             if allowed || !report {
                 return Ok(page_translation(entry.phys_page));
             }
@@ -852,10 +875,7 @@ impl Iommu {
         }
         let domain = entry.domain_id();
         if entry.mode() == 0 {
-            let allowed = match access {
-                Access::Read => entry.read_allowed(),
-                Access::Write => entry.write_allowed(),
-            };
+            let allowed = access.allowed(entry.read_allowed(), entry.write_allowed());
             if allowed || !report {
                 return Ok(identity);
             }
@@ -864,10 +884,7 @@ impl Iommu {
         }
         match tables::walk(mem, &entry, iova) {
             Ok(leaf) => {
-                let allowed = match access {
-                    Access::Read => leaf.read,
-                    Access::Write => leaf.write,
-                };
+                let allowed = access.allowed(leaf.read, leaf.write);
                 if self.iotlb.is_empty() {
                     self.iotlb = vec![EMPTY_IOTLB_ENTRY; IOTLB_ENTRIES];
                 }

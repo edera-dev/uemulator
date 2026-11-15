@@ -9,6 +9,7 @@ mod bios;
 #[cfg(not(freestanding))]
 mod bios_keys;
 mod bmi;
+pub(crate) mod cppc;
 mod cpuid;
 pub(crate) mod decode;
 pub(crate) mod exception;
@@ -429,6 +430,7 @@ pub(crate) struct Cpu {
     pub mtrr: mtrr::Mtrr,
     pub mca: mca::Mca,
     pub rdt: rdt::Rdt,
+    pub cppc: cppc::Cppc,
     pub efer: u64,
     pub star: u64,
     pub lstar: u64,
@@ -806,6 +808,7 @@ impl Cpu {
             mtrr: mtrr::Mtrr::new(),
             mca: mca::Mca::new(),
             rdt: rdt::Rdt::new(),
+            cppc: cppc::Cppc::new(),
             efer: EFER_LMA | EFER_LME,
             star: 0,
             lstar: 0,

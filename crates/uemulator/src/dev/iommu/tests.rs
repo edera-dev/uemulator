@@ -253,7 +253,7 @@ fn expect_one(events: Vec<Event>) -> Event {
 fn config_space_identifies_an_amd_iommu_with_its_capabilities() {
     let iommu = Iommu::new();
     assert_eq!(iommu.config_read(0, 2), 0x1022);
-    assert_eq!(iommu.config_read(2, 2), 0x1419);
+    assert_eq!(iommu.config_read(2, 2), 0x153b, "Turin IOMMU");
     assert_eq!(iommu.config_read(0x0b, 1), 0x08, "class: system peripheral");
     assert_eq!(iommu.config_read(0x0a, 1), 0x06, "subclass: IOMMU");
     assert_eq!(
@@ -302,7 +302,7 @@ fn identification_and_capability_headers_are_read_only() {
     iommu.config_write(0, 4, 0xffff_ffff);
     iommu.config_write(CAP_HEADER, 4, 0);
     iommu.config_write(CAP_MISC, 4, 0);
-    assert_eq!(iommu.config_read(0, 4), 0x1419_1022);
+    assert_eq!(iommu.config_read(0, 4), 0x153b_1022);
     assert_eq!(iommu.config_read(CAP_HEADER, 1), 0x0f);
     assert_ne!(iommu.config_read(CAP_MISC, 4), 0);
 }
@@ -433,6 +433,40 @@ fn extended_feature_register_advertises_what_is_implemented() {
     assert_eq!(f.read(REG_EXTENDED_FEATURE), EXTENDED_FEATURES);
     assert_ne!(EXTENDED_FEATURES & EFR_INVALIDATE_ALL, 0);
     assert_ne!(EXTENDED_FEATURES & EFR_GUEST_APIC, 0);
+    assert_ne!(EXTENDED_FEATURES & EFR_NO_EXECUTE, 0);
+    // Not implemented, so not advertised: PPR, GT, HE, PC, GAM (vAPIC), HA/HD, EPH.
+    for unimplemented in [1, 4, 8, 9, 21, 50, 52] {
+        assert_eq!(
+            EXTENDED_FEATURES & 1 << unimplemented,
+            0,
+            "bit {unimplemented}"
+        );
+    }
+}
+
+/// NXSup: an execute request needs read permission (host page tables have no execute bit) and
+/// a denied one says so in the IO_PAGE_FAULT flags.
+#[test]
+fn execute_requests_need_read_permission_and_fault_as_no_execute() {
+    let mut f = Fixture::enabled();
+    let root = f.alloc_page();
+    f.set_dte(DEVICE, [dte_q0(3, root, true, true), DOMAIN as u64, 0, 0]);
+    f.map_4k(root, 3, 0x5000, DATA_AT, true);
+    let mem = GuestMem::new(&mut f.ram, &[]);
+    let translation = f.iommu.translate(&mem, DEVICE, 0x5000, Access::Execute);
+    assert_eq!(translation.map(|t| t.phys), Ok(DATA_AT));
+    // Write-only DTE: execute is refused like a read, as a present no-execute fault.
+    f.set_dte(DEVICE, [dte_q0(3, root, false, true), DOMAIN as u64, 0, 0]);
+    f.invalidate_all();
+    let mut mem = GuestMem::new(&mut f.ram, &[]);
+    assert_eq!(
+        f.iommu.translate(&mem, DEVICE, 0x5000, Access::Execute),
+        Err(DmaFault::Permission)
+    );
+    f.iommu.service(&mut mem);
+    let event = expect_one(f.events());
+    assert_eq!(event.code, EVENT_IO_PAGE_FAULT);
+    assert_eq!(event.flags, events::FLAG_PRESENT | events::FLAG_NO_EXECUTE);
 }
 
 #[test]
@@ -1658,7 +1692,7 @@ fn pci_host_exposes_the_iommu_function_only_when_asked() {
 
     let mut on = PciHost::new(Vec::new()).with_iommu(true);
     on.io_out(CONFIG_ADDRESS_PORT, 4, config_address(2, 0));
-    assert_eq!(on.io_in(CONFIG_DATA_PORT, 4), 0x1419_1022);
+    assert_eq!(on.io_in(CONFIG_DATA_PORT, 4), 0x153b_1022);
     on.io_out(CONFIG_ADDRESS_PORT, 4, config_address(0, 0x0c));
     assert_eq!(
         on.io_in(CONFIG_DATA_PORT, 4) >> 16 & 0xff,

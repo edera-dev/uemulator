@@ -1,4 +1,5 @@
-//! The fixed-format tables: RSDP, RSDT, XSDT, FACS, FADT, MADT, MCFG, HPET. Layouts follow
+//! The fixed-format tables: RSDP, RSDT, XSDT, FACS, FADT, MADT, MCFG, HPET, SRAT, SLIT, SPCR.
+//! Layouts follow
 //! ACPI 6.x chapter 5 (and the HPET specification 1.0a); QEMU's `hw/acpi/aml-build.c` is the
 //! cross-check for which optional fields guests actually read.
 #[cfg(freestanding)]
@@ -140,6 +141,9 @@ const FLAG_RESET_REGISTER: u32 = 1 << 10;
 /// machine resets, and 0x06 is what Linux's ACPI reboot writes.
 const RESET_PORT: u64 = 0xcf9;
 const RESET_VALUE: u8 = 0x06;
+/// Preferred PM profile "Enterprise Server", which is what a Turin board says. Linux's amd_pstate
+/// refuses to load by default on a machine whose profile is unspecified (0).
+const PM_PROFILE_ENTERPRISE_SERVER: u8 = 4;
 
 /// FADT revision 6.0 (276 bytes). No SMI_CMD and no ACPI_ENABLE value: ACPI starts enabled, which
 /// is how Linux decides not to try the SMI handshake (`acpi_enable` only runs with SMI_CMD).
@@ -158,7 +162,7 @@ pub(super) fn fadt(dsdt: u64, facs: u64) -> Vec<u8> {
     dword(&mut body, firmware_ctrl);
     dword(&mut body, dsdt as u32);
     body.push(0); // reserved (was INT_MODEL)
-    body.push(0); // preferred PM profile: unspecified
+    body.push(PM_PROFILE_ENTERPRISE_SERVER);
     word(&mut body, SCI_IRQ as u16);
     dword(&mut body, 0); // SMI_CMD
     body.extend_from_slice(&[0, 0, 0, 0]); // ACPI_ENABLE, ACPI_DISABLE, S4BIOS_REQ, PSTATE_CNT
@@ -359,4 +363,123 @@ pub(super) fn tpm2() -> Vec<u8> {
     body.extend_from_slice(&TPM2_START_METHOD_CRB.to_le_bytes());
     body.extend_from_slice(&[0; TPM2_START_METHOD_PARAMETER_BYTES]);
     table(b"TPM2", TPM2_REVISION, &body)
+}
+
+const SRAT_REVISION: u8 = 3;
+/// The dword after the header must be 1 "for backward compatibility"; a reserved qword follows.
+const SRAT_LEGACY_RESERVED: u32 = 1;
+const SRAT_PROCESSOR_APIC: u8 = 0;
+const SRAT_MEMORY: u8 = 1;
+const SRAT_PROCESSOR_X2APIC: u8 = 2;
+const SRAT_PROCESSOR_APIC_LENGTH: u8 = 16;
+const SRAT_MEMORY_LENGTH: u8 = 40;
+const SRAT_PROCESSOR_X2APIC_LENGTH: u8 = 24;
+const SRAT_ENABLED: u32 = 1;
+
+/// Static resource affinity (ACPI 6 5.2.16): every processor and every RAM range in proximity
+/// domain `node_of_cpu(cpu)` / the domain given with the range. The processor entries follow
+/// the MADT's split (APIC ids from 255 up need the x2APIC form). Linux's NUMA setup drops the
+/// whole table ("NUMA: nodes only cover ...") unless the ranges cover all the RAM in e820.
+pub(super) fn srat(
+    cpus: u32,
+    node_of_cpu: impl Fn(u32) -> u32,
+    memory: &[(u32, u64, u64)],
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&SRAT_LEGACY_RESERVED.to_le_bytes());
+    body.extend_from_slice(&[0; 8]);
+    for cpu in 0..cpus {
+        let node = node_of_cpu(cpu);
+        if cpu < FIRST_X2APIC_ONLY_ID {
+            // The domain is split: bits 7:0 here, bits 31:8 after the SAPIC EID.
+            body.extend_from_slice(&[SRAT_PROCESSOR_APIC, SRAT_PROCESSOR_APIC_LENGTH]);
+            body.push(node as u8);
+            body.push(cpu as u8);
+            body.extend_from_slice(&SRAT_ENABLED.to_le_bytes());
+            body.push(0); // local SAPIC EID
+            body.extend_from_slice(&node.to_le_bytes()[1..]);
+            body.extend_from_slice(&0u32.to_le_bytes()); // clock domain
+        } else {
+            body.extend_from_slice(&[SRAT_PROCESSOR_X2APIC, SRAT_PROCESSOR_X2APIC_LENGTH, 0, 0]);
+            body.extend_from_slice(&node.to_le_bytes());
+            body.extend_from_slice(&cpu.to_le_bytes());
+            body.extend_from_slice(&SRAT_ENABLED.to_le_bytes());
+            body.extend_from_slice(&0u32.to_le_bytes()); // clock domain
+            body.extend_from_slice(&[0; 4]);
+        }
+    }
+    for &(node, base, length) in memory {
+        body.extend_from_slice(&[SRAT_MEMORY, SRAT_MEMORY_LENGTH]);
+        body.extend_from_slice(&node.to_le_bytes());
+        body.extend_from_slice(&[0; 2]);
+        body.extend_from_slice(&base.to_le_bytes());
+        body.extend_from_slice(&length.to_le_bytes());
+        body.extend_from_slice(&[0; 4]);
+        body.extend_from_slice(&SRAT_ENABLED.to_le_bytes());
+        body.extend_from_slice(&[0; 8]);
+    }
+    table(b"SRAT", SRAT_REVISION, &body)
+}
+
+const SLIT_REVISION: u8 = 1;
+/// Relative distances: 10 is a node to itself (ACPI 6 5.2.17); 20 is the distance Linux assumes
+/// between two nodes when it has no table, and close to what a two-socket Turin reports.
+const SLIT_LOCAL_DISTANCE: u8 = 10;
+const SLIT_REMOTE_DISTANCE: u8 = 20;
+
+/// System locality distances between `nodes` proximity domains.
+pub(super) fn slit(nodes: usize) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&(nodes as u64).to_le_bytes());
+    for from in 0..nodes {
+        for to in 0..nodes {
+            body.push(if from == to {
+                SLIT_LOCAL_DISTANCE
+            } else {
+                SLIT_REMOTE_DISTANCE
+            });
+        }
+    }
+    table(b"SLIT", SLIT_REVISION, &body)
+}
+
+const SPCR_REVISION: u8 = 2;
+/// Interface type: full 16550 (DBGP table 2 subtype 0).
+const SPCR_INTERFACE_16550: u8 = 0;
+/// Generic address access size 1: byte accesses.
+const GAS_ACCESS_BYTE: u8 = 1;
+/// Interrupt type bits: dual-8259 IRQ (0) and I/O APIC GSI (1); the UART's line reaches both.
+const SPCR_INTERRUPT_8259: u8 = 1 << 0;
+const SPCR_INTERRUPT_IOAPIC: u8 = 1 << 1;
+const SPCR_BAUD_115200: u8 = 7;
+const SPCR_STOP_BITS_1: u8 = 1;
+const SPCR_TERMINAL_VT100: u8 = 0;
+/// PCI device and vendor id 0xFFFF: the port is not a PCI device.
+const SPCR_NOT_PCI: u16 = 0xffff;
+
+/// Serial port console redirection (Microsoft's SPCR, revision 2): COM1, which Windows' EMS and
+/// Linux's `earlycon` (with no argument) take as the console. Linux on x86 only reads it for
+/// `earlycon`; it does not change the console otherwise.
+pub(super) fn spcr(port: u16, irq: u8) -> Vec<u8> {
+    let mut body = vec![SPCR_INTERFACE_16550, 0, 0, 0];
+    body.extend_from_slice(&[GAS_SYSTEM_IO, BITS_PER_BYTE, 0, GAS_ACCESS_BYTE]);
+    body.extend_from_slice(&(port as u64).to_le_bytes());
+    body.push(SPCR_INTERRUPT_8259 | SPCR_INTERRUPT_IOAPIC);
+    body.push(irq);
+    body.extend_from_slice(&(irq as u32).to_le_bytes());
+    body.extend_from_slice(&[
+        SPCR_BAUD_115200,
+        0, // no parity
+        SPCR_STOP_BITS_1,
+        0, // no flow control
+        SPCR_TERMINAL_VT100,
+        0, // language
+    ]);
+    body.extend_from_slice(&SPCR_NOT_PCI.to_le_bytes());
+    body.extend_from_slice(&SPCR_NOT_PCI.to_le_bytes());
+    body.extend_from_slice(&[0, 0, 0]); // bus, device, function
+    body.extend_from_slice(&0u32.to_le_bytes()); // PCI flags
+    body.push(0); // PCI segment
+    body.extend_from_slice(&[0; 4]);
+    table(b"SPCR", SPCR_REVISION, &body)
 }

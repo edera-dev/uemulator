@@ -375,6 +375,22 @@ fn quality_of_service_leaves_describe_l3_monitoring_allocation_and_bandwidth() {
     assert!(h.cpu.rdmsr(0xc90 + 16).is_err());
 }
 
+/// Leaf 0x8000_0008 EBX bit 27 promises the CPPC MSRs (`cppc.rs`); amd_pstate reads CAPABILITY_1
+/// and REQUEST and writes ENABLE through them.
+#[test]
+fn cppc_bit_comes_with_its_msrs() {
+    let mut h = blank();
+    assert_ne!(cpuid(&mut h, 0x8000_0008, 0)[1] & 1 << 27, 0);
+    let capability = h.cpu.rdmsr(0xc001_02b0).unwrap();
+    assert_ne!(capability >> 24 & 0xff, 0, "highest performance");
+    h.cpu.wrmsr(0xc001_02b1, 1).unwrap();
+    assert_eq!(h.cpu.rdmsr(0xc001_02b1).unwrap(), 1);
+    h.cpu.wrmsr(0xc001_02b3, 0x8064_0064).unwrap();
+    assert_eq!(h.cpu.rdmsr(0xc001_02b3).unwrap(), 0x8064_0064);
+    assert!(h.cpu.wrmsr(0xc001_02b0, 0).is_err());
+    assert_eq!(h.cpu.rdmsr(0xc001_02b4).unwrap(), 0);
+}
+
 #[test]
 fn address_size_leaf_reports_40_physical_and_48_virtual_bits_and_the_extensions() {
     let mut h = blank();
@@ -383,10 +399,10 @@ fn address_size_leaf_reports_40_physical_and_48_virtual_bits_and_the_extensions(
     assert_eq!((eax >> 8) & 0xff, 48);
     assert_eq!(eax >> 16, 0);
     // CLZERO XSAVEERPTR WBNOINVD IBPB IBRS STIBP STIBP_ALWAYS_ON IBRS_SAME_MODE EFER_LMSLE_MBZ
-    // SSBD PSFD BTC_NO IBPB_RET MBE; no AMD_SSB_NO, VIRT_SSBD, PPIN, IBRS_ALWAYS_ON
+    // SSBD MBE CPPC PSFD BTC_NO IBPB_RET; no AMD_SSB_NO, VIRT_SSBD, PPIN, IBRS_ALWAYS_ON
     assert_eq!(
         ebx,
-        bits(&[0, 2, 6, 9, 12, 14, 15, 17, 19, 20, 24, 28, 29, 30])
+        bits(&[0, 2, 6, 9, 12, 14, 15, 17, 19, 20, 24, 27, 28, 29, 30])
     );
     assert_eq!((ecx, edx), (0, 0));
     // NC is the processor count minus one, ApicIdSize the bits the ids need

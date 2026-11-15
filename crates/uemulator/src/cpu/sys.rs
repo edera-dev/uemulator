@@ -243,6 +243,7 @@ impl Cpu {
             _ if mca::Mca::owns(msr) => self.mca.read(msr).unwrap_or(0),
             _ if rdt::Rdt::owns(msr) => self.rdt.read(msr).unwrap_or(0),
             _ if pmu::Pmu::owns(msr) => self.pmu_rdmsr(msr)?,
+            _ if cppc::Cppc::owns(msr) => self.cppc.read(msr).unwrap_or(0),
             MSR_EFER => self.efer,
             MSR_STAR => self.star,
             MSR_LSTAR => self.lstar,
@@ -336,6 +337,11 @@ impl Cpu {
                 }
             }
             _ if pmu::Pmu::owns(msr) => self.pmu_wrmsr(msr, v)?,
+            _ if cppc::Cppc::owns(msr) => {
+                if !self.cppc.write(msr, v) {
+                    return Err(Exception::general_protection(0));
+                }
+            }
             MSR_EFER => {
                 // SVME cannot be set while the firmware has disabled SVM in VM_CR
                 if v & !EFER_WRMSR_ALLOWED != 0

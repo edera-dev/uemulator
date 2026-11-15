@@ -305,6 +305,8 @@ pub(crate) mod resource {
     const SMALL_IRQ: u8 = 0x22;
     const SMALL_IO: u8 = 0x47;
     const SMALL_END_TAG: u8 = 0x79;
+    const LARGE_GENERIC_REGISTER: u8 = 0x82;
+    const LARGE_GENERIC_REGISTER_LENGTH: u16 = 12;
     const LARGE_MEMORY32_FIXED: u8 = 0x86;
     const LARGE_DWORD_ADDRESS: u8 = 0x87;
     const LARGE_WORD_ADDRESS: u8 = 0x88;
@@ -375,6 +377,16 @@ pub(crate) mod resource {
         for dword in [0, first, last, 0, last - first + 1] {
             out.extend_from_slice(&dword.to_le_bytes());
         }
+        out
+    }
+
+    /// `Register (space, bit width, bit offset, address, access size)`: a Generic Address
+    /// Structure as a resource descriptor (6.4.3.7), which is how `_CPC` names its registers.
+    pub fn register(space: u8, bit_width: u8, bit_offset: u8, address: u64, access: u8) -> Vec<u8> {
+        let mut out = vec![LARGE_GENERIC_REGISTER];
+        out.extend_from_slice(&LARGE_GENERIC_REGISTER_LENGTH.to_le_bytes());
+        out.extend_from_slice(&[space, bit_width, bit_offset, access]);
+        out.extend_from_slice(&address.to_le_bytes());
         out
     }
 
@@ -493,5 +505,16 @@ mod tests {
         assert_eq!(resource::io_range(0, 0xcf7).len(), 16);
         assert_eq!(resource::memory_range(0xa0000, 0xbffff, false).len(), 26);
         assert_eq!(resource::template(&[]), [0x79, 0x00]);
+    }
+
+    #[test]
+    fn a_register_descriptor_matches_what_iasl_emits() {
+        // Register (FFixedHW, 0x08, 0x18, 0x00000000C00102B0, 0x04)
+        assert_eq!(
+            resource::register(0x7f, 8, 24, 0xc001_02b0, 4),
+            [
+                0x82, 0x0c, 0x00, 0x7f, 0x08, 0x18, 0x04, 0xb0, 0x02, 0x01, 0xc0, 0, 0, 0, 0
+            ]
+        );
     }
 }
