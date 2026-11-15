@@ -4,6 +4,7 @@ pub(crate) mod acpi_pm;
 pub(crate) mod apic;
 pub(crate) mod bootfb;
 pub(crate) mod data_fabric;
+pub(crate) mod fch;
 pub(crate) mod guestmem;
 pub(crate) mod handle;
 pub(crate) mod hpet;
@@ -245,6 +246,10 @@ pub(crate) struct Devices {
     lowest_priority_cursor: usize,
     ioapic: IoApic,
     pm: AcpiPm,
+    /// The FCH's PM block, SMBus controllers and watchdog (`fch.rs`).
+    fch: fch::Fch,
+    /// The FCH watchdog expired with its power-off action.
+    watchdog_powered_off: bool,
     hpet: Hpet,
     /// Level of the SCI line as last driven.
     sci_level: bool,
@@ -376,6 +381,8 @@ impl Devices {
             lowest_priority_cursor: 0,
             ioapic: IoApic::new(),
             pm: AcpiPm::new(),
+            fch: fch::Fch::new(),
+            watchdog_powered_off: false,
             hpet: Hpet::new(),
             sci_level: false,
             deferred: Vec::new(),
@@ -432,6 +439,7 @@ impl Devices {
             self.uart.next_deadline(),
             self.hpet.next_deadline(),
             self.pm.next_deadline(now),
+            self.fch.next_deadline(),
         ]
         .into_iter()
         .chain(self.lapics.iter().map(Lapic::next_deadline))
@@ -743,7 +751,7 @@ impl Devices {
 
     /// The guest wrote SLP_EN with the S5 type: nothing wakes the machine from that.
     pub fn shutdown_requested(&self) -> bool {
-        self.pm.shutdown_requested()
+        self.pm.shutdown_requested() || self.watchdog_powered_off
     }
 
     /// Whether an interrupt is waiting for the CPU (the CPU still checks IF and the interrupt
@@ -877,6 +885,11 @@ impl Devices {
         if self.pit.tick(now) {
             self.pic.raise(IRQ_PIT);
         }
+        match self.fch.tick(now) {
+            Some(fch::WatchdogAction::Reset) => self.reset_requested = true,
+            Some(fch::WatchdogAction::PowerOff) => self.watchdog_powered_off = true,
+            None => {}
+        }
         self.hpet.tick(now);
         let mut raise = Vec::new();
         let mut messages = Vec::new();
@@ -940,6 +953,9 @@ impl Devices {
         if let Some(tpm) = self.tpm.as_ref().filter(|_| TpmCrb::decodes(phys_addr)) {
             return Some(tpm.mmio_read(phys_addr, size));
         }
+        if self.fch.decodes(phys_addr) {
+            return Some(self.fch.mmio_read(phys_addr, size));
+        }
         let value = self.pci.mmio_read(phys_addr, size);
         // Reading the ISR register acknowledges the interrupt.
         self.update_pci_irqs();
@@ -983,6 +999,10 @@ impl Devices {
         }
         if let Some(tpm) = self.tpm.as_mut().filter(|_| TpmCrb::decodes(phys_addr)) {
             tpm.mmio_write(phys_addr, size, val, self.now_ns);
+            return true;
+        }
+        if self.fch.decodes(phys_addr) {
+            self.fch.mmio_write(phys_addr, size, val, self.now_ns);
             return true;
         }
         let mut messages = Vec::new();
@@ -1067,6 +1087,7 @@ impl Devices {
             KV_PORT_FIRST..=KV_PORT_LAST if self.kv.is_some() => {
                 return self.kv.as_mut().unwrap().io_in(port, size);
             }
+            port if self.fch.decodes_port(port) => self.fch.io_read(port),
             _ => return ones,
         };
         if matches!(port, UART_COM1_BASE..=UART_COM1_LAST) {
@@ -1115,6 +1136,7 @@ impl Devices {
             KV_PORT_FIRST..=KV_PORT_LAST if self.kv.is_some() => {
                 self.kv.as_mut().unwrap().io_out(port, size, value)
             }
+            port if self.fch.decodes_port(port) => self.fch.io_write(port, byte),
             UART_COM1_BASE..=UART_COM1_LAST => {
                 self.uart.write(port - UART_COM1_BASE, byte);
                 self.update_uart_irq();
@@ -1186,6 +1208,34 @@ mod tests {
 
     fn inp(dev: &mut Devices, port: u16, size: u8) -> u32 {
         dev.io_in(port, size, NOW_ZERO)
+    }
+
+    /// The FCH answers where i2c-piix4 and sp5100_tco look: the PM block in AcpiMmio and at
+    /// 0xCD6/0xCD7, the SMBus at 0xB00, and an expired watchdog resets the machine.
+    #[test]
+    fn the_fch_answers_at_its_ports_and_windows_and_its_watchdog_resets() {
+        const PM_MMIO: u64 = fch::ACPI_MMIO_BASE + 0x300;
+        const SMBUS_STATUS_PORT: u16 = 0xb00;
+        const SMBUS_CONTROL_PORT: u16 = 0xb02;
+        const START_QUICK: u32 = 1 << 6;
+        const DEVICE_ERROR: u32 = 1 << 2;
+        const WATCHDOG_DECODE: u64 = 1 << 7 | 1 << 4;
+        const WATCHDOG_RUN: u64 = 1;
+        let mut dev = Devices::new(ConsoleHandle::default(), DevConfig::default());
+        assert_eq!(dev.mmio_read(PM_MMIO + 1, 1), Some(0x0b));
+        out(&mut dev, fch::PM_INDEX_PORT, 1, 0x01);
+        assert_eq!(inp(&mut dev, fch::PM_DATA_PORT, 1), 0x0b);
+        out(&mut dev, SMBUS_CONTROL_PORT, 1, START_QUICK);
+        assert_eq!(inp(&mut dev, SMBUS_STATUS_PORT, 1), DEVICE_ERROR);
+        let mut ram = vec![0u8; 4096];
+        let mut mem = test_mem(&mut ram);
+        assert!(dev.mmio_write(PM_MMIO, 1, WATCHDOG_DECODE, &mut mem));
+        assert!(dev.mmio_write(fch::WATCHDOG_BASE + 4, 4, 2, &mut mem));
+        assert!(dev.mmio_write(fch::WATCHDOG_BASE, 4, WATCHDOG_RUN, &mut mem));
+        let deadline = dev.next_deadline(0).unwrap();
+        assert_eq!(deadline, 2 * NS_PER_SECOND);
+        dev.tick(deadline, &mut mem);
+        assert!(dev.reset_requested);
     }
 
     fn cmos_read(dev: &mut Devices, index: u8, now: u64) -> u8 {
