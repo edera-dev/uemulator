@@ -99,6 +99,17 @@ mod file {
     use std::io::{Read, Write};
     use std::path::{Path, PathBuf};
 
+    #[cfg(test)]
+    mod fault {
+        use std::cell::Cell;
+
+        thread_local! {
+            pub(super) static PARTIAL_WRITE: Cell<Option<usize>> = const { Cell::new(None) };
+            pub(super) static FAIL_SYNC: Cell<bool> = const { Cell::new(false) };
+            pub(super) static FAIL_TEMP_OPEN: Cell<bool> = const { Cell::new(false) };
+        }
+    }
+
     const MAGIC: &[u8; 8] = b"UEMUKV01";
     const OP_SET: u8 = 1;
     const OP_DELETE: u8 = 2;
@@ -170,10 +181,40 @@ mod file {
         memory: MemoryKeyValueStore,
         log: File,
         log_bytes: u64,
+        needs_recovery: bool,
     }
 
     fn io_error(what: &str, path: &Path, error: std::io::Error) -> KeyValueError {
         KeyValueError(format!("{what} {}: {error}", path.display()))
+    }
+
+    fn write_record(log: &mut File, record: &[u8]) -> std::io::Result<()> {
+        #[cfg(test)]
+        if let Some(bytes) = fault::PARTIAL_WRITE.with(|fault| fault.take()) {
+            log.write_all(&record[..bytes])?;
+            return Err(std::io::Error::other("injected partial append"));
+        }
+        log.write_all(record)
+    }
+
+    fn sync_record(log: &File) -> std::io::Result<()> {
+        #[cfg(test)]
+        if fault::FAIL_SYNC.with(|fault| fault.replace(false)) {
+            return Err(std::io::Error::other("injected sync failure"));
+        }
+        log.sync_data()
+    }
+
+    fn open_temporary(path: &Path) -> std::io::Result<File> {
+        #[cfg(test)]
+        if fault::FAIL_TEMP_OPEN.with(|fault| fault.replace(false)) {
+            return Err(std::io::Error::other("injected temporary-open failure"));
+        }
+        OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .create(true)
+            .open(path)
     }
 
     impl FileKeyValueStore {
@@ -206,11 +247,13 @@ mod file {
                 memory,
                 log,
                 log_bytes,
+                needs_recovery: false,
             })
         }
 
-        /// Writes `memory` to `path.tmp`, syncs it and renames it over `path`; returns the
-        /// new file opened for appending. A crash before the rename leaves the old file whole.
+        /// Writes `memory` to `path.tmp`, syncs it and renames it over `path`. Keep the
+        /// writable descriptor at EOF across the rename: reopening after replacement could
+        /// fail while the old descriptor already points to an unlinked file.
         fn write_compacted(
             path: &Path,
             memory: &MemoryKeyValueStore,
@@ -223,11 +266,10 @@ mod file {
                 contents.extend_from_slice(&encode_record(OP_SET, key, value));
             }
             let mut file =
-                File::create(&temporary).map_err(|e| io_error("creating", &temporary, e))?;
+                open_temporary(&temporary).map_err(|e| io_error("creating", &temporary, e))?;
             file.write_all(&contents)
                 .and_then(|()| file.sync_all())
                 .map_err(|e| io_error("writing", &temporary, e))?;
-            drop(file);
             fs::rename(&temporary, path).map_err(|e| io_error("renaming to", path, e))?;
             // Persist the rename itself. Not possible on every platform, so best effort.
             if let Some(parent) = path.parent() {
@@ -240,25 +282,38 @@ mod file {
                     let _ = directory.sync_all();
                 }
             }
-            let log = OpenOptions::new()
-                .append(true)
-                .open(path)
-                .map_err(|e| io_error("opening", path, e))?;
-            Ok((log, contents.len() as u64))
+            Ok((file, contents.len() as u64))
+        }
+
+        fn recover(&mut self) -> Result<(), KeyValueError> {
+            if self.needs_recovery {
+                // A failed write may have left a partial record, while a failed sync may
+                // have left a complete one. Rewrite the last acknowledged state either way.
+                let (log, log_bytes) = Self::write_compacted(&self.path, &self.memory)?;
+                self.log = log;
+                self.log_bytes = log_bytes;
+                self.needs_recovery = false;
+            }
+            Ok(())
         }
 
         fn append(&mut self, record: &[u8]) -> Result<(), KeyValueError> {
-            self.log
-                .write_all(record)
-                .and_then(|()| self.log.sync_data())
-                .map_err(|e| io_error("appending to", &self.path, e))?;
-            self.log_bytes += record.len() as u64;
+            self.recover()?;
+            // Compact the old state before appending: `memory` does not include this
+            // operation until append succeeds, so compacting afterwards would lose it.
             let live = (MAGIC.len() + self.memory.live_bytes()) as u64;
-            if self.log_bytes > live + WASTE_COMPACTION_BYTES {
+            if self.log_bytes + record.len() as u64 > live + WASTE_COMPACTION_BYTES {
                 let (log, log_bytes) = Self::write_compacted(&self.path, &self.memory)?;
                 self.log = log;
                 self.log_bytes = log_bytes;
             }
+            if let Err(error) =
+                write_record(&mut self.log, record).and_then(|()| sync_record(&self.log))
+            {
+                self.needs_recovery = true;
+                return Err(io_error("appending to", &self.path, error));
+            }
+            self.log_bytes += record.len() as u64;
             Ok(())
         }
     }
@@ -283,6 +338,7 @@ mod file {
         }
 
         fn delete(&mut self, key: &[u8]) -> Result<(), KeyValueError> {
+            self.recover()?;
             if self.memory.get(key).is_none() {
                 return Ok(());
             }
@@ -340,6 +396,79 @@ mod file {
             let after = fs::metadata(&path).unwrap().len();
             assert!(after < before / 10, "{after} vs {before}");
             assert_eq!(store.get(b"key"), Some(vec![49; 100]));
+        }
+
+        #[test]
+        fn compaction_keeps_the_write_that_triggers_it() {
+            let path = temp_path("compaction-write");
+            let mut store = FileKeyValueStore::open(&path).unwrap();
+            for version in 0..5u8 {
+                store.set(b"k", &vec![version; MAX_VALUE_BYTES]).unwrap();
+            }
+            assert!(store.get(b"k") == Some(vec![4; MAX_VALUE_BYTES]));
+            drop(store);
+            let mut store = FileKeyValueStore::open(&path).unwrap();
+            assert!(store.get(b"k") == Some(vec![4; MAX_VALUE_BYTES]));
+        }
+
+        #[test]
+        fn compaction_keeps_the_delete_that_triggers_it() {
+            let path = temp_path("compaction-delete");
+            let mut store = FileKeyValueStore::open(&path).unwrap();
+            for _ in 0..4 {
+                store.set(b"k", &vec![1; MAX_VALUE_BYTES]).unwrap();
+            }
+            // Shrink the live value just enough that the next append compacts the log.
+            const SHRINK_BYTES: usize = 128;
+            store
+                .set(b"k", &vec![2; MAX_VALUE_BYTES - SHRINK_BYTES])
+                .unwrap();
+            store.delete(b"k").unwrap();
+            assert!(store.get(b"k").is_none());
+            drop(store);
+            let mut store = FileKeyValueStore::open(&path).unwrap();
+            assert!(store.get(b"k").is_none());
+        }
+
+        #[test]
+        fn partial_failed_append_does_not_hide_a_later_success() {
+            let path = temp_path("partial-append-recovery");
+            let mut store = FileKeyValueStore::open(&path).unwrap();
+            store.set(b"keep", b"before").unwrap();
+            fault::PARTIAL_WRITE.with(|fault| fault.set(Some(5)));
+            assert!(store.set(b"failed", b"incomplete").is_err());
+            store.set(b"later", b"durable").unwrap();
+            drop(store);
+            let mut reopened = FileKeyValueStore::open(&path).unwrap();
+            assert_eq!(reopened.get(b"keep"), Some(b"before".to_vec()));
+            assert_eq!(reopened.get(b"later"), Some(b"durable".to_vec()));
+        }
+
+        #[test]
+        fn delete_after_uncertain_sync_failure_stays_deleted() {
+            let path = temp_path("delete-after-sync-failure");
+            let mut store = FileKeyValueStore::open(&path).unwrap();
+            fault::FAIL_SYNC.with(|fault| fault.set(true));
+            assert!(store.set(b"failed", b"complete record").is_err());
+            store.delete(b"failed").unwrap();
+            drop(store);
+            let mut reopened = FileKeyValueStore::open(&path).unwrap();
+            assert_eq!(reopened.get(b"failed"), None);
+        }
+
+        #[test]
+        fn failed_temporary_open_during_compaction_keeps_later_writes_linked() {
+            let path = temp_path("compaction-open-failure");
+            let mut store = FileKeyValueStore::open(&path).unwrap();
+            for version in 0..4u8 {
+                store.set(b"k", &vec![version; MAX_VALUE_BYTES]).unwrap();
+            }
+            fault::FAIL_TEMP_OPEN.with(|fault| fault.set(true));
+            assert!(store.set(b"k", &vec![4; MAX_VALUE_BYTES]).is_err());
+            store.set(b"later", b"durable").unwrap();
+            drop(store);
+            let mut reopened = FileKeyValueStore::open(&path).unwrap();
+            assert_eq!(reopened.get(b"later"), Some(b"durable".to_vec()));
         }
 
         #[test]

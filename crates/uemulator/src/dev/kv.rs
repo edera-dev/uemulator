@@ -44,6 +44,10 @@ pub(crate) struct KvDevice {
     store: SharedKeyValueStore,
     key: Vec<u8>,
     aux: Vec<u8>,
+    /// Truncating an oversized input must not turn it into a valid key or value.
+    /// Selecting that buffer again is the only operation that clears its error.
+    key_overflow: bool,
+    aux_overflow: bool,
     selected: Input,
     /// Bytes the guest announced for the selected input; the stream is cut there, so a final
     /// dword's padding never becomes part of the key or value.
@@ -59,6 +63,8 @@ impl KvDevice {
             store,
             key: Vec::new(),
             aux: Vec::new(),
+            key_overflow: false,
+            aux_overflow: false,
             selected: Input::Key,
             announced: 0,
             output: Vec::new(),
@@ -71,6 +77,20 @@ impl KvDevice {
         match self.selected {
             Input::Key => &mut self.key,
             Input::Aux => &mut self.aux,
+        }
+    }
+
+    fn input_limit(&self) -> usize {
+        match self.selected {
+            Input::Key => MAX_KEY_BYTES,
+            Input::Aux => MAX_VALUE_BYTES,
+        }
+    }
+
+    fn input_overflow(&mut self) -> &mut bool {
+        match self.selected {
+            Input::Key => &mut self.key_overflow,
+            Input::Aux => &mut self.aux_overflow,
         }
     }
 
@@ -95,11 +115,18 @@ impl KvDevice {
         match port - KV_PORT_BASE {
             REGISTER_COMMAND_STATUS => self.command(value),
             REGISTER_DATA => {
-                let room = self.announced.saturating_sub(self.input().len());
+                let bound = self.announced.min(self.input_limit());
+                let room = bound.saturating_sub(self.input().len());
                 let take = room.min(size.clamp(1, 4) as usize);
                 self.input().extend_from_slice(&value.to_le_bytes()[..take]);
             }
-            REGISTER_LENGTH => self.announced = value as usize,
+            REGISTER_LENGTH => {
+                self.announced = value as usize;
+                if self.announced > self.input_limit() {
+                    *self.input_overflow() = true;
+                    self.status = STATUS_TOO_LARGE;
+                }
+            }
             _ => {}
         }
     }
@@ -108,6 +135,15 @@ impl KvDevice {
         self.output.clear();
         self.read_position = 0;
         self.status = STATUS_OK;
+        let uses_key = matches!(
+            command,
+            COMMAND_GET | COMMAND_SET | COMMAND_DELETE | COMMAND_NEXT
+        );
+        let uses_aux = matches!(command, COMMAND_SET | COMMAND_NEXT);
+        if (uses_key && self.key_overflow) || (uses_aux && self.aux_overflow) {
+            self.status = STATUS_TOO_LARGE;
+            return;
+        }
         // The TPM keeps its seeds and NV in the same store; the guest must not read or forge
         // them, so those keys do not exist as far as the port is concerned.
         let reserved = self.key.starts_with(TPM_STORE_PREFIX);
@@ -127,6 +163,7 @@ impl KvDevice {
                     Input::Aux
                 };
                 self.input().clear();
+                *self.input_overflow() = false;
                 self.announced = 0;
             }
             COMMAND_GET => match self.store.lock().unwrap().get(&self.key) {
@@ -309,6 +346,50 @@ mod tests {
         }
         assert_eq!(run(&mut device, COMMAND_SET), STATUS_TOO_LARGE);
         assert_eq!(run(&mut device, 99), STATUS_BAD_COMMAND);
+    }
+
+    #[test]
+    fn oversized_inputs_are_bounded_and_stay_invalid_until_reselected() {
+        for (select, limit) in [
+            (COMMAND_SELECT_KEY, MAX_KEY_BYTES),
+            (COMMAND_SELECT_AUX, MAX_VALUE_BYTES),
+        ] {
+            let mut device = device();
+            set(&mut device, b"keep", b"value");
+            device.io_out(COMMAND, 4, select);
+            device.io_out(ANNOUNCE, 4, u32::MAX);
+            for _ in 0..limit / 4 + 2 {
+                device.io_out(DATA, 4, 0);
+            }
+            assert!(device.input().len() <= limit);
+            assert_eq!(device.io_in(COMMAND, 4), STATUS_TOO_LARGE);
+            // Neither changing the length nor selecting the other buffer validates a
+            // truncated input. Otherwise SET could silently write the retained prefix.
+            device.io_out(ANNOUNCE, 4, 0);
+            let other = if select == COMMAND_SELECT_KEY {
+                COMMAND_SELECT_AUX
+            } else {
+                COMMAND_SELECT_KEY
+            };
+            put(&mut device, other, b"keep");
+            assert_eq!(run(&mut device, COMMAND_SET), STATUS_TOO_LARGE);
+            assert_eq!(run(&mut device, COMMAND_NEXT), STATUS_TOO_LARGE);
+            if select == COMMAND_SELECT_KEY {
+                assert_eq!(run(&mut device, COMMAND_GET), STATUS_TOO_LARGE);
+                assert_eq!(run(&mut device, COMMAND_DELETE), STATUS_TOO_LARGE);
+            }
+            assert_eq!(set(&mut device, b"recovered", b"ok"), STATUS_OK);
+            assert_eq!(get(&mut device, b"keep"), Ok(b"value".to_vec()));
+        }
+    }
+
+    #[test]
+    fn maximum_sized_inputs_are_stored_without_truncation() {
+        let mut device = device();
+        let key = vec![b'k'; MAX_KEY_BYTES];
+        let value = vec![0x5a; MAX_VALUE_BYTES];
+        assert_eq!(set(&mut device, &key, &value), STATUS_OK);
+        assert!(get(&mut device, &key) == Ok(value));
     }
 
     #[test]

@@ -1396,3 +1396,312 @@ fn capabilities_list_the_curve_and_the_new_algorithms() {
     let curves = capability(&mut client, CAP_ECC_CURVES);
     assert_eq!(&curves[5..], &[0, 0, 0, 1, 0, ECC_NIST_P256 as u8]);
 }
+
+#[test]
+fn failed_hierarchy_auth_persistence_preserves_live_and_reopened_authorization() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct FailingStore {
+        memory: MemoryKeyValueStore,
+        fail: Arc<AtomicBool>,
+    }
+    impl KeyValueStore for FailingStore {
+        fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
+            self.memory.get(key)
+        }
+        fn list(&mut self, prefix: &[u8]) -> Vec<Vec<u8>> {
+            self.memory.list(prefix)
+        }
+        fn set(&mut self, key: &[u8], value: &[u8]) -> Result<(), crate::kv::KeyValueError> {
+            if self.fail.load(Ordering::Relaxed) {
+                return Err(crate::kv::KeyValueError("injected write failure".into()));
+            }
+            self.memory.set(key, value)
+        }
+        fn delete(&mut self, key: &[u8]) -> Result<(), crate::kv::KeyValueError> {
+            self.memory.delete(key)
+        }
+    }
+
+    for hierarchy in [RH_OWNER, RH_ENDORSEMENT, RH_LOCKOUT] {
+        let fail = Arc::new(AtomicBool::new(false));
+        let store: SharedKeyValueStore = Arc::new(Mutex::new(Box::new(FailingStore {
+            memory: MemoryKeyValueStore::new(),
+            fail: fail.clone(),
+        })));
+        let mut client = Client::new(store.clone());
+        let old = marshal(|writer| writer.sized(b"old"));
+        let new = marshal(|writer| writer.sized(b"new"));
+        client
+            .call(
+                CC_HIERARCHY_CHANGE_AUTH,
+                &[hierarchy],
+                &mut [Auth::Password(&[])],
+                &old,
+                0,
+            )
+            .unwrap();
+        fail.store(true, Ordering::Relaxed);
+        assert_eq!(
+            client
+                .call(
+                    CC_HIERARCHY_CHANGE_AUTH,
+                    &[hierarchy],
+                    &mut [Auth::Password(b"old")],
+                    &new,
+                    0
+                )
+                .err(),
+            Some(RC_NV_UNAVAILABLE)
+        );
+        assert_eq!(client.tpm.hierarchy_auth(hierarchy), b"old");
+        let reopened = Client::new(store.clone());
+        assert_eq!(reopened.tpm.hierarchy_auth(hierarchy), b"old");
+        fail.store(false, Ordering::Relaxed);
+        client
+            .call(
+                CC_HIERARCHY_CHANGE_AUTH,
+                &[hierarchy],
+                &mut [Auth::Password(b"old")],
+                &new,
+                0,
+            )
+            .unwrap();
+        assert_eq!(client.tpm.hierarchy_auth(hierarchy), b"new");
+        assert_eq!(Client::new(store).tpm.hierarchy_auth(hierarchy), b"new");
+    }
+}
+
+#[test]
+fn failed_clear_state_write_preserves_live_and_reopened_hierarchy() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct FailingStateStore {
+        memory: MemoryKeyValueStore,
+        fail_state: Arc<AtomicBool>,
+    }
+    impl KeyValueStore for FailingStateStore {
+        fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
+            self.memory.get(key)
+        }
+        fn list(&mut self, prefix: &[u8]) -> Vec<Vec<u8>> {
+            self.memory.list(prefix)
+        }
+        fn set(&mut self, key: &[u8], value: &[u8]) -> Result<(), crate::kv::KeyValueError> {
+            if key == b"tpm/state" && self.fail_state.load(Ordering::Relaxed) {
+                return Err(crate::kv::KeyValueError(
+                    "injected state write failure".into(),
+                ));
+            }
+            self.memory.set(key, value)
+        }
+        fn delete(&mut self, key: &[u8]) -> Result<(), crate::kv::KeyValueError> {
+            self.memory.delete(key)
+        }
+    }
+
+    let fail_state = Arc::new(AtomicBool::new(false));
+    let store: SharedKeyValueStore = Arc::new(Mutex::new(Box::new(FailingStateStore {
+        memory: MemoryKeyValueStore::new(),
+        fail_state: fail_state.clone(),
+    })));
+    let mut client = Client::new(store.clone());
+    let (primary, _) = client.create_primary(RH_OWNER, &ecc_storage_template());
+    client
+        .call(
+            CC_EVICT_CONTROL,
+            &[RH_OWNER, primary],
+            &mut [Auth::Password(&[])],
+            &SRK_HANDLE.to_be_bytes(),
+            0,
+        )
+        .unwrap();
+    let original_seed = client.tpm.state.storage.seed.clone();
+    let original_proof = client.tpm.state.storage.proof.clone();
+    fail_state.store(true, Ordering::Relaxed);
+    assert_eq!(
+        client
+            .call(CC_CLEAR, &[RH_LOCKOUT], &mut [Auth::Password(&[])], &[], 0)
+            .err(),
+        Some(RC_NV_UNAVAILABLE)
+    );
+    // A failed Clear may have removed an object, but it must not leave live hierarchy
+    // secrets different from the durable hierarchy secrets used after TPM Reset.
+    assert_eq!(client.tpm.state.storage.seed, original_seed);
+    assert_eq!(client.tpm.state.storage.proof, original_proof);
+    let reopened = Client::new(store);
+    assert_eq!(reopened.tpm.state.storage.seed, original_seed);
+    assert_eq!(reopened.tpm.state.storage.proof, original_proof);
+}
+
+#[test]
+fn clear_write_and_delete_failures_leave_reopenable_persistent_state() {
+    use super::nv::{NV_AUTHREAD, NV_AUTHWRITE};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FailNthOperation {
+        memory: MemoryKeyValueStore,
+        operation: Arc<AtomicUsize>,
+        fail_at: Arc<AtomicUsize>,
+    }
+    impl FailNthOperation {
+        fn should_fail(&self) -> bool {
+            self.operation.fetch_add(1, Ordering::Relaxed) + 1
+                == self.fail_at.load(Ordering::Relaxed)
+        }
+    }
+    impl KeyValueStore for FailNthOperation {
+        fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
+            self.memory.get(key)
+        }
+        fn list(&mut self, prefix: &[u8]) -> Vec<Vec<u8>> {
+            self.memory.list(prefix)
+        }
+        fn set(&mut self, key: &[u8], value: &[u8]) -> Result<(), crate::kv::KeyValueError> {
+            if self.should_fail() {
+                return Err(crate::kv::KeyValueError("injected write failure".into()));
+            }
+            self.memory.set(key, value)
+        }
+        fn delete(&mut self, key: &[u8]) -> Result<(), crate::kv::KeyValueError> {
+            if self.should_fail() {
+                return Err(crate::kv::KeyValueError("injected delete failure".into()));
+            }
+            self.memory.delete(key)
+        }
+    }
+
+    for failure_position in 1..=3 {
+        let operation = Arc::new(AtomicUsize::new(0));
+        let fail_at = Arc::new(AtomicUsize::new(usize::MAX));
+        let store: SharedKeyValueStore = Arc::new(Mutex::new(Box::new(FailNthOperation {
+            memory: MemoryKeyValueStore::new(),
+            operation: operation.clone(),
+            fail_at: fail_at.clone(),
+        })));
+        let mut client = Client::new(store.clone());
+        let (primary, _) = client.create_primary(RH_OWNER, &ecc_storage_template());
+        client
+            .call(
+                CC_EVICT_CONTROL,
+                &[RH_OWNER, primary],
+                &mut [Auth::Password(&[])],
+                &SRK_HANDLE.to_be_bytes(),
+                0,
+            )
+            .unwrap();
+        define_nv(&mut client, NV_AUTHREAD | NV_AUTHWRITE, b"", 8).unwrap();
+        operation.store(0, Ordering::Relaxed);
+        fail_at.store(failure_position, Ordering::Relaxed);
+        assert_eq!(
+            client
+                .call(CC_CLEAR, &[RH_LOCKOUT], &mut [Auth::Password(&[])], &[], 0)
+                .err(),
+            Some(RC_NV_UNAVAILABLE),
+            "failure position {failure_position}"
+        );
+        let reopened = Client::new(store.clone());
+        assert_eq!(
+            client.tpm.state.storage.seed, reopened.tpm.state.storage.seed,
+            "failure position {failure_position}"
+        );
+        assert_eq!(
+            client.tpm.object(SRK_HANDLE).is_some(),
+            reopened.tpm.object(SRK_HANDLE).is_some(),
+            "failure position {failure_position}"
+        );
+        assert_eq!(
+            client.tpm.nv_index(NV_INDEX).is_some(),
+            reopened.tpm.nv_index(NV_INDEX).is_some(),
+            "failure position {failure_position}"
+        );
+        // Retrying a failed Clear completes the remaining deletes and rotates the seed.
+        fail_at.store(usize::MAX, Ordering::Relaxed);
+        client
+            .call(CC_CLEAR, &[RH_LOCKOUT], &mut [Auth::Password(&[])], &[], 0)
+            .unwrap();
+        let reopened = Client::new(store);
+        assert!(reopened.tpm.object(SRK_HANDLE).is_none());
+        assert!(reopened.tpm.nv_index(NV_INDEX).is_none());
+        assert_eq!(
+            client.tpm.state.storage.seed,
+            reopened.tpm.state.storage.seed
+        );
+    }
+}
+
+#[test]
+fn encryption_only_sessions_check_hmac_before_consuming_the_session() {
+    let mut client = Client::new(store());
+    let (primary, _) = client.create_primary(RH_NULL, &ecc_storage_template());
+    for (command, attributes, parameters) in [
+        (CC_GET_RANDOM, SESSION_ENCRYPT, 8u16.to_be_bytes().to_vec()),
+        (
+            CC_HASH,
+            SESSION_DECRYPT,
+            marshal(|writer| {
+                writer.sized(b"authenticated input");
+                writer.u16(ALG_SHA256);
+                writer.u32(RH_NULL);
+            }),
+        ),
+    ] {
+        let mut session = client.start_session(primary, SE_HMAC, attributes);
+        let nonce = client.fresh_nonce();
+        let mut sent = parameters.clone();
+        if attributes & SESSION_DECRYPT != 0 {
+            crypt_first_parameter(&session.key, &nonce, &session.nonce_tpm, &mut sent, true);
+        }
+        let cp_hash = sha256(&[&command.to_be_bytes(), &sent]);
+        let mut mac = hmac(
+            &session.key,
+            &[&cp_hash, &nonce, &session.nonce_tpm, &[attributes]],
+        );
+        mac[0] ^= 1;
+        let area = marshal(|writer| {
+            writer.u32(session.handle);
+            writer.sized(&nonce);
+            writer.u8(attributes);
+            writer.sized(&mac);
+        });
+        let mut request = marshal(|writer| {
+            writer.u16(ST_SESSIONS);
+            writer.u32(0);
+            writer.u32(command);
+            writer.u32(area.len() as u32);
+            writer.bytes(&area);
+            writer.bytes(&sent);
+        });
+        let length = request.len() as u32;
+        request[2..6].copy_from_slice(&length.to_be_bytes());
+        let response = client.tpm.execute(&request, 0);
+        assert_eq!(
+            u32::from_be_bytes(response[6..10].try_into().unwrap()),
+            session_error(RC_AUTH_FAIL, 1)
+        );
+        assert_eq!(
+            client.tpm.session(session.handle).unwrap().nonce_tpm,
+            session.nonce_tpm
+        );
+        // A valid retry checks both response authentication and parameter encryption.
+        let reply = client
+            .call(
+                command,
+                &[],
+                &mut [Auth::Session(&mut session)],
+                &parameters,
+                0,
+            )
+            .unwrap();
+        let mut answer = Reader::new(&reply.parameters);
+        if command == CC_GET_RANDOM {
+            assert_eq!(answer.sized().unwrap().len(), 8);
+        } else {
+            assert_eq!(answer.sized().unwrap(), sha256(&[b"authenticated input"]));
+        }
+        assert!(
+            client.tpm.session(session.handle).is_none(),
+            "the successful command consumed the session"
+        );
+    }
+}

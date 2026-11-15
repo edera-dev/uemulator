@@ -315,48 +315,59 @@ impl Tpm {
         };
         let (nonce_decrypt, nonce_encrypt) = (extra_nonce(decrypt), extra_nonce(encrypt));
         let mut auths = Vec::new();
-        for (index, entry) in sessions.iter().enumerate().take(authorized) {
+        for (index, entry) in sessions.iter().enumerate() {
             let number = index as u32 + 1;
-            let handle = handles[index];
-            let entity = self.entity(handle).ok_or(handle_error(RC_HANDLE, number))?;
-            let session = self.loaded_session(entry.handle);
-            let policy = session.is_some_and(|session| session.kind != SessionKind::Hmac);
-            if matches!(command.code, CC_NV_READ | CC_NV_WRITE) && index == 0 {
-                self.nv_access_check(command.code, handles[0], handles[1], policy)?;
-            }
-            auths.push(entity.auth.clone());
-            let Some(session) = session else {
-                if !entity.user_with_auth {
-                    return Err(session_error(RC_AUTH_UNAVAILABLE, number));
-                }
-                if trim_auth(&entry.hmac) != entity.auth {
-                    return Err(session_error(RC_AUTH_FAIL, number));
-                }
-                continue;
+            let entity = if index < authorized {
+                Some(
+                    self.entity(handles[index])
+                        .ok_or(handle_error(RC_HANDLE, number))?,
+                )
+            } else {
+                None
             };
-            if session.kind == SessionKind::Policy {
-                if entity.policy.is_empty() {
-                    return Err(session_error(RC_AUTH_UNAVAILABLE, number));
+            let session = self.loaded_session(entry.handle);
+            if let Some(entity) = &entity {
+                let policy = session.is_some_and(|session| session.kind != SessionKind::Hmac);
+                if matches!(command.code, CC_NV_READ | CC_NV_WRITE) && index == 0 {
+                    self.nv_access_check(command.code, handles[0], handles[1], policy)?;
                 }
-                if session.policy_digest != entity.policy {
-                    return Err(session_error(RC_POLICY_FAIL, number));
-                }
-                if session
-                    .pcr_counter
-                    .is_some_and(|counter| counter != self.pcr_update_counter)
-                {
-                    return Err(RC_PCR_CHANGED);
-                }
-                if session.password_needed {
+                auths.push(entity.auth.clone());
+                let Some(session) = session else {
+                    if !entity.user_with_auth {
+                        return Err(session_error(RC_AUTH_UNAVAILABLE, number));
+                    }
                     if trim_auth(&entry.hmac) != entity.auth {
                         return Err(session_error(RC_AUTH_FAIL, number));
                     }
                     continue;
+                };
+                if session.kind == SessionKind::Policy {
+                    if entity.policy.is_empty() {
+                        return Err(session_error(RC_AUTH_UNAVAILABLE, number));
+                    }
+                    if session.policy_digest != entity.policy {
+                        return Err(session_error(RC_POLICY_FAIL, number));
+                    }
+                    if session
+                        .pcr_counter
+                        .is_some_and(|counter| counter != self.pcr_update_counter)
+                    {
+                        return Err(RC_PCR_CHANGED);
+                    }
+                    if session.password_needed {
+                        if trim_auth(&entry.hmac) != entity.auth {
+                            return Err(session_error(RC_AUTH_FAIL, number));
+                        }
+                        continue;
+                    }
+                } else if !entity.user_with_auth {
+                    return Err(session_error(RC_AUTH_UNAVAILABLE, number));
                 }
-            } else if !entity.user_with_auth {
-                return Err(session_error(RC_AUTH_UNAVAILABLE, number));
             }
-            let key = self.session_secret(session, Some(&entity));
+            // Encryption-only sessions still authenticate the command. They have no
+            // entity authorization to add, so their HMAC key is just the session key.
+            let session = session.ok_or(RC_REFERENCE_S0 + index as u32)?;
+            let key = self.session_secret(session, entity.as_ref());
             let expected = hash::hmac(
                 session.hash,
                 &key,

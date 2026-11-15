@@ -295,17 +295,21 @@ impl Tpm {
         if new_auth.len() > MAX_HIERARCHY_AUTH_BYTES {
             return Err(parameter_error(RC_SIZE, 1));
         }
+        if handle == RH_PLATFORM {
+            self.platform_auth = new_auth;
+            return Ok(Response::empty());
+        }
+        // An NV failure must leave the old authorization usable both now and after
+        // reset. Publish the replacement only after the persistent write succeeds.
+        let mut state = self.state.clone();
         match handle {
-            RH_PLATFORM => {
-                self.platform_auth = new_auth;
-                return Ok(Response::empty());
-            }
-            RH_OWNER => self.state.owner_auth = new_auth,
-            RH_ENDORSEMENT => self.state.endorsement_auth = new_auth,
-            RH_LOCKOUT => self.state.lockout_auth = new_auth,
+            RH_OWNER => state.owner_auth = new_auth,
+            RH_ENDORSEMENT => state.endorsement_auth = new_auth,
+            RH_LOCKOUT => state.lockout_auth = new_auth,
             _ => return Err(handle_error(RC_VALUE, 1)),
         }
-        self.save_state()?;
+        self.store_set(STATE_KEY, &state.encode())?;
+        self.state = state;
         Ok(Response::empty())
     }
 
@@ -343,8 +347,10 @@ impl Tpm {
         let mut fresh = PersistentState::manufacture(&mut self.random);
         fresh.platform = self.state.platform.clone();
         fresh.endorsement.seed = self.state.endorsement.seed.clone();
+        // The preceding deletes can partially succeed on NV failure. Keep the hierarchy
+        // secrets in step with the durable state even when this final write fails.
+        self.store_set(STATE_KEY, &fresh.encode())?;
         self.state = fresh;
-        self.save_state()?;
         Ok(Response::empty())
     }
 
