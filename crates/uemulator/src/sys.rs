@@ -93,11 +93,13 @@ mod imp {
     use super::ExecMem;
     use std::ffi::c_void;
 
-    #[cfg(target_os = "macos")]
+    // On every Apple OS, not just macOS: the iOS device SDK's libSystem has no `__clear_cache`
+    // (the simulator's does), so a device build would fail to link.
+    #[cfg(target_vendor = "apple")]
     unsafe extern "C" {
         fn sys_icache_invalidate(start: *mut c_void, len: usize);
     }
-    #[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
+    #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
     unsafe extern "C" {
         fn __clear_cache(start: *mut c_void, end: *mut c_void);
     }
@@ -153,11 +155,11 @@ mod imp {
     /// aarch64 has split, non-coherent instruction and data caches, so freshly written code must
     /// be flushed before it runs. x86 caches are coherent and need nothing.
     pub unsafe fn flush(start: *mut u8, len: usize) {
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         unsafe {
             sys_icache_invalidate(start as *mut c_void, len);
         }
-        #[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
+        #[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
         unsafe {
             __clear_cache(start as *mut c_void, start.add(len) as *mut c_void);
         }
