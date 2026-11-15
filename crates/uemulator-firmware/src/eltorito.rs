@@ -81,6 +81,37 @@ fn valid_header(entry: &[u8]) -> bool {
     entry[0] == HEADER_VALIDATION && entry[30..32] == VALIDATION_KEY && sum == 0
 }
 
+/// Only one catalog sector is kept in memory. Catalog length is determined by the
+/// section headers, not by the first sector boundary (El Torito section 2).
+struct Catalog {
+    sector: u64,
+    bytes: alloc::vec::Vec<u8>,
+    offset: usize,
+}
+
+impl Catalog {
+    fn new(disk: &mut impl Blocks, sector: u64) -> Option<Self> {
+        Some(Self {
+            sector,
+            bytes: read_cd_sector(disk, sector)?,
+            offset: 0,
+        })
+    }
+
+    fn next(&mut self, disk: &mut impl Blocks) -> Option<[u8; ENTRY_BYTES]> {
+        if self.offset == self.bytes.len() {
+            self.sector = self.sector.checked_add(1)?;
+            self.bytes = read_cd_sector(disk, self.sector)?;
+            self.offset = 0;
+        }
+        let entry = self.bytes[self.offset..self.offset + ENTRY_BYTES]
+            .try_into()
+            .ok()?;
+        self.offset += ENTRY_BYTES;
+        Some(entry)
+    }
+}
+
 /// The first bootable EFI image in the catalog, or `None` when the disk is not an El Torito CD
 /// image or names none.
 pub fn efi_boot_image(disk: &mut impl Blocks) -> Option<BootImage> {
@@ -92,40 +123,49 @@ pub fn efi_boot_image(disk: &mut impl Blocks) -> Option<BootImage> {
         return None;
     }
     let catalog_sector = u64::from(u32_at(&record, CATALOG_POINTER));
-    let catalog = read_cd_sector(disk, catalog_sector)?;
-    let mut entries = catalog.as_chunks::<ENTRY_BYTES>().0.iter();
-    let validation = entries.next()?;
-    if !valid_header(validation) {
+    let mut catalog = Catalog::new(disk, catalog_sector)?;
+    let validation = catalog.next(disk)?;
+    if !valid_header(&validation) {
         return None;
     }
-    // The default entry belongs to the platform the validation entry names; each section header
-    // names the platform of the entries after it.
-    let mut platform = validation[1];
-    let mut last_section = false;
-    let mut image_index = 0u32;
-    for entry in entries {
-        match entry[0] {
-            HEADER_SECTION_MORE | HEADER_SECTION_LAST => {
-                // A header after the last section's entries ends the catalog.
-                if last_section {
-                    return None;
-                }
-                last_section = entry[0] == HEADER_SECTION_LAST;
-                platform = entry[1];
+    let default = catalog.next(disk)?;
+    if validation[1] == PLATFORM_EFI
+        && default[0] == ENTRY_BOOTABLE
+        && let Some(image) = image_at(disk, &default, 0)
+    {
+        return Some(image);
+    }
+    let mut image_index = 1u32;
+    loop {
+        let mut header = catalog.next(disk)?;
+        while header[0] == ENTRY_EXTENSION {
+            header = catalog.next(disk)?;
+        }
+        if !matches!(header[0], HEADER_SECTION_MORE | HEADER_SECTION_LAST) {
+            return None;
+        }
+        let count = u16_at(&header, 2);
+        for _ in 0..count {
+            let mut entry = catalog.next(disk)?;
+            // Extension records do not count as boot images or section entries.
+            while entry[0] == ENTRY_EXTENSION {
+                entry = catalog.next(disk)?;
             }
-            ENTRY_EXTENSION => {}
-            ENTRY_BOOTABLE if platform == PLATFORM_EFI => {
-                if let Some(image) = image_at(disk, entry, image_index) {
-                    return Some(image);
-                }
-                image_index += 1;
+            if matches!(entry[0], HEADER_SECTION_MORE | HEADER_SECTION_LAST) {
+                return None;
             }
-            // A non-bootable entry still counts; anything else (zeros) ends the catalog.
-            0 if entry.iter().all(|&byte| byte == 0) => return None,
-            _ => image_index += 1,
+            if header[1] == PLATFORM_EFI
+                && entry[0] == ENTRY_BOOTABLE
+                && let Some(image) = image_at(disk, &entry, image_index)
+            {
+                return Some(image);
+            }
+            image_index = image_index.checked_add(1)?;
+        }
+        if header[0] == HEADER_SECTION_LAST {
+            return None;
         }
     }
-    None
 }
 
 fn image_at(disk: &mut impl Blocks, entry: &[u8], index: u32) -> Option<BootImage> {
@@ -247,6 +287,61 @@ mod tests {
         sector[BPB_TOTAL_SECTORS_16..BPB_TOTAL_SECTORS_16 + 2]
             .copy_from_slice(&sectors.to_le_bytes());
         sector[510..512].copy_from_slice(&VALIDATION_KEY);
+    }
+
+    #[test]
+    fn efi_sections_in_later_catalog_sectors_are_found() {
+        const BIOS_ENTRIES: u16 = 61;
+        let mut entries = alloc::vec![
+            validation(0),
+            boot_entry(MEDIA_NO_EMULATION, 4, IMAGE_SECTOR),
+            section(HEADER_SECTION_MORE, 0, BIOS_ENTRIES),
+        ];
+        entries.extend((0..BIOS_ENTRIES).map(|_| boot_entry(MEDIA_NO_EMULATION, 4, IMAGE_SECTOR)));
+        assert_eq!(entries.len() * ENTRY_BYTES, CD_SECTOR_BYTES as usize);
+        entries.push(section(HEADER_SECTION_LAST, PLATFORM_EFI, 1));
+        entries.push(boot_entry(MEDIA_NO_EMULATION, 16, IMAGE_SECTOR));
+        let mut disk = with_catalog(&entries);
+        let image = efi_boot_image(&mut disk).unwrap();
+        assert_eq!(
+            (image.entry, image.cd_sector),
+            (u32::from(BIOS_ENTRIES) + 1, IMAGE_SECTOR)
+        );
+        disk.bytes
+            .truncate(((CATALOG_SECTOR + 1) * CD_SECTOR_BYTES) as usize);
+        assert_eq!(
+            efi_boot_image(&mut disk),
+            None,
+            "missing continuation sector"
+        );
+    }
+
+    #[test]
+    fn one_section_can_cross_a_catalog_sector_boundary() {
+        const SKIPPED_ENTRIES: u16 = 61;
+        let mut entries = alloc::vec![
+            validation(0),
+            boot_entry(MEDIA_NO_EMULATION, 4, IMAGE_SECTOR),
+            section(HEADER_SECTION_LAST, PLATFORM_EFI, SKIPPED_ENTRIES + 1),
+        ];
+        let mut skipped = boot_entry(MEDIA_NO_EMULATION, 4, IMAGE_SECTOR);
+        skipped[0] = 0;
+        entries.extend((0..SKIPPED_ENTRIES).map(|_| skipped));
+        entries.push(boot_entry(MEDIA_NO_EMULATION, 16, IMAGE_SECTOR));
+        let image = efi_boot_image(&mut with_catalog(&entries)).unwrap();
+        assert_eq!(image.entry, u32::from(SKIPPED_ENTRIES) + 1);
+    }
+
+    #[test]
+    fn the_last_section_count_ends_the_catalog() {
+        let mut disk = with_catalog(&[
+            validation(0),
+            boot_entry(MEDIA_NO_EMULATION, 4, IMAGE_SECTOR),
+            section(HEADER_SECTION_LAST, PLATFORM_EFI, 1),
+            [0; ENTRY_BYTES],
+            boot_entry(MEDIA_NO_EMULATION, 16, IMAGE_SECTOR),
+        ]);
+        assert_eq!(efi_boot_image(&mut disk), None);
     }
 
     #[test]

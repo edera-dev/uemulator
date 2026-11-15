@@ -22,10 +22,13 @@ const DIRECTORY_ENTRY_BYTES: usize = 32;
 const FAT12_CLUSTER_LIMIT: u32 = 4085;
 const FAT16_CLUSTER_LIMIT: u32 = 65525;
 const FIRST_DATA_CLUSTER: u32 = 2;
-/// Bytes of the first FAT cached at a time. A power of two that FAT12's 1.5-byte entries may
+/// Bytes of the active FAT cached at a time. A power of two that FAT12's 1.5-byte entries may
 /// straddle, so lookups go byte by byte.
 const FAT_CACHE_BYTES: u64 = 4096;
 const FAT32_ENTRY_MASK: u32 = 0x0fff_ffff;
+const FAT32_EXT_FLAGS_OFFSET: usize = 40;
+const FAT32_MIRRORING_DISABLED: u16 = 1 << 7;
+const FAT32_ACTIVE_FAT_MASK: u16 = 0x0f;
 
 const ATTRIBUTE_VOLUME_LABEL: u8 = 0x08;
 const ATTRIBUTE_DIRECTORY: u8 = 0x10;
@@ -93,6 +96,7 @@ pub struct Volume<S: Storage> {
     kind: Kind,
     cluster_bytes: u64,
     fat_start: u64,
+    fat_bytes: u64,
     root_start: u64,
     root_bytes: u64,
     root_cluster: u32,
@@ -155,6 +159,17 @@ impl<S: Storage> Volume<S> {
         } else {
             Kind::Fat32
         };
+        // BPB_ExtFlags only selects a FAT when FAT32 mirroring is disabled; the
+        // inactive copies can be stale, so using copy zero can break valid chains.
+        let ext_flags = u16_at(&boot, FAT32_EXT_FLAGS_OFFSET);
+        let active_fat = if kind == Kind::Fat32 && ext_flags & FAT32_MIRRORING_DISABLED != 0 {
+            u64::from(ext_flags & FAT32_ACTIVE_FAT_MASK)
+        } else {
+            0
+        };
+        if active_fat >= fat_count {
+            return Err(FatError::Corrupt);
+        }
         let label_at = if kind == Kind::Fat32 { 71 } else { 43 };
         let label = String::from_utf8_lossy(&boot[label_at..label_at + 11])
             .trim_end()
@@ -163,7 +178,8 @@ impl<S: Storage> Volume<S> {
             storage,
             kind,
             cluster_bytes: sector_bytes * sectors_per_cluster as u64,
-            fat_start: reserved * sector_bytes,
+            fat_start: (reserved + active_fat * fat_sectors) * sector_bytes,
+            fat_bytes: fat_sectors * sector_bytes,
             root_start: (reserved + fat_count * fat_sectors) * sector_bytes,
             root_bytes: root_sectors * sector_bytes,
             root_cluster: if kind == Kind::Fat32 {
@@ -194,10 +210,19 @@ impl<S: Storage> Volume<S> {
     }
 
     fn fat_byte(&mut self, offset: u64) -> Result<u8, FatError> {
+        if offset >= self.fat_bytes {
+            return Err(FatError::Corrupt);
+        }
         let chunk = offset & !(FAT_CACHE_BYTES - 1);
         if self.fat_cache_at != Some(chunk) {
+            // A FAT (or its final cache page) can be smaller than the cache. Do not
+            // read the next FAT, directory, or bytes beyond a small volume.
+            let count = (self.fat_bytes - chunk).min(FAT_CACHE_BYTES) as usize;
+            self.fat_cache_at = None;
             let mut cache = core::mem::take(&mut self.fat_cache);
-            let result = self.storage.read(self.fat_start + chunk, &mut cache);
+            let result = self
+                .storage
+                .read(self.fat_start + chunk, &mut cache[..count]);
             self.fat_cache = cache;
             result?;
             self.fat_cache_at = Some(chunk);
@@ -242,14 +267,16 @@ impl<S: Storage> Volume<S> {
         if next >= end_of_chain {
             return Ok(None);
         }
-        if next < FIRST_DATA_CLUSTER {
-            return Err(FatError::Corrupt);
-        }
+        self.cluster_offset(next)?;
         Ok(Some(next))
     }
 
-    fn cluster_offset(&self, cluster: u32) -> u64 {
-        self.data_start + (cluster - FIRST_DATA_CLUSTER) as u64 * self.cluster_bytes
+    fn cluster_offset(&self, cluster: u32) -> Result<u64, FatError> {
+        let index = cluster
+            .checked_sub(FIRST_DATA_CLUSTER)
+            .filter(|index| *index < self.cluster_count)
+            .ok_or(FatError::Corrupt)?;
+        Ok(self.data_start + u64::from(index) * self.cluster_bytes)
     }
 
     fn read_directory_bytes(&mut self, directory: u32) -> Result<Vec<u8>, FatError> {
@@ -258,7 +285,7 @@ impl<S: Storage> Volume<S> {
         } else {
             directory
         };
-        if directory == 0 {
+        if directory == 0 && self.kind != Kind::Fat32 {
             let mut bytes = alloc::vec![0u8; self.root_bytes as usize];
             self.storage.read(self.root_start, &mut bytes)?;
             return Ok(bytes);
@@ -267,10 +294,10 @@ impl<S: Storage> Volume<S> {
         let mut cluster = Some(directory);
         let mut guard = 0;
         while let Some(current) = cluster {
+            let offset = self.cluster_offset(current)?;
             let start = bytes.len();
             bytes.resize(start + self.cluster_bytes as usize, 0);
-            self.storage
-                .read(self.cluster_offset(current), &mut bytes[start..])?;
+            self.storage.read(offset, &mut bytes[start..])?;
             guard += 1;
             if guard > self.cluster_count {
                 return Err(FatError::Corrupt);
@@ -387,6 +414,7 @@ impl<S: Storage> Volume<S> {
                 file.cluster = self.next_cluster(file.cluster)?.ok_or(FatError::Corrupt)?;
                 file.index += 1;
             }
+            let at = self.cluster_offset(file.cluster)? + within;
             // Extend over the clusters that follow in order, so a contiguous file is one request.
             let wanted = (total - done) as u64;
             let mut run = self.cluster_bytes - within;
@@ -403,7 +431,6 @@ impl<S: Storage> Volume<S> {
                 }
             }
             let length = run.min(wanted) as usize;
-            let at = self.cluster_offset(file.cluster) + within;
             self.storage.read(at, &mut buffer[done..done + length])?;
             done += length;
             file.cluster = last;
@@ -745,6 +772,124 @@ pub mod testing {
 mod tests {
     use super::testing::*;
     use super::*;
+
+    #[test]
+    fn fat32_reads_the_selected_active_fat() {
+        const EXT_FLAGS_OFFSET: usize = 40;
+        const MIRRORING_DISABLED: u16 = 0x80;
+        const SECTOR_BYTES: usize = 512;
+        for active in 0..2u16 {
+            let mut builder = Builder::new(Size::Fat32);
+            let data = pattern(2 * SECTOR_BYTES);
+            let (cluster, size) = builder.file(&data, true);
+            builder.set_root(&[file_entry("BOOTX64.EFI", cluster, size)]);
+            builder.image[EXT_FLAGS_OFFSET..EXT_FLAGS_OFFSET + 2]
+                .copy_from_slice(&(MIRRORING_DISABLED | active).to_le_bytes());
+            let reserved = u16_at(&builder.image, 14) as usize;
+            let fat_sectors = u32_at(&builder.image, 36) as usize;
+            let inactive = 1 - active as usize;
+            let entry = (reserved + inactive * fat_sectors) * SECTOR_BYTES + cluster as usize * 4;
+            // The inactive FAT is allowed to contain an obsolete end-of-chain.
+            builder.image[entry..entry + 4].copy_from_slice(&0x0fff_ffffu32.to_le_bytes());
+            let mut volume = Volume::open(builder.finish()).unwrap();
+            let file = volume.lookup(volume.root(), "BOOTX64.EFI").unwrap();
+            assert_eq!(read_all(&mut volume, &file, SECTOR_BYTES), data);
+        }
+    }
+
+    #[test]
+    fn fat32_rejects_an_active_fat_outside_the_volume() {
+        let mut builder = Builder::new(Size::Fat32);
+        // Two FATs exist, so selecting index 2 with mirroring disabled is invalid.
+        builder.image[40..42].copy_from_slice(&0x82u16.to_le_bytes());
+        assert!(matches!(
+            Volume::open(builder.finish()),
+            Err(FatError::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn mirrored_fat32_ignores_the_active_fat_bits() {
+        let mut builder = Builder::new(Size::Fat32);
+        // When mirroring is enabled the low nibble is not an active FAT index.
+        builder.image[40..42].copy_from_slice(&0x0fu16.to_le_bytes());
+        let data = pattern(1024);
+        let (cluster, size) = builder.file(&data, true);
+        builder.set_root(&[file_entry("BOOTX64.EFI", cluster, size)]);
+        let mut volume = Volume::open(builder.finish()).unwrap();
+        let file = volume.lookup(volume.root(), "BOOTX64.EFI").unwrap();
+        assert_eq!(read_all(&mut volume, &file, 512), data);
+    }
+
+    fn tiny_fat() -> Vec<u8> {
+        let mut b = vec![0; 5 * 512];
+        b[..3].copy_from_slice(&[0xeb, 0x3c, 0x90]);
+        b[3..11].copy_from_slice(b"MSDOS5.0");
+        b[21] = 0xf8;
+        b[24..26].copy_from_slice(&1u16.to_le_bytes());
+        b[26..28].copy_from_slice(&1u16.to_le_bytes());
+        b[11..13].copy_from_slice(&512u16.to_le_bytes());
+        b[13] = 1;
+        b[14..16].copy_from_slice(&1u16.to_le_bytes());
+        b[16] = 1;
+        b[17..19].copy_from_slice(&16u16.to_le_bytes());
+        b[19..21].copy_from_slice(&5u16.to_le_bytes());
+        b[22..24].copy_from_slice(&1u16.to_le_bytes());
+        b[510..512].copy_from_slice(&[0x55, 0xaa]);
+        b[512..518].copy_from_slice(&[0xf8, 0xff, 0xff, 0x03, 0xf0, 0xff]);
+        b[1024..1035].copy_from_slice(b"BOOTX64 EFI");
+        b[1035] = 0x20;
+        b[1050..1052].copy_from_slice(&2u16.to_le_bytes());
+        b[1052..1056].copy_from_slice(&1024u32.to_le_bytes());
+        b[1536..2048].fill(0x11);
+        b[2048..2560].fill(0x22);
+        b
+    }
+
+    #[test]
+    fn a_small_fat_volume_reads_a_file_spanning_clusters() {
+        let mut volume = Volume::open(Image(tiny_fat())).unwrap();
+        let entry = volume.lookup(0, "BOOTX64.EFI").unwrap();
+        let mut bytes = [0; 1024];
+        assert_eq!(
+            volume.read(&mut Cursor::new(&entry), 0, &mut bytes),
+            Ok(1024)
+        );
+        assert_eq!(&bytes[..512], &[0x11; 512]);
+        assert_eq!(&bytes[512..], &[0x22; 512]);
+    }
+
+    #[test]
+    fn invalid_initial_file_clusters_are_corrupt_not_storage_addresses() {
+        let mut volume = Volume::open(Image(tiny_fat())).unwrap();
+        let entry = volume.lookup(0, "BOOTX64.EFI").unwrap();
+        for first_cluster in [0, 1, volume.cluster_count + FIRST_DATA_CLUSTER, u32::MAX] {
+            let entry = DirEntry {
+                first_cluster,
+                ..entry.clone()
+            };
+            assert_eq!(
+                volume.read(&mut Cursor::new(&entry), 0, &mut [0]),
+                Err(FatError::Corrupt)
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_initial_directory_clusters_are_corrupt_not_storage_addresses() {
+        let mut volume = Volume::open(Builder::new(Size::Fat32).finish()).unwrap();
+        for cluster in [0, 1, volume.cluster_count + FIRST_DATA_CLUSTER, u32::MAX] {
+            volume.root_cluster = cluster;
+            assert_eq!(volume.list(volume.root()), Err(FatError::Corrupt));
+        }
+    }
+
+    #[test]
+    fn fat_entries_cannot_be_read_from_the_following_region() {
+        let mut volume = Volume::open(Image(tiny_fat())).unwrap();
+        const FAT_BYTES: u64 = 512;
+        assert_eq!(volume.fat_byte(FAT_BYTES), Err(FatError::Corrupt));
+    }
 
     fn pattern(length: usize) -> Vec<u8> {
         (0..length).map(|index| (index * 7 + 3) as u8).collect()
