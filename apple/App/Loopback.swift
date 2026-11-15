@@ -24,6 +24,8 @@ final class LoopbackFiles: @unchecked Sendable {
     private let root: URL
     private let lock = NSLock()
     private var blobs: [String: Data] = [:]
+    // Files served by range straight from disk (disk images: an ISO is gigabytes).
+    private var registeredFiles: [String: URL] = [:]
 
     init(root: URL) {
         self.root = root
@@ -36,10 +38,35 @@ final class LoopbackFiles: @unchecked Sendable {
         lock.unlock()
     }
 
+    func register(_ path: String, file: URL) {
+        lock.lock()
+        registeredFiles[path] = file
+        lock.unlock()
+    }
+
     func removeAll(prefix: String) {
         lock.lock()
         blobs = blobs.filter { !$0.key.hasPrefix(prefix) }
+        registeredFiles = registeredFiles.filter { !$0.key.hasPrefix(prefix) }
         lock.unlock()
+    }
+
+    // A byte range of a registered file, read on demand. worker.js always asks for a range: its
+    // first request (bytes 0-0) learns the length from Content-Range.
+    private func reply(file: URL, range: String?) -> LoopbackReply {
+        guard let handle = try? FileHandle(forReadingFrom: file) else { return Self.make(404, Data(), "text/plain") }
+        defer { try? handle.close() }
+        guard let size = try? handle.seekToEnd(), size > 0 else { return Self.make(404, Data(), "text/plain") }
+        guard let range, let (first, last) = Self.parse(range, size: Int(size)) else {
+            // A whole disk image in one reply is never what anyone wants.
+            return Self.make(416, Data(), "text/plain")
+        }
+        guard (try? handle.seek(toOffset: UInt64(first))) != nil,
+              let data = try? handle.read(upToCount: last - first + 1)
+        else { return Self.make(404, Data(), "text/plain") }
+        var reply = Self.make(206, data, "application/octet-stream")
+        reply.headers["Content-Range"] = "bytes \(first)-\(first + data.count - 1)/\(size)"
+        return reply
     }
 
     func reply(path: String, range: String?) -> LoopbackReply {
@@ -48,7 +75,9 @@ final class LoopbackFiles: @unchecked Sendable {
         let relative = String(path.dropFirst(prefix.count))
         lock.lock()
         let blob = blobs[relative]
+        let registered = registeredFiles[relative]
         lock.unlock()
+        if let registered { return reply(file: registered, range: range) }
         let data: Data
         let type: String
         if let blob {

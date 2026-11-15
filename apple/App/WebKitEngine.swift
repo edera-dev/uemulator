@@ -14,6 +14,7 @@ import WebKit
 final class WebKitEngine: NSObject, MachineEngine {
     var onOutput: (([UInt8]) -> Void)?
     var onState: ((EngineState) -> Void)?
+    var screen: ScreenSurface?
 
     // Must sit in a window's view hierarchy (1x1, invisible): M0 ran it that way, and a web view in
     // no window may be throttled.
@@ -34,12 +35,35 @@ final class WebKitEngine: NSObject, MachineEngine {
         static let none = 0
         static let uefi = 1
     }
-    private enum Option {
-        static let jit = 1 << 0
-        static let acpi = 1 << 1
-        static let rng = 1 << 3
-        static let serialConsole = 1 << 4
+    // The bridge's binary kinds (apple/WebEngine/engine.js has the layout).
+    private enum ToPage {
+        static let keys: UInt8 = 1
+        static let events: UInt8 = 2
     }
+    private enum ToApp {
+        static let output: UInt8 = 1
+        static let frame: UInt8 = 2
+        static let cursor: UInt8 = 3
+    }
+    // `www/protocol.js` EVENT kinds, written into the worker's event ring by the page.
+    private enum Event {
+        static let key: Int32 = 1
+        static let pointerMove: Int32 = 2
+        static let pointerButton: Int32 = 3
+        static let wheel: Int32 = 4
+        static let releaseAll: Int32 = 5
+        static let requestSize: Int32 = 6
+    }
+    // `www/protocol.js` CURSOR kinds.
+    private enum CursorKind {
+        static let hidden: UInt32 = 1
+        static let image: UInt32 = 2
+    }
+    private static let frameHeaderWords = 3
+    private static let rectWords = 4
+    private static let cursorHeaderWords = 5
+    private static let bytesPerPixel = 4
+    private static let wordBytes = MemoryLayout<UInt32>.size
     // worker.js's exit codes (protocol.js EXIT_NAMES), and the page's own for setup failures.
     private static let exitNames = [
         0: "Powered off", 1: "Reset", 2: "Triple fault", 3: "Stopped", 4: "Emulator error",
@@ -70,21 +94,27 @@ final class WebKitEngine: NSObject, MachineEngine {
         let prefix = "run/\(run)/"
         files.register(prefix + "kernel", settings.kernel)
         files.register(prefix + "initrd", settings.initrd)
+        var disks: [[String: Any]] = []
+        for (index, disk) in settings.disks.enumerated() {
+            let path = prefix + "disk\(index)"
+            files.register(path, file: disk.url)
+            // The web build keeps a writable disk's writes in memory (a udisk overlay) until M4.
+            disks.append(["url": path, "readOnly": disk.readOnly])
+        }
         if let firmware = settings.firmware { files.register(prefix + "firmware", firmware) }
-        var options = Option.acpi | Option.rng
-        if settings.jit { options |= Option.jit }
-        if settings.serialConsole { options |= Option.serialConsole }
+        if settings.display.hasScreen { screen?.reset() }
         let boot: [String: Any] = [
             "type": "boot",
             // Relative to the page, which is at /<token>/engine.html.
-            "kernel": prefix + "kernel",
-            "initrd": prefix + "initrd",
+            "kernel": settings.kernel.isEmpty ? NSNull() : prefix + "kernel",
+            "initrd": settings.initrd.isEmpty ? NSNull() : prefix + "initrd",
+            "disks": disks,
             "firmware": settings.firmware == nil ? NSNull() : prefix + "firmware",
             "firmwareKind": settings.firmware == nil ? Firmware.none : Firmware.uefi,
             "cmdline": settings.cmdlineAppend,
             "memoryMib": settings.memoryMib,
             "cpus": settings.cpus,
-            "options": options,
+            "options": settings.options,
             "cols": settings.cols,
             "rows": settings.rows,
         ]
@@ -113,7 +143,99 @@ final class WebKitEngine: NSObject, MachineEngine {
     }
 
     func send(_ bytes: [UInt8]) {
-        socket?.send(binary: Data(bytes))
+        socket?.send(binary: Data([ToPage.keys] + bytes))
+    }
+
+    func requestSize(width: Int, height: Int) {
+        guard width > 0, height > 0 else { return }
+        sendEvent(Event.requestSize, Int32(clamping: width), Int32(clamping: height))
+    }
+
+    // ScreenInput: events for the worker's ring (protocol.js EVENT), one message each. A
+    // pointer move per mouse event is small and the WebSocket keeps them in order.
+    func key(usage: UInt16, pressed: Bool) {
+        sendEvent(Event.key, Int32(usage), pressed ? 1 : 0)
+    }
+
+    func pointerMove(x: Int, y: Int) {
+        sendEvent(Event.pointerMove, Int32(clamping: x), Int32(clamping: y))
+    }
+
+    func pointerButton(_ button: Int, pressed: Bool) {
+        sendEvent(Event.pointerButton, Int32(clamping: button), pressed ? 1 : 0)
+    }
+
+    func scroll(clicks: Int) {
+        sendEvent(Event.wheel, Int32(clamping: clicks), 0)
+    }
+
+    func releaseAll() {
+        sendEvent(Event.releaseAll, 0, 0)
+    }
+
+    private func sendEvent(_ kind: Int32, _ first: Int32, _ second: Int32) {
+        guard let socket else { return }
+        var bytes = Data([ToPage.events])
+        for word in [kind, first, second] {
+            withUnsafeBytes(of: word.littleEndian) { bytes.append(contentsOf: $0) }
+        }
+        socket.send(binary: bytes)
+    }
+
+    private func receive(_ data: Data) {
+        guard let kind = data.first else { return }
+        let body = data.dropFirst()
+        switch kind {
+        case ToApp.output: onOutput?([UInt8](body))
+        case ToApp.frame: drawFrame(body)
+        case ToApp.cursor: setCursor(body)
+        default: break
+        }
+    }
+
+    // Data slices keep their parent's indices; read relative to `startIndex`, unaligned.
+    private static func word(_ data: Data, _ index: Int) -> Int {
+        let offset = data.startIndex + index * wordBytes
+        return Int(data[offset..<offset + wordBytes].withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }.littleEndian)
+    }
+
+    private func drawFrame(_ body: Data) {
+        defer {
+            // Drawn (or dropped): the worker may send the next one. One frame in flight, never a
+            // backlog, as on the web page.
+            socket?.send(text: Self.json(["type": "frame-ack"]))
+        }
+        guard let screen, body.count >= Self.frameHeaderWords * Self.wordBytes else { return }
+        let width = Self.word(body, 0)
+        let height = Self.word(body, 1)
+        let rectCount = Self.word(body, 2)
+        let rectsEnd = (Self.frameHeaderWords + rectCount * Self.rectWords) * Self.wordBytes
+        guard body.count >= rectsEnd else { return }
+        screen.resize(width: width, height: height)
+        var pixelOffset = rectsEnd
+        body.withUnsafeBytes { raw in
+            for index in 0..<rectCount {
+                let base = Self.frameHeaderWords + index * Self.rectWords
+                let rect = ScreenSurface.Rect(x: Self.word(body, base), y: Self.word(body, base + 1),
+                                              width: Self.word(body, base + 2), height: Self.word(body, base + 3))
+                let bytes = rect.width * rect.height * Self.bytesPerPixel
+                guard pixelOffset + bytes <= raw.count, let start = raw.baseAddress else { return }
+                screen.copy(rect, from: start + pixelOffset, sourceStride: rect.width * Self.bytesPerPixel)
+                pixelOffset += bytes
+            }
+        }
+        screen.commit()
+    }
+
+    private func setCursor(_ body: Data) {
+        guard let screen, body.count >= Self.cursorHeaderWords * Self.wordBytes else { return }
+        switch UInt32(Self.word(body, 0)) {
+        case CursorKind.hidden: screen.setPointerHidden()
+        case CursorKind.image:
+            screen.setPointer(width: Self.word(body, 1), height: Self.word(body, 2), hotX: Self.word(body, 3),
+                              hotY: Self.word(body, 4), pixels: Data(body.dropFirst(Self.cursorHeaderWords * Self.wordBytes)))
+        default: screen.setPointerHost()
+        }
     }
 
     func resize(cols: Int, rows: Int) {
@@ -130,7 +252,7 @@ final class WebKitEngine: NSObject, MachineEngine {
         self.socket = socket
         socket.onBinary = { [weak self, weak socket] data in
             guard let self, let socket, socket === self.socket else { return }
-            self.onOutput?([UInt8](data))
+            self.receive(data)
         }
         socket.onText = { [weak self, weak socket] text in
             guard let self, let socket, socket === self.socket else { return }

@@ -14,6 +14,8 @@
 		B1000000000000000000B005 /* Loopback.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000F007 /* Loopback.swift */; };
 		B1000000000000000000B006 /* MachineEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000F008 /* MachineEngine.swift */; };
 		B1000000000000000000B007 /* WebKitEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000F009 /* WebKitEngine.swift */; };
+		B1000000000000000000B008 /* ScreenSurface.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000F00A /* ScreenSurface.swift */; };
+		B1000000000000000000B009 /* ScreenView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000F00B /* ScreenView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -26,6 +28,8 @@
 		B1000000000000000000F007 /* Loopback.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Loopback.swift; sourceTree = "<group>"; };
 		B1000000000000000000F008 /* MachineEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MachineEngine.swift; sourceTree = "<group>"; };
 		B1000000000000000000F009 /* WebKitEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebKitEngine.swift; sourceTree = "<group>"; };
+		B1000000000000000000F00A /* ScreenSurface.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenSurface.swift; sourceTree = "<group>"; };
+		B1000000000000000000F00B /* ScreenView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -55,6 +59,8 @@
 				B1000000000000000000F001 /* UemulatorApp.swift */,
 				B1000000000000000000F002 /* NativeEngine.swift */,
 				B1000000000000000000F003 /* TerminalPane.swift */,
+				B1000000000000000000F00B /* ScreenView.swift */,
+				B1000000000000000000F00A /* ScreenSurface.swift */,
 				B1000000000000000000F009 /* WebKitEngine.swift */,
 				B1000000000000000000F008 /* MachineEngine.swift */,
 				B1000000000000000000F007 /* Loopback.swift */,
@@ -174,6 +180,8 @@
 				B1000000000000000000B001 /* UemulatorApp.swift in Sources */,
 				B1000000000000000000B002 /* NativeEngine.swift in Sources */,
 				B1000000000000000000B003 /* TerminalPane.swift in Sources */,
+				B1000000000000000000B009 /* ScreenView.swift in Sources */,
+				B1000000000000000000B008 /* ScreenSurface.swift in Sources */,
 				B1000000000000000000B007 /* WebKitEngine.swift in Sources */,
 				B1000000000000000000B006 /* MachineEngine.swift in Sources */,
 				B1000000000000000000B005 /* Loopback.swift in Sources */,

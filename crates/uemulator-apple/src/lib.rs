@@ -13,8 +13,9 @@ use std::sync::Mutex;
 use std::thread::JoinHandle;
 
 use uemulator::{
-    ConsoleHandle, ConsoleKind, EmulatedMachine, Error, ExitReason, JitMode, MachineConfig,
-    StopHandle,
+    BlockBackend, ConsoleHandle, ConsoleKind, Cursor, Disk, DisplayHandle, DisplayMode,
+    EmulatedMachine, Error, ExitReason, ImageFile, InputHandle, JitMode, MachineConfig,
+    PointerButton, RawImage, ScreenMirror, StopHandle, Udisk,
 };
 
 // `ua_config.options`: the web build's OPTION_* bits (crates/uemulator-web/src/lib.rs), so one set
@@ -23,6 +24,23 @@ const OPTION_JIT: u32 = 1 << 0;
 const OPTION_ACPI: u32 = 1 << 1;
 const OPTION_RNG: u32 = 1 << 3;
 const OPTION_SERIAL_CONSOLE: u32 = 1 << 4;
+/// A screen (virtio-gpu, the firmware's GOP framebuffer).
+const OPTION_DISPLAY: u32 = 1 << 8;
+/// A virtio keyboard and tablet.
+const OPTION_INPUT: u32 = 1 << 9;
+/// With `OPTION_DISPLAY`: the screen is `/dev/console` (`MachineConfig::console_on_screen`).
+const OPTION_SCREEN_CONSOLE: u32 = 1 << 10;
+
+// `ua_cursor_fn` kinds, the library's `Cursor`: the web build's CURSOR_* values. Mirrored in
+// include/uemulator.h.
+const CURSOR_HOST: i32 = 0;
+const CURSOR_HIDDEN: i32 = 1;
+const CURSOR_IMAGE: i32 = 2;
+
+// `ua_screen_update` and the input calls' results.
+const RESULT_NOTHING_NEW: i32 = 0;
+const RESULT_DONE: i32 = 1;
+const RESULT_NO_DEVICE: i32 = -1;
 
 // `ua_exit_fn` reasons; mirrored in include/uemulator.h.
 const EXIT_SHUTDOWN: i32 = 0;
@@ -40,6 +58,8 @@ pub struct Config {
     firmware: *const u8,
     firmware_len: usize,
     cmdline_append: *const c_char,
+    disks: *const DiskConfig,
+    disk_count: usize,
     memory_mib: u32,
     cpus: u32,
     options: u32,
@@ -49,6 +69,42 @@ pub struct Config {
 
 type OutputFn = extern "C" fn(context: *mut c_void, bytes: *const u8, len: usize);
 type ExitFn = extern "C" fn(context: *mut c_void, reason: i32, message: *const c_char);
+type ScreenFn = extern "C" fn(
+    context: *mut c_void,
+    width: u32,
+    height: u32,
+    pixels: *const u8,
+    stride: usize,
+    rects: *const ScreenRect,
+    rect_count: usize,
+);
+type CursorFn = extern "C" fn(
+    context: *mut c_void,
+    kind: i32,
+    width: u32,
+    height: u32,
+    hot_x: u32,
+    hot_y: u32,
+    pixels: *const u8,
+    len: usize,
+);
+
+/// `ua_disk`: an image file the guest gets as a virtio-blk disk, in `ua_config.disks` order
+/// (`vda`, `vdb`, ...).
+#[repr(C)]
+pub struct DiskConfig {
+    path: *const c_char,
+    read_only: i32,
+}
+
+/// `ua_rect`: the library's `Rect`, which is not `repr(C)`.
+#[repr(C)]
+pub struct ScreenRect {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
 
 /// Swift's context pointer, handed back on every callback and never dereferenced here. The app
 /// keeps what it points at alive until `ua_destroy` returns, which is when callbacks stop.
@@ -73,6 +129,8 @@ struct Settings {
     initrd: Vec<u8>,
     firmware: Option<Vec<u8>>,
     cmdline_append: String,
+    /// (path, read-only), opened when the machine is built.
+    disks: Vec<(String, bool)>,
     memory_mib: usize,
     cpus: usize,
     options: u32,
@@ -99,7 +157,22 @@ impl Settings {
                 .to_string_lossy()
                 .into_owned()
         };
+        let disks = if config.disks.is_null() {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(config.disks, config.disk_count) }
+                .iter()
+                .filter(|disk| !disk.path.is_null())
+                .map(|disk| {
+                    let path = unsafe { CStr::from_ptr(disk.path) }
+                        .to_string_lossy()
+                        .into_owned();
+                    (path, disk.read_only != 0)
+                })
+                .collect()
+        };
         Settings {
+            disks,
             kernel: bytes(config.kernel, config.kernel_len),
             initrd: bytes(config.initrd, config.initrd_len),
             firmware: (!firmware.is_empty()).then_some(firmware),
@@ -132,6 +205,15 @@ impl Settings {
         if !self.cmdline_append.is_empty() {
             config = config.cmdline_append(self.cmdline_append.clone());
         }
+        if has(OPTION_DISPLAY) {
+            config = config
+                .display(DisplayMode::Framebuffer)
+                .console_on_screen(has(OPTION_SCREEN_CONSOLE));
+        }
+        config = config.input(has(OPTION_INPUT));
+        for (path, read_only) in &self.disks {
+            config = config.disk(open_disk(path, *read_only)?);
+        }
         if let Some(firmware) = &self.firmware {
             config = config.uefi_firmware(firmware.clone());
         }
@@ -145,10 +227,34 @@ pub struct Machine {
     /// The thread that starts the machine, waits for it and reports the exit.
     runner: Mutex<Option<JoinHandle<()>>>,
     console: ConsoleHandle,
+    display: Option<DisplayHandle>,
+    input: Option<InputHandle>,
+    /// What the app was last given (`ua_screen_update`), and the cursor generation it last saw.
+    /// Only the app's thread that draws calls those, so the locks are never contended.
+    mirror: Mutex<ScreenMirror>,
+    cursor_generation: Mutex<Option<u64>>,
     stop: StopHandle,
     jit: bool,
     exit: ExitFn,
     context: Context,
+}
+
+/// A raw or udisk image file (`docs/spec/uemulator-disk-format.md`). An overlay's base is not
+/// followed: the app flattens or refuses those (M4), so one says so here rather than failing late.
+fn open_disk(path: &str, read_only: bool) -> Result<Disk, Error> {
+    let failed = |what: String| Error::BadConfig(format!("{path}: {what}"));
+    let mut file = ImageFile::open(path, read_only).map_err(|e| failed(e.to_string()))?;
+    let backend: Box<dyn BlockBackend> =
+        match Udisk::probe(&mut file).map_err(|e| failed(e.to_string()))? {
+            Some(info) if info.backing.is_some() => {
+                return Err(failed(
+                    "an overlay; flatten it first with `uemulator disk convert`".into(),
+                ));
+            }
+            Some(_) => Box::new(Udisk::open(file, None).map_err(|e| failed(e.to_string()))?),
+            None => Box::new(RawImage::new(file)),
+        };
+    Ok(Disk::from_backend(backend))
 }
 
 /// # Safety
@@ -193,6 +299,10 @@ pub unsafe extern "C" fn ua_create(
     console.on_output(move |bytes| output(output_context.pointer(), bytes.as_ptr(), bytes.len()));
     Box::into_raw(Box::new(Machine {
         stop: machine.stop_handle(),
+        display: machine.display(),
+        input: machine.input(),
+        mirror: Mutex::new(ScreenMirror::new()),
+        cursor_generation: Mutex::new(None),
         pending: Mutex::new(Some(machine)),
         runner: Mutex::new(None),
         console,
@@ -278,6 +388,185 @@ pub unsafe extern "C" fn ua_destroy(machine: *mut Machine) {
 }
 
 /// # Safety
+/// `machine` came from `ua_create` and was not destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ua_has_display(machine: *const Machine) -> i32 {
+    i32::from(unsafe { &*machine }.display.is_some())
+}
+
+/// Brings the app's copy of the screen up to date. `screen` gets the whole screen and the parts
+/// that differ from the last call (none when the guest flushed what was already there), and runs
+/// before this returns, on the calling thread; `pixels` is valid only during it.
+///
+/// # Safety
+/// `machine` came from `ua_create` and was not destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ua_screen_update(
+    machine: *const Machine,
+    screen: ScreenFn,
+    context: *mut c_void,
+) -> i32 {
+    let machine = unsafe { &*machine };
+    let Some(display) = &machine.display else {
+        return RESULT_NO_DEVICE;
+    };
+    let mut mirror = machine.mirror.lock().unwrap();
+    let Some(changed) = display.sync_mirror(&mut mirror) else {
+        return RESULT_NOTHING_NEW;
+    };
+    let rects: Vec<ScreenRect> = changed
+        .iter()
+        .map(|rect| ScreenRect {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
+        })
+        .collect();
+    let (width, height) = mirror.size();
+    screen(
+        context,
+        width,
+        height,
+        mirror.pixels().as_ptr(),
+        mirror.stride(),
+        rects.as_ptr(),
+        rects.len(),
+    );
+    RESULT_DONE
+}
+
+/// Calls `cursor` when the guest's pointer image changed since the last call (and on the first),
+/// before returning; `pixels` (straight-alpha BGRA) is valid only during it.
+///
+/// # Safety
+/// `machine` came from `ua_create` and was not destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ua_cursor_update(
+    machine: *const Machine,
+    cursor: CursorFn,
+    context: *mut c_void,
+) -> i32 {
+    let machine = unsafe { &*machine };
+    let Some(display) = &machine.display else {
+        return RESULT_NO_DEVICE;
+    };
+    let (generation, image) = display.cursor();
+    let mut seen = machine.cursor_generation.lock().unwrap();
+    if *seen == Some(generation) {
+        return RESULT_NOTHING_NEW;
+    }
+    *seen = Some(generation);
+    match image {
+        Cursor::Host => cursor(context, CURSOR_HOST, 0, 0, 0, 0, std::ptr::null(), 0),
+        Cursor::Hidden => cursor(context, CURSOR_HIDDEN, 0, 0, 0, 0, std::ptr::null(), 0),
+        Cursor::Image(image) => cursor(
+            context,
+            CURSOR_IMAGE,
+            image.width,
+            image.height,
+            image.hot_x,
+            image.hot_y,
+            image.pixels.as_ptr(),
+            image.pixels.len(),
+        ),
+    }
+    RESULT_DONE
+}
+
+/// Runs `send` on the machine's keyboard and tablet: `RESULT_DONE` when it was queued,
+/// `RESULT_NOTHING_NEW` when the guest's driver is not listening yet (or the key has no Linux
+/// code), `RESULT_NO_DEVICE` without input devices.
+///
+/// # Safety
+/// `machine` came from `ua_create` and was not destroyed.
+unsafe fn with_input(machine: *const Machine, send: impl FnOnce(&InputHandle) -> bool) -> i32 {
+    match &unsafe { &*machine }.input {
+        None => RESULT_NO_DEVICE,
+        Some(input) if send(input) => RESULT_DONE,
+        Some(_) => RESULT_NOTHING_NEW,
+    }
+}
+
+/// A key by USB HID usage (keyboard page 0x07). Any thread.
+///
+/// # Safety
+/// `machine` came from `ua_create` and was not destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ua_key(machine: *const Machine, usage: u16, pressed: i32) -> i32 {
+    unsafe { with_input(machine, |input| input.key_usb(usage, pressed != 0)) }
+}
+
+/// The pointer at (`x`, `y`) in screen pixels. Any thread.
+///
+/// # Safety
+/// `machine` came from `ua_create` and was not destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ua_pointer_move(machine: *const Machine, x: u32, y: u32) -> i32 {
+    unsafe { with_input(machine, |input| input.pointer_move(x, y)) }
+}
+
+/// `button` 0 left, 1 right, 2 middle, 3 back, 4 forward (the web build's numbering). Any thread.
+///
+/// # Safety
+/// `machine` came from `ua_create` and was not destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ua_pointer_button(
+    machine: *const Machine,
+    button: u32,
+    pressed: i32,
+) -> i32 {
+    let button = match button {
+        0 => PointerButton::Left,
+        1 => PointerButton::Right,
+        2 => PointerButton::Middle,
+        3 => PointerButton::Side,
+        4 => PointerButton::Extra,
+        _ => return RESULT_NOTHING_NEW,
+    };
+    unsafe { with_input(machine, |input| input.pointer_button(button, pressed != 0)) }
+}
+
+/// The wheel, `clicks` notches, positive away from the user. Any thread.
+///
+/// # Safety
+/// `machine` came from `ua_create` and was not destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ua_scroll(machine: *const Machine, clicks: i32) -> i32 {
+    unsafe { with_input(machine, |input| input.scroll(clicks)) }
+}
+
+/// Releases every key and button the guest thinks is down: for a view that loses the focus and
+/// with it the release events. Any thread.
+///
+/// # Safety
+/// `machine` came from `ua_create` and was not destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ua_release_all(machine: *const Machine) -> i32 {
+    unsafe {
+        with_input(machine, |input| {
+            input.release_all();
+            true
+        })
+    }
+}
+
+/// Asks the guest for a `width` x `height` screen, as a monitor hotplug would; the guest decides.
+///
+/// # Safety
+/// `machine` came from `ua_create` and was not destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ua_request_size(machine: *const Machine, width: u32, height: u32) -> i32 {
+    match &unsafe { &*machine }.display {
+        None => RESULT_NO_DEVICE,
+        Some(display) => {
+            display.request_size(width, height);
+            RESULT_DONE
+        }
+    }
+}
+
+/// # Safety
 /// `buffer` has `capacity` writable bytes, or is null.
 unsafe fn write_message(buffer: *mut c_char, capacity: usize, text: &str) {
     if buffer.is_null() || capacity == 0 {
@@ -306,12 +595,238 @@ mod tests {
             firmware: std::ptr::null(),
             firmware_len: 0,
             cmdline_append: std::ptr::null(),
+            disks: std::ptr::null(),
+            disk_count: 0,
             memory_mib: 256,
             cpus: 1,
             options: OPTION_ACPI,
             cols: 80,
             rows: 25,
         }
+    }
+
+    /// A bzImage the loader accepts (the boot protocol header, 64-bit entry) whose 64-bit entry
+    /// is `hlt; jmp` back to it: what the library's `testkit::FakeKernel` builds, which is not
+    /// visible from here. These tests never start it; they need a machine, not a guest.
+    fn halting_kernel() -> Vec<u8> {
+        const SECTOR: usize = 512;
+        const SETUP_SECTS: usize = 1;
+        const ENTRY_OFFSET: usize = 0x200;
+        const KERNEL_LOAD: u64 = 0x100_0000;
+        const HALT_LOOP: [u8; 3] = [0xf4, 0xeb, 0xfd];
+        let protected = (SETUP_SECTS + 1) * SECTOR;
+        let payload = ENTRY_OFFSET + HALT_LOOP.len();
+        let mut image = vec![0u8; protected + payload];
+        image[0x1f1] = SETUP_SECTS as u8;
+        image[0x200] = 0xeb; // jmp short over the header
+        image[0x201] = 0x6a; // header length: up to and past handover_offset
+        image[0x202..0x206].copy_from_slice(b"HdrS");
+        image[0x206..0x208].copy_from_slice(&0x020fu16.to_le_bytes()); // boot protocol 2.15
+        image[0x211] = 1; // LOADED_HIGH
+        image[0x22c..0x230].copy_from_slice(&0x7fff_ffffu32.to_le_bytes()); // initrd_addr_max
+        image[0x234] = 1; // relocatable
+        image[0x236..0x238].copy_from_slice(&1u16.to_le_bytes()); // XLF_KERNEL_64
+        image[0x238..0x23c].copy_from_slice(&2048u32.to_le_bytes()); // cmdline_size
+        image[0x258..0x260].copy_from_slice(&KERNEL_LOAD.to_le_bytes()); // pref_address
+        image[0x260..0x264].copy_from_slice(&(payload as u32).to_le_bytes()); // init_size
+        image[protected + ENTRY_OFFSET..].copy_from_slice(&HALT_LOOP);
+        image
+    }
+
+    fn create(kernel: &[u8], options: u32) -> *mut Machine {
+        let mut config = config(kernel);
+        config.options = options;
+        let mut error = [0 as c_char; 256];
+        let machine = unsafe {
+            ua_create(
+                &config,
+                ignore_output,
+                ignore_exit,
+                std::ptr::null_mut(),
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        assert!(
+            !machine.is_null(),
+            "{}",
+            unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy()
+        );
+        machine
+    }
+
+    /// What the screen callback was given, through its context pointer.
+    #[derive(Default)]
+    struct SeenScreen {
+        width: u32,
+        height: u32,
+        bytes: usize,
+        rects: Vec<(u32, u32, u32, u32)>,
+    }
+
+    extern "C" fn record_screen(
+        context: *mut c_void,
+        width: u32,
+        height: u32,
+        _pixels: *const u8,
+        stride: usize,
+        rects: *const ScreenRect,
+        rect_count: usize,
+    ) {
+        let seen = unsafe { &mut *context.cast::<SeenScreen>() };
+        seen.width = width;
+        seen.height = height;
+        seen.bytes = stride * height as usize;
+        let rects = unsafe { std::slice::from_raw_parts(rects, rect_count) };
+        seen.rects = rects
+            .iter()
+            .map(|rect| (rect.x, rect.y, rect.width, rect.height))
+            .collect();
+    }
+
+    extern "C" fn record_cursor(
+        context: *mut c_void,
+        kind: i32,
+        _: u32,
+        _: u32,
+        _: u32,
+        _: u32,
+        _: *const u8,
+        _: usize,
+    ) {
+        unsafe { *context.cast::<i32>() = kind };
+    }
+
+    // A machine without a screen says so to every screen and input call, rather than crashing or
+    // pretending.
+    #[test]
+    fn screen_and_input_calls_without_devices_say_so() {
+        let kernel = halting_kernel();
+        let machine = create(&kernel, OPTION_ACPI);
+        let mut seen = SeenScreen::default();
+        unsafe {
+            assert_eq!(ua_has_display(machine), 0);
+            let context = (&raw mut seen).cast();
+            assert_eq!(
+                ua_screen_update(machine, record_screen, context),
+                RESULT_NO_DEVICE
+            );
+            assert_eq!(ua_key(machine, 0x04, 1), RESULT_NO_DEVICE);
+            assert_eq!(ua_pointer_move(machine, 1, 1), RESULT_NO_DEVICE);
+            assert_eq!(ua_request_size(machine, 1024, 768), RESULT_NO_DEVICE);
+            ua_destroy(machine);
+        }
+    }
+
+    // The app's first look gets the whole (blank) screen as one rectangle; a second look with
+    // nothing drawn gets nothing. The cursor starts as the host's and is reported once.
+    #[test]
+    fn screen_update_hands_over_the_whole_screen_once() {
+        const DEFAULT_WIDTH: u32 = 1280;
+        const DEFAULT_HEIGHT: u32 = 800;
+        let kernel = halting_kernel();
+        let machine = create(&kernel, OPTION_ACPI | OPTION_DISPLAY | OPTION_INPUT);
+        let mut seen = SeenScreen::default();
+        let mut cursor_kind = -1;
+        unsafe {
+            assert_eq!(ua_has_display(machine), 1);
+            let context = (&raw mut seen).cast();
+            assert_eq!(
+                ua_screen_update(machine, record_screen, context),
+                RESULT_DONE
+            );
+            assert_eq!((seen.width, seen.height), (DEFAULT_WIDTH, DEFAULT_HEIGHT));
+            assert_eq!(seen.bytes, (DEFAULT_WIDTH * DEFAULT_HEIGHT * 4) as usize);
+            assert_eq!(seen.rects, vec![(0, 0, DEFAULT_WIDTH, DEFAULT_HEIGHT)]);
+            assert_eq!(
+                ua_screen_update(machine, record_screen, context),
+                RESULT_NOTHING_NEW
+            );
+
+            let cursor_context = (&raw mut cursor_kind).cast();
+            assert_eq!(
+                ua_cursor_update(machine, record_cursor, cursor_context),
+                RESULT_DONE
+            );
+            assert_eq!(cursor_kind, CURSOR_HOST);
+            assert_eq!(
+                ua_cursor_update(machine, record_cursor, cursor_context),
+                RESULT_NOTHING_NEW
+            );
+
+            // A button number the tablet does not have is refused, not mapped to something.
+            assert_eq!(ua_pointer_button(machine, 9, 1), RESULT_NOTHING_NEW);
+            assert_eq!(ua_request_size(machine, 1024, 768), RESULT_DONE);
+            ua_destroy(machine);
+        }
+    }
+
+    // A disk that is not there fails the machine with the path in the message, not later in the
+    // guest.
+    #[test]
+    fn create_names_a_missing_disk() {
+        let kernel = halting_kernel();
+        let path = CString::new("/nonexistent/uemulator-test.iso").unwrap();
+        let disks = [DiskConfig {
+            path: path.as_ptr(),
+            read_only: 1,
+        }];
+        let mut config = config(&kernel);
+        config.disks = disks.as_ptr();
+        config.disk_count = disks.len();
+        let mut error = [0 as c_char; 256];
+        let machine = unsafe {
+            ua_create(
+                &config,
+                ignore_output,
+                ignore_exit,
+                std::ptr::null_mut(),
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        assert!(machine.is_null());
+        let message = unsafe { CStr::from_ptr(error.as_ptr()) }.to_str().unwrap();
+        assert!(
+            message.contains("/nonexistent/uemulator-test.iso"),
+            "{message}"
+        );
+    }
+
+    // A raw image file becomes a disk.
+    #[test]
+    fn create_attaches_a_raw_image() {
+        const IMAGE_BYTES: usize = 1 << 20;
+        let kernel = halting_kernel();
+        let file =
+            std::env::temp_dir().join(format!("uemulator-apple-test-{}.img", std::process::id()));
+        std::fs::write(&file, vec![0u8; IMAGE_BYTES]).unwrap();
+        let path = CString::new(file.to_str().unwrap()).unwrap();
+        let disks = [DiskConfig {
+            path: path.as_ptr(),
+            read_only: 1,
+        }];
+        let mut config = config(&kernel);
+        config.disks = disks.as_ptr();
+        config.disk_count = disks.len();
+        let mut error = [0 as c_char; 256];
+        let machine = unsafe {
+            ua_create(
+                &config,
+                ignore_output,
+                ignore_exit,
+                std::ptr::null_mut(),
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        std::fs::remove_file(&file).unwrap();
+        assert!(
+            !machine.is_null(),
+            "{}",
+            unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy()
+        );
+        unsafe { ua_destroy(machine) };
     }
 
     // What the app shows when a file is not a kernel: NULL and the library's own message.

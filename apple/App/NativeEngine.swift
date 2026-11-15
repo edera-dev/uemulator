@@ -17,6 +17,8 @@ final class NativeEngine: MachineEngine, @unchecked Sendable {
     // Called on the main actor.
     var onOutput: (([UInt8]) -> Void)?
     var onState: ((EngineState) -> Void)?
+    // Main actor only.
+    var screen: ScreenSurface?
 
     // One machine's callback context. Retained for the C side from `ua_create` until `ua_destroy`
     // has returned, so a callback never sees it freed.
@@ -52,6 +54,12 @@ final class NativeEngine: MachineEngine, @unchecked Sendable {
     private var flushScheduled = false
 
     private static let outputInterval: DispatchTimeInterval = .milliseconds(16)
+    // How often the screen and the pointer image are looked at: a display refresh. Cheap when
+    // nothing changed (a generation compare under the display's lock).
+    private static let screenInterval: TimeInterval = 1.0 / 60
+    // The library's pixel format, XRGB8888.
+    private static let bytesPerPixel = 4
+    private var screenTimer: Timer?
     private static let errorCapacity = 1024
 
     deinit {
@@ -67,10 +75,12 @@ final class NativeEngine: MachineEngine, @unchecked Sendable {
         let runId = nextRunId
         let context = Unmanaged.passRetained(Run(engine: self, id: runId)).toOpaque()
         var error = [CChar](repeating: 0, count: NativeEngine.errorCapacity)
-        var options = UInt32(UA_OPTION_ACPI) | UInt32(UA_OPTION_RNG)
-        if settings.jit { options |= UInt32(UA_OPTION_JIT) }
-        if settings.serialConsole { options |= UInt32(UA_OPTION_SERIAL_CONSOLE) }
-        let created: OpaquePointer? = settings.kernel.withUnsafeBytes { kernel in
+        let options = settings.options
+        // C strings for the disks' paths, alive until ua_create has copied them.
+        let paths = settings.disks.map { strdup($0.url.path) }
+        defer { paths.forEach { free($0) } }
+        let disks = zip(settings.disks, paths).map { ua_disk(path: $1, read_only: $0.readOnly ? 1 : 0) }
+        let created: OpaquePointer? = disks.withUnsafeBufferPointer { disks in settings.kernel.withUnsafeBytes { kernel in
             settings.initrd.withUnsafeBytes { initrd in
                 (settings.firmware ?? Data()).withUnsafeBytes { firmware in
                     settings.cmdlineAppend.withCString { cmdline in
@@ -79,6 +89,7 @@ final class NativeEngine: MachineEngine, @unchecked Sendable {
                             initrd: initrd.bindMemory(to: UInt8.self).baseAddress, initrd_len: initrd.count,
                             firmware: firmware.bindMemory(to: UInt8.self).baseAddress, firmware_len: firmware.count,
                             cmdline_append: cmdline,
+                            disks: disks.baseAddress, disk_count: disks.count,
                             memory_mib: settings.memoryMib, cpus: settings.cpus, options: options,
                             cols: settings.cols, rows: settings.rows)
                         return ua_create(&config, NativeEngine.outputCallback, NativeEngine.exitCallback, context,
@@ -86,7 +97,7 @@ final class NativeEngine: MachineEngine, @unchecked Sendable {
                     }
                 }
             }
-        }
+        } }
         guard let created else {
             Unmanaged<Run>.fromOpaque(context).release()
             onState?(.stopped(String(cString: error)))
@@ -99,6 +110,14 @@ final class NativeEngine: MachineEngine, @unchecked Sendable {
         lock.unlock()
         let jit = ua_jit_active(created) != 0
         ua_start(created)
+        if ua_has_display(created) != 0 {
+            screen?.reset()
+            let timer = Timer(timeInterval: Self.screenInterval, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.refreshScreen() }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            screenTimer = timer
+        }
         // One word for a phone's toolbar, beside the engine menu.
         onState?(.running(detail: jit ? "JIT" : "interp"))
     }
@@ -113,6 +132,8 @@ final class NativeEngine: MachineEngine, @unchecked Sendable {
         currentRunId = nil
         pending = []
         lock.unlock()
+        screenTimer?.invalidate()
+        screenTimer = nil
         ua_stop(machine)
         let teardown = Teardown(machine: machine, context: context)
         DispatchQueue.global(qos: .userInitiated).async { teardown.run() }
@@ -123,6 +144,85 @@ final class NativeEngine: MachineEngine, @unchecked Sendable {
     func send(_ bytes: [UInt8]) {
         guard let machine else { return }
         bytes.withUnsafeBufferPointer { ua_input(machine, $0.baseAddress, $0.count) }
+    }
+
+    @MainActor
+    func requestSize(width: Int, height: Int) {
+        guard let machine, width > 0, height > 0 else { return }
+        ua_request_size(machine, UInt32(width), UInt32(height))
+    }
+
+    // ScreenInput. The library queues the events for the vCPU; a key the guest's driver is not
+    // listening for yet is dropped there.
+    @MainActor
+    func key(usage: UInt16, pressed: Bool) {
+        guard let machine else { return }
+        ua_key(machine, usage, pressed ? 1 : 0)
+    }
+
+    @MainActor
+    func pointerMove(x: Int, y: Int) {
+        guard let machine, x >= 0, y >= 0 else { return }
+        ua_pointer_move(machine, UInt32(x), UInt32(y))
+    }
+
+    @MainActor
+    func pointerButton(_ button: Int, pressed: Bool) {
+        guard let machine, button >= 0 else { return }
+        ua_pointer_button(machine, UInt32(button), pressed ? 1 : 0)
+    }
+
+    @MainActor
+    func scroll(clicks: Int) {
+        guard let machine else { return }
+        ua_scroll(machine, Int32(clamping: clicks))
+    }
+
+    @MainActor
+    func releaseAll() {
+        guard let machine else { return }
+        ua_release_all(machine)
+    }
+
+    // The library hands over the whole screen and the rectangles that differ from what the
+    // surface already has; only those are copied.
+    @MainActor
+    private func refreshScreen() {
+        guard let machine, let screen else { return }
+        let context = Unmanaged.passUnretained(screen).toOpaque()
+        ua_screen_update(machine, NativeEngine.screenCallback, context)
+        ua_cursor_update(machine, NativeEngine.cursorCallback, context)
+    }
+
+    // Both run inside ua_*_update on the main thread, so the surface may be touched directly.
+    private static let screenCallback: ua_screen_fn = { context, width, height, pixels, stride, rects, count in
+        guard let context, let pixels else { return }
+        let surface = Unmanaged<ScreenSurface>.fromOpaque(context).takeUnretainedValue()
+        MainActor.assumeIsolated {
+            surface.resize(width: Int(width), height: Int(height))
+            for index in 0..<count {
+                guard let rect = rects?[index] else { continue }
+                let origin = UnsafeRawPointer(pixels) + Int(rect.y) * stride + Int(rect.x) * NativeEngine.bytesPerPixel
+                surface.copy(ScreenSurface.Rect(x: Int(rect.x), y: Int(rect.y), width: Int(rect.width), height: Int(rect.height)),
+                             from: origin, sourceStride: stride)
+            }
+            surface.commit()
+        }
+    }
+
+    private static let cursorCallback: ua_cursor_fn = { context, kind, width, height, hotX, hotY, pixels, len in
+        guard let context else { return }
+        let surface = Unmanaged<ScreenSurface>.fromOpaque(context).takeUnretainedValue()
+        let image = pixels.map { Data(bytes: $0, count: len) }
+        MainActor.assumeIsolated {
+            switch kind {
+            case Int32(UA_CURSOR_HIDDEN): surface.setPointerHidden()
+            case Int32(UA_CURSOR_IMAGE):
+                surface.setPointer(width: Int(width), height: Int(height), hotX: Int(hotX), hotY: Int(hotY),
+                                   pixels: image ?? Data())
+            default: surface.setPointerHost()
+            }
+        }
     }
 
     @MainActor
