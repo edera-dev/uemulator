@@ -95,6 +95,9 @@ impl VirtioDev for VirtioConsole {
             // would be lost. A buffer with no writable space is returned empty.
             let data = self.console.guest_rx_bulk(chain.writable());
             let written = chain.write_at(mem, 0, &data);
+            if written < data.len() {
+                self.console.guest_unrx_bulk(&data[written..]);
+            }
             queues[RECEIVEQ].push_used(mem, chain.head, written as u32);
             any = true;
         }
@@ -174,6 +177,21 @@ mod tests {
             out.truncate(count);
             out
         }
+    }
+
+    #[test]
+    fn transmit_does_not_forward_bytes_from_a_write_only_dma_page() {
+        let mut rig = Rig::new();
+        rig.transmit(b"secret");
+        let mut iommu = iommu_deny_read(&mut rig.ram, BUF);
+        let mut mem = test_mem(&mut rig.ram);
+        assert!(mem.with_dma(&mut iommu, 0x18, |mem| rig.dev.kick(
+            TRANSMITQ,
+            &mut rig.queues,
+            mem
+        )));
+        assert_eq!(used_idx(&rig.ram, TX_USED), 1);
+        assert!(rig.drain_console().is_empty());
     }
 
     #[test]

@@ -303,9 +303,18 @@ impl VirtioNet {
             let mut written = 0;
             if index == 0 {
                 written = chain.write_at(mem, 0, &header.to_bytes());
+                if written != HEADER_LEN {
+                    queue.rewind_to(first_avail);
+                    return Delivery::NoRoom;
+                }
             }
             let take = (chain.writable() - written).min(rest.len());
-            written += chain.write_at(mem, written, &rest[..take]);
+            let payload_written = chain.write_at(mem, written, &rest[..take]);
+            if payload_written != take {
+                queue.rewind_to(first_avail);
+                return Delivery::NoRoom;
+            }
+            written += payload_written;
             rest = &rest[take..];
             used.push((chain.head, written as u32));
         }
@@ -367,11 +376,13 @@ impl VirtioDev for VirtioNet {
             let readable = chain.readable();
             if readable > HEADER_LEN && readable - HEADER_LEN <= MAX_FRAME_LEN {
                 let mut header = [0u8; HEADER_LEN];
-                chain.read_from(mem, 0, &mut header);
-                let mut frame = vec![0u8; readable - HEADER_LEN];
-                chain.read_from(mem, HEADER_LEN, &mut frame);
-                if NetHeader::parse(&header).transmit_allowed(frame.len(), self.negotiated) {
-                    self.net.guest_send(frame);
+                if chain.read_from(mem, 0, &mut header) == HEADER_LEN {
+                    let mut frame = vec![0u8; readable - HEADER_LEN];
+                    if chain.read_from(mem, HEADER_LEN, &mut frame) == frame.len()
+                        && NetHeader::parse(&header).transmit_allowed(frame.len(), self.negotiated)
+                    {
+                        self.net.guest_send(frame);
+                    }
                 }
             }
             queues[TRANSMITQ].push_used(mem, chain.head, 0);
@@ -507,6 +518,33 @@ mod tests {
             0,
         );
         post(&mut rig.ram, TX_AVAIL, QUEUE_SIZE, head);
+    }
+
+    #[test]
+    fn transmit_drops_a_frame_whose_payload_dma_read_is_denied() {
+        let mut rig = Rig::new();
+        rig.ram[TX_BUF as usize..TX_BUF as usize + HEADER_LEN].fill(0);
+        rig.ram[TX_BUF as usize + 0x1000..TX_BUF as usize + 0x1003].copy_from_slice(&[1, 2, 3]);
+        put_desc(
+            &mut rig.ram,
+            TX_DESC,
+            0,
+            TX_BUF,
+            HEADER_LEN as u32,
+            DESC_F_NEXT,
+            1,
+        );
+        put_desc(&mut rig.ram, TX_DESC, 1, TX_BUF + 0x1000, 3, 0, 0);
+        post(&mut rig.ram, TX_AVAIL, QUEUE_SIZE, 0);
+        let mut iommu = iommu_deny_read(&mut rig.ram, TX_BUF + 0x1000);
+        let mut mem = test_mem(&mut rig.ram);
+        assert!(mem.with_dma(&mut iommu, 0x18, |mem| rig.dev.kick(
+            TRANSMITQ,
+            &mut rig.queues,
+            mem
+        )));
+        assert_eq!(used_idx(&rig.ram, TX_USED), 1);
+        assert!(rig.net.try_recv_frame().is_none());
     }
 
     fn frame_of(len: usize, seed: u8) -> Vec<u8> {

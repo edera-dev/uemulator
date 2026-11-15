@@ -44,9 +44,9 @@ const IRTE_LEGACY_VECTOR_SHIFT: u32 = 16;
 /// The 128-bit IRTE (guest APIC mode) has the same flags in its low qword, a 24-bit destination
 /// at 31:8 and the vector in the low byte of the high qword.
 const IRTE_GUEST_APIC_DESTINATION_MASK: u64 = 0xff_ffff;
-/// With XTEn the destination's top byte is in the high qword (`irte_ga` in Linux: vector 7:0,
-/// then ga_log_intr, then destination at 16).
-const IRTE_XT_DESTINATION_HIGH_SHIFT: u32 = 16;
+/// With XTEn the destination's top byte is in high-qword bits 63:56
+/// (`irte_ga_hi` in Linux and `AMDVI_IRTE_GA_HI.DESTINATION_HI` in QEMU).
+const IRTE_XT_DESTINATION_HIGH_SHIFT: u32 = 56;
 const IRTE_INT_TYPE_FIXED: u64 = 0;
 const IRTE_INT_TYPE_ARBITRATED: u64 = 1;
 

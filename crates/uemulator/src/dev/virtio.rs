@@ -174,7 +174,10 @@ impl Chain {
             let n = (seg.len as usize).min(limit.saturating_sub(out.len()));
             let at = out.len();
             out.resize(at + n, 0);
-            mem.read(seg.addr, &mut out[at..]);
+            if !mem.read(seg.addr, &mut out[at..]) {
+                out.truncate(at);
+                break;
+            }
         }
         out
     }
@@ -190,7 +193,9 @@ impl Chain {
                 continue;
             }
             let n = (len - offset).min(out.len() - done);
-            mem.read(seg.addr + offset as u64, &mut out[done..done + n]);
+            if !mem.read(seg.addr + offset as u64, &mut out[done..done + n]) {
+                return done;
+            }
             done += n;
             offset = 0;
             if done == out.len() {
@@ -217,7 +222,9 @@ impl Chain {
             let mut done = 0usize;
             while done < seg.len as usize {
                 let n = (seg.len as usize - done).min(buf.len());
-                mem.read(seg.addr + done as u64, &mut buf[..n]);
+                if !mem.read(seg.addr + done as u64, &mut buf[..n]) {
+                    return;
+                }
                 sink(&buf[..n]);
                 done += n;
             }
@@ -244,9 +251,12 @@ impl Chain {
                 continue;
             }
             let n = (len - offset).min(data.len());
-            mem.write(seg.addr + offset as u64, &data[..n]);
+            let wrote = mem.write_prefix(seg.addr + offset as u64, &data[..n]);
+            done += wrote;
+            if wrote != n {
+                break;
+            }
             data = &data[n..];
-            done += n;
             offset = 0;
             if data.is_empty() {
                 break;
@@ -284,7 +294,10 @@ impl Queue {
             self.broken = true;
             return None;
         }
-        let avail_idx = mem.read_u16(self.avail + AVAIL_IDX);
+        let Some(avail_idx) = mem.try_read_u16(self.avail + AVAIL_IDX) else {
+            self.broken = true;
+            return None;
+        };
         let pending = avail_idx.wrapping_sub(self.last_avail);
         if pending == 0 {
             return None;
@@ -296,7 +309,10 @@ impl Queue {
             return None;
         }
         let slot = (self.last_avail % self.size) as u64;
-        let head = mem.read_u16(self.avail + AVAIL_RING + AVAIL_ENTRY_SIZE * slot);
+        let Some(head) = mem.try_read_u16(self.avail + AVAIL_RING + AVAIL_ENTRY_SIZE * slot) else {
+            self.broken = true;
+            return None;
+        };
         let Some(segs) = self.walk_chain(mem, head) else {
             self.broken = true;
             return None;
@@ -316,13 +332,13 @@ impl Queue {
                 return None;
             }
             let desc = self.desc + DESC_SIZE * current as u64;
-            let flags = mem.read_u16(desc + DESC_FLAGS);
+            let flags = mem.try_read_u16(desc + DESC_FLAGS)?;
             // VIRTIO_RING_F_INDIRECT_DESC is not offered.
             if flags & DESC_F_INDIRECT != 0 {
                 return None;
             }
-            let addr = mem.read_u64(desc + DESC_ADDR);
-            let len = mem.read_u32(desc + DESC_LEN);
+            let addr = mem.try_read_u64(desc + DESC_ADDR)?;
+            let len = mem.try_read_u32(desc + DESC_LEN)?;
             if !mem.contains(addr, len as u64) {
                 return None;
             }
@@ -334,7 +350,7 @@ impl Queue {
             if flags & DESC_F_NEXT == 0 {
                 return Some(segs);
             }
-            current = mem.read_u16(desc + DESC_NEXT);
+            current = mem.try_read_u16(desc + DESC_NEXT)?;
         }
         None
     }
@@ -897,6 +913,40 @@ impl Transport {
 #[cfg(test)]
 pub(crate) mod testutil {
     use super::*;
+
+    /// Identity-map test DMA except for one present page which the device may only write.
+    /// The rings remain readable, so a payload fault happens after `Queue::pop` validates it.
+    pub fn iommu_deny_read(ram: &mut [u8], denied_page: u64) -> super::super::iommu::Iommu {
+        use super::super::iommu::Iommu;
+        const PAGE: usize = 4096;
+        const REQUESTER: usize = 0x18;
+        const DEVICE_TABLE: usize = 0x4000;
+        const PAGE_TABLE: usize = 0x7000;
+        const PRESENT: u64 = 1;
+        const READ: u64 = 1 << 61;
+        const WRITE: u64 = 1 << 62;
+        assert!(ram.len() <= PAGE * 512);
+        assert_ne!(denied_page as usize, DEVICE_TABLE);
+        assert_ne!(denied_page as usize, PAGE_TABLE);
+        for page in (0..ram.len()).step_by(PAGE) {
+            let permissions = if page as u64 == denied_page {
+                WRITE
+            } else {
+                READ | WRITE
+            };
+            let entry = page as u64 | PRESENT | permissions;
+            ram[PAGE_TABLE + page / PAGE * 8..PAGE_TABLE + page / PAGE * 8 + 8]
+                .copy_from_slice(&entry.to_le_bytes());
+        }
+        let dte = PRESENT | 1 << 1 | 1 << 9 | PAGE_TABLE as u64 | READ | WRITE;
+        let at = DEVICE_TABLE + REQUESTER * 32;
+        ram[at..at + 8].copy_from_slice(&dte.to_le_bytes());
+        let mut iommu = Iommu::new();
+        let mut mem = super::super::guestmem::test_mem(ram);
+        iommu.mmio_write(0, 8, DEVICE_TABLE as u64, &mut mem);
+        iommu.mmio_write(0x18, 8, 1, &mut mem);
+        iommu
+    }
 
     pub fn setup_queue(ram: &mut [u8], desc: u64, avail: u64, used: u64, size: u16) -> Queue {
         let _ = ram;
@@ -2810,6 +2860,25 @@ mod tests {
         assert_eq!(chain.read_from(&mem, 5, &mut rest), 2);
         assert_eq!(&rest[..2], b"fg");
         assert_eq!(chain.read_from(&mem, 7, &mut rest), 0);
+    }
+
+    #[test]
+    fn read_helpers_stop_before_a_write_only_dma_page() {
+        let mut ram = vec![0u8; RAM_BYTES];
+        ram[0x100..0x103].copy_from_slice(b"abc");
+        ram[0xc000..0xc003].copy_from_slice(b"bad");
+        let chain = chain_of(&[(0x100, 3, false), (0xc000, 3, false)]);
+        let mut iommu = iommu_deny_read(&mut ram, 0xc000);
+        let mut mem = test_mem(&mut ram);
+        mem.with_dma(&mut iommu, 0x18, |mem| {
+            assert_eq!(chain.read_all(mem, 6), b"abc");
+            let mut pieces = Vec::new();
+            chain.read_chunks(mem, 3, |piece| pieces.push(piece.to_vec()));
+            assert_eq!(pieces, [b"abc".to_vec()]);
+            let mut out = [0xee; 6];
+            assert_eq!(chain.read_from(mem, 0, &mut out), 3);
+            assert_eq!(&out[..3], b"abc");
+        });
     }
 
     #[test]

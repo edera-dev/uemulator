@@ -99,6 +99,10 @@ impl VirtioBlk {
             return 0;
         }
         let header = chain.read_all(mem, REQUEST_HEADER_SIZE);
+        if header.len() != REQUEST_HEADER_SIZE {
+            let written = chain.write_at(mem, writable_bytes - 1, &[STATUS_IOERR]);
+            return written as u32;
+        }
         let request_type = u32::from_le_bytes(header[0..4].try_into().unwrap());
         let sector = u64::from_le_bytes(
             header[HEADER_SECTOR_OFFSET..HEADER_SECTOR_OFFSET + 8]
@@ -118,7 +122,11 @@ impl VirtioBlk {
                     match self.disk.backend.read_at(offset, buf) {
                         Ok(()) => {
                             written = chain.write_at(mem, 0, buf);
-                            STATUS_OK
+                            if written == in_len {
+                                STATUS_OK
+                            } else {
+                                STATUS_IOERR
+                            }
                         }
                         Err(_) => STATUS_IOERR,
                     }
@@ -130,8 +138,9 @@ impl VirtioBlk {
                     if Self::valid_transfer_len(out_len) && !self.disk.backend.read_only() =>
                 {
                     let data = Self::scratch(&mut self.scratch, out_len);
-                    chain.read_from(mem, REQUEST_HEADER_SIZE, data);
-                    if self.disk.backend.write_at(offset, data).is_ok() {
+                    if chain.read_from(mem, REQUEST_HEADER_SIZE, data) != out_len {
+                        STATUS_IOERR
+                    } else if self.disk.backend.write_at(offset, data).is_ok() {
                         STATUS_OK
                     } else {
                         STATUS_IOERR
@@ -147,13 +156,18 @@ impl VirtioBlk {
                 }
             }
             REQUEST_GET_ID => {
-                written = chain.write_at(mem, 0, &self.id[..in_len.min(ID_BYTES)]);
-                STATUS_OK
+                let id_len = in_len.min(ID_BYTES);
+                written = chain.write_at(mem, 0, &self.id[..id_len]);
+                if written == id_len {
+                    STATUS_OK
+                } else {
+                    STATUS_IOERR
+                }
             }
             _ => STATUS_UNSUPP,
         };
-        chain.write_at(mem, in_len, &[status]);
-        (written + 1) as u32
+        let status_written = chain.write_at(mem, in_len, &[status]);
+        (written + status_written) as u32
     }
 }
 

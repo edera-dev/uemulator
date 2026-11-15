@@ -399,12 +399,22 @@ fn without_intcapxt_the_event_interrupt_is_the_msi_capabilitys_message() {
 fn with_xten_the_irte_destination_gains_the_top_byte_from_the_high_qword() {
     let mut f = interrupt_fixture(9, CONTROL_GUEST_APIC_ENABLE | CONTROL_XT_ENABLE);
     let low: u64 = 1 | 0x00ab_cdef << 8;
-    let high: u64 = 0x77 | 0x12 << 16;
+    let high: u64 = 0x77 | 0x12 << 56;
     let at = INTERRUPT_TABLE_AT + 16 * 3;
     f.write64(at, low);
     f.write64(at + 8, high);
     let remapped = remap(&mut f, msi(DEVICE, 3, 0)).unwrap();
     assert_eq!(remapped.vector, 0x77);
+    assert_eq!(remapped.destination, 0x12ab_cdef);
+}
+
+#[test]
+fn xt_irte_ignores_high_qword_bits_below_destination() {
+    let mut f = interrupt_fixture(9, CONTROL_GUEST_APIC_ENABLE | CONTROL_XT_ENABLE);
+    let at = INTERRUPT_TABLE_AT;
+    f.write64(at, 1 | 0x00ab_cdef << 8);
+    f.write64(at + 8, 0x77 | 0x34 << 16 | 0x12 << 56);
+    let remapped = remap(&mut f, msi(DEVICE, 0, 0)).unwrap();
     assert_eq!(remapped.destination, 0x12ab_cdef);
 }
 
@@ -1708,4 +1718,340 @@ fn register_window_stays_clear_of_the_fch_block() {
     const FCH_BLOCK: core::ops::Range<u64> = 0xfed8_0000..0xfed9_0000;
     assert!(!FCH_BLOCK.contains(&MMIO_BASE));
     assert!(!FCH_BLOCK.contains(&(MMIO_BASE + MMIO_WINDOW_BYTES - 1)));
+}
+
+#[test]
+fn excluded_dma_must_stop_at_the_range_boundary() {
+    let mut f = Fixture::enabled();
+    f.device_with_tables(DEVICE, 3);
+    f.mmio_write(
+        REG_EXCLUSION_BASE,
+        8,
+        0x30_0000 | EXCLUSION_ENABLE | EXCLUSION_ALLOW_ALL,
+    );
+    f.mmio_write(REG_EXCLUSION_LIMIT, 8, 0x30_0000);
+    f.ram[0x30_0fff] = 0x11;
+    f.ram[0x30_1000] = 0x22;
+    assert!(f.dma_read(DEVICE, 0x30_1000, 1).is_none());
+    f.events();
+    let read = f.dma_read(DEVICE, 0x30_0fff, 2);
+    let write = f.dma_write(DEVICE, 0x30_0fff, &[0xaa, 0xbb]);
+    let contains = {
+        let mut mem = GuestMem::new(&mut f.ram, &[]);
+        mem.with_dma(&mut f.iommu, DEVICE, |mem| mem.contains(0x30_0fff, 2))
+    };
+    let _events = f.events();
+    assert_eq!(
+        f.ram[0x30_1000], 0x22,
+        "DMA crossing out of exclusion must not write protected byte"
+    );
+    assert!(read.is_none() && !write && !contains);
+}
+
+#[test]
+fn identity_dma_must_stop_at_the_interrupt_window() {
+    let mut f = Fixture::enabled();
+    f.set_dte(DEVICE, [0; 4]);
+    let mem = GuestMem::new(&mut f.ram, &[]);
+    let before = f
+        .iommu
+        .translate(&mem, DEVICE, INTERRUPT_WINDOW_FIRST - 1, Access::Read)
+        .unwrap();
+    assert_eq!(before.bytes_left, 1);
+    assert_eq!(
+        f.iommu
+            .translate(&mem, DEVICE, INTERRUPT_WINDOW_FIRST, Access::Read),
+        Err(DmaFault::InterruptWindow)
+    );
+}
+
+#[test]
+fn failed_virtio_block_dma_read_never_writes_stale_scratch() {
+    use crate::dev::vblk::VirtioBlk;
+    use crate::dev::virtio::testutil::{post, put_desc, setup_queue};
+    use crate::dev::virtio::{DESC_F_NEXT, DESC_F_WRITE, VirtioDev};
+    use crate::disk::Disk;
+    let mut f = Fixture::enabled();
+    let root = f.device_with_tables(DEVICE, 3);
+    for iova in (0x1000..=0xa000).step_by(0x1000) {
+        f.map_4k(root, 3, iova, DATA_AT + iova, true);
+    }
+    let mut queue = setup_queue(&mut f.ram, 0x1000, 0x2000, 0x3000, 8);
+    let mut disk = VirtioBlk::new(Disk::memory(vec![0xcc; 4096]));
+    for (round, pattern) in [0x31, 0x72].into_iter().enumerate() {
+        f.ram[(DATA_AT + 0xa000) as usize..][..512].fill(pattern);
+        f.ram[(DATA_AT + 0x6000) as usize] = 0xff;
+        f.write64(DATA_AT + 0x4000, 1);
+        f.write64(DATA_AT + 0x4008, round as u64);
+        if round == 1 {
+            f.map(root, 3, 0xa000, 1, pte(0, DATA_AT + 0xa000, false, true));
+            f.invalidate_domain(DOMAIN);
+        }
+        let ram = &mut f.ram;
+        put_desc(
+            &mut ram[(DATA_AT + 0x1000) as usize..],
+            0,
+            0,
+            0x4000,
+            16,
+            DESC_F_NEXT,
+            1,
+        );
+        put_desc(
+            &mut ram[(DATA_AT + 0x1000) as usize..],
+            0,
+            1,
+            0xa000,
+            512,
+            DESC_F_NEXT,
+            2,
+        );
+        put_desc(
+            &mut ram[(DATA_AT + 0x1000) as usize..],
+            0,
+            2,
+            0x6000,
+            1,
+            DESC_F_WRITE,
+            0,
+        );
+        post(&mut ram[(DATA_AT + 0x2000) as usize..], 0, 8, 0);
+        let mut mem = GuestMem::new(&mut f.ram, &[]);
+        assert!(mem.with_dma(&mut f.iommu, DEVICE, |mem| disk.kick(
+            0,
+            std::slice::from_mut(&mut queue),
+            mem
+        )));
+        f.iommu.service(&mut mem);
+    }
+    let mut actual = [0; 512];
+    disk.block_backend()
+        .unwrap()
+        .read_at(512, &mut actual)
+        .unwrap();
+    let status = f.ram[(DATA_AT + 0x6000) as usize];
+    assert!(!f.events().is_empty());
+    assert!(
+        actual.iter().all(|&b| b == 0xcc),
+        "faulted DMA must not write previous request's cached bytes into another sector"
+    );
+    assert_eq!(status, 1);
+}
+
+#[test]
+fn denied_block_header_dma_does_not_panic() {
+    use crate::dev::vblk::VirtioBlk;
+    use crate::dev::virtio::testutil::{post, put_desc, setup_queue};
+    use crate::dev::virtio::{DESC_F_NEXT, DESC_F_WRITE, VirtioDev};
+    use crate::disk::Disk;
+
+    let mut f = Fixture::enabled();
+    let root = f.device_with_tables(DEVICE, 3);
+    for iova in [0x1000, 0x2000, 0x3000, 0x6000] {
+        f.map_4k(root, 3, iova, DATA_AT + iova, true);
+    }
+    f.map(root, 3, 0x4000, 1, pte(0, DATA_AT + 0x4000, false, true));
+    let mut queue = setup_queue(&mut f.ram, 0x1000, 0x2000, 0x3000, 8);
+    put_desc(
+        &mut f.ram[(DATA_AT + 0x1000) as usize..],
+        0,
+        0,
+        0x4000,
+        16,
+        DESC_F_NEXT,
+        1,
+    );
+    put_desc(
+        &mut f.ram[(DATA_AT + 0x1000) as usize..],
+        0,
+        1,
+        0x6000,
+        1,
+        DESC_F_WRITE,
+        0,
+    );
+    post(&mut f.ram[(DATA_AT + 0x2000) as usize..], 0, 8, 0);
+    let mut disk = VirtioBlk::new(Disk::memory(vec![0; 512]));
+    let mut mem = GuestMem::new(&mut f.ram, &[]);
+    assert!(mem.with_dma(&mut f.iommu, DEVICE, |mem| disk.kick(
+        0,
+        std::slice::from_mut(&mut queue),
+        mem,
+    )));
+    assert_eq!(f.ram[(DATA_AT + 0x3000 + 2) as usize], 1);
+}
+
+#[test]
+fn denied_dma_write_is_not_counted_as_written() {
+    use crate::dev::virtio::{Chain, Segment};
+
+    let mut f = Fixture::enabled();
+    let root = f.device_with_tables(DEVICE, 3);
+    f.map_4k(root, 3, 0x8000, DATA_AT + 0x8000, false);
+    let chain = Chain {
+        head: 0,
+        segs: vec![Segment {
+            addr: 0x8000,
+            len: 4,
+            device_writable: true,
+        }],
+    };
+    let mut mem = GuestMem::new(&mut f.ram, &[]);
+    assert_eq!(
+        mem.with_dma(&mut f.iommu, DEVICE, |mem| chain.write_at(
+            mem,
+            0,
+            &[1, 2, 3, 4]
+        )),
+        0
+    );
+    assert_eq!(&f.ram[(DATA_AT + 0x8000) as usize..][..4], &[0; 4]);
+}
+
+#[test]
+fn chain_write_counts_only_bytes_before_a_cross_page_dma_fault() {
+    use crate::dev::virtio::{Chain, Segment};
+
+    let mut f = Fixture::enabled();
+    let root = f.device_with_tables(DEVICE, 3);
+    f.map_4k(root, 3, 0x8000, DATA_AT + 0x8000, true);
+    f.map_4k(root, 3, 0x9000, DATA_AT + 0x9000, false);
+    let chain = Chain {
+        head: 0,
+        segs: vec![Segment {
+            addr: 0x8ffe,
+            len: 4,
+            device_writable: true,
+        }],
+    };
+    let mut mem = GuestMem::new(&mut f.ram, &[]);
+    assert_eq!(
+        mem.with_dma(&mut f.iommu, DEVICE, |mem| chain.write_at(
+            mem,
+            0,
+            &[1, 2, 3, 4]
+        )),
+        2
+    );
+    assert_eq!(&f.ram[(DATA_AT + 0x8ffe) as usize..][..2], &[1, 2]);
+    assert_eq!(&f.ram[(DATA_AT + 0x9000) as usize..][..2], &[0, 0]);
+}
+
+#[test]
+fn denied_console_receive_dma_preserves_host_input() {
+    use crate::console::ConsoleHandle;
+    use crate::dev::vcons::VirtioConsole;
+    use crate::dev::virtio::testutil::{post, put_desc, setup_queue};
+    use crate::dev::virtio::{DESC_F_WRITE, Queue, VirtioDev};
+
+    let mut f = Fixture::enabled();
+    let root = f.device_with_tables(DEVICE, 3);
+    for iova in [0x1000, 0x2000, 0x3000] {
+        f.map_4k(root, 3, iova, DATA_AT + iova, true);
+    }
+    f.map_4k(root, 3, 0x8000, DATA_AT + 0x8000, false);
+    let mut queues = vec![
+        setup_queue(&mut f.ram, 0x1000, 0x2000, 0x3000, 8),
+        Queue::default(),
+    ];
+    put_desc(
+        &mut f.ram[(DATA_AT + 0x1000) as usize..],
+        0,
+        0,
+        0x8000,
+        3,
+        DESC_F_WRITE,
+        0,
+    );
+    post(&mut f.ram[(DATA_AT + 0x2000) as usize..], 0, 8, 0);
+    let console = ConsoleHandle::default();
+    console.write(b"abc");
+    let mut dev = VirtioConsole::new(console.clone());
+    let mut mem = GuestMem::new(&mut f.ram, &[]);
+    mem.with_dma(&mut f.iommu, DEVICE, |mem| dev.poll(&mut queues, mem));
+    assert_eq!(console.guest_rx_bulk(3), b"abc");
+    assert_eq!(f.ram[(DATA_AT + 0x3000 + 8) as usize], 0);
+}
+
+#[test]
+fn denied_net_receive_dma_preserves_frame_and_queue() {
+    use crate::dev::virtio::testutil::{post, put_desc, setup_queue};
+    use crate::dev::virtio::{DESC_F_WRITE, Queue, VirtioDev};
+    use crate::dev::vnet::VirtioNet;
+    use crate::netdev::NetHandle;
+
+    let mut f = Fixture::enabled();
+    let root = f.device_with_tables(DEVICE, 3);
+    for iova in [0x1000, 0x2000, 0x3000] {
+        f.map_4k(root, 3, iova, DATA_AT + iova, true);
+    }
+    f.map_4k(root, 3, 0x8000, DATA_AT + 0x8000, false);
+    let mut queues = vec![
+        setup_queue(&mut f.ram, 0x1000, 0x2000, 0x3000, 8),
+        Queue::default(),
+    ];
+    put_desc(
+        &mut f.ram[(DATA_AT + 0x1000) as usize..],
+        0,
+        0,
+        0x8000,
+        64,
+        DESC_F_WRITE,
+        0,
+    );
+    post(&mut f.ram[(DATA_AT + 0x2000) as usize..], 0, 8, 0);
+    let net = NetHandle::default();
+    assert!(net.send_frame(&[0xaa; 32]));
+    let mut dev = VirtioNet::new([0; 6], net.clone());
+    let mut mem = GuestMem::new(&mut f.ram, &[]);
+    assert!(!mem.with_dma(&mut f.iommu, DEVICE, |mem| dev.poll(&mut queues, mem)));
+    assert!(net.has_pending());
+    assert_eq!(queues[0].last_avail, 0);
+}
+
+#[test]
+fn denied_descriptor_read_breaks_queue_instead_of_consuming_zero_descriptor() {
+    use crate::dev::virtio::testutil::{post, put_desc, setup_queue};
+
+    let mut f = Fixture::enabled();
+    let root = f.device_with_tables(DEVICE, 3);
+    f.map(root, 3, 0x1000, 1, pte(0, DATA_AT + 0x1000, false, true));
+    for iova in [0x2000, 0x3000, 0x8000] {
+        f.map_4k(root, 3, iova, DATA_AT + iova, true);
+    }
+    let mut queue = setup_queue(&mut f.ram, 0x1000, 0x2000, 0x3000, 8);
+    put_desc(
+        &mut f.ram[(DATA_AT + 0x1000) as usize..],
+        0,
+        0,
+        0x8000,
+        4,
+        0,
+        0,
+    );
+    post(&mut f.ram[(DATA_AT + 0x2000) as usize..], 0, 8, 0);
+    let mut mem = GuestMem::new(&mut f.ram, &[]);
+    mem.with_dma(&mut f.iommu, DEVICE, |mem| {
+        assert!(queue.pop(mem).is_none());
+    });
+    assert!(queue.broken);
+    assert_eq!(queue.last_avail, 0);
+}
+
+#[test]
+fn denied_available_index_read_breaks_queue_instead_of_appearing_empty() {
+    use crate::dev::virtio::testutil::setup_queue;
+
+    let mut f = Fixture::enabled();
+    let root = f.device_with_tables(DEVICE, 3);
+    for iova in [0x1000, 0x3000] {
+        f.map_4k(root, 3, iova, DATA_AT + iova, true);
+    }
+    f.map(root, 3, 0x2000, 1, pte(0, DATA_AT + 0x2000, false, true));
+    let mut queue = setup_queue(&mut f.ram, 0x1000, 0x2000, 0x3000, 8);
+    let mut mem = GuestMem::new(&mut f.ram, &[]);
+    mem.with_dma(&mut f.iommu, DEVICE, |mem| {
+        assert!(queue.pop(mem).is_none());
+    });
+    assert!(queue.broken);
 }

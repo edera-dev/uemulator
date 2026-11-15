@@ -188,10 +188,23 @@ impl<'a> GuestMem<'a> {
         if self.dma.is_none() {
             return self.write_raw(phys_addr, data);
         }
+        self.write_prefix(phys_addr, data) == data.len()
+    }
+
+    /// Number of bytes written before the first DMA fault. A device that consumes a host buffer
+    /// needs this count to retry only the part the guest did not receive.
+    pub fn write_prefix(&mut self, phys_addr: u64, data: &[u8]) -> usize {
+        if self.dma.is_none() {
+            return if self.write_raw(phys_addr, data) {
+                data.len()
+            } else {
+                0
+            };
+        }
         let mut done = 0;
         while done < data.len() {
             let Some(address) = phys_addr.checked_add(done as u64) else {
-                return false;
+                return done;
             };
             let translated = match &self.dma {
                 Some(port) => port.iommu.borrow_mut().translate(
@@ -200,18 +213,18 @@ impl<'a> GuestMem<'a> {
                     address,
                     Access::Write,
                 ),
-                None => return false,
+                None => return done,
             };
             let Ok(translation) = translated else {
-                return false;
+                return done;
             };
             let chunk = chunk_len(data.len() - done, translation.bytes_left);
             if !self.write_raw(translation.phys, &data[done..done + chunk]) {
-                return false;
+                return done;
             }
             done += chunk;
         }
-        true
+        done
     }
 
     /// `read` without the IOMMU: `phys_addr` is a physical address.
@@ -260,21 +273,35 @@ impl<'a> GuestMem<'a> {
 
     /// The `read_u*` accessors return 0 for unmapped addresses.
     pub fn read_u16(&self, phys_addr: u64) -> u16 {
+        self.try_read_u16(phys_addr).unwrap_or(0)
+    }
+
+    pub fn try_read_u16(&self, phys_addr: u64) -> Option<u16> {
         let mut bytes = [0u8; 2];
-        self.read(phys_addr, &mut bytes);
-        u16::from_le_bytes(bytes)
+        self.read(phys_addr, &mut bytes)
+            .then_some(u16::from_le_bytes(bytes))
     }
 
+    #[cfg(test)]
     pub fn read_u32(&self, phys_addr: u64) -> u32 {
-        let mut bytes = [0u8; 4];
-        self.read(phys_addr, &mut bytes);
-        u32::from_le_bytes(bytes)
+        self.try_read_u32(phys_addr).unwrap_or(0)
     }
 
+    pub fn try_read_u32(&self, phys_addr: u64) -> Option<u32> {
+        let mut bytes = [0u8; 4];
+        self.read(phys_addr, &mut bytes)
+            .then_some(u32::from_le_bytes(bytes))
+    }
+
+    #[cfg(test)]
     pub fn read_u64(&self, phys_addr: u64) -> u64 {
+        self.try_read_u64(phys_addr).unwrap_or(0)
+    }
+
+    pub fn try_read_u64(&self, phys_addr: u64) -> Option<u64> {
         let mut bytes = [0u8; 8];
-        self.read(phys_addr, &mut bytes);
-        u64::from_le_bytes(bytes)
+        self.read(phys_addr, &mut bytes)
+            .then_some(u64::from_le_bytes(bytes))
     }
 
     pub fn write_u16(&mut self, phys_addr: u64, value: u16) {

@@ -255,8 +255,8 @@ pub(crate) enum DmaFault {
     InterruptWindow,
 }
 
-/// `bytes_left` is how many bytes from `phys` stay inside this one mapping's 4 KiB page (the
-/// IOTLB works in 4 KiB units), so a caller splits a longer access at that boundary.
+/// `bytes_left` is how many bytes stay in this translation before the caller must check again.
+/// Page-table mappings stop at a 4 KiB boundary; passthrough mappings stop at policy boundaries.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Translation {
     pub phys: u64,
@@ -781,6 +781,16 @@ impl Iommu {
         if (INTERRUPT_WINDOW_FIRST..=INTERRUPT_WINDOW_LAST).contains(&iova) {
             return Err(DmaFault::InterruptWindow);
         }
+        // Identity mappings still have to split before the interrupt window: a DMA operation
+        // starting just below it must be checked again when it enters the window.
+        let identity = Translation {
+            bytes_left: if iova < INTERRUPT_WINDOW_FIRST {
+                INTERRUPT_WINDOW_FIRST - iova
+            } else {
+                u64::MAX
+            },
+            ..identity
+        };
         let offset = iova & (PAGE_BYTES - 1);
         let page_translation = |phys_page: u64| Translation {
             phys: phys_page | offset,
@@ -832,7 +842,10 @@ impl Iommu {
             return Err(DmaFault::DeviceTable);
         }
         if self.in_exclusion_range(iova) && (self.exclusion_allows_all() || entry.exclusion()) {
-            return Ok(identity);
+            return Ok(Translation {
+                bytes_left: identity.bytes_left.min(self.exclusion_limit - iova + 1),
+                ..identity
+            });
         }
         if !entry.translation_valid() {
             return Ok(identity);

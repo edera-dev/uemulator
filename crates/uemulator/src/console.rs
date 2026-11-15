@@ -146,6 +146,14 @@ impl ConsoleHandle {
         state.rx.drain(..count).collect()
     }
 
+    /// Put input back ahead of bytes added by the host while DMA was attempted.
+    pub(crate) fn guest_unrx_bulk(&self, bytes: &[u8]) {
+        let mut state = self.inner.0.lock().unwrap();
+        for &byte in bytes.iter().rev() {
+            state.rx.push_front(byte);
+        }
+    }
+
     pub(crate) fn take_size_change(&self) -> Option<(u16, u16)> {
         let mut state = self.inner.0.lock().unwrap();
         if state.size_dirty {
