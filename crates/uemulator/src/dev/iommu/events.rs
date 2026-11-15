@@ -15,7 +15,9 @@ const EVENT_ILLEGAL_COMMAND: u32 = 0x5;
 const EVENT_COMMAND_HW_ERROR: u32 = 0x6;
 
 /// IO_PAGE_FAULT flags as the Linux driver names them (`EVENT_FLAG_*`, dword 1 bits 27:16): the
-/// entry was present, the access was a write, a reserved bit was set, it was an interrupt.
+/// access asked for execute permission, the entry was present, the access was a write, a
+/// reserved bit was set, it was an interrupt.
+pub(super) const FLAG_NO_EXECUTE: u16 = 0x002;
 pub(super) const FLAG_INTERRUPT: u16 = 0x008;
 pub(super) const FLAG_PRESENT: u16 = 0x010;
 pub(super) const FLAG_WRITE: u16 = 0x020;
