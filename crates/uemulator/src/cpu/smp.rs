@@ -181,6 +181,7 @@ impl Smp {
         cpu.start_slice(divisor.max(1));
         cpu.dev.lock().set_current_cpu(target);
         cpu.revoke_stale_write_tags();
+        cpu.catch_up_tlb_shootdowns();
     }
 }
 
@@ -215,6 +216,10 @@ impl Cpu {
         swap(&mut self.logged, &mut other.logged);
         swap(&mut self.trace, &mut other.trace);
         swap(&mut self.code_mark_epoch, &mut other.code_mark_epoch);
+        swap(
+            &mut self.tlb_shootdown_epoch,
+            &mut other.tlb_shootdown_epoch,
+        );
     }
 
     /// Folds the time the last slice took into the clock and starts the next with `divisor`
@@ -284,6 +289,12 @@ impl Cpu {
         self.cr2 = 0;
         self.pdpte = [0; 4];
         self.dr = [0, 0, 0, 0, 0, 0, DR6_RESET, DR7_RESET];
+        // DEBUGCTL and the address masks are MSRs, which INIT leaves alone.
+        self.debug = debug::DebugState {
+            debugctl: self.debug.debugctl,
+            address_masks: self.debug.address_masks,
+            ..Default::default()
+        };
         self.xcr0 = xsave::XCR0_X87;
         self.mxcsr = MXCSR_RESET;
         self.fcw = FCW_RESET;

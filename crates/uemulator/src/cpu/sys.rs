@@ -12,10 +12,6 @@ pub(crate) const MSR_SYSENTER_CS: u32 = 0x174;
 pub(crate) const MSR_SYSENTER_ESP: u32 = 0x175;
 pub(crate) const MSR_SYSENTER_EIP: u32 = 0x176;
 pub(crate) const MSR_PAT: u32 = 0x277;
-/// DEBUGCTL: stored only (nothing records branches or single-steps on branches), in
-/// `Cpu::msr_misc`; a KVM host saves and restores it around every guest run, and LBR
-/// virtualization swaps it with the VMCB's.
-pub(crate) const MSR_DEBUGCTL: u32 = 0x1d9;
 pub(crate) const MSR_EFER: u32 = 0xc000_0080;
 pub(crate) const MSR_STAR: u32 = 0xc000_0081;
 pub(crate) const MSR_LSTAR: u32 = 0xc000_0082;
@@ -119,10 +115,10 @@ const CR8_MASK: u64 = 0xf;
 /// CR8 is TPR[7:4] (SDM 10.8.6.1).
 const CR8_TPR_SHIFT: u32 = 4;
 
-/// DR6 bits software may write: B0-B3 (3:0), BD (13), BS (14), BT (15). Bits 31:16 and 11:4
-/// always read as one (no RTM, no bus-lock detect) and bit 12 as zero.
-const DR6_WRITABLE: u64 = 0xe00f;
-const DR6_FIXED_ONE: u64 = 0xffff_0ff0;
+/// DR6 bits software may write: B0-B3 (3:0), BLD (11, bus-lock detect, active low), BD (13),
+/// BS (14), BT (15). Bits 31:16 and 10:4 always read as one (no RTM) and bit 12 as zero.
+const DR6_WRITABLE: u64 = 0xe80f;
+const DR6_FIXED_ONE: u64 = 0xffff_07f0;
 /// DR7 bits software may write: L0-G3, LE, GE (9:0), GD (13) and the RW/LEN fields (31:16).
 /// Bit 10 always reads as one; bits 15:14 and 12:11 as zero.
 const DR7_WRITABLE: u64 = 0xffff_23ff;
@@ -291,6 +287,11 @@ impl Cpu {
             MSR_SPEC_CTRL => self.spec_ctrl,
             MSR_SYSENTER_CS..=MSR_SYSENTER_EIP => self.sysenter[(msr - MSR_SYSENTER_CS) as usize],
             _ if super::model_msr::owns(msr) => self.model_msr_read(msr)?,
+            debug::MSR_DEBUGCTL
+            | debug::MSR_DR0_ADDRESS_MASK
+            | debug::MSR_DR1_ADDRESS_MASK..=debug::MSR_DR3_ADDRESS_MASK => {
+                self.debug_msr_read(msr).unwrap_or(0)
+            }
             _ => match self.msr_misc.get(&msr) {
                 Some(v) => *v,
                 None => {
@@ -438,6 +439,11 @@ impl Cpu {
                 self.pmu_hwcr_written(v);
                 self.msr_misc.insert(msr, v);
             }
+            debug::MSR_DEBUGCTL
+            | debug::MSR_DR0_ADDRESS_MASK
+            | debug::MSR_DR1_ADDRESS_MASK..=debug::MSR_DR3_ADDRESS_MASK => {
+                self.debug_msr_write(msr, v).unwrap_or(Ok(()))?
+            }
             _ if self.msr_misc.contains_key(&msr) => {
                 self.msr_misc.insert(msr, v);
             }
@@ -453,8 +459,8 @@ impl Cpu {
     }
 
     /// 0F 20..23: mov to/from control and debug registers. ModRM.reg is the CR/DR number
-    /// (REX.R makes CR8 or DR8-DR15) and ModRM.rm the GPR; mod is ignored. Nothing triggers
-    /// hardware breakpoints, so the debug registers are validated storage.
+    /// (REX.R makes CR8 or DR8-DR15) and ModRM.rm the GPR; mod is ignored. The breakpoints the
+    /// debug registers describe fire in `debug.rs`.
     pub fn mov_cr_dr(&mut self, i: &Insn) -> ExecResult<()> {
         const OP_MOV_FROM_CR: u16 = 0x120;
         const OP_MOV_FROM_DR: u16 = 0x121;
@@ -528,6 +534,7 @@ impl Cpu {
             }
             OP_MOV_FROM_DR => {
                 let index = self.debug_register_index(register)?;
+                self.general_detect()?;
                 self.gpr[gpr] = if self.efer & EFER_LMA != 0 {
                     self.dr[index]
                 } else {
@@ -536,6 +543,7 @@ impl Cpu {
             }
             _ => {
                 let index = self.debug_register_index(register)?;
+                self.general_detect()?;
                 let v = self.gpr[gpr];
                 self.write_debug_register(index, v)?;
             }
@@ -1058,6 +1066,7 @@ impl Cpu {
         const MODRM_MWAITX: u8 = 0xfb;
         const MODRM_RDPRU: u8 = 0xfd;
         const REP_F3: u8 = 1;
+        use super::invlpgb::{MODRM_INVLPGB, MODRM_TLBSYNC};
         let reg = i.reg & 7;
         if i.op == OP_GROUP6 {
             let loc = self.modrm_location(i, next)?;
@@ -1110,6 +1119,8 @@ impl Cpu {
                 MODRM_STGI => return self.stgi_clgi(true, next),
                 MODRM_CLGI => return self.stgi_clgi(false, next),
                 MODRM_INVLPGA => return self.invlpga(next),
+                MODRM_INVLPGB => return self.invlpgb(next),
+                MODRM_TLBSYNC => return self.tlbsync(next),
                 MODRM_XGETBV => self.xgetbv()?,
                 MODRM_MONITOR => self.monitor()?,
                 MODRM_MWAIT => self.mwait()?,
@@ -3360,15 +3371,17 @@ mod sys_tests {
 
         #[test]
         fn dr6_write_forces_the_reserved_bits() {
+            // Bit 11 (bus-lock detect, active low) is the one writable bit among 11:4.
             for (written, expected) in [
-                (0u64, 0xffff_0ff0u64),
-                (0xf, 0xffff_0fff),
+                (0u64, 0xffff_07f0u64),
+                (0xf, 0xffff_07ff),
                 (0xffff_ffff, 0xffff_efff),
-                (1 << 13, 0xffff_2ff0),
-                (1 << 14, 0xffff_4ff0),
-                (1 << 15, 0xffff_8ff0),
-                (1 << 12, 0xffff_0ff0),
-                (0xffff_0000, 0xffff_0ff0),
+                (1 << 13, 0xffff_27f0),
+                (1 << 14, 0xffff_47f0),
+                (1 << 15, 0xffff_87f0),
+                (1 << 12, 0xffff_07f0),
+                (1 << 11, 0xffff_0ff0),
+                (0xffff_0000, 0xffff_07f0),
                 (0x0000_0ff0, 0xffff_0ff0),
             ] {
                 let (h, stop) = write_dr(6, written);
@@ -3427,7 +3440,7 @@ mod sys_tests {
             let (h, stop) = write_dr(4, 0xf);
             assert_eq!(stop, Stop::Halted);
             assert_eq!(
-                h.cpu.dr[6], 0xffff_0fff,
+                h.cpu.dr[6], 0xffff_07ff,
                 "a write through dr4 is a dr6 write"
             );
             assert_eq!(h.cpu.dr[4], 0, "the raw slot stays unused");
@@ -3472,7 +3485,7 @@ mod sys_tests {
                 h.cpu.gpr[RAX] = 1;
             });
             assert_eq!(stop, Stop::Halted);
-            assert_eq!(h.cpu.dr[6], 0xffff_0ff1);
+            assert_eq!(h.cpu.dr[6], 0xffff_07f1);
         }
 
         #[test]

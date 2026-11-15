@@ -34,7 +34,7 @@ Rules from `CLAUDE.md` hold for all of it: a CPUID bit goes on in the same commi
 | RDPRU | 8000_0008 EBX 4 | `rdpru` reading MPERF/APERF (fixed ratio 1; the MSRs `0xE7`/`0xE8` come with it) |
 | CR8_LEGACY | 8000_0001 ECX 4 | `lock mov cr8` in 32-bit code, a 3-line decoder rule |
 | OSVW | 8000_0001 ECX 9 | `OSVW_ID_LENGTH` / `OSVW_STATUS` MSRs (`0xC0010140/1`): storage only |
-| INVLPGB / TLBSYNC | 8000_0008 EBX 4... (confirm bit in APM) | broadcast TLB invalidation; with one thread running all vCPUs, "broadcast" is a flush of every vCPU's TLB in `Smp` |
+| INVLPGB / TLBSYNC | 8000_0008 EBX 3, EDX[15:0] = 7 | done (`cpu/invlpgb.rs`): threaded vCPUs are stopped and invalidated in place, time-shared ones flush their whole TLB before they next run; TLBSYNC has nothing left to wait for |
 
 ### B. Architectural state that touches paging and XSAVE (the real work)
 
@@ -90,7 +90,7 @@ Speculation-control bits (all in the AMD spelling; the Intel leaf 7 EDX bits and
 | PSFD | EBX 28 | SPEC_CTRL bit 7 stored | (opt-in) |
 | BTC_NO | EBX 29 | no branch type confusion | Retbleed not affected |
 | IBPB_RET | EBX 30 | (IBPB flushes nothing) | no `ibpb_no_ret` bug |
-| NO_NESTED_DATA_BP | 0x8000_0021 EAX 0 | no hardware breakpoint ever fires | KVM |
+| NO_NESTED_DATA_BP | 0x8000_0021 EAX 0 | only the accesses of the instruction `step_debug` runs are watched, never event delivery's | KVM |
 | WRMSR_XX_BASE_NS | EAX 1 | serialization only ever errs the safe way | |
 | LFENCE_ALWAYS_SERIALIZING | EAX 2 | in-order | lfence as the rdtsc barrier |
 | NULL_SEL_CLR_BASE | EAX 6 | null selector loads leave base 0 (test pins it) | no `null_seg` bug, no FS/GS reload per switch |
@@ -122,7 +122,13 @@ Platform identity (`docs/plans/07-devices.md`): the PCI root complex is Turin's 
 
 Small Zen extensions, advertised with tests (`cpu/model_msr_tests.rs`, `cpu/sse_amd_tests.rs`, JIT differential cases through the interpreter helper): SSE4A, MMXEXT (the SSE integer forms on MMX registers, already implemented), the MMX forms of SSSE3, MISALIGNSSE, MWAITX/MONITORX, RDPRU, MCOMMIT, FFXSR, CR8_LEGACY, TCE, OSVW, NO_SMM_CTL_MSR, FSRS/FSRC, PREFETCH_CTL_MSR, CPUID_USER_DIS, SRSO_BP_SPEC_REDUCE, INT_WBINVD, PPIN, APERF/MPERF (leaf 6) with EffFreqRO, HwPstate, CPB, RAPL, and leaf 0x8000001A (MOVU, FP256). TSC-deadline and SRSO_NO, the former departures, are gone. The CPUID override MSRs, MMIO_CONF_BASE, SMM, TW_CFG, FP_CFG and SEV_STATUS MSRs exist.
 
-Present on Turin, not advertised (not implemented): LA57, PKU/OSPKE, CET shadow stacks, INVLPGB/TLBSYNC, IBS, ERAPS, UpperAddressIgnore, WDT, the thermal bits of leaf 0x80000007, the extended SVM features GMET, ROGPT and the host MCE override (everything else Turin has in 0x8000_000A EDX outside SEV is advertised), SEV/SEV-ES/SEV-SNP, 52/57 address bits. Left clear for want of a source: FP512 (leaf 0x8000001A bit 3), IBRS_PREFERRED, AMD_ERMSB and the leaf 0x80000021 EBX microcode patch size. AMD_SSB_NO and IBRS_ALWAYS_ON stay clear because Turin does not report them.
+Debug and TLB features (`cpu/debug.rs`, `cpu/invlpgb.rs`, tests in `cpu/debug_tests.rs`, `cpu/invlpgb.rs`, `cpu/smp_tests.rs` and `cpu/svm.rs`):
+- The debug registers fire: instruction breakpoints (faults; RF suppresses them for one instruction, fault-class exceptions push RF set, `iretq` loads it), data write and read/write watchpoints (traps, LEN 1/2/4/8 aligned down, repeated string instructions stop between iterations), I/O breakpoints with CR4.DE, general detect, single-step with DEBUGCTL.BTF, the `mov ss`/`pop ss` delay (including the CVE-2018-8897 case of an event in between), the TSS T bit, and DR6 status bits. Whenever anything could raise a #DB the run loop executes one interpreted instruction at a time (`Cpu::debug_slow_path`) and `helper_exec` ends a JIT block that turns it on; generated code never checks. A guest's DR6/DR7 come and go with the VMCB.
+- BPEXT (0x8000_0001 ECX 26): DR0_ADDR_MASK (0xC001_1027) and DR1-DR3 (0xC001_1019-101B), 32-bit masks applied to data breakpoints. AdMskExtn (bit 30, which Genoa/Turin set) is not advertised: what it changes for instruction breakpoints could not be confirmed from a public source.
+- BUS_LOCK_DETECT (leaf 7 ECX 24, Zen 5's "bus lock trap"): DEBUGCTL bit 2 makes a locked access split across a 64-byte line a #DB trap with DR6 bit 11 (active low, now writable) cleared. Linux turns it on at boot (`split_lock_detect=warn` by default), so it is checked in `Cpu::exec`, which every locked instruction goes through on either engine, and does not slow the JIT. Locked accesses to uncached (device) memory are not counted as bus locks.
+- INVLPGB/TLBSYNC (0x8000_0008 EBX 3, EDX[15:0] = 7): the PCID, global and final-only filters widen to "all" (the soft TLB keeps none of them apart); the ASID picks the running or parked TLB. #UD in real and virtual-8086 mode and in a guest (no VMCB enable bit is emulated), #GP at CPL > 0 or with more than eight pages; the SVM intercepts (vector 5 bits 0, 1, 4; exits 0xA0, 0xA1, 0xA4) are honored. EFER.TCE is not involved.
+
+Present on Turin, not advertised (not implemented): LA57, PKU/OSPKE, CET shadow stacks, IBS, ERAPS, UpperAddressIgnore, WDT, the thermal bits of leaf 0x80000007, the extended SVM features GMET, ROGPT and the host MCE override (everything else Turin has in 0x8000_000A EDX outside SEV is advertised), SEV/SEV-ES/SEV-SNP, 52/57 address bits. Left clear for want of a source: FP512 (leaf 0x8000001A bit 3), IBRS_PREFERRED, AMD_ERMSB and the leaf 0x80000021 EBX microcode patch size. AMD_SSB_NO and IBRS_ALWAYS_ON stay clear because Turin does not report them.
 
 ## Order
 

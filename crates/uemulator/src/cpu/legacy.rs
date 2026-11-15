@@ -235,6 +235,7 @@ impl Cpu {
                 self.load_segment_register(index, selector)?;
                 if index == SEG_SS {
                     self.interrupt_shadow = true;
+                    self.debug.mov_ss_shadow = true;
                 }
             }
             0x8f => {
@@ -492,6 +493,7 @@ impl Cpu {
         }
         if index == SEG_SS {
             self.interrupt_shadow = true;
+            self.debug.mov_ss_shadow = true;
         }
         Ok(())
     }
@@ -667,7 +669,7 @@ impl Cpu {
                     break;
                 }
             }
-            if iterations >= REP_ITERATIONS_PER_SLICE && count != 0 {
+            if (iterations >= REP_ITERATIONS_PER_SLICE || self.rep_must_pause()) && count != 0 {
                 self.icount += iterations;
                 self.pmu.unretired += iterations + 1;
                 return Ok(());
@@ -737,7 +739,7 @@ impl Cpu {
             let count = self.gpr[GPR_RCX].wrapping_sub(1) & amask;
             self.write_address_register(GPR_RCX, count, i);
             iterations += 1;
-            if iterations >= REP_ITERATIONS_PER_SLICE && count != 0 {
+            if (iterations >= REP_ITERATIONS_PER_SLICE || self.rep_must_pause()) && count != 0 {
                 self.icount += iterations;
                 self.pmu.unretired += iterations + 1;
                 return Ok(());

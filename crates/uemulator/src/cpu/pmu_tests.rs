@@ -431,6 +431,28 @@ fn the_jit_takes_over_again_once_branch_counting_stops() {
     assert_eq!(h.cpu.uses_jit(), jit);
 }
 
+/// With a hardware breakpoint armed every instruction goes through `step_debug`, which must still
+/// let the branch counters see them (`Cpu::exec_interpreted`).
+#[test]
+fn branch_events_still_count_while_a_breakpoint_is_armed() {
+    const DR7_L0: u64 = 1;
+    let setup = |h: &mut Harness| {
+        program(h, 0, BRANCHES, 0);
+        program(h, 1, TAKEN_BRANCHES, 0);
+        // an instruction breakpoint nothing reaches
+        h.cpu.dr[0] = SCRATCH;
+        h.cpu.dr[7] |= DR7_L0;
+    };
+    let result = run_both(&BRANCHY, setup);
+    let mut engines = vec![result.interpreter];
+    engines.extend(result.jit.map(|(h, _)| h));
+    for h in &engines {
+        assert!(!h.cpu.uses_jit());
+        assert_eq!(h.cpu.gpr[R8], 6, "three jnz, jmp, call, ret");
+        assert_eq!(h.cpu.gpr[RAX], 5, "the last jnz falls through");
+    }
+}
+
 fn lbr_entry(h: &mut Harness, index: u32) -> (u64, u64) {
     (
         h.cpu.rdmsr(0xc001_0300 + 2 * index).unwrap(),

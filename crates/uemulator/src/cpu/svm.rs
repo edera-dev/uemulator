@@ -67,6 +67,15 @@ const VMCB_INTERCEPT4: u64 = 0x10;
 /// Two words: the pause filter threshold (cycles) and count (APM 15.14.4).
 const VMCB_PAUSE_FILTER_THRESHOLD: u64 = 0x3c;
 const VMCB_PAUSE_FILTER_COUNT: u64 = 0x3e;
+/// Intercept vector 5: INVLPGB (bit 0), INVLPGB with illegal operands (1), INVPCID (2),
+/// MCOMMIT (3), TLBSYNC (4).
+const VMCB_INTERCEPT5: u64 = 0x14;
+const INTERCEPT_INVLPGB: u32 = 1 << 0;
+const INTERCEPT_INVLPGB_ILLEGAL: u32 = 1 << 1;
+const INTERCEPT_TLBSYNC: u32 = 1 << 4;
+const VMEXIT_INVLPGB: u64 = 0xa0;
+const VMEXIT_INVLPGB_ILLEGAL: u64 = 0xa1;
+const VMEXIT_TLBSYNC: u64 = 0xa4;
 const VMCB_IOPM_BASE: u64 = 0x40;
 const VMCB_MSRPM_BASE: u64 = 0x48;
 const VMCB_TSC_OFFSET: u64 = 0x50;
@@ -425,6 +434,7 @@ pub(crate) struct Guest {
     intercept_exceptions: u32,
     intercept3: u32,
     intercept4: u32,
+    intercept5: u32,
     iopm: u64,
     msrpm: u64,
     tsc_offset: u64,
@@ -476,7 +486,7 @@ pub(crate) struct Svm {
     /// SVM-Lock key: `MSR_SVM_KEY` written while unlocked, compared while locked.
     key: u64,
     tsc_ratio: u64,
-    /// DEBUGCTL lives in `Cpu::msr_misc`; these are the other LBR MSRs (`MSR_LAST_BRANCH_FROM_IP`
+    /// DEBUGCTL lives in `Cpu::debug`; these are the other LBR MSRs (`MSR_LAST_BRANCH_FROM_IP`
     /// on).
     pub(crate) last_branches: [u64; LAST_BRANCH_MSRS],
     pub(crate) guest: Option<Box<Guest>>,
@@ -776,15 +786,14 @@ impl Cpu {
         Ok(())
     }
 
+    /// DEBUGCTL is `DebugState::debugctl` (`debug.rs`, which acts on BTF and bus-lock detect);
+    /// LBR virtualization swaps it with the VMCB's.
     fn debugctl(&self) -> u64 {
-        self.msr_misc
-            .get(&super::sys::MSR_DEBUGCTL)
-            .copied()
-            .unwrap_or(0)
+        self.debug.debugctl
     }
 
     fn set_debugctl(&mut self, value: u64) {
-        self.msr_misc.insert(super::sys::MSR_DEBUGCTL, value);
+        self.debug.debugctl = value;
     }
 
     fn vmcb_read(&mut self, base: u64, offset: u64, size: u8) -> u64 {
@@ -939,6 +948,25 @@ impl Cpu {
         Ok(())
     }
 
+    /// Makes the parked TLB unusable if it holds the host's translations (`host`) or a guest's
+    /// (`guest`): the next world switch starts that side empty. For INVLPGB, which may drop more
+    /// than it was asked to.
+    pub(super) fn drop_parked_tlb(&mut self, host: bool, guest: bool) {
+        if let Some(parked) = self.svm.parked_tlb.as_deref_mut() {
+            let matches = match parked.owner {
+                TlbOwner::Nobody => false,
+                TlbOwner::Host => host,
+                TlbOwner::Guest(_) => guest,
+            };
+            if matches {
+                parked.owner = TlbOwner::Nobody;
+            }
+        }
+        if guest {
+            self.forget_nested_leaves();
+        }
+    }
+
     /// Empties `NestedLeafCache`, together with the guest TLB it belongs to.
     fn forget_nested_leaves(&mut self) {
         if let Some(cache) = self.svm.nested_leaves.as_deref_mut() {
@@ -1065,6 +1093,7 @@ impl Cpu {
             intercept_exceptions: self.vmcb_read(vmcb, VMCB_INTERCEPT_EXCEPTIONS, 4) as u32,
             intercept3,
             intercept4,
+            intercept5: self.vmcb_read(vmcb, VMCB_INTERCEPT5, 4) as u32,
             iopm: self.vmcb_read(vmcb, VMCB_IOPM_BASE, 8),
             msrpm: self.vmcb_read(vmcb, VMCB_MSRPM_BASE, 8),
             tsc_offset: self.vmcb_read(vmcb, VMCB_TSC_OFFSET, 8),
@@ -1839,6 +1868,21 @@ impl Cpu {
                 0xde => simple(VMEXIT_SKINIT, v4 & INTERCEPT_SKINIT != 0),
                 0xdf => simple(VMEXIT_INVLPGA, v3 & INTERCEPT_INVLPGA != 0),
                 0xf9 => simple(VMEXIT_RDTSCP, v4 & INTERCEPT_RDTSCP != 0),
+                super::invlpgb::MODRM_INVLPGB => {
+                    let v5 = self.svm.guest.as_ref().map_or(0, |guest| guest.intercept5);
+                    if v5 & INTERCEPT_INVLPGB != 0 {
+                        Some((VMEXIT_INVLPGB, 0, 0))
+                    } else if v5 & INTERCEPT_INVLPGB_ILLEGAL != 0 && self.invlpgb_operands_illegal()
+                    {
+                        Some((VMEXIT_INVLPGB_ILLEGAL, 0, 0))
+                    } else {
+                        None
+                    }
+                }
+                super::invlpgb::MODRM_TLBSYNC => {
+                    let v5 = self.svm.guest.as_ref().map_or(0, |guest| guest.intercept5);
+                    simple(VMEXIT_TLBSYNC, v5 & INTERCEPT_TLBSYNC != 0)
+                }
                 _ => None,
             },
             _ => None,
@@ -2042,8 +2086,9 @@ mod tests {
     //! and interrupt intercepts live there, not in `Harness::run`.
     use super::*;
     use crate::cpu::BeforeStep;
+    use crate::cpu::debug::MSR_DEBUGCTL;
     use crate::cpu::mem::AccessKind;
-    use crate::cpu::sys::{CR0_EM, MSR_DEBUGCTL, MSR_EFER};
+    use crate::cpu::sys::{CR0_EM, MSR_EFER};
     use crate::cpu::test_support::{LegacyTables, PTE_P, PaeTables};
     use crate::testkit::RBX;
     use crate::testkit::{CODE_BASE, Harness, SCRATCH};
@@ -2162,11 +2207,7 @@ mod tests {
             // as in `Cpu::run`: the shadow of `sti`/`mov ss` covers exactly one instruction
             h.cpu.interrupt_shadow = false;
             h.cpu.icount += 1;
-            let result = if h.cpu.jit.is_some() && h.cpu.is_long64() {
-                h.cpu.step_block()
-            } else {
-                h.cpu.step()
-            };
+            let result = h.cpu.dispatch_step();
             if let Some(reason) = h.cpu.after_step(result) {
                 panic!("machine exit: {reason:?}\n{}", h.cpu.dump_regs());
             }
@@ -4646,4 +4687,59 @@ mod tests {
         x2avic_serves_the_x2apic_msrs_from_the_backing_page,
         with_v_intr_masking_the_guests_cr8_is_its_virtual_tpr,
     );
+    #[test]
+    fn invlpgb_and_tlbsync_exit_when_intercepted_and_are_ud_in_a_guest_otherwise() {
+        // invlpgb / tlbsync, then cpuid
+        const INVLPGB: &[u8] = &[0x0f, 0x01, 0xfe, 0x0f, 0xa2];
+        const TLBSYNC: &[u8] = &[0x0f, 0x01, 0xff, 0x0f, 0xa2];
+        const TOO_MANY_PAGES: u64 = 8;
+        for (code, intercept5, rcx, expected) in [
+            (INVLPGB, INTERCEPT_INVLPGB, 0, VMEXIT_INVLPGB),
+            (
+                INVLPGB,
+                INTERCEPT_INVLPGB_ILLEGAL,
+                TOO_MANY_PAGES,
+                VMEXIT_INVLPGB_ILLEGAL,
+            ),
+            (INVLPGB, INTERCEPT_INVLPGB_ILLEGAL, 0, VMEXIT_EXCEPTION + 6),
+            (TLBSYNC, INTERCEPT_TLBSYNC, 0, VMEXIT_TLBSYNC),
+            (TLBSYNC, 0, 0, VMEXIT_EXCEPTION + 6),
+        ] {
+            let mut h = rig(code);
+            put(&mut h, VMCB_INTERCEPT5, 4, intercept5 as u64);
+            put(&mut h, VMCB_INTERCEPT_EXCEPTIONS, 4, 1 << 6);
+            h.cpu.gpr[RCX] = rcx;
+            run(&mut h);
+            assert_eq!(
+                get(&h, VMCB_EXITCODE, 8),
+                expected,
+                "{code:02x?} {intercept5:#x}"
+            );
+            assert_eq!(get(&h, SAVE_RIP, 8), GUEST_CODE);
+        }
+    }
+
+    #[test]
+    fn a_guest_data_breakpoint_follows_the_vmcb_dr7_and_the_host_gets_its_own_back() {
+        // mov dword [rbx], eax; cpuid
+        let mut h = rig(&[0x89, 0x03, 0x0f, 0xa2]);
+        const WATCHED: u64 = crate::testkit::SCRATCH;
+        // L0, R/W 01 (write), LEN 11 (four bytes)
+        const GUEST_DR7: u64 = 0x400 | 1 | (1 | 3 << 2) << 16;
+        h.cpu.dr[0] = WATCHED;
+        h.cpu.gpr[RBX] = WATCHED;
+        put(&mut h, SAVE_DR7, 8, GUEST_DR7);
+        put(&mut h, VMCB_INTERCEPT_EXCEPTIONS, 4, 1 << 1);
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_EXCEPTION + 1);
+        assert_eq!(
+            get(&h, SAVE_RIP, 8),
+            GUEST_CODE + 2,
+            "a trap: after the store"
+        );
+        assert_eq!(get(&h, SAVE_DR6, 8), 0xffff_0ff1, "B0 in the guest's DR6");
+        assert_eq!(get(&h, SAVE_DR7, 8), GUEST_DR7);
+        assert_eq!(h.cpu.dr[7], 0x400, "the host's DR7 is back");
+        assert_eq!(h.cpu.dr[6], 0xffff_0ff0);
+    }
 }

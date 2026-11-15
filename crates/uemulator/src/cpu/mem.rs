@@ -899,6 +899,9 @@ impl Cpu {
     /// the page the tag covers: the tag only describes one page, and the next page may map
     /// anywhere, so a straddling access translates and reads each page separately.
     fn mem_read(&mut self, linear: u64, size: u8, supervisor: bool) -> ExecResult<u64> {
+        if self.debug.watch_accesses {
+            self.watch_access(linear, size as u64, false);
+        }
         let user = self.cpl == USER_CPL && !supervisor;
         let entry = &self.tlb[tlb_slot(linear, user)];
         if entry.tag_r == linear & !PAGE_OFFSET_MASK
@@ -940,6 +943,9 @@ impl Cpu {
     /// Store counterpart of `mem_read`. A straddling store translates both pages before
     /// writing either, so a fault on the second page leaves memory untouched.
     fn mem_write(&mut self, linear: u64, size: u8, val: u64, supervisor: bool) -> ExecResult<()> {
+        if self.debug.watch_accesses {
+            self.watch_access(linear, size as u64, true);
+        }
         let user = self.cpl == USER_CPL && !supervisor;
         let entry = &self.tlb[tlb_slot(linear, user)];
         if entry.tag_w == linear & !PAGE_OFFSET_MASK

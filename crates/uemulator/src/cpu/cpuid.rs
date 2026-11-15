@@ -327,6 +327,9 @@ const STRUCTURED_ECX_RDPID: u32 = 1 << 22;
 /// movdiri and movdir64b (Zen 5): direct stores of a register and of 64 bytes (`sse_ext.rs`).
 const STRUCTURED_ECX_MOVDIRI: u32 = 1 << 27;
 const STRUCTURED_ECX_MOVDIR64B: u32 = 1 << 28;
+/// Bus-lock detect (Zen 5's "bus lock trap"): DEBUGCTL bit 2 makes a split lock a #DB trap with
+/// DR6 bit 11 cleared (`debug.rs`).
+const STRUCTURED_ECX_BUS_LOCK_DETECT: u32 = 1 << 24;
 const STRUCTURED_ECX: u32 = STRUCTURED_ECX_AVX512_VBMI
     | STRUCTURED_ECX_UMIP
     | STRUCTURED_ECX_AVX512_VBMI2
@@ -338,7 +341,8 @@ const STRUCTURED_ECX: u32 = STRUCTURED_ECX_AVX512_VBMI
     | STRUCTURED_ECX_AVX512_VPOPCNTDQ
     | STRUCTURED_ECX_RDPID
     | STRUCTURED_ECX_MOVDIRI
-    | STRUCTURED_ECX_MOVDIR64B;
+    | STRUCTURED_ECX_MOVDIR64B
+    | STRUCTURED_ECX_BUS_LOCK_DETECT;
 
 // Leaf 7 subleaf 0 EDX. The speculation-control bits Intel defines here (SPEC_CTRL, STIBP,
 // L1D_FLUSH, ARCH_CAPABILITIES, SSBD, bits 26-31) stay clear, as on every AMD part: the AMD
@@ -425,6 +429,9 @@ const EXT_FEATURE_PERFCTR_CORE: u32 = 1 << 23;
 /// and readable (by rdmsr and rdpmc 6-15) but never count.
 const EXT_FEATURE_PERFCTR_NB: u32 = 1 << 24;
 const EXT_FEATURE_PERFCTR_LLC: u32 = 1 << 28;
+/// BPEXT, the data breakpoint extension: the DR0-DR3 address mask MSRs (`debug.rs`). Bit 30,
+/// AdMskExtn (the masks extended to instruction breakpoints), stays clear.
+const EXT_FEATURE_BPEXT: u32 = 1 << 26;
 /// monitorx and mwaitx (`protection.rs`), including the mwaitx timer.
 const EXT_FEATURE_MWAITX: u32 = 1 << 29;
 // Leaf 0x8000_0001 EDX, besides the aliases of leaf 1.
@@ -655,9 +662,12 @@ const EXT_ADDRESS_PSFD: u32 = 1 << 28;
 const EXT_ADDRESS_BTC_NO: u32 = 1 << 29;
 /// IBPB also flushes the return predictor; without it Linux marks the CPU "ibpb_no_ret".
 const EXT_ADDRESS_IBPB_RET: u32 = 1 << 30;
+/// INVLPGB and TLBSYNC (`invlpgb.rs`); EDX[15:0] holds the largest page count minus one.
+const EXT_ADDRESS_INVLPGB: u32 = 1 << 3;
 const EXT_ADDRESS_EBX: u32 = EXT_ADDRESS_CLZERO
     | EXT_ADDRESS_IRPERF
     | EXT_ADDRESS_RDPRU
+    | EXT_ADDRESS_INVLPGB
     | EXT_ADDRESS_XSAVEERPTR
     | EXT_ADDRESS_MCOMMIT
     | EXT_ADDRESS_WBNOINVD
@@ -705,8 +715,8 @@ const FP_HINTS_MOVU: u32 = 1 << 1;
 const FP_HINTS_FP256: u32 = 1 << 2;
 
 // Leaf 0x8000_0021 EAX.
-/// Data breakpoints never fire while a #DB is being delivered. True because no hardware
-/// breakpoint fires at all (`mov_cr_dr` keeps the debug registers as validated storage).
+/// Data breakpoints never fire while a #DB is being delivered: only the accesses of the
+/// instruction `step_debug` runs are watched, never those of event delivery (`debug.rs`).
 const EXT_FEATURES_2_NO_NESTED_DATA_BP: u32 = 1 << 0;
 /// wrmsr to FS_BASE, GS_BASE and KERNEL_GS_BASE is not serializing. Software that relied on it
 /// serializing would have to fence; the emulator serializes everything, so either answer is safe.
@@ -948,6 +958,7 @@ impl Cpu {
                     | EXT_FEATURE_PERFCTR_CORE
                     | EXT_FEATURE_PERFCTR_NB
                     | EXT_FEATURE_PERFCTR_LLC
+                    | EXT_FEATURE_BPEXT
                     | EXT_FEATURE_MWAITX,
                 EXT_FEATURE_SYSCALL
                     | EXT_FEATURE_NX
@@ -987,7 +998,8 @@ impl Cpu {
                 EXT_ADDRESS_EBX,
                 (topology.logical_processors - 1).min(0xff)
                     | ceil_log2(topology.logical_processors) << EXT_ADDRESS_APIC_ID_SIZE_SHIFT,
-                RDPRU_MAX_REGISTER << EXT_ADDRESS_EDX_RDPRU_MAX_SHIFT,
+                RDPRU_MAX_REGISTER << EXT_ADDRESS_EDX_RDPRU_MAX_SHIFT
+                    | super::invlpgb::INVLPGB_MAX_EXTRA_PAGES,
             ),
             // revision 1, number of ASIDs, features
             LEAF_SVM => (1, super::svm::SVM_ASIDS, 0, super::svm::SVM_FEATURES),
