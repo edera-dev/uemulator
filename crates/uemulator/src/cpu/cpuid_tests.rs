@@ -120,14 +120,19 @@ fn hyper_threading_follows_the_processor_count() {
 fn leaf_1_ecx_advertises_only_what_is_implemented() {
     let mut h = blank();
     let [_, _, ecx, _] = cpuid(&mut h, 1, 0);
-    // SSE3 PCLMULQDQ MONITOR SSSE3 FMA CX16 PCID SSE4.1 SSE4.2 x2APIC MOVBE POPCNT TSC-deadline
-    // AES XSAVE AVX F16C RDRAND
+    // SSE3 PCLMULQDQ MONITOR SSSE3 FMA CX16 PCID SSE4.1 SSE4.2 x2APIC MOVBE POPCNT AES XSAVE AVX
+    // F16C RDRAND
     let expected = bits(&[
-        0, 1, 3, 9, 12, 13, 17, 19, 20, 21, 22, 23, 24, 25, 26, 28, 29, 30,
+        0, 1, 3, 9, 12, 13, 17, 19, 20, 21, 22, 23, 25, 26, 28, 29, 30,
     ]);
     assert_eq!(
         ecx, expected,
         "no VMX, SMX, hypervisor or PDCM bit, and OSXSAVE only follows CR4"
+    );
+    assert_eq!(
+        ecx & 1 << 24,
+        0,
+        "no TSC-deadline timer, as on every AMD part"
     );
     h.cpu.cr4 |= CR4_OSXSAVE;
     assert_ne!(cpuid(&mut h, 1, 0)[2] & (1 << 27), 0);
@@ -148,9 +153,9 @@ fn leaf_5_describes_monitor_mwait() {
 }
 
 #[test]
-fn leaf_6_has_only_the_always_running_apic_timer() {
+fn leaf_6_has_the_always_running_apic_timer_and_aperf_mperf() {
     let mut h = blank();
-    assert_eq!(cpuid(&mut h, 6, 0), [1 << 2, 0, 0, 0]);
+    assert_eq!(cpuid(&mut h, 6, 0), [1 << 2, 0, 1, 0]);
 }
 
 #[test]
@@ -256,16 +261,33 @@ fn extended_leaf_0_reports_the_max_extended_leaf_and_vendor() {
 }
 
 #[test]
-fn extended_leaf_1_ecx_has_lahf_svm_abm_prefetchw_and_topoext() {
+fn extended_leaf_1_ecx_has_the_zen_5_features_that_are_implemented() {
     let mut h = blank();
     let [_, ebx, ecx, _] = cpuid(&mut h, 0x8000_0001, 0);
     assert_eq!(ebx, 0);
-    // LAHF_LM SVM ABM 3DNOWPREFETCH TOPOEXT; no SSE4A, XOP, FMA4, IBS, LWP, PERFCTR_CORE
-    assert_eq!(ecx, bits(&[0, 2, 5, 8, 22]));
+    // LAHF_LM SVM CR8_LEGACY ABM SSE4A MISALIGNSSE 3DNOWPREFETCH OSVW TCE TOPOEXT MWAITX
+    let expected = bits(&[0, 2, 4, 5, 6, 7, 8, 9, 17, 22, 29]);
+    assert_eq!(ecx, expected, "{ecx:#034b}");
+    for (bit, name) in [
+        (3, "EXTAPIC"),
+        (10, "IBS"),
+        (11, "XOP"),
+        (12, "SKINIT"),
+        (13, "WDT"),
+        (15, "LWP"),
+        (16, "FMA4"),
+        (23, "PERFCTR_CORE"),
+        (24, "PERFCTR_NB"),
+        (26, "BPEXT"),
+        (28, "PERFCTR_LLC"),
+        (30, "ADDR_MASK_EXT"),
+    ] {
+        assert_eq!(ecx & (1 << bit), 0, "{name} is not implemented");
+    }
     let mut h = with_topology(2, 2, 0);
     assert_eq!(
         cpuid(&mut h, 0x8000_0001, 0)[2],
-        bits(&[0, 1, 2, 5, 8, 22]),
+        expected | 1 << 1,
         "CMP_LEGACY"
     );
 }
@@ -274,15 +296,13 @@ fn extended_leaf_1_ecx_has_lahf_svm_abm_prefetchw_and_topoext() {
 fn extended_leaf_1_edx_has_syscall_nx_page1gb_rdtscp_long_mode_and_the_amd_aliases() {
     let mut h = blank();
     let [_, _, _, edx] = cpuid(&mut h, 0x8000_0001, 0);
-    // SYSCALL NX PDPE1GB RDTSCP LM, then the aliased FPU TSC MSR PAE CX8 PGE CMOV PAT MMX FXSR
-    let expected = bits(&[11, 20, 26, 27, 29, 0, 4, 5, 6, 8, 13, 15, 16, 23, 24]);
+    // SYSCALL NX MMXEXT FFXSR PDPE1GB RDTSCP LM, then the aliased FPU TSC MSR PAE CX8 PGE CMOV
+    // PAT MMX FXSR
+    let expected = bits(&[
+        11, 20, 22, 25, 26, 27, 29, 0, 4, 5, 6, 8, 13, 15, 16, 23, 24,
+    ]);
     assert_eq!(edx, expected, "{edx:#034b}");
-    for (bit, name) in [
-        (22, "MMXEXT"),
-        (25, "FFXSR"),
-        (30, "3DNOWEXT"),
-        (31, "3DNOW"),
-    ] {
+    for (bit, name) in [(30, "3DNOWEXT"), (31, "3DNOW")] {
         assert_eq!(edx & (1 << bit), 0, "{name}");
     }
 }
@@ -335,9 +355,20 @@ fn l2_and_l3_leaf_report_1m_16way_and_32m_16way() {
 }
 
 #[test]
-fn advanced_power_leaf_marks_the_tsc_invariant_and_nothing_else() {
+fn advanced_power_leaf_has_pstates_the_invariant_tsc_boost_and_rapl_but_no_thermals() {
     let mut h = blank();
-    assert_eq!(cpuid(&mut h, 0x8000_0007, 0), [0, 0, 0, 1 << 8]);
+    // HwPstate, invariant TSC, CPB, EffFreqRO, RAPL; no TS, TTP, TM, 100MHzSteps, ConnectedStandby
+    assert_eq!(
+        cpuid(&mut h, 0x8000_0007, 0),
+        [0, 0, 0, bits(&[7, 8, 9, 10, 14])]
+    );
+}
+
+#[test]
+fn leaf_0x8000001a_says_256_bit_operations_and_unaligned_loads_run_at_full_speed() {
+    let mut h = blank();
+    // MOVU and FP256; FP128 (the Zen 1 split) clear
+    assert_eq!(cpuid(&mut h, 0x8000_001a, 0), [0b110, 0, 0, 0]);
 }
 
 #[test]
@@ -347,13 +378,17 @@ fn address_size_leaf_reports_40_physical_and_48_virtual_bits_and_the_extensions(
     assert_eq!(eax & 0xff, 40);
     assert_eq!((eax >> 8) & 0xff, 48);
     assert_eq!(eax >> 16, 0);
-    // CLZERO XSAVEERPTR WBNOINVD IBPB IBRS STIBP STIBP_ALWAYS_ON IBRS_SAME_MODE EFER_LMSLE_MBZ
-    // SSBD PSFD BTC_NO IBPB_RET; no AMD_SSB_NO, VIRT_SSBD, PPIN, IBRS_ALWAYS_ON
+    // CLZERO RDPRU XSAVEERPTR MCOMMIT WBNOINVD IBPB INT_WBINVD IBRS STIBP STIBP_ALWAYS_ON
+    // IBRS_SAME_MODE EFER_LMSLE_MBZ PPIN SSBD PSFD BTC_NO IBPB_RET; no IRPERF, AMD_SSB_NO,
+    // VIRT_SSBD, IBRS_ALWAYS_ON
     assert_eq!(
         ebx,
-        bits(&[0, 2, 9, 12, 14, 15, 17, 19, 20, 24, 28, 29, 30])
+        bits(&[
+            0, 2, 4, 8, 9, 12, 13, 14, 15, 17, 19, 20, 23, 24, 28, 29, 30
+        ])
     );
-    assert_eq!((ecx, edx), (0, 0));
+    // EDX 23:16: rdpru takes ECX 0 and 1
+    assert_eq!((ecx, edx), (0, 1 << 16));
     // NC is the processor count minus one, ApicIdSize the bits the ids need
     let mut h = with_topology(8, 2, 0);
     assert_eq!(cpuid(&mut h, 0x8000_0008, 0)[2], 7 | 3 << 12);
@@ -480,15 +515,16 @@ fn every_topology_leaf_describes_the_same_machine() {
 }
 
 #[test]
-fn leaf_0x80000021_has_turins_speculation_bits_and_srso_no() {
+fn leaf_0x80000021_has_turins_bits_and_no_srso_no() {
     let mut h = blank();
     // NO_NESTED_DATA_BP WRMSR_XX_BASE_NS LFENCE_ALWAYS_SERIALIZING NULL_SEL_CLR_BASE AUTOIBRS
-    // PREFETCHI SBPB IBPB_BRTYPE SRSO_NO SRSO_USER_KERNEL_NO; no SRSO_BP_SPEC_REDUCE, ERAPS,
+    // NO_SMM_CTL_MSR FSRS FSRC PREFETCH_CTL_MSR GP_ON_USER_CPUID PREFETCHI SBPB IBPB_BRTYPE
+    // SRSO_USER_KERNEL_NO SRSO_BP_SPEC_REDUCE; no SRSO_NO (bit 29), UPPER_ADDRESS_IGNORE, ERAPS,
     // VERW_CLEAR; ECX: TSA_SQ_NO, TSA_L1_NO
     assert_eq!(
         cpuid(&mut h, 0x8000_0021, 0),
         [
-            bits(&[0, 1, 2, 6, 8, 20, 27, 28, 29, 30]),
+            bits(&[0, 1, 2, 6, 8, 9, 10, 11, 13, 17, 20, 27, 28, 30, 31]),
             0,
             bits(&[1, 2]),
             0
@@ -502,7 +538,6 @@ fn leaves_past_the_last_extended_leaf_and_the_unused_ones_are_zero() {
     for leaf in [
         0x8000_0009,
         0x8000_000b,
-        0x8000_001a,
         0x8000_001b,
         0x8000_001c,
         0x8000_001f,

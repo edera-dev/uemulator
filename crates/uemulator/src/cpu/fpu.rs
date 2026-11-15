@@ -86,9 +86,13 @@ pub(super) const FXSAVE_ST_STRIDE: u64 = 16;
 pub(super) const FXSAVE_XMM_OFFSET: u64 = 160;
 pub(super) const FXSAVE_XMM_STRIDE: u64 = 16;
 
-/// MXCSR bits that may be set by ldmxcsr/fxrstor; writing any of 31:16 is #GP. Also reported
-/// as MXCSR_MASK in the FXSAVE image.
-pub(crate) const MXCSR_VALID_BITS: u32 = 0xffff;
+/// MXCSR.MM, misaligned exception mask (AMD misaligned SSE mode, leaf 0x8000_0001 ECX bit 7):
+/// legacy SSE memory operands no longer need 16-byte alignment, except those of the explicitly
+/// aligned moves (`sse.rs`).
+pub(crate) const MXCSR_MISALIGNED_MASK: u32 = 1 << 17;
+/// MXCSR bits that may be set by ldmxcsr/fxrstor; writing any other is #GP. Also reported as
+/// MXCSR_MASK in the FXSAVE image, which is how Linux learns that MM may be set.
+pub(crate) const MXCSR_VALID_BITS: u32 = 0xffff | MXCSR_MISALIGNED_MASK;
 
 pub(crate) fn ext_to_f64(b: [u8; 10]) -> f64 {
     let significand = u64::from_le_bytes(b[..8].try_into().unwrap());
@@ -871,7 +875,24 @@ impl Cpu {
         }
         self.fpu_check()?;
         self.check_fxsave_alignment(a)?;
-        self.save_legacy_region(a, true, true)
+        let fast = self.fast_fxsave();
+        self.save_legacy_region(a, true, !fast)?;
+        if fast {
+            // The region is probed whole, so these cannot fault part way.
+            self.write(a + FXSAVE_MXCSR_OFFSET, 4, self.mxcsr as u64)?;
+            self.write(a + FXSAVE_MXCSR_MASK_OFFSET, 4, MXCSR_VALID_BITS as u64)?;
+        }
+        Ok(())
+    }
+
+    /// EFER.FFXSR in 64-bit mode at CPL 0: fxsave and fxrstor leave XMM0-15 out of the image (MXCSR
+    /// stays in), which is how a kernel saves time when it already knows the vector registers
+    /// are not live (APM vol. 2 3.1.7). Outside that mode the bit changes nothing.
+    fn fast_fxsave(&self) -> bool {
+        self.efer & super::sys::EFER_FFXSR != 0
+            && self.efer & EFER_LMA != 0
+            && self.seg[SEG_CS].long()
+            && self.cpl == 0
     }
 
     /// Writes the x87 part (control/status/tag words and the eight registers) and/or the SSE part
@@ -916,7 +937,12 @@ impl Cpu {
         }
         self.fpu_check()?;
         self.check_fxsave_alignment(a)?;
-        self.restore_legacy_region(a, LegacyRestore::Load, LegacyRestore::Load)
+        let sse = if self.fast_fxsave() {
+            LegacyRestore::MxcsrOnly
+        } else {
+            LegacyRestore::Load
+        };
+        self.restore_legacy_region(a, LegacyRestore::Load, sse)
     }
 
     /// The load half shared by fxrstor and xrstor. `Init` puts a component in its reset state
@@ -934,7 +960,8 @@ impl Cpu {
         let mut ftw = self.ftw;
         let mut st = self.st;
         match x87 {
-            LegacyRestore::Skip => {}
+            // MxcsrOnly only describes the SSE component
+            LegacyRestore::Skip | LegacyRestore::MxcsrOnly => {}
             LegacyRestore::Init => {
                 fcw = FCW_RESET;
                 fsw = 0;
@@ -969,6 +996,7 @@ impl Cpu {
                     LegacyRestore::Load => {
                         self.read128(a + FXSAVE_XMM_OFFSET + k as u64 * FXSAVE_XMM_STRIDE)?
                     }
+                    LegacyRestore::MxcsrOnly => *register,
                     _ => 0,
                 };
             }
@@ -992,6 +1020,8 @@ pub(super) enum LegacyRestore {
     Skip,
     Init,
     Load,
+    /// The SSE component of a fast fxrstor: MXCSR only, the XMM registers keep their values.
+    MxcsrOnly,
 }
 
 #[cfg(test)]
@@ -3740,8 +3770,8 @@ mod fpu_tests {
             assert_eq!(u32_at(&image, 24), 0x3f80, "MXCSR");
             assert_eq!(
                 u32_at(&image, 28),
-                0x0000_ffff,
-                "MXCSR_MASK: the writable bits"
+                0x0002_ffff,
+                "MXCSR_MASK: the writable bits, MM (17) among them"
             );
         }
 
@@ -3883,7 +3913,8 @@ mod fpu_tests {
 
         #[test]
         fn fxrstor_with_reserved_mxcsr_bits_is_gp0_and_commits_nothing() {
-            for bit in 16..32 {
+            // bit 17 is MM, misaligned SSE mode
+            for bit in (16..32).filter(|&bit| bit != 17) {
                 let mut image = vec![0u8; IMAGE_BYTES];
                 image[0..2].copy_from_slice(&0x0c00u16.to_le_bytes());
                 image[24..28].copy_from_slice(&(0x1f80u32 | 1 << bit).to_le_bytes());

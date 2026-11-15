@@ -130,6 +130,7 @@ const INTERCEPT_WBINVD: u32 = 1 << 9;
 const INTERCEPT_MONITOR: u32 = 1 << 10;
 const INTERCEPT_MWAIT: u32 = 1 << 11;
 const INTERCEPT_XSETBV: u32 = 1 << 13;
+const INTERCEPT_RDPRU: u32 = 1 << 14;
 
 // #VMEXIT codes.
 pub(crate) const VMEXIT_CR_READ: u64 = 0x00;
@@ -175,6 +176,7 @@ const VMEXIT_WBINVD: u64 = 0x89;
 const VMEXIT_MONITOR: u64 = 0x8a;
 const VMEXIT_MWAIT: u64 = 0x8b;
 const VMEXIT_XSETBV: u64 = 0x8d;
+const VMEXIT_RDPRU: u64 = 0x8e;
 pub(crate) const VMEXIT_NPF: u64 = 0x400;
 pub(crate) const VMEXIT_INVALID: u64 = u64::MAX;
 
@@ -231,8 +233,17 @@ const CR0_NW_BIT: u64 = 1 << 29;
 const CR0_PG_BIT: u64 = 1 << 31;
 const CR0_PE_BIT: u64 = 1;
 /// EFER bits a VMCB may hold; any other is a consistency failure (VMEXIT_INVALID). AIBRSE is in
-/// the set because a KVM guest that sees automatic IBRS turns it on and KVM passes its EFER on.
-const EFER_KNOWN: u64 = EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE | EFER_SVME | EFER_AIBRSE;
+/// the set because a KVM guest that sees automatic IBRS turns it on and KVM passes its EFER on;
+/// FFXSR, TCE and MCOMMIT likewise, being EFER bits the CPU accepts.
+const EFER_KNOWN: u64 = EFER_SCE
+    | EFER_LME
+    | EFER_LMA
+    | EFER_NXE
+    | EFER_SVME
+    | EFER_AIBRSE
+    | super::sys::EFER_FFXSR
+    | super::sys::EFER_TCE
+    | super::sys::EFER_MCOMMIT;
 const DR_HIGH_BITS: u64 = !0u64 << 32;
 /// Number of ASIDs reported in CPUID 0x8000000A; any non-zero ASID in a VMCB is accepted.
 pub(crate) const SVM_ASIDS: u32 = 64;
@@ -1224,8 +1235,11 @@ impl Cpu {
                 _ => None,
             },
             0x101 => match i.modrm {
+                // monitorx and mwaitx share the MONITOR and MWAIT intercepts (APM vol. 2 15.9)
                 0xc8 => simple(VMEXIT_MONITOR, v4 & INTERCEPT_MONITOR != 0),
-                0xc9 => simple(VMEXIT_MWAIT, v4 & INTERCEPT_MWAIT != 0),
+                0xfa if i.rep == 0 => simple(VMEXIT_MONITOR, v4 & INTERCEPT_MONITOR != 0),
+                0xc9 | 0xfb => simple(VMEXIT_MWAIT, v4 & INTERCEPT_MWAIT != 0),
+                0xfd => simple(VMEXIT_RDPRU, v4 & INTERCEPT_RDPRU != 0),
                 0xd1 => simple(VMEXIT_XSETBV, v4 & INTERCEPT_XSETBV != 0),
                 0xd8 => simple(VMEXIT_VMRUN, v4 & INTERCEPT_VMRUN != 0),
                 0xd9 => simple(VMEXIT_VMMCALL, v4 & INTERCEPT_VMMCALL != 0),
@@ -1638,6 +1652,10 @@ mod tests {
             (&[0x0f, 0x09], 0, INTERCEPT_WBINVD, VMEXIT_WBINVD),
             (&[0x0f, 0x01, 0xc8], 0, INTERCEPT_MONITOR, VMEXIT_MONITOR),
             (&[0x0f, 0x01, 0xc9], 0, INTERCEPT_MWAIT, VMEXIT_MWAIT),
+            // monitorx and mwaitx use the MONITOR and MWAIT intercepts
+            (&[0x0f, 0x01, 0xfa], 0, INTERCEPT_MONITOR, VMEXIT_MONITOR),
+            (&[0x0f, 0x01, 0xfb], 0, INTERCEPT_MWAIT, VMEXIT_MWAIT),
+            (&[0x0f, 0x01, 0xfd], 0, INTERCEPT_RDPRU, VMEXIT_RDPRU),
             (&[0x0f, 0x01, 0xd1], 0, INTERCEPT_XSETBV, VMEXIT_XSETBV),
             (&[0x0f, 0x01, 0xf9], 0, INTERCEPT_RDTSCP, VMEXIT_RDTSCP),
             (&[0x0f, 0x01, 0xd9], 0, INTERCEPT_VMMCALL, VMEXIT_VMMCALL),
@@ -1695,6 +1713,11 @@ mod tests {
         put(&mut h, SAVE_RAX, 8, cr3);
         run(&mut h);
         assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_CPUID);
+        // lock mov cr0, rax is a CR8 write (AltMovCr8), intercepted as one
+        let mut h = rig(&[0xf0, 0x0f, 0x22, 0xc0]);
+        put(&mut h, VMCB_INTERCEPT_CR, 4, 1 << (16 + 8));
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_CR_WRITE + 8);
     }
 
     #[test]

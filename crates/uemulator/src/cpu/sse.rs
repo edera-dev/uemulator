@@ -20,6 +20,7 @@
 use super::decode::*;
 use super::exception::Exception;
 use super::flags::*;
+use super::fpu::MXCSR_MISALIGNED_MASK;
 use super::sys::{CR0_EM, CR0_TS, CR4_OSFXSR, CR4_OSXMMEXCPT};
 use super::*;
 
@@ -952,6 +953,14 @@ impl Cpu {
         }
     }
 
+    /// AMD misaligned SSE mode (MXCSR.MM): legacy SSE memory operands may be misaligned, except
+    /// those of movaps, movapd, movdqa, movntps, movntpd, movntdq and movntdqa (APM vol. 1,
+    /// "Misaligned Exception Mask"). The JIT checks alignment inline and leaves a
+    /// misaligned access to this interpreter, so it needs no copy of the rule.
+    fn misaligned_sse(&self) -> bool {
+        self.mxcsr & MXCSR_MISALIGNED_MASK != 0
+    }
+
     fn mmx_enter(&mut self) {
         self.fsw &= !FSW_TOP_MASK;
         self.ftw = ALL_X87_REGISTERS_VALID;
@@ -1138,7 +1147,7 @@ impl Cpu {
                     None => self.xmm[rm as usize],
                     Some(addr) if prefix == Prefix::Np => self.read(addr, 8)? as u128,
                     Some(addr) => {
-                        if addr & (VECTOR_ALIGNMENT - 1) != 0 {
+                        if addr & (VECTOR_ALIGNMENT - 1) != 0 && !self.misaligned_sse() {
                             return Err(Exception::general_protection(0));
                         }
                         self.read128(addr)?
@@ -1251,13 +1260,15 @@ impl Cpu {
         };
         // Every 128-bit memory operand of a legacy-SSE instruction must be 16-byte aligned (#GP(0))
         // except for the explicitly unaligned forms: movups, movupd and movdqu loads.
+        let explicitly_aligned = matches!((opcode, prefix), (0x28, _) | (0x6f, Prefix::P66));
         let unaligned_ok = matches!(
             (opcode, prefix),
             (0x10, Prefix::Np | Prefix::P66) | (0x6f, Prefix::F3)
-        ) || (self.vex_active
-            // VEX drops the alignment rule for everything except the explicitly aligned
-            // vmovaps/vmovapd/vmovdqa loads (stores are checked by `aligned!`)
-            && !matches!((opcode, prefix), (0x28, _) | (0x6f, Prefix::P66)));
+        ) || ((self.vex_active || self.misaligned_sse())
+            // VEX, and MXCSR.MM for the legacy forms, drop the alignment rule for everything
+            // except the explicitly aligned movaps/movapd/movdqa loads (stores are checked by
+            // `aligned!`, which only the always-aligned movaps/movdqa/movnt* stores use)
+            && !explicitly_aligned);
         macro_rules! src {
             ($size:expr) => {
                 match mem_addr {
@@ -2466,8 +2477,8 @@ mod tests {
         ),
         (".byte 0x66, 0x0f, 0x77", &[0x66, 0x0f, 0x77, 0xf4]),
         (
-            ".byte 0x66, 0x0f, 0x78, 0xc1",
-            &[0x66, 0x0f, 0x78, 0xc1, 0xf4],
+            ".byte 0xf3, 0x0f, 0x78, 0xc1",
+            &[0xf3, 0x0f, 0x78, 0xc1, 0xf4],
         ),
         (
             ".byte 0x66, 0x0f, 0x7c, 0xc1",
@@ -7703,7 +7714,8 @@ mod tests {
             ".byte 0x0f, 0xd6, 0xc1",
             ".byte 0xf3, 0x0f, 0xc6, 0xc1, 0x00",
             ".byte 0x66, 0x0f, 0xf7, 0xc1",
-            ".byte 0x66, 0x0f, 0x78, 0xc1",
+            // 66 and F2 0F 78 are SSE4A extrq/insertq; F3 is nothing
+            ".byte 0xf3, 0x0f, 0x78, 0xc1",
         ];
         for key in invalid {
             rig.h.cpu.xmm[0] = A;
@@ -9525,13 +9537,14 @@ mod tests {
     #[test]
     fn ldmxcsr_with_a_reserved_bit_raises_gp0_and_keeps_mxcsr() {
         let mut rig = Rig::new();
-        for bit in 16..32 {
+        // bit 17 is MM (misaligned SSE mode), the one valid bit above 15
+        for bit in (16..32).filter(|&bit| bit != 17) {
             rig.h.write(DATA, &(MXCSR_RESET | 1 << bit).to_le_bytes());
             assert_eq!(rig.run("ldmxcsr dword ptr [rsi]"), gp0(), "bit {bit}");
             assert_eq!(rig.mxcsr(), MXCSR_RESET, "bit {bit}");
             assert_eq!(rig.h.cpu.rip, CODE_BASE);
         }
-        assert_eq!(MXCSR_VALID_BITS, 0xffff);
+        assert_eq!(MXCSR_VALID_BITS, 0x2_ffff);
     }
 
     #[test]

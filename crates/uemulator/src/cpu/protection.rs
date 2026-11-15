@@ -1,6 +1,6 @@
 //! Smaller protection and power features that CPUID advertises together with their CR4 bits:
 //! UMIP, SMEP/SMAP (clac/stac; the checks live in the page walk in `mem.rs`), PCID/INVPCID, and
-//! MONITOR/MWAIT.
+//! MONITOR/MWAIT with AMD's unprivileged MONITORX/MWAITX.
 
 use super::decode::Insn;
 use super::exception::Exception;
@@ -19,6 +19,8 @@ const INVPCID_TYPE_INDIVIDUAL_ADDRESS: u64 = 0;
 const MWAIT_ECX_INTERRUPT_BREAK: u64 = 1;
 /// MONITOR's ECX/EDX (extensions, hints) must be zero here: no extensions are enumerated.
 const MONITOR_NO_EXTENSIONS: u64 = 0;
+/// MWAITX's ECX bit 1: EBX holds a timeout in TSC-rate clocks after which the wait ends.
+const MWAITX_ECX_TIMER: u64 = 1 << 1;
 
 impl Cpu {
     /// With CR4.UMIP set, the descriptor-table and machine-status reads (sgdt, sidt, sldt, str,
@@ -67,6 +69,21 @@ impl Cpu {
         {
             return Err(Exception::general_protection(0));
         }
+        self.arm_monitor();
+        Ok(())
+    }
+
+    /// 0F 01 FA without a prefix (AMD): MONITOR at any CPL. ECX (extensions) must be zero; EDX
+    /// holds hints, of which none are defined, so it is ignored (APM vol. 3, MONITORX).
+    pub(super) fn monitorx(&mut self) -> ExecResult<()> {
+        if self.gpr[RCX] != MONITOR_NO_EXTENSIONS {
+            return Err(Exception::general_protection(0));
+        }
+        self.arm_monitor();
+        Ok(())
+    }
+
+    fn arm_monitor(&mut self) {
         self.monitor_address = self.gpr[RAX];
         self.monitor_armed = true;
         if self.multi {
@@ -74,7 +91,6 @@ impl Cpu {
             // return at once, or a vCPU that was handed work in that window sleeps through it.
             self.monitor_snapshot = self.snapshot_monitored_line();
         }
-        Ok(())
     }
 
     /// The monitored line and its contents, so a store to it by another vCPU (or a device) can
@@ -99,9 +115,36 @@ impl Cpu {
         if self.gpr[RCX] & !MWAIT_ECX_INTERRUPT_BREAK != 0 {
             return Err(Exception::general_protection(0));
         }
+        self.wait_on_monitor();
+        Ok(())
+    }
+
+    /// 0F 01 FB (AMD): MWAIT at any CPL, with an optional timeout (ECX bit 1, EBX clocks). Linux
+    /// spins in `udelay` with it. The timed form returns at once, which MWAITX may always do (the
+    /// caller rereads the TSC and waits again): waking the vCPU at a deadline would need a timer
+    /// source in all three schedulers, and the busy loop it leaves behind yields like `pause`.
+    pub(super) fn mwaitx(&mut self) -> ExecResult<()> {
+        if self.gpr[RCX] & !(MWAIT_ECX_INTERRUPT_BREAK | MWAITX_ECX_TIMER) != 0 {
+            return Err(Exception::general_protection(0));
+        }
+        if self.gpr[RCX] & MWAITX_ECX_TIMER != 0 {
+            self.monitor_armed = false;
+            self.monitor_snapshot = None;
+            if self.threads.is_some() {
+                self.pause_threaded();
+            } else if self.multi {
+                self.request_yield();
+            }
+            return Ok(());
+        }
+        self.wait_on_monitor();
+        Ok(())
+    }
+
+    fn wait_on_monitor(&mut self) {
         if !self.monitor_armed {
             // Without a preceding monitor, mwait is a no-op in hardware terms: it just returns.
-            return Ok(());
+            return;
         }
         self.monitor_armed = false;
         let snapshot = self.monitor_snapshot.take();
@@ -112,12 +155,11 @@ impl Cpu {
                 let line_now = &self.ram[line as usize..line as usize + MONITOR_WATCH_BYTES];
                 if line_now != contents {
                     // Written since MONITOR: MWAIT returns without waiting.
-                    return Ok(());
+                    return;
                 }
                 self.mwait_watch = snapshot;
             }
             self.halted = true;
         }
-        Ok(())
     }
 }

@@ -209,6 +209,14 @@ const PREFIX_ADDRESS_SIZE: u8 = 0x67;
 const PREFIX_LOCK: u8 = 0xf0;
 const PREFIX_REPNE: u8 = 0xf2;
 const PREFIX_REP: u8 = 0xf3;
+/// `Insn::rep` after an F2 prefix (F3 is 1).
+const REP_F2: u8 = 2;
+/// 0F 20 and 0F 22: mov from and to a control register; CR8 is the one AltMovCr8 reaches.
+const OPCODE_MOV_FROM_CR: u8 = 0x20;
+const OPCODE_MOV_TO_CR: u8 = 0x22;
+const CR8: u8 = 8;
+/// 0F 78: the SSE4A forms that carry two immediates.
+const OPCODE_SSE4A_IMMEDIATE_FORMS: u8 = 0x78;
 const PREFIX_SEG_ES: u8 = 0x26;
 const PREFIX_SEG_CS: u8 = 0x2e;
 const PREFIX_SEG_SS: u8 = 0x36;
@@ -306,6 +314,8 @@ enum Imm {
     Rel32,
     /// `call/jmp ptr16:16/32`: an offset of `opsize` bytes (`imm`) then a selector (`imm2`).
     FarPtr,
+    /// Two imm8s, the first in `imm` and the second in `imm2` (SSE4A extrq/insertq).
+    TwoI8,
 }
 
 struct Reader<'a> {
@@ -480,7 +490,7 @@ pub(crate) fn decode_in_mode(bytes: &[u8], mode: CodeMode) -> Result<Insn, Decod
             PREFIX_OPERAND_SIZE => i.p66 = true,
             PREFIX_ADDRESS_SIZE => address_prefix = true,
             PREFIX_LOCK => i.lock = true,
-            PREFIX_REPNE => i.rep = 2,
+            PREFIX_REPNE => i.rep = REP_F2,
             PREFIX_REP => i.rep = 1,
             PREFIX_SEG_ES => i.seg = SEG_ES as u8,
             PREFIX_SEG_CS => i.seg = SEG_CS as u8,
@@ -697,7 +707,20 @@ pub(crate) fn decode_in_mode(bytes: &[u8], mode: CodeMode) -> Result<Insn, Decod
         }
     }
 
+    let legacy_0f = map == MAP_0F && !i.vex && !i.evex;
+    // AMD AltMovCr8 (leaf 0x8000_0001 ECX bit 4, CR8_LEGACY): `lock mov cr0` is `mov cr8`, so
+    // code without REX (32-bit mode) can reach the task priority. Rewriting it here gives the SVM
+    // intercepts and `mov_cr_dr` the register they must see.
+    if legacy_0f && matches!(opb, OPCODE_MOV_FROM_CR | OPCODE_MOV_TO_CR) && i.lock && i.reg == 0 {
+        i.reg = CR8;
+        i.lock = false;
+    }
     let mut kind = imm_kind(map, opb);
+    // SSE4A extrq (66) and insertq (F2) with immediates: length then index. Without either
+    // prefix 0F 78 is Intel's vmread, #UD here.
+    if legacy_0f && opb == OPCODE_SSE4A_IMMEDIATE_FORMS && (i.p66 || i.rep == REP_F2) {
+        kind = Imm::TwoI8;
+    }
     // group 3: only /0 and /1 (test) carry an immediate; not/neg/mul/div do not
     if map == MAP_ONE_BYTE && (opb == 0xf6 || opb == 0xf7) && ((i.modrm >> 3) & 7) < 2 {
         kind = if opb == 0xf6 { Imm::I8 } else { Imm::Iz };
@@ -724,6 +747,10 @@ pub(crate) fn decode_in_mode(bytes: &[u8], mode: CodeMode) -> Result<Insn, Decod
         }
         Imm::Enter => {
             i.imm = r.int(2)? & 0xffff;
+            i.imm2 = r.int(1)? as u8 as u16;
+        }
+        Imm::TwoI8 => {
+            i.imm = r.int(1)?;
             i.imm2 = r.int(1)? as u8 as u16;
         }
     }

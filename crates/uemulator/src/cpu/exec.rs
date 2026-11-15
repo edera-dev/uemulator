@@ -2062,6 +2062,9 @@ impl Cpu {
                 }
             }
             0x1a2 => {
+                if self.cpuid_faults() {
+                    return Err(Exception::general_protection(0));
+                }
                 self.cpuid();
                 self.serialize();
             }
@@ -14420,10 +14423,14 @@ mod exec_tests {
         // prefetch/prefetchw are executed as hints in sys.rs's `prefetchw_is_a_hint_that_never_faults`
         const PREFETCHW: u64 = 1 << 8;
         const TOPOEXT: u64 = 1 << 22;
+        // the AMD extensions tested in model_msr_tests.rs and sse_amd_tests.rs: CR8_LEGACY,
+        // SSE4A, MISALIGNSSE, OSVW, TCE, MWAITX
+        const AMD_EXTENSIONS: u64 = 1 << 4 | 1 << 6 | 1 << 7 | 1 << 9 | 1 << 17 | 1 << 29;
         assert_eq!(
-            ecx & !(LAHF_SAHF | LZCNT_ABM | SVM | PREFETCHW | TOPOEXT),
+            ecx & !(LAHF_SAHF | LZCNT_ABM | SVM | PREFETCHW | TOPOEXT | AMD_EXTENSIONS),
             0,
-            "nothing beyond lahf, svm, abm, prefetchw and the topology leaves"
+            "nothing beyond lahf, svm, abm, prefetchw, the topology leaves and the tested AMD \
+             extensions"
         );
     }
 

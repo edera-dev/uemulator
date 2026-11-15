@@ -61,7 +61,7 @@ Rules from `CLAUDE.md` hold for all of it: a CPUID bit goes on in the same commi
 Add only where the behaviour is real in this implementation and testable:
 - `NullSelectorClearsBase` (`8000_0021 EAX 6`): loading a null selector into a data segment register clears the base in 64-bit mode; confirm the current behaviour and set the bit.
 - `NoNestedDataBp` (`EAX 0`) and `AutoIBRS` (`EAX 8`): `EFER.AIBRSE` accepted and inert (no speculation to restrict), exactly the stance already taken for `IBRS`.
-- Keep the declared departures from `docs/plans/03-cpu.md`: TSC-deadline advertised though AMD has none, the Intel spelling of the speculation-control leaf, `SRSO_NO`/`TSA_*_NO`, no hypervisor leaves. Decide on removing the Intel spellings separately; the right test is what Linux and Xen do with the AMD-only spelling.
+- Keep the declared departures from `docs/plans/03-cpu.md`: the Intel spelling of the speculation-control leaf, `TSA_*_NO`, no hypervisor leaves. (TSC-deadline and `SRSO_NO` were on this list and are gone with the Turin model.) Decide on removing the Intel spellings separately; the right test is what Linux and Xen do with the AMD-only spelling.
 
 ### F. Identity (last, small)
 
@@ -95,8 +95,8 @@ Speculation-control bits (all in the AMD spelling; the Intel leaf 7 EDX bits and
 | NULL_SEL_CLR_BASE | EAX 6 | null selector loads leave base 0 (test pins it) | no `null_seg` bug, no FS/GS reload per switch |
 | AUTOIBRS | EAX 8 | EFER.AIBRSE (bit 21) stored, also in VMCB guest EFER | Spectre v2 "Enhanced / Automatic IBRS", one EFER write per CPU |
 | SBPB, IBPB_BRTYPE | EAX 27/28 | PRED_CMD bit 7 accepted | SBPB instead of IBPB (an unchecked wrmsr: the MSR bit must stay) |
-| SRSO_NO | EAX 29 | never speculates | SRSO not affected (departure: real Turin lacks it and gets "IBPB on VMEXIT only") |
-| SRSO_USER_KERNEL_NO | EAX 30 | implied by SRSO_NO | what real Turin says |
+| SRSO_USER_KERNEL_NO | EAX 30 | never speculates | what real Turin says; SRSO_NO (bit 29) is clear, as on Turin |
+| SRSO_BP_SPEC_REDUCE | EAX 31 | BP_CFG (0xC001102E) bit 4 stored | KVM sets the bit while it has guests instead of an IBPB on every #VMEXIT |
 | TSA_SQ_NO, TSA_L1_NO | ECX 1/2 | never speculates | TSA not affected (Linux would set them itself for family 1Ah) |
 
 Vulnerability files of the Alpine 6.18 guest (`grep -r . /sys/devices/system/cpu/vulnerabilities/`):
@@ -113,7 +113,9 @@ Vulnerability files of the Alpine 6.18 guest (`grep -r . /sys/devices/system/cpu
 
 Zen 5 instructions advertised, each with reference tests and an interpreter/JIT differential case (they reach the JIT through the interpreter helper, no `jit/` change): AVX-VNNI (VEX vpdpbusd(s)/vpdpwssd(s), one kernel with the EVEX forms), MOVDIRI, MOVDIR64B, AVX512_VP2INTERSECT, PREFETCHI (`0F 18` hints). MOVDIR64B's 64-byte store is eight 8-byte stores, so with one host thread per vCPU another vCPU can see it half done; the SDM promises a single unit, which no guest seen so far depends on.
 
-Present on Turin, not advertised (not implemented): LA57, PKU/OSPKE, CET shadow stacks, SSE4A, MMXEXT, FFXSR, MWAITX/MONITORX, RDPRU, INVLPGB/TLBSYNC, OSVW, CR8_LEGACY, PERFCTR_CORE and PerfMonV2, IBS, LBR v2, SRSO_BP_SPEC_REDUCE (needs the BP_CFG bit KVM toggles), ERAPS, NO_SMM_CTL_MSR, the extended SVM features (vGIF, vNMI, V_VMSAVE_VMLOAD, TSC scaling, pause filter, AVIC/x2AVIC), SEV/SEV-ES/SEV-SNP, CPPC, RAPL, 52/57 address bits. AMD_SSB_NO and IBRS_ALWAYS_ON stay clear because Turin does not report them.
+Small Zen extensions, advertised with tests (`cpu/model_msr_tests.rs`, `cpu/sse_amd_tests.rs`, JIT differential cases through the interpreter helper): SSE4A, MMXEXT (the SSE integer forms on MMX registers, already implemented), the MMX forms of SSSE3, MISALIGNSSE, MWAITX/MONITORX, RDPRU, MCOMMIT, FFXSR, CR8_LEGACY, TCE, OSVW, NO_SMM_CTL_MSR, FSRS/FSRC, PREFETCH_CTL_MSR, CPUID_USER_DIS, SRSO_BP_SPEC_REDUCE, INT_WBINVD, PPIN, APERF/MPERF (leaf 6) with EffFreqRO, HwPstate, CPB, RAPL, and leaf 0x8000001A (MOVU, FP256). TSC-deadline and SRSO_NO, the former departures, are gone. The CPUID override MSRs, MMIO_CONF_BASE, SMM, TW_CFG, FP_CFG and SEV_STATUS MSRs exist.
+
+Present on Turin, not advertised (not implemented): LA57, PKU/OSPKE, CET shadow stacks, INVLPGB/TLBSYNC, PERFCTR_CORE and PerfMonV2, IRPERF, IBS, LBR v2, ERAPS, UpperAddressIgnore, WDT, the thermal bits of leaf 0x80000007, the extended SVM features (vGIF, vNMI, V_VMSAVE_VMLOAD, TSC scaling, pause filter, AVIC/x2AVIC), SEV/SEV-ES/SEV-SNP, CPPC, 52/57 address bits. Left clear for want of a source: FP512 (leaf 0x8000001A bit 3), IBRS_PREFERRED, AMD_ERMSB and the leaf 0x80000021 EBX microcode patch size. AMD_SSB_NO and IBRS_ALWAYS_ON stay clear because Turin does not report them.
 
 ## Order
 
@@ -139,6 +141,6 @@ Present on Turin, not advertised (not implemented): LA57, PKU/OSPKE, CET shadow 
 ## Open questions
 
 - Which SKU names the profile (Raphael 7600X vs Phoenix 7640U changes the PPR consulted and the brand string, not the feature set)?
-- Keep TSC-deadline as a departure (fast calibration) or remove it for fidelity? Measure boot cost before deciding.
+- Keep TSC-deadline as a departure (fast calibration) or remove it for fidelity? Decided: removed, as on the hardware; Linux calibrates the APIC timer against the PIT.
 - Is a guest hypervisor with AVIC a requirement, or is the legacy SVM path enough?
 - CET and LA57 both change the JIT's inline fast paths (shadow-stack traffic on `call`/`ret`, canonical checks): confirm with `docs/plans/20-jit-perf.md` how much they cost before turning them on by default in the profile.
