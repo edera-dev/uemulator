@@ -1,6 +1,6 @@
 # Apple platforms: a SwiftUI app
 
-**Status:** proposal. M0, the spike that decides whether the WebKit engine is worth building, is done ("M0 results" below: it is, served from loopback HTTP rather than a scheme handler). M1 is built: `apple/Uemulator.xcodeproj` boots the Alpine demo on the native engine on macOS (JIT) and iOS (interpreted).
+**Status:** proposal. M0, the spike that decides whether the WebKit engine is worth building, is done ("M0 results" below: it is, served from loopback HTTP rather than a scheme handler). M1 and M2 are built: `apple/Uemulator.xcodeproj` boots the Alpine demo on the native engine (JIT on macOS, interpreted on iOS) and on the WebKit engine (the web build's wasm JIT in a hidden web view, on both).
 
 A native app for macOS, iOS and iPadOS (visionOS later, tvOS only interpreted) that does what the web page does (`13-web.md`): pick or create a machine, boot it, show the terminal or the screen, type into it, network it. The UI is SwiftUI throughout. No web page is ever shown.
 
@@ -90,11 +90,21 @@ It follows the web page's structure (`13-web.md`, "The page") so the two stay re
 
 - **M0 — WebKit spike (decides the plan). Done; results below.** A throwaway iOS app (`apple/M0Spike`, run by `hack/apple/m0.sh`): hidden `WKWebView`, scheme handler and loopback HTTP with COOP/COEP, the existing `uemulator_web.wasm` and `worker.js`, console bytes to a `Text` view. It answers, on a real iPhone and on the simulator: `crossOriginIsolated` on a custom scheme, whether the web view runs while hidden, tail calls and SIMD on JSC, sync XHR with a body from a worker to a scheme handler, the WebContent memory ceiling, and boot time to `Run /init` for the Alpine demo with the JIT, with `--no-jit` in the same web view, and on `NativeEngine` interpreted. Exit: those numbers written into this file. If `WebKitEngine` doesn't beat the native interpreter by a clear margin, it is dropped, and iOS ships interpreted.
 - **M1 — Core and project. Done** ("M1 as built" below). `crates/uemulator-apple`, `hack/apple/build-core.sh`, the xcframework, the Xcode project with a SwiftUI shell, and `NativeEngine` booting the Alpine demo to a shell on macOS (JIT) and iOS (interpreted) in a SwiftTerm view. Exit: ⌘R on both, and `xcodebuild` in CI.
-- **M2 — WebKitEngine.** The headless shim, the bridge (winning transport from M0), disk reads through the loopback server, console and keyboard. Exit: the same Alpine demo on iOS through `WebKitEngine`, with the JIT on.
+- **M2 — WebKitEngine. Done** ("M2 as built" below). The headless shim, the bridge (winning transport from M0), disk reads through the loopback server, console and keyboard. Exit: the same Alpine demo on iOS through `WebKitEngine`, with the JIT on.
 - **M3 — Screen and input.** Damaged-rect frames on both engines, virtio keyboard and tablet, cursor. Exit: a live ISO's desktop (the KDE ISO from `20-jit-perf.md`) is usable on an iPad with a keyboard and trackpad.
 - **M4 — Machines and persistence.** `MachineStore` on the CLI's format, `host_disk_write` (or flushed overlays), NVRAM and TPM state, presets and validation shared with the web page in Rust. Exit: install Alpine to a disk on iOS, quit the app, boot the installed disk.
 - **M5 — Network.** The Swift Wisp relay, the in-app segment between machines. Exit: `apk update` in the demo on iOS through `WebKitEngine` (the check `hack/wasm/wisp.mjs` does under Node).
 - **Later:** visionOS (WebKit engine, tier-3 Rust for native), tvOS (native interpreter only: tvOS has no WebKit), guest 3D (`25-gpu-3d.md`) through Metal instead of WebGL2, App Store review notes (the app downloads and runs operating systems the user picks: the same position as UTM SE, which ships interpreted only).
+
+## M2 as built (2026-11-14)
+
+- `apple/WebEngine/engine.{html,js}` is the page: main.js's job without the UI. It starts `worker.js` unchanged (no compile worker: that only helps V8), writes keystrokes, sizes and the stop flag into the shared control block as main.js does, and passes the worker's output and events on.
+- The bridge is one WebSocket per run, page to app on 127.0.0.1 (`Loopback.swift`: an `NWListener` with `NWProtocolWebSocket`). The page's first message is `<token> <run>`; the app drops any socket that does not say the current run. App to page: a JSON `boot` (paths of the kernel, initrd and firmware, `uw_create`'s option bits, memory, size), then `resize` and `stop`; binary frames are keystrokes. Page to app: binary frames are console output (the worker's 16 ms / 64 KiB batches), text is `started`, `exit` (worker.js's codes) and `log`.
+- The page, the web build and each run's kernel, initrd and firmware come from a minimal HTTP/1.1 server on 127.0.0.1 (same file), under a random per-launch token in the first path segment, with ranges (worker.js's disk reads) and the COOP/COEP/CORP headers. Disks are passed through to worker.js as URLs on it; the demo has none, so that path is only as tested as M0's range probe.
+- `WebKitEngine` loads the page afresh for every start (with the run number) and blanks it on stop, which ends the worker. A cancelled load (stop then start in quick succession) is not a failure; a WebContent crash is reported as the machine stopping. The web view sits 1×1 at opacity 0 behind the terminal.
+- `MachineEngine` is the protocol both engines implement; the toolbar has an engine menu (also `-engine native|webkit`, remembered in `UserDefaults`). WebKit is the default on iOS, native on macOS. The chip says `JIT`, `interp` or `wasm`.
+- iOS simulator, Alpine demo through the UEFI firmware: the shell in about 9 to 11 s on WebKit against about 50 s on the native interpreter (the same ratio as M0's direct boots). Typing, Stop, Start again and the guest's own `poweroff -f` (reported as Powered off) work. The Mac app runs the WebKit engine too (sandboxed, with `com.apple.security.network.server` for the listeners).
+- Not done: disks in the UI, persistence (M4), the screen (M3), a real device.
 
 ## M1 as built (2026-11-14)
 

@@ -13,29 +13,10 @@ import UemulatorCore
 // on a background queue (an interpreted vCPU can take a while to notice the stop, and
 // `ua_destroy` waits for it), and whatever it still prints or reports meanwhile is dropped
 // instead of landing in the next machine's terminal.
-final class NativeEngine: @unchecked Sendable {
-    enum State: Equatable {
-        case starting
-        case running(jit: Bool)
-        case stopped(String)
-    }
-
-    struct Settings {
-        var kernel: Data
-        var initrd: Data
-        var firmware: Data?
-        var cmdlineAppend = ""
-        var memoryMib: UInt32 = 256
-        var cpus: UInt32 = 1
-        var serialConsole = true
-        var jit = true
-        var cols: UInt16 = 80
-        var rows: UInt16 = 25
-    }
-
+final class NativeEngine: MachineEngine, @unchecked Sendable {
     // Called on the main actor.
     var onOutput: (([UInt8]) -> Void)?
-    var onState: ((State) -> Void)?
+    var onState: ((EngineState) -> Void)?
 
     // One machine's callback context. Retained for the C side from `ua_create` until `ua_destroy`
     // has returned, so a callback never sees it freed.
@@ -79,7 +60,7 @@ final class NativeEngine: @unchecked Sendable {
     }
 
     @MainActor
-    func start(_ settings: Settings) {
+    func start(_ settings: MachineSettings) {
         stop()
         onState?(.starting)
         nextRunId += 1
@@ -118,7 +99,8 @@ final class NativeEngine: @unchecked Sendable {
         lock.unlock()
         let jit = ua_jit_active(created) != 0
         ua_start(created)
-        onState?(.running(jit: jit))
+        // One word for a phone's toolbar, beside the engine menu.
+        onState?(.running(detail: jit ? "JIT" : "interp"))
     }
 
     // Detaches the machine from the UI at once and tears it down in the background.

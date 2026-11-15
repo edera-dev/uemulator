@@ -11,5 +11,8 @@
 	<true/>
 	<key>com.apple.security.network.client</key>
 	<true/>
+	<!-- The WebKit engine's loopback HTTP and WebSocket servers (Loopback.swift). -->
+	<key>com.apple.security.network.server</key>
+	<true/>
 </dict>
 </plist>

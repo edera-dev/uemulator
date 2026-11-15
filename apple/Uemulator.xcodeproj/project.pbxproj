@@ -11,6 +11,9 @@
 		B1000000000000000000B002 /* NativeEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000F002 /* NativeEngine.swift */; };
 		B1000000000000000000B003 /* TerminalPane.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000F003 /* TerminalPane.swift */; };
 		B1000000000000000000B004 /* SwiftTerm in Frameworks */ = {isa = PBXBuildFile; productRef = B1000000000000000000S002 /* SwiftTerm */; };
+		B1000000000000000000B005 /* Loopback.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000F007 /* Loopback.swift */; };
+		B1000000000000000000B006 /* MachineEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000F008 /* MachineEngine.swift */; };
+		B1000000000000000000B007 /* WebKitEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000F009 /* WebKitEngine.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -20,6 +23,9 @@
 		B1000000000000000000F004 /* Uemulator-macOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "Uemulator-macOS.entitlements"; sourceTree = "<group>"; };
 		B1000000000000000000F005 /* Uemulator.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Uemulator.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B1000000000000000000F006 /* uemulator.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = uemulator.h; path = "../crates/uemulator-apple/include/uemulator.h"; sourceTree = SOURCE_ROOT; };
+		B1000000000000000000F007 /* Loopback.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Loopback.swift; sourceTree = "<group>"; };
+		B1000000000000000000F008 /* MachineEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MachineEngine.swift; sourceTree = "<group>"; };
+		B1000000000000000000F009 /* WebKitEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebKitEngine.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -49,6 +55,9 @@
 				B1000000000000000000F001 /* UemulatorApp.swift */,
 				B1000000000000000000F002 /* NativeEngine.swift */,
 				B1000000000000000000F003 /* TerminalPane.swift */,
+				B1000000000000000000F009 /* WebKitEngine.swift */,
+				B1000000000000000000F008 /* MachineEngine.swift */,
+				B1000000000000000000F007 /* Loopback.swift */,
 				B1000000000000000000F004 /* Uemulator-macOS.entitlements */,
 			);
 			path = App;
@@ -148,7 +157,7 @@
 			);
 			inputPaths = (
 			);
-			name = "Bundle firmware and demo";
+			name = "Bundle firmware, web engine and demo";
 			outputPaths = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -165,6 +174,9 @@
 				B1000000000000000000B001 /* UemulatorApp.swift in Sources */,
 				B1000000000000000000B002 /* NativeEngine.swift in Sources */,
 				B1000000000000000000B003 /* TerminalPane.swift in Sources */,
+				B1000000000000000000B007 /* WebKitEngine.swift in Sources */,
+				B1000000000000000000B006 /* MachineEngine.swift in Sources */,
+				B1000000000000000000B005 /* Loopback.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
