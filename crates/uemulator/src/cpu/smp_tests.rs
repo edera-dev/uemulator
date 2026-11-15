@@ -826,43 +826,60 @@ const STALE_DONE: u64 = STALE_DATA;
 const STALE_VERSION: u64 = STALE_DATA + 0x08;
 const STALE_FAILURES: u64 = STALE_DATA + 0x10;
 const STALE_EXITED: u64 = STALE_DATA + 0x18;
+/// The version a worker last read before calling the site. Now and then the writer waits for it
+/// before the next rewrite (`STALE_PACED_VERSIONS`), so it rewrites while a worker is translating
+/// the site, however the host schedules the threads. Paced by a spin loop instead, the writer's whole run took a few
+/// milliseconds of host time, and on a loaded host it was often over before a worker thread got
+/// a core: nothing raced, and the test failed for not having tested.
+const STALE_CALLING: u64 = STALE_DATA + 0x1c;
+// The writer and the workers below have it hand-assembled as an absolute address.
+const _: () = assert!(STALE_CALLING == 0x40_001c);
+/// How often the writer waits for a worker (`STALE_CALLING`).
+const STALE_PACED_VERSIONS: u32 = 32;
 /// The page the writer rewrites and the workers run: `mov eax, <version>; ret`.
 const STALE_SITE: u64 = STALE_DATA + 0x1000;
 const STALE_WORKER_CODE: u64 = STALE_DATA + 0x2000;
 const STALE_WORKER_STACKS: u64 = STALE_DATA + 0x10000;
 const STALE_WORKER_STACK_BYTES: u64 = 0x1000;
 const STALE_WORKERS: usize = 2;
-/// How long a translation lingers between reading the bytes and registering the block, and how
-/// long the writer waits between rewrites. The first is the longer, so a rewrite always lands in
-/// a worker's window.
+/// How long a translation lingers between reading the bytes and registering the block: the
+/// writer, which now and then rewrites as soon as a worker is about to call the site
+/// (`STALE_CALLING`), has that long to land in the window.
 const STALE_WINDOW_MICROS: u64 = 1000;
 // mov eax, 0; ret
 const STALE_SITE_CODE: [u8; 6] = [0xb8, 0x00, 0x00, 0x00, 0x00, 0xc3];
 
 // The writer: for version 1 to 1000, patch the immediate of the site (a store to a code page, so
-// `code_written` runs) and then publish the version; wait a little between versions; at the end
-// raise DONE and wait for the workers.
+// `code_written` runs) and then publish the version; on every `STALE_PACED_VERSIONS`th, wait for a
+// worker to read it and head for the site, whose translation the next rewrite then races; at the
+// end raise DONE and wait for the workers. Waiting on every version instead made each one cost a
+// translation's exclusive section and pause, and a loaded host ran out the watchdog.
 //   xor ebx, ebx
-// again: inc ebx; mov [site + 1], ebx; mov [VERSION], ebx
-//   mov ecx, 1000; spin: dec ecx; jnz spin; cmp ebx, 1000; jb again
+// again: inc ebx; mov [site + 1], ebx; mov [VERSION], ebx; test bl, 31; jnz next
+// called: pause; cmp [CALLING], ebx; jb called
+// next: cmp ebx, 1000; jb again
 //   mov dword [DONE], 1; wait: pause; cmp dword [EXITED], 2; jne wait; cli; hlt
-const STALE_WRITER: [u8; 60] = [
+const STALE_WRITER: [u8; 67] = [
     0x31, 0xdb, 0xff, 0xc3, 0x89, 0x1c, 0x25, 0x04, 0x10, 0x40, 0x00, 0x89, 0x1c, 0x25, 0x08, 0x00,
-    0x40, 0x00, 0xb9, 0xe8, 0x03, 0x00, 0x00, 0xff, 0xc9, 0x75, 0xfc, 0x81, 0xfb, 0xe8, 0x03, 0x00,
-    0x00, 0x72, 0xdf, 0xc7, 0x04, 0x25, 0x00, 0x00, 0x40, 0x00, 0x01, 0x00, 0x00, 0x00, 0xf3, 0x90,
-    0x83, 0x3c, 0x25, 0x18, 0x00, 0x40, 0x00, 0x02, 0x75, 0xf4, 0xfa, 0xf4,
+    0x40, 0x00, 0xf6, 0xc3, 0x1f, 0x75, 0x0b, 0xf3, 0x90, 0x39, 0x1c, 0x25, 0x1c, 0x00, 0x40, 0x00,
+    0x72, 0xf5, 0x81, 0xfb, 0xe8, 0x03, 0x00, 0x00, 0x72, 0xd8, 0xc7, 0x04, 0x25, 0x00, 0x00, 0x40,
+    0x00, 0x01, 0x00, 0x00, 0x00, 0xf3, 0x90, 0x83, 0x3c, 0x25, 0x18, 0x00, 0x40, 0x00, 0x02, 0x75,
+    0xf4, 0xfa, 0xf4,
 ];
+// The writer's `test bl, 31`.
+const _: () = assert!(STALE_WRITER[20] as u32 == STALE_PACED_VERSIONS - 1);
 
 // A worker, the cross-modifying code protocol of SDM vol. 3, 8.1.3: read the version the writer
 // published, run a serializing `cpuid`, then run the site, which must be at least that new.
-// work: mov r8d, [VERSION]; xor eax, eax; cpuid; mov eax, site; call rax
+// The store to CALLING tells the writer it may rewrite.
+// work: mov r8d, [VERSION]; xor eax, eax; cpuid; mov [CALLING], r8d; mov eax, site; call rax
 //   cmp eax, r8d; jae ok; lock inc qword [FAILURES]
 // ok: cmp dword [DONE], 0; je work; lock inc dword [EXITED]; cli; hlt
-const STALE_WORKER: [u8; 54] = [
-    0x44, 0x8b, 0x04, 0x25, 0x08, 0x00, 0x40, 0x00, 0x31, 0xc0, 0x0f, 0xa2, 0xb8, 0x03, 0x10, 0x40,
-    0x00, 0xff, 0xd0, 0x44, 0x39, 0xc0, 0x73, 0x09, 0xf0, 0x48, 0xff, 0x04, 0x25, 0x10, 0x00, 0x40,
-    0x00, 0x83, 0x3c, 0x25, 0x00, 0x00, 0x40, 0x00, 0x00, 0x74, 0xd5, 0xf0, 0xff, 0x04, 0x25, 0x18,
-    0x00, 0x40, 0x00, 0xfa, 0xf4, 0xf4,
+const STALE_WORKER: [u8; 61] = [
+    0x44, 0x8b, 0x04, 0x25, 0x08, 0x00, 0x40, 0x00, 0x31, 0xc0, 0x0f, 0xa2, 0x44, 0x89, 0x04, 0x25,
+    0x1c, 0x00, 0x40, 0x00, 0xb8, 0x03, 0x10, 0x40, 0x00, 0xff, 0xd0, 0x44, 0x39, 0xc0, 0x73, 0x09,
+    0xf0, 0x48, 0xff, 0x04, 0x25, 0x10, 0x00, 0x40, 0x00, 0x83, 0x3c, 0x25, 0x00, 0x00, 0x40, 0x00,
+    0x00, 0x74, 0xcd, 0xf0, 0xff, 0x04, 0x25, 0x18, 0x00, 0x40, 0x00, 0xfa, 0xf4,
 ];
 
 /// Starts a parked secondary in the 64-bit mode the bootstrap processor runs in, at `rip`.
@@ -1026,14 +1043,20 @@ fn identity_paging(cpu: &mut Cpu, aliases: &[(u64, u64)]) {
 
 // The stale-translation worker (`STALE_WORKER`) with the site's address in rdi instead of a
 // constant, so each worker can reach it through its own mapping:
-// work: mov r8d, [VERSION]; xor eax, eax; cpuid; mov rax, rdi; call rax; cmp eax, r8d; jae ok;
-//   lock inc qword [FAILURES]; ok: cmp dword [DONE], 0; je work; lock inc dword [EXITED]; cli; hlt
-const ALIASED_WORKER: &[u8] = &[
-    0x44, 0x8b, 0x04, 0x25, 0x08, 0x00, 0x40, 0x00, 0x31, 0xc0, 0x0f, 0xa2, 0x48, 0x89, 0xf8, 0xff,
-    0xd0, 0x44, 0x39, 0xc0, 0x73, 0x09, 0xf0, 0x48, 0xff, 0x04, 0x25, 0x10, 0x00, 0x40, 0x00, 0x83,
-    0x3c, 0x25, 0x00, 0x00, 0x40, 0x00, 0x00, 0x74, 0xd7, 0xf0, 0xff, 0x04, 0x25, 0x18, 0x00, 0x40,
-    0x00, 0xfa, 0xf4,
+// work: mov r8d, [VERSION]; xor eax, eax; cpuid; mov [CALLING], r8d; mov rax, rdi; call rax
+//   cmp eax, r8d; jae ok; lock inc qword [FAILURES]
+// ok: cmp dword [DONE], 0; je work; lock inc dword [EXITED]; cli; hlt
+const ALIASED_WORKER: [u8; 59] = [
+    0x44, 0x8b, 0x04, 0x25, 0x08, 0x00, 0x40, 0x00, 0x31, 0xc0, 0x0f, 0xa2, 0x44, 0x89, 0x04, 0x25,
+    0x1c, 0x00, 0x40, 0x00, 0x48, 0x89, 0xf8, 0xff, 0xd0, 0x44, 0x39, 0xc0, 0x73, 0x09, 0xf0, 0x48,
+    0xff, 0x04, 0x25, 0x10, 0x00, 0x40, 0x00, 0x83, 0x3c, 0x25, 0x00, 0x00, 0x40, 0x00, 0x00, 0x74,
+    0xcf, 0xf0, 0xff, 0x04, 0x25, 0x18, 0x00, 0x40, 0x00, 0xfa, 0xf4,
 ];
+
+// mov ecx, 5000000; l: dec ecx; jnz l. Ahead of a worker it stands in for a host that starts the
+// worker threads late: milliseconds, longer than a writer paced by its own spin loop took for
+// all of its rewrites, which then failed this test every time.
+const STALE_LATE_START: [u8; 9] = [0xb9, 0x40, 0x4b, 0x4c, 0x00, 0xff, 0xc9, 0x75, 0xfc];
 
 /// `STALE_WRITER` and `STALE_WORKER` again, but the workers reach the site through two different
 /// virtual addresses while the writer rewrites it through a third (the identity mapping): a
@@ -1049,7 +1072,11 @@ fn code_rewritten_through_one_address_is_never_stale_through_the_aliases_of_its_
             jit,
             |cpu| {
                 place(cpu, STALE_SITE + 3, &STALE_SITE_CODE);
-                place(cpu, STALE_WORKER_CODE, ALIASED_WORKER);
+                place(
+                    cpu,
+                    STALE_WORKER_CODE,
+                    &program(&[&STALE_LATE_START, &ALIASED_WORKER]),
+                );
                 identity_paging(cpu, &aliases);
                 if let Some(jit) = &cpu.jit {
                     jit.set_install_pause_micros(STALE_WINDOW_MICROS);
