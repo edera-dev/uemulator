@@ -3140,27 +3140,22 @@ mod cpus {
         assert_eq!(run.text(), "", "{:?}", run.exit);
     }
 
-    /// `MachineConfig::shadow_stacks` reaches CPUID: off by default, on when asked for.
+    /// CET shadow stacks are always offered, as on a Turin.
     #[test]
-    fn shadow_stacks_are_offered_only_when_asked_for() {
+    fn shadow_stacks_are_always_offered() {
         // mov eax, 7; xor ecx, ecx; cpuid; mov eax, ecx; shr eax, 7; and al, 1; add al, '0';
         // mov dx, 0x3f8; out dx, al; hlt
         const PRINT_CET_SS: [u8; 24] = [
             0xb8, 0x07, 0x00, 0x00, 0x00, 0x31, 0xc9, 0x0f, 0xa2, 0x89, 0xc8, 0xc1, 0xe8, 0x07,
             0x24, 0x01, 0x04, 0x30, 0x66, 0xba, 0xf8, 0x03, 0xee, 0xf4,
         ];
-        for (shadow_stacks, expected) in [(None, "0"), (Some(false), "0"), (Some(true), "1")] {
-            let run = run_machine(
-                fake_bzimage(&PRINT_CET_SS),
-                JitMode::Off,
-                WATCHDOG_LIMIT,
-                |config| match shadow_stacks {
-                    Some(on) => config.shadow_stacks(on),
-                    None => config,
-                },
-            );
-            assert_eq!(run.text(), expected, "{shadow_stacks:?}: {:?}", run.exit);
-        }
+        let run = run_machine(
+            fake_bzimage(&PRINT_CET_SS),
+            JitMode::Off,
+            WATCHDOG_LIMIT,
+            |config| config,
+        );
+        assert_eq!(run.text(), "1", "{:?}", run.exit);
     }
 
     #[test]

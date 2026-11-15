@@ -148,12 +148,6 @@ pub struct HardwareArgs {
     #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = BOOL_FLAG_DEFAULT,
         value_name = "BOOL")]
     pub smt: Option<bool>,
-    /// Give the CPU CET shadow stacks (CPUID, CR4.CET, the CET MSRs). Code running on a shadow
-    /// stack stays on the interpreter, and Xen turns them on whenever they are offered, so they
-    /// make it about 3x slower; `--shadow-stacks=false` takes them away again [default: false]
-    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = BOOL_FLAG_DEFAULT,
-        value_name = "BOOL")]
-    pub shadow_stacks: Option<bool>,
     /// How the vCPUs run: a host thread each on the host clock (auto, threads) or in turns on one
     /// thread, deterministically (timeshare) [default: auto]
     #[arg(long, value_enum, value_name = "MODE")]
@@ -429,7 +423,6 @@ pub struct Settings {
     pub iommu: bool,
     pub tpm: bool,
     pub secure_boot: bool,
-    pub shadow_stacks: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display: Option<DisplayArg>,
     /// `None` follows the display, so a machine saved before input could be chosen keeps its
@@ -543,9 +536,6 @@ impl Settings {
         }
         if let Some(secure_boot) = hardware.secure_boot {
             self.secure_boot = secure_boot;
-        }
-        if let Some(shadow_stacks) = hardware.shadow_stacks {
-            self.shadow_stacks = shadow_stacks;
         }
         if hardware.display.is_some() {
             self.display = hardware.display;
@@ -862,7 +852,6 @@ mod tests {
             iommu: true,
             tpm: true,
             secure_boot: true,
-            shadow_stacks: true,
             display: Some(DisplayArg::Both),
             input: Some(false),
             consoles: vec![ConsoleArg::Virtio, ConsoleArg::Serial],

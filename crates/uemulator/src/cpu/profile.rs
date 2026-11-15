@@ -54,8 +54,6 @@ pub(crate) struct CpuProfile {
     pub logical_processors: u32,
     pub threads_per_core: u32,
     pub brand: &'static str,
-    /// CET shadow stacks (`CpuTopology::shadow_stacks`); `new` leaves them off.
-    pub shadow_stacks: bool,
 }
 
 impl CpuProfile {
@@ -78,14 +76,6 @@ impl CpuProfile {
             logical_processors,
             threads_per_core,
             brand,
-            shadow_stacks: false,
-        }
-    }
-
-    pub(crate) fn with_shadow_stacks(self, on: bool) -> Self {
-        CpuProfile {
-            shadow_stacks: on,
-            ..self
         }
     }
 
@@ -101,7 +91,6 @@ impl CpuProfile {
             threads_per_core: self.threads_per_core,
             x2apic_id: index,
             brand: self.brand,
-            shadow_stacks: self.shadow_stacks,
         }
     }
 }

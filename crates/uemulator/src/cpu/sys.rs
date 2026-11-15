@@ -76,7 +76,7 @@ pub(crate) const CR4_PKE: u64 = 1 << 22;
 /// outside IA-32e mode (APM 5.3.6): Linux's trampoline leaves long mode to flip it.
 pub(crate) const CR4_LA57: u64 = 1 << 12;
 /// CR4 bits a guest may set. Everything else is rejected with #GP because CPUID does not
-/// advertise it. CR4.CET only counts on a CPU with shadow stacks: check `Cpu::cr4_supported`.
+/// advertise it.
 const CR4_SUPPORTED: u64 = super::vme::CR4_VME
     | super::vme::CR4_PVI
     | CR4_TSD
@@ -440,7 +440,7 @@ impl Cpu {
             MSR_KERNEL_GS_BASE => self.kgsbase = v,
             MSR_TSC_AUX => self.tsc_aux = v,
             MSR_XSS => {
-                if v & !self.xss_supported() != 0 {
+                if v & !xsave::XSS_SUPPORTED != 0 {
                     return Err(Exception::general_protection(0));
                 }
                 self.xss = v;
@@ -546,7 +546,7 @@ impl Cpu {
                         // needs IA-32e mode and may only be set while the PCID field of CR3 is
                         // zero.
                         let long_mode = self.efer & EFER_LMA != 0;
-                        if v & !self.cr4_supported() != 0
+                        if v & !CR4_SUPPORTED != 0
                             || (long_mode && v & CR4_PAE == 0)
                             || (long_mode && (v ^ self.cr4) & CR4_LA57 != 0)
                             || (v & super::cet::CR4_CET != 0 && self.cr0 & CR0_WP == 0)

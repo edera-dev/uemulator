@@ -721,8 +721,7 @@ impl Cpu {
         let ram_bytes = ram.len();
         let pages = ram_bytes >> PAGE_SHIFT;
         let cpu_count = dev_config.cpus.max(1) as u32;
-        let profile = profile::CpuProfile::new(cpu_count, dev_config.smt)
-            .with_shadow_stacks(dev_config.shadow_stacks);
+        let profile = profile::CpuProfile::new(cpu_count, dev_config.smt);
         let devices = DevHandle::new(Devices::new(console, dev_config));
         let parts = MachineParts {
             ram,

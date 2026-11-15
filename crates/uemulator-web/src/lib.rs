@@ -138,9 +138,8 @@ pub const OPTION_SECURE_BOOT: u32 = 1 << 12;
 /// One thread per core instead of SMT pairs (`MachineConfig::smt`). Inverted so a caller that
 /// predates it gets the library's default.
 pub const OPTION_NO_SMT: u32 = 1 << 13;
-/// CET shadow stacks (`MachineConfig::shadow_stacks`), off by default: shadowed code runs on the
-/// interpreter, and Xen turns them on whenever CPUID offers them.
-pub const OPTION_SHADOW_STACKS: u32 = 1 << 14;
+// Bit 14 was the shadow-stack switch; CET shadow stacks are always on now and a page that still
+// sets it is ignored. Do not reuse it for something a stale page could turn on by accident.
 
 // Input event kinds in the page's event ring, as `www/protocol.js` numbers them.
 /// A key by USB HID usage; then pressed (1) or released (0).
@@ -557,7 +556,6 @@ pub unsafe extern "C" fn uw_create(
         // anyway (its function table belongs to this instance; `docs/plans/13-web.md`).
         .cpus(cpus as usize)
         .smt(!option(OPTION_NO_SMT))
-        .shadow_stacks(option(OPTION_SHADOW_STACKS))
         // Blocks are compiled to WebAssembly modules the page instantiates; without the page's
         // `host_jit_*` imports working, `Auto` falls back to the interpreter.
         .jit(if option(OPTION_JIT) {

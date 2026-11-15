@@ -1887,6 +1887,21 @@ mod tests {
         assert!(text.contains("[[disks]]"), "{text}");
     }
 
+    /// Machines saved while shadow stacks were a choice (`--shadow-stacks`) have a
+    /// `shadow_stacks` key. The CPU always has them now; the key is ignored, either value.
+    #[test]
+    fn an_old_file_with_a_shadow_stacks_key_still_loads() {
+        let home = TempDir::new("machines-shadow-stacks");
+        let machine = create_machine(home.path(), &["--memory", "300"]);
+        let path = home.path().join("machines/m/machine.toml");
+        let text = fs::read_to_string(&path).unwrap();
+        for value in ["true", "false"] {
+            fs::write(&path, format!("shadow_stacks = {value}\n{text}")).unwrap();
+            let loaded = load(home.path(), "m").unwrap();
+            assert_eq!(loaded.settings, machine.settings, "shadow_stacks = {value}");
+        }
+    }
+
     #[test]
     fn firmware_defaults_to_uefi_and_old_files_without_it_load_as_uefi() {
         let home = TempDir::new("machines-firmware-serde");

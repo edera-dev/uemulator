@@ -1312,42 +1312,6 @@ mod tests {
     }
 
     #[test]
-    fn every_machine_command_takes_shadow_stacks_and_a_machine_keeps_them() {
-        for command in ["create", "edit", "boot"] {
-            let mut argv = vec!["quick", command, "m", "--shadow-stacks"];
-            if command == "create" {
-                argv.extend(["--install", "alpine"]);
-            }
-            let hardware = match parse(&argv).unwrap().cmd {
-                Cmd::Quick {
-                    cmd:
-                        QuickCmd::Create { hardware, .. }
-                        | QuickCmd::Edit { hardware, .. }
-                        | QuickCmd::Boot { hardware, .. },
-                } => hardware,
-                _ => unreachable!(),
-            };
-            assert_eq!(hardware.shadow_stacks, Some(true), "quick {command}");
-        }
-        let mut settings = Settings::default();
-        assert!(!settings.shadow_stacks, "off by default");
-        settings.add(
-            &hardware(&["--shadow-stacks"]),
-            &LinuxArgs::default(),
-            Vec::new(),
-        );
-        assert!(settings.shadow_stacks);
-        settings.add(&hardware(&[]), &LinuxArgs::default(), Vec::new());
-        assert!(settings.shadow_stacks, "kept when not given");
-        settings.add(
-            &hardware(&["--shadow-stacks=false"]),
-            &LinuxArgs::default(),
-            Vec::new(),
-        );
-        assert!(!settings.shadow_stacks);
-    }
-
-    #[test]
     fn boolean_options_take_an_optional_value_only_after_an_equals_sign() {
         assert_eq!(hardware(&[]).disable_jit, None);
         assert_eq!(hardware(&["--disable-jit"]).disable_jit, Some(true));
@@ -1365,12 +1329,6 @@ mod tests {
         assert_eq!(hardware(&[]).secure_boot, None);
         assert_eq!(hardware(&["--secure-boot"]).secure_boot, Some(true));
         assert_eq!(hardware(&["--secure-boot=false"]).secure_boot, Some(false));
-        assert_eq!(hardware(&[]).shadow_stacks, None);
-        assert_eq!(hardware(&["--shadow-stacks"]).shadow_stacks, Some(true));
-        assert_eq!(
-            hardware(&["--shadow-stacks=false"]).shadow_stacks,
-            Some(false)
-        );
         assert_eq!(
             error_kind(&["advanced", "boot", "--kernel", "k", "--disable-jit=maybe"]),
             ErrorKind::InvalidValue

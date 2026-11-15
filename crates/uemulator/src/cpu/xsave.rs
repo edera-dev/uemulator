@@ -168,15 +168,6 @@ pub(crate) fn splitmix64(state: &mut u64) -> u64 {
 }
 
 impl Cpu {
-    /// The IA32_XSS bits this CPU has: the CET components only with shadow stacks.
-    pub(super) fn xss_supported(&self) -> u64 {
-        if self.has_shadow_stacks() {
-            XSS_SUPPORTED
-        } else {
-            XSS_SUPPORTED & !(XSS_CET_U | XSS_CET_S)
-        }
-    }
-
     /// Next value of the rdrand/rdseed generator. Deterministic given `MachineConfig::random_seed`.
     pub(super) fn next_random(&mut self) -> u64 {
         splitmix64(&mut self.rng_state)
@@ -1171,7 +1162,6 @@ mod tests {
     #[test]
     fn cpuid_describes_the_compacted_format() {
         let mut h = Harness::new(&[HLT]);
-        h.enable_shadow_stacks();
         h.cpu.xcr0 = ALL_COMPONENTS;
         h.cpu.gpr[RAX] = 0xd;
         h.cpu.gpr[RCX] = 1;
@@ -1205,7 +1195,6 @@ mod tests {
     fn ia32_xss_starts_at_zero_and_accepts_only_the_cet_components() {
         use crate::cpu::sys::MSR_XSS;
         let mut h = Harness::new(&[HLT]);
-        h.enable_shadow_stacks();
         assert_eq!(h.cpu.rdmsr(MSR_XSS).unwrap(), 0);
         assert!(h.cpu.wrmsr(MSR_XSS, XSS_CET_U).is_ok());
         assert_eq!(h.cpu.rdmsr(MSR_XSS).unwrap(), XSS_CET_U);

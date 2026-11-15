@@ -183,12 +183,6 @@ impl Harness {
         }
     }
 
-    /// Gives the CPU CET shadow stacks, which `MachineConfig` leaves off by default
-    /// (`CpuTopology::shadow_stacks`).
-    pub fn enable_shadow_stacks(&mut self) {
-        self.cpu.topology.shadow_stacks = true;
-    }
-
     /// A real-mode CPU (paging and long mode off) running `code` at 0000:7c00 with the stack at
     /// 0000:7000 and every data segment 0.
     pub fn real(code: &[u8]) -> Self {

@@ -201,9 +201,6 @@ pub(crate) struct DevConfig {
     /// Pairs the vCPUs into two-thread cores when their count is even (`cpu::profile`). Only the
     /// CPUs read it: the APIC ids are the vCPU numbers either way.
     pub smt: bool,
-    /// Gives the CPUs CET shadow stacks (`cpu::cpuid::CpuTopology::shadow_stacks`). Only the CPUs
-    /// read it.
-    pub shadow_stacks: bool,
     /// Adds a virtio-rng function, last in slot order, fed by this source.
     pub rng: Option<RngSource>,
     /// Adds the screen (`DISPLAY_FUNCTIONS` functions) after the NICs.

@@ -3,7 +3,7 @@
 // and for checking the WebAssembly JIT against a real guest without a browser.
 //
 //   node hack/wasm/boot.mjs [--kernel K] [--initrd I] [--disk D]... [--cdrom ISO]... [--cmdline S] [--memory MiB]
-//                           [--firmware none|uefi|bios] [--cpus N] [--iommu] [--tpm] [--secure-boot] [--shadow-stacks] [--no-acpi] [--serial]
+//                           [--firmware none|uefi|bios] [--cpus N] [--iommu] [--tpm] [--secure-boot] [--no-acpi] [--serial]
 //                           [--hypervisor XEN [--hypervisor-cmdline S]]
 //                           [--gpu] [--no-jit] [--no-compile-worker] [--debug] [--wasm FILE] [--until TEXT]
 //                           [--seconds N] [--mark TEXT]... [--keys TEXT [--keys-after TEXT]]
@@ -55,7 +55,6 @@ const { values } = parseArgs({
     iommu: { type: "boolean", default: false },
     tpm: { type: "boolean", default: false },
     "secure-boot": { type: "boolean", default: false },
-    "shadow-stacks": { type: "boolean", default: false },
     "no-acpi": { type: "boolean", default: false },
     serial: { type: "boolean", default: false },
     hypervisor: { type: "string" },
@@ -273,8 +272,7 @@ if (values.gpu) {
 const options =
   (values.gpu ? OPTION.DISPLAY : 0) | (values["no-jit"] ? 0 : OPTION.JIT) | (values["no-acpi"] ? 0 : OPTION.ACPI) |
   (values.iommu ? OPTION.IOMMU : 0) | (values.serial ? OPTION.SERIAL_CONSOLE : 0) | OPTION.RNG |
-  (values.debug ? OPTION.DEBUG : 0) | (values.tpm ? OPTION.TPM : 0) | (values["secure-boot"] ? OPTION.SECURE_BOOT : 0) |
-  (values["shadow-stacks"] ? OPTION.SHADOW_STACKS : 0);
+  (values.debug ? OPTION.DEBUG : 0) | (values.tpm ? OPTION.TPM : 0) | (values["secure-boot"] ? OPTION.SECURE_BOOT : 0);
 const failed = wasm.uw_create(
   upload(kernel), kernel.length, upload(initrd), initrd.length, upload(cmdline), cmdline.length,
   Number(values.memory), Number(values.cpus), Math.floor(Date.now() / 1000), 80, 25, options,

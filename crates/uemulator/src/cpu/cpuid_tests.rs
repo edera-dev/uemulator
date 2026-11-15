@@ -27,7 +27,7 @@ fn with_topology(logical: u32, threads: u32, x2apic_id: u32) -> Harness {
         logical_processors: logical,
         threads_per_core: threads,
         x2apic_id,
-        ..harness.cpu.topology
+        brand: harness.cpu.topology.brand,
     };
     harness
 }
@@ -162,8 +162,6 @@ fn leaf_6_has_the_always_running_apic_timer_and_aperf_mperf() {
 #[test]
 fn leaf_7_subleaf_0_features() {
     let mut h = blank();
-    // CET_SS is opt-in (`cet_tests.rs` checks it off)
-    h.enable_shadow_stacks();
     // FSGSBASE BMI1 AVX2 SMEP BMI2 ERMS INVPCID PQM PQE AVX512F AVX512DQ RDSEED ADX SMAP
     // AVX512IFMA CLFLUSHOPT CLWB AVX512CD SHA AVX512BW AVX512VL
     let ebx = bits(&[
@@ -232,7 +230,6 @@ fn leaf_0xb_follows_the_configured_topology() {
 #[test]
 fn leaf_0xd_describes_the_xsave_area() {
     let mut h = blank();
-    h.enable_shadow_stacks();
     // supported XCR0 bits (x87, SSE, AVX, opmask, ZMM_Hi256, Hi16_ZMM, PKRU), size for the
     // enabled set, size for all supported
     assert_eq!(cpuid(&mut h, 0xd, 0), [0x2e7, 576, 2696, 0]);
