@@ -277,12 +277,11 @@ impl GpuLink {
     fn complete(&self, completion: GpuCompletion) {
         let wake = {
             let mut state = self.state.lock().unwrap();
-            if let GpuCompletion::Fence(sequence)
-            | GpuCompletion::Read {
-                token: sequence, ..
-            } = completion
-                && sequence >= state.next_sequence
-            {
+            let sequence = match &completion {
+                GpuCompletion::Fence(sequence) => *sequence,
+                GpuCompletion::Read { token, .. } => *token,
+            };
+            if sequence >= state.next_sequence {
                 return;
             }
             state.completions.push_back(completion);

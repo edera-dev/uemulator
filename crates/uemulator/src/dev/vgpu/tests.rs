@@ -223,6 +223,74 @@ fn screen_pixel(display: &DisplayHandle, x: u32, y: u32) -> [u8; 4] {
 }
 
 #[test]
+fn attach_backing_rejects_a_write_only_dma_entry_page() {
+    let mut rig = Rig::new();
+    assert_eq!(
+        rig.create(RESOURCE, FORMAT_B8G8R8A8, WIDTH, HEIGHT),
+        RESP_OK_NODATA
+    );
+    let mut request = header(CMD_RESOURCE_ATTACH_BACKING);
+    request.extend(words(&[RESOURCE, 1]));
+    let split = request.len();
+    request.extend(BACKING_A.to_le_bytes());
+    request.extend(words(&[WIDTH * HEIGHT * 4, 0]));
+    rig.ram[REQUEST as usize..REQUEST as usize + split].copy_from_slice(&request[..split]);
+    rig.ram[ENTRIES as usize..ENTRIES as usize + request.len() - split]
+        .copy_from_slice(&request[split..]);
+    let chain = Chain {
+        head: 0,
+        segs: vec![
+            super::super::virtio::Segment {
+                addr: REQUEST,
+                len: split as u32,
+                device_writable: false,
+            },
+            super::super::virtio::Segment {
+                addr: ENTRIES,
+                len: (request.len() - split) as u32,
+                device_writable: false,
+            },
+        ],
+    };
+    let mut iommu = iommu_deny_read(&mut rig.ram, ENTRIES);
+    let mut mem = test_mem(&mut rig.ram);
+    let response = mem.with_dma(&mut iommu, 0x18, |mem| rig.gpu.execute(&chain, mem));
+    assert_eq!(response_type(&response), RESP_ERR_UNSPEC);
+    assert!(rig.gpu.resources.get(&RESOURCE).unwrap().backing.is_empty());
+}
+
+#[test]
+fn transfer_2d_rejects_unreadable_backing_without_changing_pixels() {
+    let mut rig = Rig::new();
+    assert_eq!(
+        rig.create(RESOURCE, FORMAT_B8G8R8A8, WIDTH, HEIGHT),
+        RESP_OK_NODATA
+    );
+    assert_eq!(rig.attach(RESOURCE, WIDTH * HEIGHT * 4), RESP_OK_NODATA);
+    let mut request = header(CMD_TRANSFER_TO_HOST_2D);
+    request.extend(words(&[0, 0, 1, 1]));
+    request.extend(0u64.to_le_bytes());
+    request.extend(words(&[RESOURCE, 0]));
+    rig.ram[REQUEST as usize..REQUEST as usize + request.len()].copy_from_slice(&request);
+    let chain = Chain {
+        head: 0,
+        segs: vec![super::super::virtio::Segment {
+            addr: REQUEST,
+            len: request.len() as u32,
+            device_writable: false,
+        }],
+    };
+    let mut iommu = iommu_deny_read(&mut rig.ram, BACKING_A);
+    let mut mem = test_mem(&mut rig.ram);
+    let response = mem.with_dma(&mut iommu, 0x18, |mem| rig.gpu.execute(&chain, mem));
+    assert_eq!(response_type(&response), RESP_ERR_UNSPEC);
+    assert_eq!(
+        &rig.gpu.resources.get(&RESOURCE).unwrap().pixels[..4],
+        &[0; 4]
+    );
+}
+
+#[test]
 fn identity_is_a_gpu_with_a_control_and_a_cursor_queue_and_one_scanout() {
     let rig = Rig::new();
     assert_eq!(rig.gpu.device_type(), 16);

@@ -197,6 +197,11 @@ impl Accel {
     }
 
     pub fn backing_mut(&mut self, id: u32) -> Option<&mut Vec<BackingEntry>> {
+        if self.resources.contains_key(&id) {
+            // A pending read belongs to the backing mapped when it was requested. Once the
+            // guest replaces that mapping, its completion must not write into the new pages.
+            self.reads.retain(|_, read| read.resource != id);
+        }
         self.resources
             .get_mut(&id)
             .map(|resource| &mut resource.backing)
@@ -529,11 +534,18 @@ impl Accel {
             return RESP_ERR_OUT_OF_MEMORY;
         }
         data.resize(bytes, 0);
+        let mut read_ok = true;
         placement.for_each_row(|from, to, length| {
+            if !read_ok {
+                return;
+            }
             let mut cursor = BackingCursor::default();
             cursor.advance(&resource.backing, from);
-            cursor.read(&resource.backing, mem, &mut data[to..to + length]);
+            read_ok = cursor.read(&resource.backing, mem, &mut data[to..to + length]);
         });
+        if !read_ok {
+            return RESP_ERR_UNSPEC;
+        }
         self.outgoing.push(GpuCommand::WriteResource {
             context,
             resource: id,
@@ -584,7 +596,9 @@ impl Accel {
             return RESP_ERR_INVALID_PARAMETER;
         }
         let mut commands = vec![0u8; size];
-        chain.read_from(mem, start, &mut commands);
+        if chain.read_from(mem, start, &mut commands) != size {
+            return RESP_ERR_INVALID_PARAMETER;
+        }
         self.outgoing.push(GpuCommand::Submit { context, commands });
         RESP_OK_NODATA
     }
@@ -691,7 +705,17 @@ impl Accel {
             match completion {
                 GpuCompletion::Read { token, data } => self.write_back(token, &data, mem),
                 // Every earlier fence passed too: the renderer works in order.
-                GpuCompletion::Fence(sequence) => passed = passed.max(Some(sequence)),
+                GpuCompletion::Fence(sequence) => {
+                    // Read tokens share the sequence allocator but are not fences. A host
+                    // reporting one as a fence must not release an earlier guest response.
+                    if self
+                        .held
+                        .binary_search_by_key(&sequence, |held| held.sequence)
+                        .is_ok()
+                    {
+                        passed = passed.max(Some(sequence));
+                    }
+                }
             }
         }
         let Some(passed) = passed else {

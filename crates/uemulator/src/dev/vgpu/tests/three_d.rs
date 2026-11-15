@@ -153,6 +153,88 @@ fn region(x: u32, y: u32, width: u32, height: u32) -> GpuBox {
     }
 }
 
+#[test]
+fn submit_does_not_forward_a_write_only_dma_stream() {
+    let (mut rig, link) = renderer();
+    assert_eq!(
+        rig.status(&create_context_request(CONTEXT, b"test")),
+        RESP_OK_NODATA
+    );
+    link.take_commands();
+    let request = submit_request(&[1; 80]);
+    let fixed = LARGEST_FIXED_REQUEST;
+    rig.ram[REQUEST as usize..REQUEST as usize + fixed].copy_from_slice(&request[..fixed]);
+    rig.ram[ENTRIES as usize..ENTRIES as usize + request.len() - fixed]
+        .copy_from_slice(&request[fixed..]);
+    put_desc(
+        &mut rig.ram,
+        CONTROL_DESC,
+        0,
+        REQUEST,
+        fixed as u32,
+        DESC_F_NEXT,
+        1,
+    );
+    put_desc(
+        &mut rig.ram,
+        CONTROL_DESC,
+        1,
+        ENTRIES,
+        (request.len() - fixed) as u32,
+        DESC_F_NEXT,
+        2,
+    );
+    put_desc(
+        &mut rig.ram,
+        CONTROL_DESC,
+        2,
+        RESPONSE,
+        RESPONSE_BYTES,
+        DESC_F_WRITE,
+        0,
+    );
+    post(&mut rig.ram, CONTROL_AVAIL, QUEUE_SIZE, 0);
+    let mut iommu = iommu_deny_read(&mut rig.ram, ENTRIES);
+    let mut mem = test_mem(&mut rig.ram);
+    assert!(mem.with_dma(&mut iommu, 0x18, |mem| rig.gpu.kick(
+        CONTROL_QUEUE,
+        &mut rig.queues,
+        mem
+    )));
+    let response = &rig.ram[RESPONSE as usize..RESPONSE as usize + HEADER_BYTES];
+    assert_eq!(response_type(response), RESP_ERR_INVALID_PARAMETER);
+    assert!(link.take_commands().is_empty());
+}
+
+#[test]
+fn transfer_3d_does_not_forward_unreadable_backing() {
+    let (mut rig, link) = renderer();
+    rig.backed_texture(&link);
+    link.take_commands();
+    let request = transfer_3d_request(
+        CMD_TRANSFER_TO_HOST_3D,
+        TEXTURE,
+        region(0, 0, 1, 1),
+        0,
+        TEXTURE_STRIDE,
+        0,
+    );
+    rig.ram[REQUEST as usize..REQUEST as usize + request.len()].copy_from_slice(&request);
+    let chain = Chain {
+        head: 0,
+        segs: vec![super::super::super::virtio::Segment {
+            addr: REQUEST,
+            len: request.len() as u32,
+            device_writable: false,
+        }],
+    };
+    let mut iommu = iommu_deny_read(&mut rig.ram, BACKING_A);
+    let mut mem = test_mem(&mut rig.ram);
+    let response = mem.with_dma(&mut iommu, 0x18, |mem| rig.gpu.execute(&chain, mem));
+    assert_eq!(response_type(&response), RESP_ERR_UNSPEC);
+    assert!(link.take_commands().is_empty());
+}
+
 impl Rig {
     /// Posts `request` on its own descriptors and buffers (`slot` 0 or 1) so it can stay in
     /// flight while others complete; returns what the kick returned.
@@ -630,6 +712,73 @@ fn a_readback_lands_in_the_backing_before_its_fence_is_answered() {
             );
         }
     }
+}
+
+#[test]
+fn a_readback_does_not_write_into_replaced_backing() {
+    let (mut rig, link) = renderer();
+    rig.backed_texture(&link);
+    let read = transfer_3d_request(
+        CMD_TRANSFER_FROM_HOST_3D,
+        TEXTURE,
+        region(0, 0, 2, 1),
+        0,
+        TEXTURE_STRIDE,
+        0,
+    );
+    assert_eq!(rig.status(&read), RESP_OK_NODATA);
+    let [GpuCommand::ReadResource { token, .. }] = link.take_commands()[..] else {
+        panic!("one read request");
+    };
+    let mut detach = header(CMD_RESOURCE_DETACH_BACKING);
+    detach.extend(words(&[TEXTURE, 0]));
+    assert_eq!(rig.status(&detach), RESP_OK_NODATA);
+    const REPLACEMENT: u64 = 0x4_0000;
+    let mut attach = header(CMD_RESOURCE_ATTACH_BACKING);
+    attach.extend(words(&[TEXTURE, 1]));
+    attach.extend(REPLACEMENT.to_le_bytes());
+    attach.extend(words(&[TEXTURE_BYTES, 0]));
+    assert_eq!(rig.status(&attach), RESP_OK_NODATA);
+    rig.ram[REPLACEMENT as usize..REPLACEMENT as usize + 8].fill(0xa5);
+    link.complete_read(token, (1..=8).collect());
+    assert!(!rig.poll());
+    assert_eq!(
+        &rig.ram[REPLACEMENT as usize..REPLACEMENT as usize + 8],
+        &[0xa5; 8]
+    );
+}
+
+#[test]
+fn a_read_token_is_not_a_fence_sequence() {
+    let (mut rig, link) = renderer();
+    rig.backed_texture(&link);
+    assert!(!rig.send(0, &fenced(header(CMD_GET_DISPLAY_INFO), 11)));
+    let read = transfer_3d_request(
+        CMD_TRANSFER_FROM_HOST_3D,
+        TEXTURE,
+        region(0, 0, 1, 1),
+        0,
+        TEXTURE_STRIDE,
+        0,
+    );
+    assert_eq!(rig.status(&read), RESP_OK_NODATA);
+    let [
+        GpuCommand::Fence { sequence },
+        GpuCommand::ReadResource { token, .. },
+    ] = link.take_commands()[..]
+    else {
+        panic!("fence followed by read");
+    };
+    assert!(sequence < token);
+    link.complete_fence(token);
+    assert!(!rig.poll());
+    assert_eq!(rig.slot_response(0), None);
+    link.complete_fence(sequence);
+    assert!(rig.poll());
+    assert_eq!(
+        response_type(&rig.slot_response(0).unwrap()),
+        RESP_OK_DISPLAY_INFO
+    );
 }
 
 #[test]

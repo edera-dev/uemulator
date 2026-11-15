@@ -196,22 +196,23 @@ impl BackingCursor {
     }
 
     /// Fills `out` from here, as if the entries were one buffer, and moves past it. Bytes past
-    /// the backing's end, or in an entry outside RAM, read as zero.
-    fn read(&mut self, backing: &[BackingEntry], mem: &GuestMem, out: &mut [u8]) {
+    /// the backing's end read as zero; a DMA fault fails instead of inventing image data.
+    fn read(&mut self, backing: &[BackingEntry], mem: &GuestMem, out: &mut [u8]) -> bool {
         let mut done = 0;
         while done < out.len() {
             let Some(entry) = backing.get(self.entry) else {
                 out[done..].fill(0);
-                return;
+                return true;
             };
             let count = ((entry.length - self.offset) as usize).min(out.len() - done);
             let piece = &mut out[done..done + count];
             if !mem.read(entry.address + self.offset, piece) {
-                piece.fill(0);
+                return false;
             }
             done += count;
             self.advance(backing, count as u64);
         }
+        true
     }
 
     /// Stores `data` from here, as `read` reads; bytes past the backing's end, or for an entry
@@ -365,7 +366,7 @@ impl VirtioGpu {
         let mut fixed = [0u8; LARGEST_FIXED_REQUEST];
         let length = chain.read_from(mem, 0, &mut fixed);
         let header = Header::parse(&fixed[..length]);
-        if length < HEADER_BYTES {
+        if length < HEADER_BYTES || length != chain.readable().min(fixed.len()) {
             return header.response(RESP_ERR_UNSPEC);
         }
         let body = &fixed[HEADER_BYTES..length];
@@ -379,7 +380,11 @@ impl VirtioGpu {
             CMD_RESOURCE_ATTACH_BACKING => {
                 let nr_entries = u32_at(body, 4);
                 let request = chain.read_all(mem, request_limit(nr_entries));
-                self.attach_backing(&request[HEADER_BYTES.min(request.len())..], mem)
+                if request.len() != chain.readable().min(request_limit(nr_entries)) {
+                    RESP_ERR_UNSPEC
+                } else {
+                    self.attach_backing(&request[HEADER_BYTES.min(request.len())..], mem)
+                }
             }
             CMD_RESOURCE_DETACH_BACKING => self.detach_backing(u32_at(body, 0)),
             virgl::CMD_GET_CAPSET_INFO | virgl::CMD_GET_CAPSET => match &self.accel {
@@ -668,16 +673,30 @@ impl VirtioGpu {
         }
         let mut cursor = BackingCursor::default();
         cursor.advance(&resource.backing, offset);
+        let Some(staged_bytes) = row_bytes.checked_mul(rect.height as usize) else {
+            return RESP_ERR_OUT_OF_MEMORY;
+        };
+        let mut staged = Vec::new();
+        if staged.try_reserve_exact(staged_bytes).is_err() {
+            return RESP_ERR_OUT_OF_MEMORY;
+        }
+        staged.resize(staged_bytes, 0);
         for line in 0..rect.height as usize {
             if line > 0 {
                 cursor.advance(&resource.backing, (stride - row_bytes) as u64);
             }
-            let target = (rect.y as usize + line) * stride + rect.x as usize * BYTES_PER_PIXEL;
-            cursor.read(
+            if !cursor.read(
                 &resource.backing,
                 mem,
-                &mut resource.pixels[target..target + row_bytes],
-            );
+                &mut staged[line * row_bytes..(line + 1) * row_bytes],
+            ) {
+                return RESP_ERR_UNSPEC;
+            }
+        }
+        for line in 0..rect.height as usize {
+            let target = (rect.y as usize + line) * stride + rect.x as usize * BYTES_PER_PIXEL;
+            resource.pixels[target..target + row_bytes]
+                .copy_from_slice(&staged[line * row_bytes..(line + 1) * row_bytes]);
         }
         RESP_OK_NODATA
     }
@@ -685,9 +704,14 @@ impl VirtioGpu {
     /// `resource_id`, `nr_entries`, then that many `virtio_gpu_mem_entry`s.
     fn attach_backing(&mut self, body: &[u8], mem: &GuestMem) -> u32 {
         let (id, count) = (u32_at(body, 0), u32_at(body, 4));
-        let Some(target) = self.backing_mut(id) else {
+        if !self.resources.contains_key(&id)
+            && !self
+                .accel
+                .as_ref()
+                .is_some_and(|accel| accel.has_resource(id))
+        {
             return RESP_ERR_INVALID_RESOURCE_ID;
-        };
+        }
         const ENTRIES_START: usize = 8;
         if count == 0
             || count > MAX_BACKING_ENTRIES
@@ -709,6 +733,9 @@ impl VirtioGpu {
             }
             backing.push(entry);
         }
+        let Some(target) = self.backing_mut(id) else {
+            return RESP_ERR_INVALID_RESOURCE_ID;
+        };
         *target = backing;
         RESP_OK_NODATA
     }
@@ -810,7 +837,9 @@ impl VirtioDev for VirtioGpu {
         while let Some(chain) = queues[queue].pop(mem) {
             let mut request = [0u8; CURSOR_REQUEST_BYTES];
             let length = chain.read_from(mem, 0, &mut request);
-            self.cursor_command(&request[..length]);
+            if length == CURSOR_REQUEST_BYTES {
+                self.cursor_command(&request);
+            }
             queues[queue].push_used(mem, chain.head, 0);
             completed = true;
         }
