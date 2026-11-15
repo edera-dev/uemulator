@@ -771,10 +771,11 @@ impl Cpu {
             self.ram[start..start + len].copy_from_slice(&val.to_le_bytes()[..len]);
         } else {
             let now = self.now_ns();
-            self.begin_device_dma();
             self.dev.lock().set_time(now);
             let written_code_pages = {
-                let mut mem = GuestMem::new(&mut self.ram, self.page_has_code.as_bytes());
+                let barrier = self.threads.as_ref().map(|t| &t.links.dma_in_flight);
+                let mut mem = GuestMem::new(&mut self.ram, self.page_has_code.as_bytes())
+                    .with_code_write_barrier(barrier);
                 if self.dev.lock().mmio_write(pa, size, val, &mut mem) {
                     mem.code_pages_written
                 } else {
@@ -784,10 +785,13 @@ impl Cpu {
                     Vec::new()
                 }
             };
+            let wrote_code = !written_code_pages.is_empty();
             for page in written_code_pages {
                 self.code_written(page);
             }
-            self.end_device_dma();
+            if wrote_code {
+                self.lower_code_write_barrier();
+            }
         }
     }
 

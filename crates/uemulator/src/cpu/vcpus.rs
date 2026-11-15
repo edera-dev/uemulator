@@ -128,9 +128,13 @@ pub(crate) struct VcpuLinks {
     /// The device thread, for work a vCPU just handed the devices.
     device_waker: Waker,
     device_sleeping: AtomicBool,
-    /// Counts device ticks and vCPU MMIO writes that could publish DMA completion. Each writer
-    /// leaves only after its code-page invalidations, so a serializing vCPU cannot pass that gap.
-    dma_in_flight: AtomicUsize,
+    /// Device writers (the device thread's tick, a vCPU's MMIO write) that have written a page
+    /// holding translated code and not yet invalidated it. `GuestMem` raises it at the first such
+    /// write, before the device can publish a used-ring entry after it; whoever drains
+    /// `code_pages_written` lowers it once the invalidations are visible. A vCPU that saw the
+    /// completion therefore sees the count or the invalidation. Raising it for every tick instead
+    /// would stall every vCPU at every block boundary for the length of every tick.
+    pub(super) dma_in_flight: AtomicUsize,
     #[cfg(test)]
     dma_wait_observed: AtomicBool,
 }
@@ -257,6 +261,10 @@ impl VcpuLinks {
         jit: Option<&crate::jit::Jit>,
         flags: &CodePages,
     ) {
+        // Non-empty exactly when `GuestMem` raised the barrier for this writer.
+        if pages.is_empty() {
+            return;
+        }
         for page in pages {
             invalidate_for_device_write(self, jit, flags, page);
         }
@@ -406,7 +414,7 @@ impl Cpu {
             .dma_in_flight
             .load(Ordering::SeqCst)
             != 0;
-        // Read the marker first: if the tick just finished, its invalidation attention was
+        // Read the marker first: if the writer just finished, its invalidation attention was
         // published before it cleared the marker. The reverse order can miss both.
         let mut attention = self.attention();
         if attention & !ATTENTION_DEVICE_MASK == 0 && !dma_in_flight {
@@ -549,15 +557,10 @@ impl Cpu {
         }
     }
 
-    /// A vCPU's MMIO write can drive DMA too. Keep its completion behind the same barrier as
-    /// device-thread ticks; the count allows both writers to overlap without clearing it early.
-    pub(super) fn begin_device_dma(&self) {
-        if let Some(runtime) = &self.threads {
-            runtime.links.dma_in_flight.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    pub(super) fn end_device_dma(&self) {
+    /// Lowers the barrier that a `GuestMem` built with `with_code_write_barrier` raised, once
+    /// the pages it listed have gone through `code_written`. Only for a non-empty
+    /// `code_pages_written`: an empty one never raised it.
+    pub(super) fn lower_code_write_barrier(&self) {
         if let Some(runtime) = &self.threads {
             runtime.links.dma_in_flight.fetch_sub(1, Ordering::SeqCst);
         }
@@ -790,12 +793,12 @@ pub(crate) fn run_threaded(
             poll(false);
         }
         let now = wall.as_ref().map_or(0, WallClock::elapsed_ns);
-        // A device can write code and then publish a used-ring entry in this tick. Keep the
-        // marker set until the JIT and decode invalidations are visible, even though we must
-        // release the device lock before taking the JIT cache lock.
-        links.dma_in_flight.fetch_add(1, Ordering::SeqCst);
+        // A device can write code and then publish a used-ring entry in this tick. The barrier
+        // stays up until the JIT and decode invalidations are visible, even though the device
+        // lock is released before the JIT cache lock is taken.
         let written_code_pages = {
-            let mut mem = GuestMem::new(&mut ram, flags.as_bytes());
+            let mut mem = GuestMem::new(&mut ram, flags.as_bytes())
+                .with_code_write_barrier(Some(&links.dma_in_flight));
             device_handle.lock().tick(now, &mut mem);
             mem.code_pages_written
         };
@@ -942,18 +945,56 @@ mod tests {
 
     #[test]
     fn overlapping_device_writers_keep_the_barrier_until_both_finish() {
+        const CODE_PAGE: usize = 5;
         let mut harness = crate::testkit::Harness::new(&[0xf4]);
         let links = VcpuLinks::new(1);
         harness.cpu.attach_threads(links.clone());
         let flags = harness.cpu.page_has_code.clone();
-        harness.cpu.begin_device_dma();
-        links.dma_in_flight.fetch_add(1, Ordering::SeqCst);
-        links.finish_device_writes(Vec::new(), None, &flags);
+        flags.set(CODE_PAGE, 1);
+        let address = (CODE_PAGE << PAGE_SHIFT) as u64;
+        let mut ram = harness.cpu.ram.clone();
+        let mut write_code = || {
+            let mut mem = GuestMem::new(&mut ram, flags.as_bytes())
+                .with_code_write_barrier(Some(&links.dma_in_flight));
+            assert!(mem.write_raw(address, &[0x90]));
+            assert!(
+                mem.write_raw(address + 1, &[0x90]),
+                "raised once per writer"
+            );
+            mem.code_pages_written
+        };
+        let first = write_code();
+        let second = write_code();
+        assert_eq!(links.dma_in_flight.load(Ordering::SeqCst), 2);
+        links.finish_device_writes(first, None, &flags);
         assert_eq!(links.dma_in_flight.load(Ordering::SeqCst), 1);
         harness.cpu.serialize();
         assert!(harness.cpu.block_exit_requested);
-        harness.cpu.end_device_dma();
+        links.finish_device_writes(second, None, &flags);
         assert_eq!(links.dma_in_flight.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn device_writes_that_miss_code_pages_raise_no_barrier() {
+        let mut harness = crate::testkit::Harness::new(&[0xf4]);
+        let links = VcpuLinks::new(1);
+        harness.cpu.attach_threads(links.clone());
+        let flags = harness.cpu.page_has_code.clone();
+        let mut ram = harness.cpu.ram.clone();
+        let written = {
+            let mut mem = GuestMem::new(&mut ram, flags.as_bytes())
+                .with_code_write_barrier(Some(&links.dma_in_flight));
+            assert!(mem.write_raw(crate::testkit::SCRATCH, &[1, 2, 3, 4]));
+            mem.code_pages_written
+        };
+        assert!(written.is_empty());
+        assert_eq!(links.dma_in_flight.load(Ordering::SeqCst), 0);
+        links.finish_device_writes(written, None, &flags);
+        assert_eq!(links.dma_in_flight.load(Ordering::SeqCst), 0);
+        harness.cpu.block_exit_requested = false;
+        harness.cpu.serialize();
+        assert!(!harness.cpu.block_exit_requested, "no stall without code");
+        assert!(harness.cpu.thread_attention().is_none());
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -979,9 +1020,9 @@ mod tests {
         let flags = harness.cpu.page_has_code.clone();
         let page = (CODE_BASE >> PAGE_SHIFT) as usize;
         let mut ram = harness.cpu.ram.clone();
-        links.dma_in_flight.fetch_add(1, Ordering::SeqCst);
         let written = {
-            let mut mem = GuestMem::new(&mut ram, flags.as_bytes());
+            let mut mem = GuestMem::new(&mut ram, flags.as_bytes())
+                .with_code_write_barrier(Some(&links.dma_in_flight));
             assert!(mem.write_raw(CODE_BASE + 13, &2u32.to_le_bytes()));
             // The used-ring entry becomes visible before the device lock is released.
             assert!(mem.write_raw(SCRATCH, &2u32.to_le_bytes()));

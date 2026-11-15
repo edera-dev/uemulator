@@ -984,17 +984,21 @@ impl Cpu {
         if let Some(poll) = &self.poll {
             poll(false);
         }
-        self.begin_device_dma();
         let written_code_pages = {
-            let mut mem = GuestMem::new(&mut self.ram, self.page_has_code.as_bytes());
+            let barrier = self.threads.as_ref().map(|t| &t.links.dma_in_flight);
+            let mut mem = GuestMem::new(&mut self.ram, self.page_has_code.as_bytes())
+                .with_code_write_barrier(barrier);
             self.dev.lock().tick(now, &mut mem);
             mem.code_pages_written
         };
         // DMA by devices bypasses the store path, so tell the code caches about it.
+        let wrote_code = !written_code_pages.is_empty();
         for page in written_code_pages {
             self.code_written(page);
         }
-        self.end_device_dma();
+        if wrote_code {
+            self.lower_code_write_barrier();
+        }
     }
 
     fn service_events(&mut self) -> Option<ExitReason> {

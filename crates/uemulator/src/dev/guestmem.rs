@@ -3,7 +3,7 @@ use super::iommu::{Access, Iommu, PhysRead, PhysWrite};
 use crate::prelude::*;
 use crate::ram::{RamSpan, is_ram_range};
 use core::cell::RefCell;
-use core::sync::atomic::{Ordering, fence};
+use core::sync::atomic::{AtomicUsize, Ordering, fence};
 
 /// Guest page size in bytes is 1 << PAGE_SHIFT; must match `Cpu::page_has_code` indexing.
 const PAGE_SHIFT: u32 = 12;
@@ -26,6 +26,10 @@ pub(crate) struct GuestMem<'a> {
     code: &'a [u8],
     /// Page numbers written while flagged in `code`, each listed once.
     pub code_pages_written: Vec<usize>,
+    /// `VcpuLinks::dma_in_flight` of a threaded machine: raised once, at the first write that
+    /// lands in `code_pages_written`, so it is up before anything the device writes after it.
+    /// The caller lowers it after invalidating those pages; a stuck count stalls every vCPU.
+    code_write_barrier: Option<&'a AtomicUsize>,
     /// Set only inside `with_dma`. A `RefCell` because `read` takes `&self` but a translation
     /// fills the IOTLB and queues fault events.
     dma: Option<DmaPort>,
@@ -75,8 +79,15 @@ impl<'a> GuestMem<'a> {
             ram: ram.into(),
             code,
             code_pages_written: Vec::new(),
+            code_write_barrier: None,
             dma: None,
         }
+    }
+
+    /// See `code_write_barrier`. `None` (one vCPU, or time-sharing) leaves it off.
+    pub fn with_code_write_barrier(mut self, barrier: Option<&'a AtomicUsize>) -> Self {
+        self.code_write_barrier = barrier;
+        self
     }
 
     /// Runs `f` with every access of this `GuestMem` translated by `iommu` as DMA from
@@ -234,6 +245,13 @@ impl<'a> GuestMem<'a> {
             if self.code.get(page).is_some_and(|&flag| flag != 0)
                 && !self.code_pages_written.contains(&page)
             {
+                // SeqCst read-modify-write: no later store (the used-ring entry) can become
+                // visible before it.
+                if self.code_pages_written.is_empty()
+                    && let Some(barrier) = self.code_write_barrier
+                {
+                    barrier.fetch_add(1, Ordering::SeqCst);
+                }
                 self.code_pages_written.push(page);
             }
         }
