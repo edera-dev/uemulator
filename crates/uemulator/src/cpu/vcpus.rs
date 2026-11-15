@@ -128,6 +128,11 @@ pub(crate) struct VcpuLinks {
     /// The device thread, for work a vCPU just handed the devices.
     device_waker: Waker,
     device_sleeping: AtomicBool,
+    /// Counts device ticks and vCPU MMIO writes that could publish DMA completion. Each writer
+    /// leaves only after its code-page invalidations, so a serializing vCPU cannot pass that gap.
+    dma_in_flight: AtomicUsize,
+    #[cfg(test)]
+    dma_wait_observed: AtomicBool,
 }
 
 impl VcpuLinks {
@@ -154,6 +159,9 @@ impl VcpuLinks {
             finished: AtomicUsize::new(0),
             device_waker: Waker::default(),
             device_sleeping: AtomicBool::new(false),
+            dma_in_flight: AtomicUsize::new(0),
+            #[cfg(test)]
+            dma_wait_observed: AtomicBool::new(false),
         })
     }
 
@@ -241,6 +249,18 @@ impl VcpuLinks {
                     .fetch_or(ATTENTION_INVALIDATE, Ordering::SeqCst);
             }
         }
+    }
+
+    fn finish_device_writes(
+        &self,
+        pages: Vec<usize>,
+        jit: Option<&crate::jit::Jit>,
+        flags: &CodePages,
+    ) {
+        for page in pages {
+            invalidate_for_device_write(self, jit, flags, page);
+        }
+        self.dma_in_flight.fetch_sub(1, Ordering::SeqCst);
     }
 
     /// Every vCPU is halted and none could be woken by an interrupt: the guest is dead, which is
@@ -331,7 +351,7 @@ impl Cpu {
     /// The `ATTENTION_*` bits set for this vCPU right now.
     pub(super) fn attention(&self) -> u32 {
         match &self.threads {
-            Some(runtime) => unsafe { (*runtime.attention).load(Ordering::Acquire) },
+            Some(runtime) => unsafe { (*runtime.attention).load(Ordering::SeqCst) },
             None => 0,
         }
     }
@@ -378,17 +398,40 @@ impl Cpu {
     /// The per-block-boundary work of a threaded vCPU: the machine ending, an exclusive section
     /// to park for, stale translations to drop. `Some` ends this vCPU's run.
     pub(super) fn thread_attention(&mut self) -> Option<ExitReason> {
-        let attention = self.attention();
-        if attention & !ATTENTION_DEVICE_MASK == 0 {
+        let dma_in_flight = self
+            .threads
+            .as_ref()
+            .expect("a threaded vCPU")
+            .links
+            .dma_in_flight
+            .load(Ordering::SeqCst)
+            != 0;
+        // Read the marker first: if the tick just finished, its invalidation attention was
+        // published before it cleared the marker. The reverse order can miss both.
+        let mut attention = self.attention();
+        if attention & !ATTENTION_DEVICE_MASK == 0 && !dma_in_flight {
             return None;
         }
         let links = self.links();
-        if attention & ATTENTION_EXIT != 0 {
-            return Some(links.exit_reason());
+        // Device DMA can publish a completion before the device thread releases its lock and
+        // invalidates code pages. Still honor exclusive requests while waiting: their owner
+        // cannot finish until every running vCPU parks.
+        loop {
+            if attention & ATTENTION_EXIT != 0 {
+                return Some(links.exit_reason());
+            }
+            if attention & ATTENTION_EXCLUSIVE != 0 {
+                self.park_for_exclusive(&links);
+            }
+            if links.dma_in_flight.load(Ordering::SeqCst) == 0 {
+                break;
+            }
+            #[cfg(test)]
+            links.dma_wait_observed.store(true, Ordering::SeqCst);
+            crate::sync::yield_now();
+            attention = self.attention();
         }
-        if attention & ATTENTION_EXCLUSIVE != 0 {
-            self.park_for_exclusive(&links);
-        }
+        attention = self.attention();
         if attention & ATTENTION_INVALIDATE != 0 {
             self.drain_invalidations(&links);
         }
@@ -497,8 +540,26 @@ impl Cpu {
     /// be what runs next (SDM vol. 3, 8.1.3, cross-modifying code). Instructions already
     /// translated are only dropped at a block boundary, so ask the running block to end there.
     pub(super) fn serialize(&mut self) {
-        if self.attention() & ATTENTION_INVALIDATE != 0 {
+        let dma_in_flight = self
+            .threads
+            .as_ref()
+            .is_some_and(|runtime| runtime.links.dma_in_flight.load(Ordering::SeqCst) != 0);
+        if dma_in_flight || self.attention() & ATTENTION_INVALIDATE != 0 {
             self.block_exit_requested = true;
+        }
+    }
+
+    /// A vCPU's MMIO write can drive DMA too. Keep its completion behind the same barrier as
+    /// device-thread ticks; the count allows both writers to overlap without clearing it early.
+    pub(super) fn begin_device_dma(&self) {
+        if let Some(runtime) = &self.threads {
+            runtime.links.dma_in_flight.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    pub(super) fn end_device_dma(&self) {
+        if let Some(runtime) = &self.threads {
+            runtime.links.dma_in_flight.fetch_sub(1, Ordering::SeqCst);
         }
     }
 
@@ -729,14 +790,16 @@ pub(crate) fn run_threaded(
             poll(false);
         }
         let now = wall.as_ref().map_or(0, WallClock::elapsed_ns);
+        // A device can write code and then publish a used-ring entry in this tick. Keep the
+        // marker set until the JIT and decode invalidations are visible, even though we must
+        // release the device lock before taking the JIT cache lock.
+        links.dma_in_flight.fetch_add(1, Ordering::SeqCst);
         let written_code_pages = {
             let mut mem = GuestMem::new(&mut ram, flags.as_bytes());
             device_handle.lock().tick(now, &mut mem);
             mem.code_pages_written
         };
-        for page in written_code_pages {
-            invalidate_for_device_write(&links, device_jit.as_deref(), &flags, page);
-        }
+        links.finish_device_writes(written_code_pages, device_jit.as_deref(), &flags);
         let (reset, shutdown, deadline) = {
             let devices = device_handle.lock();
             (
@@ -875,6 +938,110 @@ mod tests {
         let links = VcpuLinks::new(1);
         invalidate_for_device_write(&links, None, &harness.cpu.page_has_code, page);
         assert_eq!(harness.cpu.page_has_code.get(page), 0);
+    }
+
+    #[test]
+    fn overlapping_device_writers_keep_the_barrier_until_both_finish() {
+        let mut harness = crate::testkit::Harness::new(&[0xf4]);
+        let links = VcpuLinks::new(1);
+        harness.cpu.attach_threads(links.clone());
+        let flags = harness.cpu.page_has_code.clone();
+        harness.cpu.begin_device_dma();
+        links.dma_in_flight.fetch_add(1, Ordering::SeqCst);
+        links.finish_device_writes(Vec::new(), None, &flags);
+        assert_eq!(links.dma_in_flight.load(Ordering::SeqCst), 1);
+        harness.cpu.serialize();
+        assert!(harness.cpu.block_exit_requested);
+        harness.cpu.end_device_dma();
+        assert_eq!(links.dma_in_flight.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn dma_completion_makes_cpuid_exit_before_its_code_invalidation() {
+        use crate::testkit::{CODE_BASE, Harness, RAX, SCRATCH, Stop};
+
+        // mov r12d,[SCRATCH]; xor eax,eax; cpuid; mov eax,1; hlt
+        let code = [
+            0x44, 0x8b, 0x24, 0x25, 0x00, 0x00, 0x40, 0x00, 0x31, 0xc0, 0x0f, 0xa2, 0xb8, 1, 0, 0,
+            0, 0xf4,
+        ];
+        let mut harness = Harness::new(&code);
+        if !harness.enable_jit() {
+            return;
+        }
+        let links = VcpuLinks::new(1);
+        harness.cpu.attach_threads(links.clone());
+        assert_eq!(harness.run(100), Stop::Halted);
+        assert_eq!(harness.cpu.gpr[RAX], 1);
+
+        let device_jit = harness.cpu.jit.as_ref().unwrap().sibling();
+        let flags = harness.cpu.page_has_code.clone();
+        let page = (CODE_BASE >> PAGE_SHIFT) as usize;
+        let mut ram = harness.cpu.ram.clone();
+        links.dma_in_flight.fetch_add(1, Ordering::SeqCst);
+        let written = {
+            let mut mem = GuestMem::new(&mut ram, flags.as_bytes());
+            assert!(mem.write_raw(CODE_BASE + 13, &2u32.to_le_bytes()));
+            // The used-ring entry becomes visible before the device lock is released.
+            assert!(mem.write_raw(SCRATCH, &2u32.to_le_bytes()));
+            mem.code_pages_written
+        };
+        assert_eq!(written, [page]);
+        assert_eq!(harness.cpu.ram[SCRATCH as usize], 2);
+        assert_eq!(links.links[0].attention.load(Ordering::SeqCst), 0);
+        harness.cpu.block_exit_requested = false;
+        harness.cpu.serialize();
+        assert!(
+            harness.cpu.block_exit_requested,
+            "CPUID after a DMA completion must leave the stale block"
+        );
+
+        harness.cpu.block_exit_requested = false;
+        std::thread::scope(|scope| {
+            let worker_links = links.clone();
+            let worker = scope.spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while !worker_links.dma_wait_observed.load(Ordering::SeqCst)
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::yield_now();
+                }
+                let waited = worker_links.dma_wait_observed.load(Ordering::SeqCst);
+                if waited {
+                    // An exclusive owner must still be able to park this vCPU during the wait.
+                    worker_links
+                        .exclusive_requested
+                        .store(true, Ordering::SeqCst);
+                    worker_links.links[0]
+                        .attention
+                        .fetch_or(ATTENTION_EXCLUSIVE, Ordering::SeqCst);
+                    while worker_links.running.load(Ordering::SeqCst) != 0
+                        && std::time::Instant::now() < deadline
+                    {
+                        std::thread::yield_now();
+                    }
+                }
+                let parked = waited && worker_links.running.load(Ordering::SeqCst) == 0;
+                worker_links
+                    .exclusive_requested
+                    .store(false, Ordering::SeqCst);
+                worker_links.finish_device_writes(written, Some(&device_jit), &flags);
+                (waited, parked)
+            });
+            harness.cpu.halted = false;
+            harness.cpu.rip = CODE_BASE;
+            assert!(harness.cpu.thread_attention().is_none());
+            assert_eq!(harness.run(100), Stop::Halted);
+            let (waited, parked) = worker.join().unwrap();
+            assert!(waited, "vCPU skipped the in-flight DMA barrier");
+            assert!(
+                parked,
+                "an exclusive request could not park the waiting vCPU"
+            );
+            assert_eq!(harness.cpu.gpr[12], 2);
+            assert_eq!(harness.cpu.gpr[RAX], 2);
+        });
     }
 
     /// The flag is cleared under the cache's lock by whoever invalidates the page. Telling the

@@ -984,6 +984,7 @@ impl Cpu {
         if let Some(poll) = &self.poll {
             poll(false);
         }
+        self.begin_device_dma();
         let written_code_pages = {
             let mut mem = GuestMem::new(&mut self.ram, self.page_has_code.as_bytes());
             self.dev.lock().tick(now, &mut mem);
@@ -993,6 +994,7 @@ impl Cpu {
         for page in written_code_pages {
             self.code_written(page);
         }
+        self.end_device_dma();
     }
 
     fn service_events(&mut self) -> Option<ExitReason> {

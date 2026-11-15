@@ -771,6 +771,7 @@ impl Cpu {
             self.ram[start..start + len].copy_from_slice(&val.to_le_bytes()[..len]);
         } else {
             let now = self.now_ns();
+            self.begin_device_dma();
             self.dev.lock().set_time(now);
             let written_code_pages = {
                 let mut mem = GuestMem::new(&mut self.ram, self.page_has_code.as_bytes());
@@ -786,6 +787,7 @@ impl Cpu {
             for page in written_code_pages {
                 self.code_written(page);
             }
+            self.end_device_dma();
         }
     }
 
