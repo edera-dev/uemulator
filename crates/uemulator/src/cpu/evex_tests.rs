@@ -631,7 +631,8 @@ mod xsave_state {
         use crate::cpu::xsave::enabled_area_size;
         assert_eq!(enabled_area_size(XCR0_X87 | XCR0_SSE), 576);
         assert_eq!(enabled_area_size(XCR0_X87 | XCR0_SSE | XCR0_AVX), 832);
-        assert_eq!(enabled_area_size(XCR0_SUPPORTED), 2688);
+        // PKRU's 8 bytes end the area
+        assert_eq!(enabled_area_size(XCR0_SUPPORTED), 2696);
     }
 
     #[test]

@@ -969,6 +969,14 @@ impl Cpu {
         }
     }
 
+    /// Makes whatever TLB is parked, the host's or a guest's, unusable: for state both sides
+    /// share that just changed (PKRU, which VMRUN leaves alone).
+    pub(super) fn forget_parked_tlb(&mut self) {
+        if let Some(parked) = self.svm.parked_tlb.as_deref_mut() {
+            parked.owner = TlbOwner::Nobody;
+        }
+    }
+
     /// Empties `NestedLeafCache`, together with the guest TLB it belongs to.
     fn forget_nested_leaves(&mut self) {
         if let Some(cache) = self.svm.nested_leaves.as_deref_mut() {
@@ -1918,7 +1926,11 @@ const NPT_DIRTY: u64 = 1 << 6;
 const NPT_PAGE_SIZE: u64 = 1 << 7;
 const NPT_NO_EXECUTE: u64 = 1 << 63;
 const NPT_ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
+/// The nested tables have the host's depth: 4 levels, or 5 when the host ran VMRUN with
+/// CR4.LA57 (APM 15.25.5; KVM sizes its NPT by its own LA57). Only the PDPT and PD take PS.
 const NPT_LEVELS: u32 = 4;
+const NPT_LEVELS_LA57: u32 = 5;
+const NPT_PDPT_LEVEL: u32 = 2;
 const NPT_INDEX_BITS: u32 = 9;
 const NPT_PAGE_SHIFT: u32 = 12;
 
@@ -1998,6 +2010,16 @@ impl Cpu {
             .guest
             .as_ref()
             .is_some_and(|guest| guest.host.efer & EFER_NXE != 0);
+        let levels = if self
+            .svm
+            .guest
+            .as_ref()
+            .is_some_and(|guest| guest.host.cr4 & super::sys::CR4_LA57 != 0)
+        {
+            NPT_LEVELS_LA57
+        } else {
+            NPT_LEVELS
+        };
         let fault = |cpu: &mut Cpu, present: bool, reserved: bool| {
             if cpu.svm.fetching_instruction_bytes {
                 return Err(Exception::general_protection(0));
@@ -2017,7 +2039,7 @@ impl Cpu {
         let mut table = root & NPT_ADDRESS_MASK;
         let mut writable = true;
         let mut no_execute = false;
-        for level in (0..NPT_LEVELS).rev() {
+        for level in (0..levels).rev() {
             let shift = NPT_PAGE_SHIFT + NPT_INDEX_BITS * level;
             let index = (guest_physical >> shift) & ((1 << NPT_INDEX_BITS) - 1);
             let entry_address = table + index * 8;
@@ -2028,10 +2050,10 @@ impl Cpu {
             if entry & NPT_PRESENT == 0 {
                 return fault(self, false, false);
             }
-            let leaf = level == 0 || (entry & NPT_PAGE_SIZE != 0 && level <= 2);
+            let leaf = level == 0 || (entry & NPT_PAGE_SIZE != 0 && level <= NPT_PDPT_LEVEL);
             let alignment_mask = (1u64 << shift) - 1;
             if (!nx_enabled && entry & NPT_NO_EXECUTE != 0)
-                || (level == NPT_LEVELS - 1 && entry & NPT_PAGE_SIZE != 0)
+                || (level > NPT_PDPT_LEVEL && entry & NPT_PAGE_SIZE != 0)
                 || (leaf && level > 0 && entry & alignment_mask & NPT_ADDRESS_MASK != 0)
             {
                 return fault(self, true, true);
@@ -2595,7 +2617,7 @@ mod tests {
             put(h, SAVE_CR0, 8, (cr0 | CR0_NW_BIT) & !CR0_CD_BIT);
         });
         consistency_failure(|h| put(h, SAVE_DR7, 8, 1 << 32));
-        consistency_failure(|h| put(h, SAVE_CR3, 8, 1 << 50));
+        consistency_failure(|h| put(h, SAVE_CR3, 8, 1 << 52));
         consistency_failure(|h| {
             let cr4 = h.cpu.cr4;
             put(h, SAVE_CR4, 8, cr4 | (1 << 63));
@@ -2880,7 +2902,7 @@ mod tests {
             crate::testkit::Stop::Fault { vector: 6, .. }
         ));
         // #GP for a misaligned address, or one above the physical address space
-        for address in [VMCB + 8, 1 << 45] {
+        for address in [VMCB + 8, 1 << 52] {
             let mut h = rig(&[0xf4]);
             h.cpu.gpr[RAX] = address;
             assert!(
@@ -3551,6 +3573,34 @@ mod tests {
         // mov rax, [0x800000]; cpuid : the guest's identity-mapped page 0x800000 is guest-physical
         // 0x800000, which the nested tables send to 0x900000.
         let mut h = nested_rig(&[0x48, 0xa1, 0, 0, 0x80, 0, 0, 0, 0, 0, 0x0f, 0xa2]);
+        h.write(NESTED_REMAPPED_HPA, &0xfeed_face_cafe_beefu64.to_le_bytes());
+        h.write(NESTED_REMAPPED_GPA, &0x1111_1111_1111_1111u64.to_le_bytes());
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_CPUID);
+        assert_eq!(get(&h, SAVE_RAX, 8), 0xfeed_face_cafe_beef);
+    }
+
+    /// A host on 5-level paging (its PML5's first entry is the old PML4) gets 5-level nested
+    /// tables: the same identity tables under a PML5. The guest inherits LA57 from the host's
+    /// state and walks five levels of its own, each table through the nested ones.
+    #[test]
+    fn nested_tables_have_five_levels_when_the_host_runs_with_la57() {
+        const NESTED_PML5: u64 = NPT + 0x4000;
+        const HOST_PML5: u64 = NPT + 0x5000;
+        const PRESENT_WRITABLE_USER: u64 = 7;
+        let read_then_cpuid = [0x48, 0xa1, 0, 0, 0x80, 0, 0, 0, 0, 0, 0x0f, 0xa2];
+        let (mut h, ()) = rig_prepared(&read_then_cpuid, |h| {
+            let pml4 = h.cpu.cr3 & NPT_ADDRESS_MASK;
+            h.write(HOST_PML5, &(pml4 | PRESENT_WRITABLE_USER).to_le_bytes());
+            h.cpu.cr3 = HOST_PML5;
+            h.cpu.cr4 |= super::super::sys::CR4_LA57;
+            h.cpu.flush_tlb();
+        });
+        build_nested_tables(&mut h);
+        h.write(NESTED_PML5, &(NPT | PRESENT_WRITABLE_USER).to_le_bytes());
+        put(&mut h, VMCB_NP_ENABLE, 8, NP_ENABLE);
+        put(&mut h, VMCB_N_CR3, 8, NESTED_PML5);
+        put(&mut h, SAVE_G_PAT, 8, 0x0007_0406_0007_0406);
         h.write(NESTED_REMAPPED_HPA, &0xfeed_face_cafe_beefu64.to_le_bytes());
         h.write(NESTED_REMAPPED_GPA, &0x1111_1111_1111_1111u64.to_le_bytes());
         run(&mut h);

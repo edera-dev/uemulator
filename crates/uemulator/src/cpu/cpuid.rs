@@ -13,7 +13,7 @@
 //!
 //! Deliberate departures from the hardware, each so a guest does not run code the emulator would
 //! only slow down:
-//! - 40 physical and 48 virtual address bits, not 52 and 57.
+//! - TSA_SQ_NO and TSA_L1_NO in leaf 0x8000_0021 ECX, true of a CPU that never speculates.
 //!
 //! The speculation-control interface is Turin's, in the AMD spelling only (leaf 0x8000_0008 EBX,
 //! 0x8000_0021 EAX): automatic IBRS, so Spectre v2 costs one EFER write per CPU at boot, and no
@@ -26,7 +26,7 @@
 
 use super::model_msr::CpuidMask;
 use super::sys::{
-    CR4_OSXSAVE, PHYSICAL_ADDRESS_BITS, RAX, RBX, RCX, RDPRU_MAX_REGISTER, RDX,
+    CR4_OSXSAVE, CR4_PKE, PHYSICAL_ADDRESS_BITS, RAX, RBX, RCX, RDPRU_MAX_REGISTER, RDX,
     VIRTUAL_ADDRESS_BITS,
 };
 use super::{Cpu, mca, rdt, xsave};
@@ -148,8 +148,8 @@ const FEATURE_PGE: u32 = 1 << 13;
 const FEATURE_MCA: u32 = 1 << 14;
 const FEATURE_CMOV: u32 = 1 << 15;
 const FEATURE_PAT: u32 = 1 << 16;
-/// PSE-36 comes with the 4 MiB PDE address bits 39:32 (`mem.rs`), which match the 40 physical
-/// address bits of leaf 0x8000_0008.
+/// PSE-36 comes with the 4 MiB PDE address bits 39:32 (`mem.rs`): 32-bit paging reaches 40 bits
+/// of the 52 that leaf 0x8000_0008 reports, as on AMD hardware.
 const FEATURE_PSE36: u32 = 1 << 17;
 const FEATURE_CLFSH: u32 = 1 << 19;
 /// MMX is advertised because glibc's x86-64 baseline ISA check (CMOV, CX8, FPU, FXSR, MMX, SSE,
@@ -315,6 +315,9 @@ const STRUCTURED_EBX: u32 = STRUCTURED_FEATURE_FSGSBASE
 // Leaf 7 subleaf 0 ECX. GFNI, VAES and VPCLMULQDQ also cover the legacy and VEX encodings.
 const STRUCTURED_ECX_AVX512_VBMI: u32 = 1 << 1;
 const STRUCTURED_ECX_UMIP: u32 = 1 << 2;
+/// Protection keys for user pages and rdpkru/wrpkru (`pku.rs`); OSPKE (bit 4) follows CR4.PKE.
+const STRUCTURED_ECX_PKU: u32 = 1 << 3;
+const STRUCTURED_ECX_OSPKE: u32 = 1 << 4;
 const STRUCTURED_ECX_AVX512_VBMI2: u32 = 1 << 6;
 const STRUCTURED_ECX_GFNI: u32 = 1 << 8;
 const STRUCTURED_ECX_VAES: u32 = 1 << 9;
@@ -322,6 +325,8 @@ const STRUCTURED_ECX_VPCLMULQDQ: u32 = 1 << 10;
 const STRUCTURED_ECX_AVX512_VNNI: u32 = 1 << 11;
 const STRUCTURED_ECX_AVX512_BITALG: u32 = 1 << 12;
 const STRUCTURED_ECX_AVX512_VPOPCNTDQ: u32 = 1 << 14;
+/// 5-level paging and 57-bit linear addresses (CR4.LA57). Linux turns it on by itself.
+const STRUCTURED_ECX_LA57: u32 = 1 << 16;
 /// rdpid: IA32_TSC_AUX into a register.
 const STRUCTURED_ECX_RDPID: u32 = 1 << 22;
 /// movdiri and movdir64b (Zen 5): direct stores of a register and of 64 bytes (`sse_ext.rs`).
@@ -332,6 +337,7 @@ const STRUCTURED_ECX_MOVDIR64B: u32 = 1 << 28;
 const STRUCTURED_ECX_BUS_LOCK_DETECT: u32 = 1 << 24;
 const STRUCTURED_ECX: u32 = STRUCTURED_ECX_AVX512_VBMI
     | STRUCTURED_ECX_UMIP
+    | STRUCTURED_ECX_PKU
     | STRUCTURED_ECX_AVX512_VBMI2
     | STRUCTURED_ECX_GFNI
     | STRUCTURED_ECX_VAES
@@ -339,6 +345,7 @@ const STRUCTURED_ECX: u32 = STRUCTURED_ECX_AVX512_VBMI
     | STRUCTURED_ECX_AVX512_VNNI
     | STRUCTURED_ECX_AVX512_BITALG
     | STRUCTURED_ECX_AVX512_VPOPCNTDQ
+    | STRUCTURED_ECX_LA57
     | STRUCTURED_ECX_RDPID
     | STRUCTURED_ECX_MOVDIRI
     | STRUCTURED_ECX_MOVDIR64B
@@ -877,7 +884,12 @@ impl Cpu {
                 0 => (
                     STRUCTURED_MAX_SUBLEAF,
                     STRUCTURED_EBX,
-                    STRUCTURED_ECX,
+                    STRUCTURED_ECX
+                        | if self.cr4 & CR4_PKE != 0 {
+                            STRUCTURED_ECX_OSPKE
+                        } else {
+                            0
+                        },
                     STRUCTURED_EDX,
                 ),
                 1 => (
@@ -930,7 +942,8 @@ impl Cpu {
                     xsave::XSS_SUPPORTED as u32,
                     (xsave::XSS_SUPPORTED >> 32) as u32,
                 ),
-                // Components 2 (AVX) and 5-7 (AVX-512): size and offset in the standard format
+                // Components 2 (AVX), 5-7 (AVX-512) and 9 (PKRU): size and offset in the
+                // standard format
                 _ => match xsave::COMPONENTS.iter().find(|part| part.index == subleaf) {
                     Some(part) => (part.size as u32, part.offset as u32, 0, 0),
                     None => (0, 0, 0, 0),

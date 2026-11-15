@@ -56,9 +56,11 @@ const GIB_SHIFT: u32 = 30;
 const IDENTITY_MAP_2M_GIB: u64 = 4;
 /// Everything above 4 GiB is mapped with 1 GiB pages straight from the PDPT entries, so that any
 /// amount of RAM needs no more page-table pages than the 512 GiB of one PDPT, plus a second PDPT
-/// for the last half of the 40-bit physical address space. (The CPU advertises pdpe1gb.)
+/// for the rest of the first TiB, which is as far as RAM goes (`MAX_MEMORY_MIB`). (The CPU
+/// advertises pdpe1gb.)
 const PDPT_GIB: u64 = ENTRIES_PER_TABLE;
-/// Physical address space the CPU decodes (`PHYSICAL_ADDRESS_BITS` = 40), in GiB.
+/// Physical address space the identity map covers, in GiB: 1 TiB, a 40-bit slice of the 52 bits
+/// the CPU decodes, and all a machine's RAM can reach.
 const PHYSICAL_SPACE_GIB: u64 = 1 << 10;
 /// PML4, the first PDPT, four page directories, then the second PDPT, back to back from `PML4`.
 const PAGE_TABLE_PAGES: usize = 2 + IDENTITY_MAP_2M_GIB as usize + 1;

@@ -1,7 +1,8 @@
 use super::decode::{self, DecodeErr, Insn};
 use super::exception::{Exception, VECTOR_GENERAL_PROTECTION, VECTOR_PAGE_FAULT};
 use super::flags::*;
-use super::sys::{CR4_PSE, CR4_SMAP, CR4_SMEP};
+use super::pku::{PKRU_ACCESS_DISABLE, PKRU_WRITE_DISABLE};
+use super::sys::{CR4_LA57, CR4_PKE, CR4_PSE, CR4_SMAP, CR4_SMEP, PHYSICAL_ADDRESS_BITS};
 use super::*;
 use crate::dev::guestmem::GuestMem;
 
@@ -21,7 +22,7 @@ pub(crate) enum PagingMode {
     Legacy,
     /// PAE paging: three levels of 8-byte entries, 2 MiB pages, NX with EFER.NXE.
     Pae,
-    /// IA-32e paging (4 levels).
+    /// IA-32e paging: 4 levels, or 5 with CR4.LA57.
     Long,
 }
 
@@ -33,25 +34,34 @@ const PTE_DIRTY: u64 = 1 << 6;
 /// Makes a PDPT entry a 1 GiB leaf or a PD entry a 2 MiB leaf.
 const PTE_PAGE_SIZE: u64 = 1 << 7;
 const PTE_NO_EXECUTE: u64 = 1 << 63;
+/// IA-32e leaf bits 62:59: the protection key. Ignored without CR4.PKE, and never reserved.
+const PTE_PROTECTION_KEY_SHIFT: u32 = 59;
+const PTE_PROTECTION_KEY_MASK: u64 = 0xf;
 /// In a 2 MiB or 1 GiB leaf the PAT bit moves here (bit 7 is page size); the address bits
 /// between it and the leaf's alignment are reserved.
 const PTE_LARGE_PAGE_PAT: u64 = 1 << 12;
-/// Physical address bits 40-51, reserved because CPUID 0x80000008 advertises 40 address bits.
-const PTE_RESERVED_MASK: u64 = 0x000f_ff00_0000_0000;
 const PTE_ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
+// Address bits at or above MAXPHYADDR (CPUID 0x8000_0008) are reserved in every entry. With
+// Turin's 52 bits there are none, so the walks have no such check; a narrower width must bring
+// it back (in `walk_wide` and the PDPTE mask), which this assert is here to force.
+const _: () = assert!(PHYSICAL_ADDRESS_BITS == 52);
 const PTE_BYTES: u64 = 8;
 const LEVEL_INDEX_BITS: u32 = 9;
 const LEVEL_INDEX_MASK: u64 = (1 << LEVEL_INDEX_BITS) - 1;
-/// The PML4 is level 3 and the PT is level 0 in long mode. PAE paging starts one level lower, at
-/// the PDPT (level 2), whose four entries come from `Cpu::pdpte` instead of memory.
+/// The PML4 is level 3 and the PT is level 0 in long mode; with CR4.LA57 the walk starts one
+/// level higher, at the PML5. PAE paging starts one level lower, at the PDPT (level 2), whose
+/// four entries come from `Cpu::pdpte` instead of memory.
 const TOP_LEVEL: u32 = 3;
+const LA57_TOP_LEVEL: u32 = 4;
+/// The highest level whose entries may be 1 GiB leaves (the PDPT); PS is reserved above it.
+const PDPT_LEVEL: u32 = 2;
 const PAE_TOP_LEVEL: u32 = 2;
 /// CR3 bits 31:5 of a PAE CR3: the 32-byte-aligned PDPT address.
 const PAE_PDPT_ADDRESS_MASK: u64 = 0xffff_ffe0;
 const PDPT_ENTRIES: usize = 4;
 /// PDPTE bits that must be zero when the entry is present: 2:1 and 8:5 (SDM Vol. 3A 4.4.1) and
-/// bit 63 and the bits above the physical address width.
-const PDPTE_RESERVED_MASK: u64 = 0x1e6 | (1 << 63) | PTE_RESERVED_MASK;
+/// bit 63 (the physical address width reserves nothing).
+const PDPTE_RESERVED_MASK: u64 = 0x1e6 | (1 << 63);
 /// 32-bit paging: 4-byte entries, 10 index bits per level, a 4 MiB leaf at the PDE.
 const LEGACY_PTE_BYTES: u64 = 4;
 const LEGACY_INDEX_BITS: u32 = 10;
@@ -67,8 +77,6 @@ const LEGACY_LARGE_ADDRESS_HIGH_POSITION: u32 = 32;
 const LEGACY_LARGE_RESERVED_BIT: u64 = 1 << 21;
 /// Linear addresses are 32 bits wide outside long mode.
 const LINEAR_32BIT_MASK: u64 = 0xffff_ffff;
-/// Bit 47 and everything above must be equal (48-bit linear addresses, no LA57).
-const CANONICAL_SIGN_BIT: u32 = 47;
 const MAX_INSN_LEN: usize = 15;
 
 /// Bits of the #PF error code.
@@ -77,6 +85,8 @@ const PF_WRITE: u32 = 1 << 1;
 const PF_USER: u32 = 1 << 2;
 const PF_RESERVED: u32 = 1 << 3;
 const PF_INSTRUCTION_FETCH: u32 = 1 << 4;
+/// PKRU refused the access; set alongside any other reason the access was refused.
+const PF_PROTECTION_KEY: u32 = 1 << 5;
 
 /// `log_once` key bases for unmapped physical accesses; the page number (at most 40 bits) is
 /// added to them. They sit in the top bits so no page number can reach another namespace, and
@@ -285,8 +295,61 @@ impl Cpu {
             || (access == AccessKind::Exec && no_execute && nxe)
     }
 
-    fn leaf_tlb_flags(&self, writable: bool, user_allowed: bool, no_execute: bool, pte: u64) -> u8 {
-        let mut tlb_flags = 0;
+    /// Whether PKRU refuses this access (APM 5.6.7, SDM 4.6.2): only data accesses to a page
+    /// that is user-accessible at every level, under IA-32e paging with CR4.PKE, at any CPL.
+    /// Access disable refuses them all; write disable refuses user stores, and supervisor
+    /// stores only with CR0.WP.
+    fn protection_key_denies(
+        &self,
+        access: AccessKind,
+        user: bool,
+        user_allowed: bool,
+        protection_key: u8,
+    ) -> bool {
+        if self.cr4 & CR4_PKE == 0
+            || !user_allowed
+            || access == AccessKind::Exec
+            || self.paging_mode() != PagingMode::Long
+        {
+            return false;
+        }
+        let rights = self.protection_key_rights(protection_key);
+        rights & PKRU_ACCESS_DISABLE != 0
+            || (access == AccessKind::Write
+                && rights & PKRU_WRITE_DISABLE != 0
+                && (user || self.cr0 & CR0_WP != 0))
+    }
+
+    /// The #PF for a leaf that refuses the access, with the PK bit when PKRU is (one of) the
+    /// reasons.
+    fn leaf_fault(
+        &mut self,
+        linear: u64,
+        access: AccessKind,
+        user: bool,
+        protection_key_denied: bool,
+    ) -> Exception {
+        let mut fault = self.page_fault(linear, access, user, true, false);
+        if protection_key_denied
+            && let Exception::Fault {
+                error_code: Some(code),
+                ..
+            } = &mut fault
+        {
+            *code |= PF_PROTECTION_KEY;
+        }
+        fault
+    }
+
+    fn leaf_tlb_flags(
+        &self,
+        writable: bool,
+        user_allowed: bool,
+        no_execute: bool,
+        pte: u64,
+        protection_key: u8,
+    ) -> u8 {
+        let mut tlb_flags = protection_key << TLB_FLAG_PROTECTION_KEY_SHIFT;
         if writable {
             tlb_flags |= TLB_FLAG_WRITABLE;
         }
@@ -345,12 +408,13 @@ impl Cpu {
                 cached.user_allowed,
                 cached.no_execute,
             )
+            || self.protection_key_denies(access, user, cached.user_allowed, cached.protection_key)
         {
             return None;
         }
         let offset_mask = (1u64 << cached.shift) - 1;
         let page = cached.physical_base | (linear & offset_mask & !PAGE_OFFSET_MASK);
-        let mut flags = 0;
+        let mut flags = cached.protection_key << TLB_FLAG_PROTECTION_KEY_SHIFT;
         if cached.writable {
             flags |= TLB_FLAG_WRITABLE;
         }
@@ -379,6 +443,7 @@ impl Cpu {
         user_allowed: bool,
         no_execute: bool,
         dirty: bool,
+        protection_key: u8,
     ) {
         if self
             .svm
@@ -407,6 +472,7 @@ impl Cpu {
             user_allowed,
             no_execute: no_execute && self.efer & EFER_NXE != 0,
             dirty,
+            protection_key,
         };
     }
 
@@ -424,7 +490,13 @@ impl Cpu {
         let mut writable = true;
         let mut user_allowed = true;
         let mut no_execute = false;
-        let mut level = if pae { PAE_TOP_LEVEL } else { TOP_LEVEL };
+        let mut level = if pae {
+            PAE_TOP_LEVEL
+        } else if self.cr4 & CR4_LA57 != 0 {
+            LA57_TOP_LEVEL
+        } else {
+            TOP_LEVEL
+        };
         loop {
             let index = (linear >> (PAGE_SHIFT + LEVEL_INDEX_BITS * level)) & LEVEL_INDEX_MASK;
             // A PDPTE has no permission or accessed bits and was validated when it was latched.
@@ -446,14 +518,13 @@ impl Cpu {
             if pte & PTE_PRESENT == 0 {
                 return Err(self.page_fault(linear, access, user, false, false));
             }
-            let leaf =
-                level == 0 || (pte & PTE_PAGE_SIZE != 0 && (level == 1 || (!pae && level == 2)));
-            // The page-size bit must be clear in a PML4 entry, and a large leaf must not have
-            // address bits below its alignment (PAT aside).
+            let leaf = level == 0
+                || (pte & PTE_PAGE_SIZE != 0 && (level == 1 || (!pae && level == PDPT_LEVEL)));
+            // The page-size bit must be clear in a PML4 and a PML5 entry, and a large leaf must
+            // not have address bits below its alignment (PAT aside).
             let below_leaf_alignment = (1u64 << (PAGE_SHIFT + LEVEL_INDEX_BITS * level)) - 1;
-            let reserved = pte & PTE_RESERVED_MASK != 0
-                || (!nxe && pte & PTE_NO_EXECUTE != 0)
-                || (level == TOP_LEVEL && pte & PTE_PAGE_SIZE != 0)
+            let reserved = (!nxe && pte & PTE_NO_EXECUTE != 0)
+                || (level > PDPT_LEVEL && pte & PTE_PAGE_SIZE != 0)
                 || (leaf
                     && level > 0
                     && pte & below_leaf_alignment & PTE_ADDRESS_MASK & !PTE_LARGE_PAGE_PAT != 0);
@@ -464,8 +535,17 @@ impl Cpu {
             user_allowed &= pte & PTE_USER != 0;
             no_execute |= pte & PTE_NO_EXECUTE != 0;
             if leaf {
-                if self.leaf_denied(access, user, writable, user_allowed, no_execute) {
-                    return Err(self.page_fault(linear, access, user, true, false));
+                // PAE leaves have no key: their bits 62:59 are ignored like the rest of 62:52.
+                let protection_key = if pae {
+                    0
+                } else {
+                    ((pte >> PTE_PROTECTION_KEY_SHIFT) & PTE_PROTECTION_KEY_MASK) as u8
+                };
+                let key_denied =
+                    self.protection_key_denies(access, user, user_allowed, protection_key);
+                if key_denied || self.leaf_denied(access, user, writable, user_allowed, no_execute)
+                {
+                    return Err(self.leaf_fault(linear, access, user, key_denied));
                 }
                 let mut updated = pte | PTE_ACCESSED;
                 if write {
@@ -495,12 +575,19 @@ impl Cpu {
                         user_allowed,
                         no_execute,
                         pte & PTE_DIRTY != 0,
+                        protection_key,
                     );
                 }
                 return Ok((
                     page_pa,
                     restrict_to_nested(
-                        self.leaf_tlb_flags(writable, user_allowed, no_execute, pte),
+                        self.leaf_tlb_flags(
+                            writable,
+                            user_allowed,
+                            no_execute,
+                            pte,
+                            protection_key,
+                        ),
                         nested,
                     ),
                 ));
@@ -584,7 +671,7 @@ impl Cpu {
                 return Ok((
                     page_pa,
                     restrict_to_nested(
-                        self.leaf_tlb_flags(writable, user_allowed, false, pte),
+                        self.leaf_tlb_flags(writable, user_allowed, false, pte, 0),
                         nested,
                     ),
                 ));
@@ -627,8 +714,8 @@ impl Cpu {
     ///
     /// `supervisor` marks implicit accesses by the CPU itself (descriptor tables, TSS,
     /// interrupt delivery): they ignore CPL and use the supervisor TLB half even at CPL 3.
-    /// Only the 48-bit canonical check is done, and it raises #GP(0) even for stack accesses
-    /// where hardware raises #SS.
+    /// Only the canonical check (48 bits, or 57 with CR4.LA57) is done, and it raises #GP(0) even
+    /// for stack accesses where hardware raises #SS.
     pub fn translate(
         &mut self,
         linear: u64,
@@ -640,8 +727,7 @@ impl Cpu {
         let linear = if self.efer & EFER_LMA == 0 {
             linear & LINEAR_32BIT_MASK
         } else {
-            let sign_extension = (linear as i64) >> CANONICAL_SIGN_BIT;
-            if sign_extension != 0 && sign_extension != -1 {
+            if !self.is_canonical_linear(linear) {
                 return Err(Exception::general_protection(0));
             }
             linear
@@ -680,8 +766,19 @@ impl Cpu {
                 TLB_EMPTY
             };
             refilled.addend = (self.ram_base + page_pa).wrapping_sub(page);
+            // The tags a protection key restricts stay out of the TLB, so those accesses walk and
+            // meet the check; `set_pkru` flushes when PKRU changes. Write disable withholds the
+            // write tag even from supervisor stores that a clear CR0.WP allows: a slow store,
+            // never a wrong one.
+            let key_rights = if self.cr4 & CR4_PKE != 0 && walk_flags & TLB_FLAG_USER != 0 {
+                self.protection_key_rights(walk_flags >> TLB_FLAG_PROTECTION_KEY_SHIFT)
+            } else {
+                0
+            };
             if !user || walk_flags & TLB_FLAG_USER != 0 {
-                refilled.tag_r = page;
+                if key_rights & PKRU_ACCESS_DISABLE == 0 {
+                    refilled.tag_r = page;
+                }
                 if walk_flags & TLB_FLAG_NO_EXECUTE == 0 {
                     refilled.tag_x = page;
                 }
@@ -695,7 +792,10 @@ impl Cpu {
                 } else {
                     walk_flags & TLB_FLAG_WRITABLE != 0 || !write_protect
                 };
-            if write_permitted && self.page_has_code[(page_pa >> PAGE_SHIFT) as usize] == 0 {
+            if write_permitted
+                && key_rights == 0
+                && self.page_has_code[(page_pa >> PAGE_SHIFT) as usize] == 0
+            {
                 refilled.tag_w = page;
             }
             self.tlb[slot] = refilled;
@@ -1121,6 +1221,10 @@ impl Cpu {
 #[cfg(test)]
 #[path = "paging_tests.rs"]
 mod paging_tests;
+
+#[cfg(test)]
+#[path = "la57_tests.rs"]
+mod la57_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1585,25 +1689,18 @@ mod tests {
         }
 
         #[test]
-        fn physical_address_bits_40_to_51_are_reserved_at_every_level() {
-            for level in 0..=3 {
-                for bit in [40, 45, 51] {
-                    let (mut h, mut tables) = paged();
-                    tables.map_4k(&mut h.cpu, VA, PA, PTE_PRESENT_WRITABLE_USER);
-                    let entry_address = tables.entry_address(&h.cpu, VA, level);
-                    let entry = read_pte(&h.cpu, entry_address);
-                    write_pte(&mut h.cpu, entry_address, entry | (1 << bit));
-                    let result = h.cpu.translate(VA, AccessKind::Read, false);
-                    assert_eq!(
-                        fault_of(result),
-                        (
-                            VECTOR_PAGE_FAULT,
-                            Some(rsvd_code(AccessKind::Read, false, false))
-                        ),
-                        "level {level} bit {bit}"
-                    );
-                    assert_eq!(h.cpu.cr2, VA);
-                }
+        fn physical_address_bits_up_to_51_are_address_bits_in_the_leaf() {
+            // CPUID 0x80000008 reports 52 physical address bits: nothing in 51:12 is reserved.
+            for bit in [40, 45, 51] {
+                let (mut h, mut tables) = paged();
+                let leaf = tables.map_4k(&mut h.cpu, VA, PA, PTE_PRESENT_WRITABLE_USER);
+                write_pte(
+                    &mut h.cpu,
+                    leaf,
+                    PA | PTE_PRESENT_WRITABLE_USER | (1 << bit),
+                );
+                let result = h.cpu.translate(VA, AccessKind::Read, false);
+                assert_eq!(result.unwrap(), PA | (1 << bit), "bit {bit}");
             }
         }
 
@@ -1654,7 +1751,8 @@ mod tests {
         fn reserved_fault_reports_user_and_write_bits() {
             let (mut h, mut tables) = paged();
             let leaf = tables.map_4k(&mut h.cpu, VA, PA, PTE_PRESENT_WRITABLE_USER);
-            write_pte(&mut h.cpu, leaf, PA | PTE_PRESENT_WRITABLE_USER | (1 << 50));
+            set_nxe(&mut h.cpu, false);
+            write_pte(&mut h.cpu, leaf, PA | PTE_PRESENT_WRITABLE_USER | PTE_NX);
             h.cpu.set_cpl(3);
             let result = h.cpu.translate(VA, AccessKind::Write, false);
             assert_eq!(
@@ -1667,7 +1765,8 @@ mod tests {
         fn reserved_violation_does_not_set_leaf_accessed_or_dirty() {
             let (mut h, mut tables) = paged();
             let leaf = tables.map_4k(&mut h.cpu, VA, PA, PTE_PRESENT_WRITABLE_USER);
-            write_pte(&mut h.cpu, leaf, PA | PTE_PRESENT_WRITABLE_USER | (1 << 50));
+            set_nxe(&mut h.cpu, false);
+            write_pte(&mut h.cpu, leaf, PA | PTE_PRESENT_WRITABLE_USER | PTE_NX);
             h.cpu.translate(VA, AccessKind::Write, false).unwrap_err();
             assert_eq!(read_pte(&h.cpu, leaf) & (PTE_A | PTE_D), 0);
         }

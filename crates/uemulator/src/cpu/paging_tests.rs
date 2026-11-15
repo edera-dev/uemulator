@@ -682,14 +682,18 @@ mod pae_paging {
     }
 
     #[test]
-    fn physical_address_bits_above_the_advertised_width_are_reserved() {
+    fn every_address_bit_up_to_51_is_an_address_bit() {
+        // CPUID 0x80000008 reports 52 physical address bits, so none of 51:12 is reserved.
         let (mut h, mut tables) = pae();
         let pte = tables.map_4k(&mut h.cpu, VA, PA, USER_RW);
         for bit in [40, 45, 51] {
             write_pte(&mut h.cpu, pte, PA | USER_RW | 1 << bit);
             h.cpu.flush_tlb();
-            let (_, code) = fault_of(read_access(&mut h.cpu, VA));
-            assert_eq!(code, Some(PF_P | PF_RSVD), "bit {bit}");
+            assert_eq!(
+                read_access(&mut h.cpu, VA).unwrap(),
+                PA | 1 << bit,
+                "bit {bit}"
+            );
         }
         // bits 52 to 62 are available to software
         write_pte(&mut h.cpu, pte, PA | USER_RW | 1 << 55);
@@ -829,7 +833,7 @@ mod control_register_transitions {
         tables.map_4k(&mut h.cpu, VA, PA, USER_RW);
         h.cpu.cr0 &= !CR0_PG_BIT;
         let pdpte_address = tables.pdpte_address(VA);
-        for reserved in [1 << 1, 1 << 2, 1 << 5, 1 << 8, 1 << 40, 1 << 51, BIT_63] {
+        for reserved in [1 << 1, 1 << 2, 1 << 5, 1 << 8, BIT_63] {
             let good = read_pte(&h.cpu, pdpte_address);
             write_pte(&mut h.cpu, pdpte_address, good | reserved);
             let before = h.cpu.cr0;
@@ -929,7 +933,8 @@ mod control_register_transitions {
         let mut h = harness();
         let tables = PageTables::new(&mut h.cpu);
         write_cr(&mut h.cpu, CR3, tables.pml4 | (1 << 32)).unwrap();
-        gp(write_cr(&mut h.cpu, CR3, tables.pml4 | (1 << 40)));
+        write_cr(&mut h.cpu, CR3, tables.pml4 | (1 << 51)).unwrap();
+        gp(write_cr(&mut h.cpu, CR3, tables.pml4 | (1 << 52)));
     }
 
     #[test]

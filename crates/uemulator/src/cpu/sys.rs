@@ -70,8 +70,13 @@ pub(crate) const CR4_PCIDE: u64 = 1 << 17;
 pub(crate) const CR4_SMEP: u64 = 1 << 20;
 /// Supervisor-mode access prevention: no data accesses to user pages at CPL < 3 unless EFLAGS.AC.
 pub(crate) const CR4_SMAP: u64 = 1 << 21;
-/// CR4 bits a guest may set. Everything else (VME, PVI, UMIP, LA57, PCIDE, OSXSAVE, SMEP,
-/// SMAP...) is rejected with #GP because CPUID does not advertise it.
+/// Protection keys for user pages (`pku.rs`); also mirrored into CPUID.7.0:ECX bit 4 (OSPKE).
+pub(crate) const CR4_PKE: u64 = 1 << 22;
+/// 5-level paging and 57-bit linear addresses once IA-32e mode is entered. It can only change
+/// outside IA-32e mode (APM 5.3.6): Linux's trampoline leaves long mode to flip it.
+pub(crate) const CR4_LA57: u64 = 1 << 12;
+/// CR4 bits a guest may set. Everything else (VME, PVI, CET...) is rejected with #GP because
+/// CPUID does not advertise it.
 const CR4_SUPPORTED: u64 = CR4_TSD
     | CR4_DE
     | CR4_PSE
@@ -86,13 +91,19 @@ const CR4_SUPPORTED: u64 = CR4_TSD
     | CR4_UMIP
     | CR4_PCIDE
     | CR4_SMEP
-    | CR4_SMAP;
+    | CR4_SMAP
+    | CR4_LA57
+    | CR4_PKE;
 
 pub(super) const CR4_SUPPORTED_BITS: u64 = CR4_SUPPORTED;
 
-/// Address widths reported by CPUID 0x8000_0008. CR3 and the canonical-address checks follow them.
-pub(super) const PHYSICAL_ADDRESS_BITS: u32 = 40;
-pub(super) const VIRTUAL_ADDRESS_BITS: u32 = 48;
+/// Address widths reported by CPUID 0x8000_0008, Turin's: CR3, the MTRR masks and the
+/// canonical-address checks follow them. With 52 physical bits no page-table address bit is
+/// reserved. 57 linear bits is the widest, with CR4.LA57; without it accesses are checked
+/// against `LINEAR_ADDRESS_BITS_4_LEVEL`.
+pub(super) const PHYSICAL_ADDRESS_BITS: u32 = 52;
+pub(super) const VIRTUAL_ADDRESS_BITS: u32 = 57;
+pub(super) const LINEAR_ADDRESS_BITS_4_LEVEL: u32 = 48;
 
 /// CR3 bits kept on write: physical address bits 51:12 plus PWT (bit 3) and PCD (bit 4).
 /// Everything else (bits 2:0 and 11:5, the PCID field) is ignored without CR4.PCIDE.
@@ -228,13 +239,37 @@ pub(super) const RDX: usize = 2;
 pub(super) const RBX: usize = 3;
 const R11: usize = 11;
 
-/// Whether bits 63:47 of `address` are all copies of bit 47.
+/// Whether `address` is canonical at the widest linear address width the CPU has (57 bits), as
+/// the checks on values loaded into address registers (FS/GS/KERNEL_GS base, LSTAR, wrfsbase...)
+/// are: the SDM makes them independent of CR4.LA57 on a CPU that has 5-level paging, so a 4-level
+/// kernel may still hold a 57-bit base. KVM models it the same way. Accesses use
+/// `Cpu::is_canonical_linear`.
 pub(super) fn is_canonical(address: u64) -> bool {
-    let sign_extension = (address as i64) >> (VIRTUAL_ADDRESS_BITS - 1);
+    is_canonical_at(address, VIRTUAL_ADDRESS_BITS)
+}
+
+/// Whether bits 63:`bits - 1` of `address` are all copies of bit `bits - 1`.
+pub(super) fn is_canonical_at(address: u64, bits: u32) -> bool {
+    let sign_extension = (address as i64) >> (bits - 1);
     sign_extension == 0 || sign_extension == -1
 }
 
 impl Cpu {
+    /// Width of a linear address in IA-32e mode: 57 bits with 5-level paging, else 48.
+    pub(super) fn linear_address_bits(&self) -> u32 {
+        if self.cr4 & CR4_LA57 != 0 {
+            VIRTUAL_ADDRESS_BITS
+        } else {
+            LINEAR_ADDRESS_BITS_4_LEVEL
+        }
+    }
+
+    /// Whether a memory access (or INVPCID's address) at `address` is canonical under the
+    /// current paging mode.
+    pub(super) fn is_canonical_linear(&self, address: u64) -> bool {
+        is_canonical_at(address, self.linear_address_bits())
+    }
+
     /// #GP(0) unless CPL is 0.
     pub fn need_cpl0(&self) -> ExecResult<()> {
         if self.cpl != 0 {
@@ -499,11 +534,13 @@ impl Cpu {
                     2 => self.cr2 = v,
                     3 => self.write_cr3(v)?,
                     4 => {
-                        // PAE cannot be turned off under IA-32e paging. PCIDE needs IA-32e
-                        // mode and may only be set while the PCID field of CR3 is zero.
+                        // PAE cannot be turned off under IA-32e paging, nor LA57 changed. PCIDE
+                        // needs IA-32e mode and may only be set while the PCID field of CR3 is
+                        // zero.
                         let long_mode = self.efer & EFER_LMA != 0;
                         if v & !CR4_SUPPORTED != 0
                             || (long_mode && v & CR4_PAE == 0)
+                            || (long_mode && (v ^ self.cr4) & CR4_LA57 != 0)
                             || (v & CR4_PCIDE != 0
                                 && (!long_mode
                                     || (self.cr4 & CR4_PCIDE == 0 && self.cr3 & 0xfff != 0)))
@@ -1067,6 +1104,8 @@ impl Cpu {
         const MODRM_RDPRU: u8 = 0xfd;
         const REP_F3: u8 = 1;
         use super::invlpgb::{MODRM_INVLPGB, MODRM_TLBSYNC};
+        const MODRM_RDPKRU: u8 = 0xee;
+        const MODRM_WRPKRU: u8 = 0xef;
         let reg = i.reg & 7;
         if i.op == OP_GROUP6 {
             let loc = self.modrm_location(i, next)?;
@@ -1141,6 +1180,8 @@ impl Cpu {
                 MODRM_MONITORX => self.monitorx()?,
                 MODRM_MWAITX => self.mwaitx()?,
                 MODRM_RDPRU => self.rdpru()?,
+                MODRM_RDPKRU => self.rdpkru()?,
+                MODRM_WRPKRU => self.wrpkru()?,
                 // Same CR4.TSD rule as rdtsc; ECX = IA32_TSC_AUX (zero-extended), EDX:EAX = TSC.
                 MODRM_RDTSCP => {
                     if self.cr4 & CR4_TSD != 0 && self.cpl != 0 {
@@ -1793,15 +1834,20 @@ mod sys_tests {
             const { assert!(LOG_KEY_WRMSR_FAULT + 0xffff_ffff < LOG_KEY_RDMSR_FAULT) };
         }
 
+        /// Address MSRs are checked against 57 bits whatever CR4.LA57 says (see `is_canonical`),
+        /// so 48-bit non-canonical values like 0x0000_8000_0000_0000 are accepted.
         const NON_CANONICAL: [u64; 4] = [
-            0x0000_8000_0000_0000,
-            0x0001_0000_0000_0000,
+            0x0100_0000_0000_0000,
+            0x8000_0000_0000_0000,
             0x7fff_ffff_ffff_ffff,
-            0xffff_7fff_ffff_ffff,
+            0xfeff_ffff_ffff_ffff,
         ];
-        const CANONICAL: [u64; 5] = [
+        const CANONICAL: [u64; 8] = [
             0,
             0x0000_7fff_ffff_ffff,
+            0x0000_8000_0000_0000,
+            0x00ff_ffff_ffff_ffff,
+            0xff00_0000_0000_0000,
             0xffff_8000_0000_0000,
             0xffff_ffff_ffff_ffff,
             0xffff_ffff_8123_4567,
@@ -1912,7 +1958,7 @@ mod sys_tests {
             let h = assert_general_protection_zero(&[0x0f, 0x30, 0xf4], |h| {
                 h.cpu.gpr[RCX] = TEST_MSR_LSTAR as u64;
                 h.cpu.gpr[RAX] = 0;
-                h.cpu.gpr[RDX] = 0x0001_0000;
+                h.cpu.gpr[RDX] = 0x0100_0000;
             });
             assert_eq!(h.cpu.lstar, 0);
         }
@@ -2121,7 +2167,7 @@ mod sys_tests {
             h.cpu.wrmsr(0xc001_0117, 0x20_0000).unwrap();
             assert_eq!(h.cpu.rdmsr(0xc001_0117).unwrap(), 0x20_0000);
             assert_gp0(h.cpu.wrmsr(0xc001_0117, 0x20_0008));
-            assert_gp0(h.cpu.wrmsr(0xc001_0117, 1 << 45));
+            assert_gp0(h.cpu.wrmsr(0xc001_0117, 1 << 52));
             // with VM_CR.SVMDIS set (firmware disabled SVM) EFER.SVME cannot be turned on
             let mut h = blank();
             h.cpu.wrmsr(0xc001_0114, 1 << 4).unwrap();
@@ -3061,21 +3107,21 @@ mod sys_tests {
         #[test]
         fn cr3_accepts_the_highest_valid_physical_address_bit() {
             let mut h = Harness::new(WRITE_CR3);
-            h.cpu.gpr[RAX] = 1 << 39;
+            h.cpu.gpr[RAX] = 1 << 51;
             assert_eq!(h.run(1), Stop::Limit);
-            assert_eq!(h.cpu.cr3, 1 << 39);
+            assert_eq!(h.cpu.cr3, 1 << 51);
         }
 
         #[test]
         fn cr3_bits_above_the_advertised_physical_address_width_are_gp0() {
-            for bit in 40..64 {
+            for bit in 52..64 {
                 let mut h = Harness::new(WRITE_CR3);
                 let original = h.cpu.cr3;
                 h.cpu.gpr[RAX] = original | 1 << bit;
                 assert_eq!(
                     h.run(1),
                     general_protection(0),
-                    "bit {bit} is reserved: CPUID 0x80000008 reports 40 physical bits"
+                    "bit {bit} is reserved: CPUID 0x80000008 reports 52 physical bits"
                 );
                 assert_eq!(h.cpu.cr3, original, "bit {bit}");
                 assert_eq!(h.cpu.rip, CODE_BASE);
@@ -3125,6 +3171,7 @@ mod sys_tests {
                 (9, "OSFXSR"),
                 (10, "OSXMMEXCPT"),
                 (16, "FSGSBASE"),
+                (22, "PKE"),
             ] {
                 let (h, stop) = run_with(WRITE_CR4, |h| h.cpu.gpr[RAX] = BOOT_CR4 | 1 << bit);
                 assert_eq!(stop, Stop::Halted, "{name}");
@@ -3137,11 +3184,11 @@ mod sys_tests {
             for (bit, name) in [
                 (0, "VME"),
                 (1, "PVI"),
+                // LA57 is supported but cannot change in long mode (la57_tests.rs)
                 (12, "LA57"),
                 (13, "VMXE"),
                 (14, "SMXE"),
                 (19, "reserved"),
-                (22, "PKE"),
                 (32, "upper half"),
                 (63, "upper half"),
             ] {
@@ -5219,7 +5266,8 @@ mod sys_tests {
         use crate::testkit::assert_jit_matches_interpreter;
 
         const HIGH_HALF_BASE: u64 = 0xffff_8000_0000_1000;
-        const NON_CANONICAL: u64 = 0x0001_0000_0000_0000;
+        /// Non-canonical even at 57 bits, the width wrfsbase checks against.
+        const NON_CANONICAL: u64 = 0x0100_0000_0000_0000;
 
         // rdfsbase rax
         const RDFSBASE_64: &[u8] = &[0xf3, 0x48, 0x0f, 0xae, 0xc0, 0xf4];
