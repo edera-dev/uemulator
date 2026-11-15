@@ -67,7 +67,7 @@ fn cpuid_advertises_perfctr_core_nb_llc_extapic_and_perfmon_v2() {
     ] {
         assert_ne!(ecx & (1 << bit), 0, "{name}");
     }
-    assert_eq!(ecx & (1 << 10), 0, "IBS is not implemented");
+    assert_ne!(ecx & (1 << 10), 0, "IBS (ibs_tests.rs)");
     h.cpu.gpr[RAX] = 0x8000_0022;
     h.cpu.gpr[RCX] = 0;
     h.cpu.cpuid();

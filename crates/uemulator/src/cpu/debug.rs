@@ -1,6 +1,6 @@
 //! The debug registers in action (APM vol. 2 ch. 13, SDM vol. 3 ch. 18): instruction, data and
 //! I/O breakpoints, single-step (with DEBUGCTL.BTF), general detect, the task-switch T bit,
-//! bus-lock detect (DEBUGCTL.BLD) and the BPEXT address masks.
+//! bus-lock detect (DEBUGCTL.BLD) and the BPEXT address masks (with AdMskExtn).
 //!
 //! Generated code never checks for any of it. Whenever something could raise a #DB
 //! (`Cpu::debug_slow_path`) the run loop executes one instruction at a time through
@@ -56,6 +56,10 @@ const DEBUGCTL_WRITABLE: u64 = 0x3f;
 
 /// BPEXT (CPUID 0x8000_0001 ECX bit 26) address masks, DR0's apart from the other three's (it
 /// existed first, on family 16h). A set bit is left out of that breakpoint's address compare.
+/// AdMskExtn (bit 30, which every Zen since family 17h sets) widens them from bits 11:0 to 31:0
+/// and makes instruction breakpoints honour them as well as data ones; that is the only CPU
+/// modelled, so both always hold. The CPUID override MSR hiding the bit changes neither, as on
+/// hardware.
 pub(crate) const MSR_DR0_ADDRESS_MASK: u32 = 0xc001_1027;
 pub(crate) const MSR_DR1_ADDRESS_MASK: u32 = 0xc001_1019;
 pub(crate) const MSR_DR3_ADDRESS_MASK: u32 = 0xc001_101b;
@@ -158,7 +162,8 @@ impl Cpu {
         Ok(())
     }
 
-    /// The instruction breakpoints the instruction at RIP hits.
+    /// The instruction breakpoints the instruction at RIP hits. LEN is ignored for them (it must be
+    /// 00); the address mask is not (AdMskExtn).
     fn instruction_breakpoint_hits(&self) -> u64 {
         let Ok(linear) = self.fetch_linear() else {
             return 0;
@@ -166,7 +171,7 @@ impl Cpu {
         let mut hits = 0;
         for index in 0..BREAKPOINTS {
             if let Some((RW_EXECUTE, _)) = breakpoint_control(self.dr[7], index)
-                && self.dr[index] == linear
+                && (self.dr[index] ^ linear) & !self.debug.address_masks[index] == 0
             {
                 hits |= 1 << index;
             }
@@ -186,6 +191,10 @@ impl Cpu {
     /// Called for every data access of `size` bytes at `linear` while `watch_accesses` is on.
     #[cold]
     pub(crate) fn watch_access(&mut self, linear: u64, size: u64, write: bool) {
+        // Instruction-based sampling watches the accesses of the instruction it tagged.
+        if let Some(capture) = self.pmu.ibs.capture.as_mut() {
+            capture.note(linear, size, write);
+        }
         if (linear % CACHE_LINE_BYTES) + size > CACHE_LINE_BYTES {
             self.debug.split_access = true;
         }

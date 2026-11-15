@@ -587,6 +587,10 @@ fn ivrs_and_prt_skip_the_fch_and_data_fabric_slots() {
     assert!(select(0x17 << 3));
     assert!(!select(0x18 << 3), "00:18.0 is the data fabric");
     assert!(select(0x19 << 3), "the 23rd virtio function");
+    assert!(
+        select(0x14 << 3) && select(0x14 << 3 | 3),
+        "the FCH's SMBus and LPC bridge"
+    );
     let fadt = find(&ram, "FACP");
     let dsdt = table_at(&ram, u32_at(fadt, 40) as u64);
     let prt_address = |slot: u32| {

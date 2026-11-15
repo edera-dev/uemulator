@@ -1,4 +1,5 @@
 use super::data_fabric::{self, RootComplex};
+use super::fch;
 use super::guestmem::GuestMem;
 use super::iommu::{self, InterruptRequest, Iommu};
 use super::size_mask;
@@ -56,10 +57,10 @@ const DEVFN_SLOT_SHIFT: u32 = 3;
 /// reserved ones (`virtio_slot`).
 const FIRST_VIRTIO_SLOT: u8 = 1;
 const SLOTS_PER_BUS: usize = 32;
-/// Where AMD puts the FCH: no function answers there, but the I/O APIC and HPET requester ids
-/// (`IOAPIC_REQUESTER` 00:14.0, `HPET_REQUESTER` 00:14.1) are in it, as on hardware, so no
-/// virtio function may share their IOMMU device table entries.
-const FCH_SLOT: u8 = 0x14;
+/// Where AMD puts the FCH: its SMBus (00:14.0) and LPC (00:14.3) functions (`fch.rs`), and the
+/// I/O APIC and HPET requester ids (`IOAPIC_REQUESTER` 00:14.0, `HPET_REQUESTER` 00:14.1), as
+/// on hardware, so no virtio function may share their IOMMU device table entries.
+const FCH_SLOT: u8 = fch::FCH_SLOT;
 const RESERVED_SLOTS: [u8; 2] = [FCH_SLOT, data_fabric::DATA_FABRIC_SLOT];
 pub(crate) const MAX_VIRTIO_FUNCTIONS: usize =
     SLOTS_PER_BUS - FIRST_VIRTIO_SLOT as usize - RESERVED_SLOTS.len();
@@ -425,6 +426,8 @@ impl PciHost {
             self.root.config(self.iommu.is_some())
         } else if data_fabric::is_data_fabric(devfn) {
             data_fabric::data_fabric_config(devfn)
+        } else if fch::is_fch_function(devfn) {
+            fch::fch_config(devfn)
         } else if let (Some(iommu), iommu::PCI_DEVFN) = (&self.iommu, devfn) {
             *iommu.config()
         } else if let Some(f) = self.funcs.iter().find(|f| f.devfn == devfn) {
@@ -521,6 +524,7 @@ impl PciHost {
     fn function_exists(&self, devfn: u8) -> bool {
         devfn == 0
             || data_fabric::is_data_fabric(devfn)
+            || fch::is_fch_function(devfn)
             || (self.iommu.is_some() && devfn == iommu::PCI_DEVFN)
             || self.funcs.iter().any(|f| f.devfn == devfn)
     }
@@ -747,6 +751,8 @@ mod tests {
                 (1, 0, VENDOR_VIRTIO as u32 | 0x1043 << 16),
                 (2, 0, VENDOR_VIRTIO as u32 | 0x1042 << 16),
                 (3, 0, VENDOR_VIRTIO as u32 | 0x1041 << 16),
+                (0x14, 0, 0x1022 | 0x790b << 16),
+                (0x14, 3, 0x1022 | 0x790e << 16),
                 (0x18, 0, 0x1022 | 0x12c0 << 16),
                 (0x18, 1, 0x1022 | 0x12c1 << 16),
                 (0x18, 2, 0x1022 | 0x12c2 << 16),

@@ -1427,6 +1427,23 @@ impl Cpu {
         {
             differences.push("zmm/opmask".into());
         }
+        // A breakpoint taken on one side only shows up here first: DR6 collects its status.
+        for index in 0..self.dr.len() {
+            if self.dr[index] != other.dr[index] {
+                differences.push(format!(
+                    "dr{index}: {:#x} vs {:#x}",
+                    self.dr[index], other.dr[index]
+                ));
+            }
+        }
+        if self.debug.debugctl != other.debug.debugctl {
+            differences.push("debugctl".into());
+        }
+        for index in 0..self.debug.address_masks.len() {
+            if self.debug.address_masks[index] != other.debug.address_masks[index] {
+                differences.push(format!("dr{index} mask"));
+            }
+        }
         if self.ymm_hi != other.ymm_hi {
             differences.push("ymm_hi".into());
         }
@@ -3157,6 +3174,22 @@ mod cpu_tests {
         }
 
         #[test]
+        fn diff_reports_debug_register_and_debugctl_changes() {
+            let (mut a, mut b) = pair(&[HLT]);
+            a.cpu.dr[6] ^= 1 << 14;
+            a.cpu.dr[1] = 0x1000;
+            let report = a.cpu.diff(&mut b.cpu).unwrap();
+            assert!(report.contains("dr6"), "{report}");
+            assert!(report.contains("dr1"), "{report}");
+            let (mut a, mut b) = pair(&[HLT]);
+            a.cpu.debug.debugctl = debug::DEBUGCTL_BTF;
+            a.cpu.debug.address_masks[2] = 0xff;
+            let report = a.cpu.diff(&mut b.cpu).unwrap();
+            assert!(report.contains("debugctl"), "{report}");
+            assert!(report.contains("dr2 mask"), "{report}");
+        }
+
+        #[test]
         fn diff_reports_xmm_changes() {
             let (mut a, mut b) = pair(&[HLT]);
             a.cpu.xmm[7] = 1;
@@ -3252,6 +3285,55 @@ mod cpu_tests {
             }
             let reason = main.cpu.run_verify(&mut shadow.cpu);
             assert!(matches!(reason, ExitReason::TripleFault), "{reason:?}");
+        }
+
+        /// Single-steps a loop, stores to an armed data breakpoint, then runs a loop over an
+        /// instruction breakpoint, taking every #DB through a handler that sets RF in the frame
+        /// (so the faulting instruction runs on return) and counts them in r8, then resets.
+        #[test]
+        fn run_verify_agrees_while_single_stepping_and_with_breakpoints_armed() {
+            const DEBUG_HANDLER: u64 = CODE_BASE + 0x100;
+            const R8: usize = 8;
+            // mov ecx, 50; pushfq; or qword [rsp], 0x100; popfq;
+            // 1: add rax, rcx; dec ecx; jnz 1b;
+            // pushfq; and qword [rsp], ~0x100; popfq;
+            // mov ebx, SCRATCH; mov dr0, rbx; mov eax, 0x10401 (L0, write, one byte); mov dr7, rax;
+            // mov [rbx], al; add rax, 3; xor eax, eax; mov dr7, rax;
+            // lea rdx, [rip + 3f]; mov dr1, rdx; mov eax, 0x404 (L1, execute); mov dr7, rax;
+            // mov ecx, 20; 3: add rax, rcx; dec ecx; jnz 3b; xor eax, eax; mov dr7, rax;
+            // mov al, 0xfe; out 0x64, al; 2: jmp 2b
+            const PROGRAM: [u8; 100] = [
+                0xb9, 0x32, 0x00, 0x00, 0x00, 0x9c, 0x48, 0x81, 0x0c, 0x24, 0x00, 0x01, 0x00, 0x00,
+                0x9d, 0x48, 0x01, 0xc8, 0xff, 0xc9, 0x75, 0xf9, 0x9c, 0x48, 0x81, 0x24, 0x24, 0xff,
+                0xfe, 0xff, 0xff, 0x9d, 0xbb, 0x00, 0x00, 0x40, 0x00, 0x0f, 0x23, 0xc3, 0xb8, 0x01,
+                0x04, 0x01, 0x00, 0x0f, 0x23, 0xf8, 0x88, 0x03, 0x48, 0x83, 0xc0, 0x03, 0x31, 0xc0,
+                0x0f, 0x23, 0xf8, 0x48, 0x8d, 0x15, 0x10, 0x00, 0x00, 0x00, 0x0f, 0x23, 0xca, 0xb8,
+                0x04, 0x04, 0x00, 0x00, 0x0f, 0x23, 0xf8, 0xb9, 0x14, 0x00, 0x00, 0x00, 0x48, 0x01,
+                0xc8, 0xff, 0xc9, 0x75, 0xf9, 0x31, 0xc0, 0x0f, 0x23, 0xf8, 0xb0, 0xfe, 0xe6, 0x64,
+                0xeb, 0xfe,
+            ];
+            // or qword [rsp + 16], RF; inc r8; iretq
+            const COUNT_AND_RESUME: [u8; 14] = [
+                0x48, 0x81, 0x4c, 0x24, 0x10, 0x00, 0x00, 0x01, 0x00, 0x49, 0xff, 0xc0, 0x48, 0xcf,
+            ];
+            const DEBUG_VECTOR: u8 = 1;
+            let (mut main, mut shadow) = pair(&PROGRAM);
+            if !main.enable_jit() {
+                return;
+            }
+            for h in [&mut main, &mut shadow] {
+                install_idt(h);
+                set_gate(h, DEBUG_VECTOR, Gate::interrupt(DEBUG_HANDLER));
+                h.write(DEBUG_HANDLER, &COUNT_AND_RESUME);
+                h.cpu.next_event = u64::MAX;
+            }
+            let reason = main.cpu.run_verify(&mut shadow.cpu);
+            assert!(matches!(reason, ExitReason::Reset), "{reason:?}");
+            // The popfq that sets TF does not trap; the 150 loop instructions, then the pushfq,
+            // the and and the popfq that clears TF do, the watched store does, and so does each of
+            // the 20 passes over the instruction breakpoint.
+            assert_eq!(main.cpu.gpr[R8], 174);
+            assert_eq!(shadow.cpu.gpr[R8], 174);
         }
     }
 }

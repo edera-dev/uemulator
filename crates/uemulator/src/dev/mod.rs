@@ -4,6 +4,7 @@ pub(crate) mod acpi_pm;
 pub(crate) mod apic;
 pub(crate) mod bootfb;
 pub(crate) mod data_fabric;
+pub(crate) mod fch;
 pub(crate) mod guestmem;
 pub(crate) mod handle;
 pub(crate) mod hpet;
@@ -242,6 +243,10 @@ pub(crate) struct Devices {
     lowest_priority_cursor: usize,
     ioapic: IoApic,
     pm: AcpiPm,
+    /// The FCH's PM block, SMBus controllers and watchdog (`fch.rs`).
+    fch: fch::Fch,
+    /// The FCH watchdog expired with its power-off action.
+    watchdog_powered_off: bool,
     hpet: Hpet,
     /// Level of the SCI line as last driven.
     sci_level: bool,
@@ -373,6 +378,8 @@ impl Devices {
             lowest_priority_cursor: 0,
             ioapic: IoApic::new(),
             pm: AcpiPm::new(),
+            fch: fch::Fch::new(),
+            watchdog_powered_off: false,
             hpet: Hpet::new(),
             sci_level: false,
             deferred: Vec::new(),
@@ -429,6 +436,7 @@ impl Devices {
             self.uart.next_deadline(),
             self.hpet.next_deadline(),
             self.pm.next_deadline(now),
+            self.fch.next_deadline(),
         ]
         .into_iter()
         .chain(self.lapics.iter().map(Lapic::next_deadline))
@@ -641,8 +649,9 @@ impl Devices {
         let Some(iommu) = self.pci.iommu() else {
             return;
         };
-        // A refused interrupt is dropped; the IOMMU has logged the fault.
-        let Ok(remapped) = iommu.remap_interrupt(mem, request) else {
+        // A refused interrupt is dropped (the IOMMU has logged the fault), and one posted to a
+        // guest's virtual APIC is not the host's: `Iommu::service` writes it.
+        let Ok(Some(remapped)) = iommu.remap_interrupt(mem, request) else {
             return;
         };
         let interrupt = remapped.into_interrupt();
@@ -708,17 +717,18 @@ impl Devices {
     /// The IOMMU's own event and completion-wait interrupt: its MSI (through interrupt
     /// remapping, like any device's) or, with IntCapXT, straight to the LAPIC.
     fn route_iommu_msi(&mut self, mem: &dyn PhysRead) {
-        match self.pci.iommu().and_then(|iommu| iommu.take_interrupt()) {
-            Some(IommuInterrupt::Message(message)) => self.deliver(
-                Source::Message(InterruptRequest {
-                    requester: iommu::REQUESTER_ID,
-                    address: message.address,
-                    data: message.data,
-                }),
-                Some(mem),
-            ),
-            Some(IommuInterrupt::Direct(interrupt)) => self.route_interrupt(&interrupt),
-            None => {}
+        while let Some(interrupt) = self.pci.iommu().and_then(|iommu| iommu.take_interrupt()) {
+            match interrupt {
+                IommuInterrupt::Message(message) => self.deliver(
+                    Source::Message(InterruptRequest {
+                        requester: iommu::REQUESTER_ID,
+                        address: message.address,
+                        data: message.data,
+                    }),
+                    Some(mem),
+                ),
+                IommuInterrupt::Direct(interrupt) => self.route_interrupt(&interrupt),
+            }
         }
     }
 
@@ -738,7 +748,7 @@ impl Devices {
 
     /// The guest wrote SLP_EN with the S5 type: nothing wakes the machine from that.
     pub fn shutdown_requested(&self) -> bool {
-        self.pm.shutdown_requested()
+        self.pm.shutdown_requested() || self.watchdog_powered_off
     }
 
     /// Whether an interrupt is waiting for the CPU (the CPU still checks IF and the interrupt
@@ -872,6 +882,11 @@ impl Devices {
         if self.pit.tick(now) {
             self.pic.raise(IRQ_PIT);
         }
+        match self.fch.tick(now) {
+            Some(fch::WatchdogAction::Reset) => self.reset_requested = true,
+            Some(fch::WatchdogAction::PowerOff) => self.watchdog_powered_off = true,
+            None => {}
+        }
         self.hpet.tick(now);
         let mut raise = Vec::new();
         let mut messages = Vec::new();
@@ -897,8 +912,13 @@ impl Devices {
         self.deliver_messages(messages, mem);
         self.route_line_events_with(Some(mem));
         self.route_hpet(Some(mem));
-        self.route_iommu_msi(mem);
         self.drain_deferred(mem);
+        // Interrupts the deliveries above posted to guest virtual APICs, and the GA log
+        // interrupts they caused.
+        if let Some(iommu) = self.pci.iommu() {
+            iommu.service(mem);
+        }
+        self.route_iommu_msi(mem);
     }
 
     fn deliver_messages(&mut self, messages: Vec<InterruptRequest>, mem: &dyn PhysRead) {
@@ -929,6 +949,9 @@ impl Devices {
         }
         if let Some(tpm) = self.tpm.as_ref().filter(|_| TpmCrb::decodes(phys_addr)) {
             return Some(tpm.mmio_read(phys_addr, size));
+        }
+        if self.fch.decodes(phys_addr) {
+            return Some(self.fch.mmio_read(phys_addr, size));
         }
         let value = self.pci.mmio_read(phys_addr, size);
         // Reading the ISR register acknowledges the interrupt.
@@ -973,6 +996,10 @@ impl Devices {
         }
         if let Some(tpm) = self.tpm.as_mut().filter(|_| TpmCrb::decodes(phys_addr)) {
             tpm.mmio_write(phys_addr, size, val, self.now_ns);
+            return true;
+        }
+        if self.fch.decodes(phys_addr) {
+            self.fch.mmio_write(phys_addr, size, val, self.now_ns);
             return true;
         }
         let mut messages = Vec::new();
@@ -1057,6 +1084,7 @@ impl Devices {
             KV_PORT_FIRST..=KV_PORT_LAST if self.kv.is_some() => {
                 return self.kv.as_mut().unwrap().io_in(port, size);
             }
+            port if self.fch.decodes_port(port) => self.fch.io_read(port),
             _ => return ones,
         };
         if matches!(port, UART_COM1_BASE..=UART_COM1_LAST) {
@@ -1105,6 +1133,7 @@ impl Devices {
             KV_PORT_FIRST..=KV_PORT_LAST if self.kv.is_some() => {
                 self.kv.as_mut().unwrap().io_out(port, size, value)
             }
+            port if self.fch.decodes_port(port) => self.fch.io_write(port, byte),
             UART_COM1_BASE..=UART_COM1_LAST => {
                 self.uart.write(port - UART_COM1_BASE, byte);
                 self.update_uart_irq();
@@ -1176,6 +1205,34 @@ mod tests {
 
     fn inp(dev: &mut Devices, port: u16, size: u8) -> u32 {
         dev.io_in(port, size, NOW_ZERO)
+    }
+
+    /// The FCH answers where i2c-piix4 and sp5100_tco look: the PM block in AcpiMmio and at
+    /// 0xCD6/0xCD7, the SMBus at 0xB00, and an expired watchdog resets the machine.
+    #[test]
+    fn the_fch_answers_at_its_ports_and_windows_and_its_watchdog_resets() {
+        const PM_MMIO: u64 = fch::ACPI_MMIO_BASE + 0x300;
+        const SMBUS_STATUS_PORT: u16 = 0xb00;
+        const SMBUS_CONTROL_PORT: u16 = 0xb02;
+        const START_QUICK: u32 = 1 << 6;
+        const DEVICE_ERROR: u32 = 1 << 2;
+        const WATCHDOG_DECODE: u64 = 1 << 7 | 1 << 4;
+        const WATCHDOG_RUN: u64 = 1;
+        let mut dev = Devices::new(ConsoleHandle::default(), DevConfig::default());
+        assert_eq!(dev.mmio_read(PM_MMIO + 1, 1), Some(0x0b));
+        out(&mut dev, fch::PM_INDEX_PORT, 1, 0x01);
+        assert_eq!(inp(&mut dev, fch::PM_DATA_PORT, 1), 0x0b);
+        out(&mut dev, SMBUS_CONTROL_PORT, 1, START_QUICK);
+        assert_eq!(inp(&mut dev, SMBUS_STATUS_PORT, 1), DEVICE_ERROR);
+        let mut ram = vec![0u8; 4096];
+        let mut mem = test_mem(&mut ram);
+        assert!(dev.mmio_write(PM_MMIO, 1, WATCHDOG_DECODE, &mut mem));
+        assert!(dev.mmio_write(fch::WATCHDOG_BASE + 4, 4, 2, &mut mem));
+        assert!(dev.mmio_write(fch::WATCHDOG_BASE, 4, WATCHDOG_RUN, &mut mem));
+        let deadline = dev.next_deadline(0).unwrap();
+        assert_eq!(deadline, 2 * NS_PER_SECOND);
+        dev.tick(deadline, &mut mem);
+        assert!(dev.reset_requested);
     }
 
     fn cmos_read(dev: &mut Devices, index: u8, now: u64) -> u8 {
@@ -2992,6 +3049,78 @@ mod tests {
         let mut mem = test_mem(&mut ram);
         dev.tick(1, &mut mem);
         assert_eq!(dev.interrupt_ack(), Some(REMAPPED_VECTOR));
+    }
+
+    /// A virtio message through a guest-mode IRTE (the IOMMU in virtual APIC mode) for a vCPU
+    /// that is not running: the vector lands in the backing page's IRR, where the processor's
+    /// AVIC finds it, the GA log gets the IRTE's tag, and the host gets the GA log interrupt
+    /// (through the IntCapXT GA register) instead of the guest's vector.
+    #[test]
+    fn a_virtio_message_to_a_guest_mode_irte_is_posted_and_logged() {
+        const CONSOLE_REQUESTER: u16 = 8;
+        const GA_LOG_BASE_REGISTER: u64 = 0xe0;
+        const XT_GA_LOG_REGISTER: u64 = 0x180;
+        const XT_VECTOR_SHIFT: u32 = 32;
+        const GA_LOG_LENGTH_4K: u64 = 8 << 56;
+        const GA_LOG_AT: usize = 0x9_0000;
+        const BACKING_PAGE: usize = 0xa_0000;
+        const GUEST_VECTOR: u8 = 0x51;
+        const GA_TAG: u64 = 0xabc;
+        /// IOMMUEn, GAEn, GAMEn = virtual APIC, GALogEn, GAIntEn, XTEn, IntCapXTEn.
+        const CONTROL: u64 = 1 | 1 << 17 | 1 << 25 | 1 << 28 | 1 << 29 | 1 << 50 | 1 << 51;
+        /// RemapEn, GALogIntr and GuestMode, IsRun clear.
+        const IRTE_LOW_FLAGS: u64 = 1 | 1 << 2 | 1 << 7;
+        const BACKING_IRR: usize = 0x200;
+        const BACKING_REGISTER_STRIDE: usize = 0x10;
+        let console = ConsoleHandle::default();
+        let mut dev = Devices::new(
+            ConsoleHandle::default(),
+            DevConfig {
+                iommu: true,
+                virtio_consoles: vec![console.clone()],
+                ..Default::default()
+            },
+        );
+        let mut ram = vec![0u8; IOMMU_RAM_BYTES];
+        mmio_write(
+            &mut dev,
+            &mut ram,
+            LAPIC_SPURIOUS_VECTOR_REGISTER,
+            4,
+            LAPIC_SOFTWARE_ENABLE,
+        );
+        remap_requester(&mut ram, CONSOLE_REQUESTER, None);
+        let irte = INTERRUPT_TABLE_AT + 16 * IRTE_INDEX as usize;
+        write_u64(&mut ram, irte, IRTE_LOW_FLAGS | GA_TAG << 32);
+        write_u64(
+            &mut ram,
+            irte + 8,
+            GUEST_VECTOR as u64 | BACKING_PAGE as u64,
+        );
+        enable_iommu(&mut dev, &mut ram);
+        for (register, value) in [
+            (GA_LOG_BASE_REGISTER, GA_LOG_AT as u64 | GA_LOG_LENGTH_4K),
+            (XT_GA_LOG_REGISTER, (TEST_VECTOR as u64) << XT_VECTOR_SHIFT),
+            (IOMMU_CONTROL_REGISTER, CONTROL),
+        ] {
+            mmio_write(&mut dev, &mut ram, IOMMU_BASE + register, 8, value);
+        }
+        console_with_msix_config_vector(&mut dev, &mut ram, IRTE_INDEX as u64);
+        console.resize(100, 30);
+        let mut mem = test_mem(&mut ram);
+        dev.tick(1, &mut mem);
+        assert_eq!(
+            dev.interrupt_ack(),
+            Some(TEST_VECTOR),
+            "the GA log interrupt"
+        );
+        assert_eq!(dev.interrupt_ack(), None, "and not the guest's vector");
+        let word =
+            BACKING_PAGE + BACKING_IRR + (GUEST_VECTOR as usize / 32) * BACKING_REGISTER_STRIDE;
+        let irr = u32::from_le_bytes(ram[word..word + 4].try_into().unwrap());
+        assert_eq!(irr, 1 << (GUEST_VECTOR % 32));
+        let entry = u64::from_le_bytes(ram[GA_LOG_AT..GA_LOG_AT + 8].try_into().unwrap());
+        assert_eq!(entry, GA_TAG | (CONSOLE_REQUESTER as u64) << 32 | 1 << 60);
     }
 
     #[test]

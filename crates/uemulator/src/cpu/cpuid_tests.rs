@@ -285,18 +285,18 @@ fn extended_leaf_1_ecx_has_the_zen_5_features_that_are_implemented() {
     let mut h = blank();
     let [_, ebx, ecx, _] = cpuid(&mut h, 0x8000_0001, 0);
     assert_eq!(ebx, 0);
-    // LAHF_LM SVM EXTAPIC CR8_LEGACY ABM SSE4A MISALIGNSSE 3DNOWPREFETCH OSVW TCE TOPOEXT
-    // PERFCTR_CORE PERFCTR_NB BPEXT PERFCTR_LLC MWAITX
-    let expected = bits(&[0, 2, 3, 4, 5, 6, 7, 8, 9, 17, 22, 23, 24, 26, 28, 29]);
+    // LAHF_LM SVM EXTAPIC CR8_LEGACY ABM SSE4A MISALIGNSSE 3DNOWPREFETCH OSVW IBS TCE TOPOEXT
+    // PERFCTR_CORE PERFCTR_NB BPEXT PERFCTR_LLC MWAITX ADDR_MASK_EXT
+    let expected = bits(&[
+        0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 17, 22, 23, 24, 26, 28, 29, 30,
+    ]);
     assert_eq!(ecx, expected, "{ecx:#034b}");
     for (bit, name) in [
-        (10, "IBS"),
         (11, "XOP"),
         (12, "SKINIT"),
         (13, "WDT"),
         (15, "LWP"),
         (16, "FMA4"),
-        (30, "ADDR_MASK_EXT"),
     ] {
         assert_eq!(ecx & (1 << bit), 0, "{name} is not implemented");
     }
@@ -465,12 +465,14 @@ fn leaf_0x8000000a_describes_svm() {
     assert_eq!((revision, asids, ecx), (1, 32768, 0));
     // nested paging, LBR virtualization, SVM lock, next-RIP save, the TSC ratio MSR, VMCB clean
     // bits, flush by ASID, decode assists, the pause filter and its threshold, AVIC, virtual
-    // VMLOAD/VMSAVE, vGIF, x2AVIC, SPEC_CTRL virtualization, vNMI and the SVM instruction address
-    // check order (tested in svm.rs); GMET, ROGPT, host MCE override and the rest are not
-    // implemented
+    // VMLOAD/VMSAVE, vGIF, GMET, x2AVIC, SPEC_CTRL virtualization, ROGPT, the host MCE override,
+    // TlbiCtl (the INVLPGB enable), vNMI and the SVM instruction address check order (tested in
+    // svm.rs); SSSCheck, IBS virtualization and the rest are not implemented
     assert_eq!(
         features,
-        bits(&[0, 1, 2, 3, 4, 5, 6, 7, 10, 12, 13, 15, 16, 18, 20, 25, 28])
+        bits(&[
+            0, 1, 2, 3, 4, 5, 6, 7, 10, 12, 13, 15, 16, 17, 18, 20, 21, 23, 24, 25, 28
+        ])
     );
 }
 
@@ -606,7 +608,6 @@ fn leaves_past_the_last_extended_leaf_and_the_unused_ones_are_zero() {
     for leaf in [
         0x8000_0009,
         0x8000_000b,
-        0x8000_001b,
         0x8000_001c,
         0x8000_001f,
         0x8000_0023,

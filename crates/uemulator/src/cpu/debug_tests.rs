@@ -251,6 +251,33 @@ fn an_address_mask_widens_a_data_breakpoint() {
     );
 }
 
+/// AdMskExtn (CPUID 0x8000_0001 ECX bit 30): the masks apply to instruction breakpoints too.
+#[test]
+fn an_address_mask_widens_an_instruction_breakpoint() {
+    // DR3 at CODE_BASE + 0x10 with mask 0x1f covers CODE_BASE..CODE_BASE + 0x20: the first nop.
+    on_both_engines(
+        &NOPS,
+        |h| {
+            h.cpu.wrmsr(MSR_DR3_ADDRESS_MASK, 0x1f).unwrap();
+            arm(h, 3, CODE_BASE + 0x10, RW_EXECUTE, LEN_1);
+        },
+        |h, engine| {
+            assert_eq!(h.run(100), DEBUG_TRAP, "{engine}");
+            assert_eq!(h.cpu.rip, CODE_BASE, "{engine}");
+            assert_eq!(h.cpu.dr[6], DR6_RESET | 1 << 3, "{engine}");
+        },
+    );
+    // Mask 0xf covers CODE_BASE + 0x10..0x20 only: nothing the program runs.
+    on_both_engines(
+        &NOPS,
+        |h| {
+            h.cpu.wrmsr(MSR_DR3_ADDRESS_MASK, 0xf).unwrap();
+            arm(h, 3, CODE_BASE + 0x10, RW_EXECUTE, LEN_1);
+        },
+        |h, engine| assert_eq!(h.run(100), Stop::Halted, "{engine}"),
+    );
+}
+
 #[test]
 fn the_address_mask_msrs_hold_32_bits() {
     let mut h = Harness::new(&[0xf4]);

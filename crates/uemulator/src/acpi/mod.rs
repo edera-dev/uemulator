@@ -16,6 +16,7 @@ mod tables;
 #[cfg(test)]
 mod tests;
 
+use crate::dev::fch;
 use crate::dev::iommu::{self, IvrsTopology, SpecialDevice};
 use crate::dev::pci::{ECAM_BASE, ECAM_BYTES_PER_BUS, LEGACY_IRQS, virtio_slot};
 use crate::dev::{HPET_REQUESTER, IOAPIC_REQUESTER, ioapic::IOAPIC_ID};
@@ -98,7 +99,8 @@ fn ivrs(config: &AcpiConfig) -> Vec<u8> {
     // Linux sizes the IOMMU's device table from the highest device id in the select and range
     // entries only, not the special ones: without these two the table would end below the
     // I/O APIC's requester id and every I/O APIC interrupt would fault.
-    pci_devices.extend([IOAPIC_REQUESTER, HPET_REQUESTER]);
+    // 00:14.0 is also the SMBus function; 00:14.3 is the LPC bridge (`dev/fch.rs`).
+    pci_devices.extend([IOAPIC_REQUESTER, HPET_REQUESTER, fch::LPC_DEVFN as u16]);
     iommu::Iommu::new().ivrs_table(&IvrsTopology {
         pci_devices,
         ioapics: vec![SpecialDevice {

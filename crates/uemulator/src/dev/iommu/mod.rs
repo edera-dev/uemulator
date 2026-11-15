@@ -10,6 +10,7 @@
 //! - `mod.rs`: state, PCI function, MMIO registers, the DMA translation entry point.
 //! - `commands.rs`: command buffer execution. `events.rs`: the event log.
 //! - `tables.rs`: device table entries and the page walk. `irq.rs`: interrupt remapping.
+//! - `ga.rs`: guest virtual APIC mode, posting into AVIC backing pages and the GA log.
 //! - `ivrs.rs`: the ACPI IVRS table that tells an OS this unit exists.
 //!
 //! Nothing in here touches RAM on its own: every entry point gets the memory it may use. Faults
@@ -26,6 +27,7 @@ use alloc::collections::BTreeMap;
 
 mod commands;
 mod events;
+mod ga;
 mod irq;
 mod ivrs;
 mod tables;
@@ -178,6 +180,9 @@ const CONTROL_INTCAPXT_ENABLE: u64 = 1 << 51;
 /// InvTimeOut (7:5), PassPW, ResPassPW, Coherent, Isoc: stored, no effect.
 const CONTROL_STORED_ONLY: u64 = 0xe0 | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11);
 const CONTROL_WRITABLE: u64 = CONTROL_IOMMU_ENABLE
+    | ga::CONTROL_GA_MODE_MASK
+    | ga::CONTROL_GA_LOG_ENABLE
+    | ga::CONTROL_GA_INTERRUPT_ENABLE
     | CONTROL_EVENT_LOG_ENABLE
     | CONTROL_EVENT_INTERRUPT_ENABLE
     | CONTROL_COMPLETION_WAIT_INTERRUPT_ENABLE
@@ -194,27 +199,33 @@ const STATUS_EVENT_INTERRUPT: u64 = 1 << 1;
 const STATUS_COMPLETION_WAIT_INTERRUPT: u64 = 1 << 2;
 const STATUS_EVENT_LOG_RUNNING: u64 = 1 << 3;
 const STATUS_COMMAND_BUFFER_RUNNING: u64 = 1 << 4;
-const STATUS_WRITE_ONE_TO_CLEAR: u64 =
-    STATUS_EVENT_OVERFLOW | STATUS_EVENT_INTERRUPT | STATUS_COMPLETION_WAIT_INTERRUPT;
+const STATUS_WRITE_ONE_TO_CLEAR: u64 = STATUS_EVENT_OVERFLOW
+    | STATUS_EVENT_INTERRUPT
+    | STATUS_COMPLETION_WAIT_INTERRUPT
+    | ga::STATUS_GA_LOG_OVERFLOW
+    | ga::STATUS_GA_LOG_INTERRUPT;
 
 /// Extended feature register: PreFSup (the prefetch command is accepted), XTSup (x2APIC: 32-bit
 /// IRTE destinations and the IntCapXT interrupt registers), NXSup (execute requests are checked,
-/// `Access::Execute`), IASup (invalidate all), GASup (128-bit IRTEs) and HATS = 10b (host page
-/// tables of up to six levels). Turin has more that are not implemented and so stay clear: PPR
-/// (1), GT (4), HE (8), PC (9, performance counters), GAM (21, vAPIC posting), HA/HD (52/51,
-/// access and dirty bits), EPH (50), and the v2 page table and SNP bits.
+/// `Access::Execute`), IASup (invalidate all), GASup (128-bit IRTEs), HATS = 10b (host page
+/// tables of up to six levels) and GAMSup = 001b (guest virtual APIC mode, `ga.rs`). Turin has
+/// more that are not implemented and so stay clear: PPR (1), GT (4), HE (8), PC (9, performance
+/// counters), HA/HD (52/51, access and dirty bits), EPH (50), and the v2 page table and SNP bits.
+/// The IVRS table repeats this (`ivrs.rs`).
 const EFR_PREFETCH: u64 = 1 << 0;
 const EFR_X2APIC: u64 = 1 << 2;
 const EFR_NO_EXECUTE: u64 = 1 << 3;
 const EFR_INVALIDATE_ALL: u64 = 1 << 6;
 const EFR_GUEST_APIC: u64 = 1 << 7;
 const EFR_HOST_ADDRESS_TRANSLATION_SIZE_6_LEVEL: u64 = 2 << 10;
+const EFR_GUEST_APIC_MODE_VIRTUAL: u64 = 1 << 21;
 pub(crate) const EXTENDED_FEATURES: u64 = EFR_PREFETCH
     | EFR_X2APIC
     | EFR_NO_EXECUTE
     | EFR_INVALIDATE_ALL
     | EFR_GUEST_APIC
-    | EFR_HOST_ADDRESS_TRANSLATION_SIZE_6_LEVEL;
+    | EFR_HOST_ADDRESS_TRANSLATION_SIZE_6_LEVEL
+    | EFR_GUEST_APIC_MODE_VIRTUAL;
 
 /// IOTLB slots, direct-mapped by requester and page (`iotlb_slot`): 16 MiB of 4 KiB pages. It
 /// used to be a map dropped wholesale at 1024 pages, which a device streaming through more
@@ -233,6 +244,9 @@ pub(crate) trait PhysRead {
 
 pub(crate) trait PhysWrite: PhysRead {
     fn write_phys(&mut self, addr: u64, data: &[u8]) -> bool;
+    /// Sets `bits` in the aligned 32-bit word at `addr` as one atomic read-modify-write: a vCPU
+    /// on another thread may be clearing other bits of it (an AVIC IRR it accepts from).
+    fn fetch_or_u32(&mut self, addr: u64, bits: u32) -> bool;
 }
 
 fn read_u64(mem: &dyn PhysRead, addr: u64) -> Option<u64> {
@@ -352,6 +366,14 @@ pub(crate) struct Iommu {
     xt_general_interrupt: u64,
     xt_ppr_interrupt: u64,
     xt_ga_log_interrupt: u64,
+    ga_log_base: u64,
+    ga_log_tail_address: u64,
+    ga_log_head: u64,
+    ga_log_tail: u64,
+    /// Interrupts for guest virtual APICs that `service` still has to write (`ga.rs`).
+    pending_posts: Vec<ga::Post>,
+    /// A GA log interrupt waits for the XT GA log interrupt register (IntCapXT).
+    ga_interrupt_pending: bool,
 
     /// Set by an illegal command or a failed completion-wait store: nothing runs until software
     /// toggles CmdBufEn.
@@ -395,6 +417,12 @@ impl Iommu {
             xt_general_interrupt: 0,
             xt_ppr_interrupt: 0,
             xt_ga_log_interrupt: 0,
+            ga_log_base: 0,
+            ga_log_tail_address: 0,
+            ga_log_head: 0,
+            ga_log_tail: 0,
+            pending_posts: Vec::new(),
+            ga_interrupt_pending: false,
             command_stalled: false,
             pending_events: Vec::new(),
             msi_pending: false,
@@ -626,17 +654,20 @@ impl Iommu {
         Some(MsiMessage { address, data })
     }
 
-    /// What the pending event or completion-wait interrupt turns into: the MSI the capability
-    /// holds, or with IntCapXTEn the vector and destination of the XT general interrupt register.
-    /// Once, like `take_msi`.
+    /// What the pending event, completion-wait or GA log interrupt turns into: the MSI the
+    /// capability holds, or with IntCapXTEn the vector and destination of the XT general (or GA
+    /// log) interrupt register. Each once, like `take_msi`; call until `None`.
     pub fn take_interrupt(&mut self) -> Option<IommuInterrupt> {
         if self.control & CONTROL_INTCAPXT_ENABLE == 0 {
             return self.take_msi().map(IommuInterrupt::Message);
         }
-        if !core::mem::take(&mut self.msi_pending) {
+        let register = if core::mem::take(&mut self.msi_pending) {
+            self.xt_general_interrupt
+        } else if core::mem::take(&mut self.ga_interrupt_pending) {
+            self.xt_ga_log_interrupt
+        } else {
             return None;
-        }
-        let register = self.xt_general_interrupt;
+        };
         let low = (register >> XT_DESTINATION_LOW_SHIFT) & XT_DESTINATION_LOW_MASK;
         let high = register >> XT_DESTINATION_HIGH_SHIFT;
         Some(IommuInterrupt::Direct(crate::dev::apic::Interrupt {
@@ -670,11 +701,15 @@ impl Iommu {
             REG_XT_GENERAL_INTERRUPT => self.xt_general_interrupt,
             REG_XT_PPR_INTERRUPT => self.xt_ppr_interrupt,
             REG_XT_GA_LOG_INTERRUPT => self.xt_ga_log_interrupt,
+            ga::REG_GA_LOG_BASE => self.ga_log_base,
+            ga::REG_GA_LOG_TAIL_ADDRESS => self.ga_log_tail_address,
+            ga::REG_GA_LOG_HEAD => self.ga_log_head,
+            ga::REG_GA_LOG_TAIL => self.ga_log_tail,
             _ => 0,
         }
     }
 
-    /// `offset` is relative to the window. Registers not modeled (PPR, GA log, performance
+    /// `offset` is relative to the window. Registers not modeled (PPR log, performance
     /// counters, SMI filters, hardware error registers) read zero.
     pub fn mmio_read(&self, offset: u64, size: u8) -> u64 {
         let lane = offset & 7;
@@ -736,6 +771,21 @@ impl Iommu {
             REG_XT_GA_LOG_INTERRUPT => {
                 self.xt_ga_log_interrupt = merge(self.xt_ga_log_interrupt, u64::MAX)
             }
+            ga::REG_GA_LOG_BASE => {
+                self.ga_log_base = merge(self.ga_log_base, ga::GA_LOG_BASE_WRITABLE);
+                self.ga_log_head = 0;
+                self.ga_log_tail = 0;
+            }
+            ga::REG_GA_LOG_TAIL_ADDRESS => {
+                self.ga_log_tail_address =
+                    merge(self.ga_log_tail_address, ga::GA_LOG_TAIL_ADDRESS_WRITABLE)
+            }
+            ga::REG_GA_LOG_HEAD => {
+                self.ga_log_head = merge(self.ga_log_head, ga::GA_LOG_POINTER_MASK)
+            }
+            ga::REG_GA_LOG_TAIL => {
+                self.ga_log_tail = merge(self.ga_log_tail, ga::GA_LOG_POINTER_MASK)
+            }
             _ => {}
         }
         self.service(mem);
@@ -753,6 +803,9 @@ impl Iommu {
             } else {
                 self.status &= !STATUS_EVENT_LOG_RUNNING;
             }
+        }
+        if changed & ga::CONTROL_GA_LOG_ENABLE != 0 {
+            self.ga_log_enable_changed(new & ga::CONTROL_GA_LOG_ENABLE != 0);
         }
         if changed & CONTROL_COMMAND_BUFFER_ENABLE != 0 {
             if new & CONTROL_COMMAND_BUFFER_ENABLE != 0 {
@@ -772,6 +825,7 @@ impl Iommu {
             self.run_commands(mem);
         }
         self.flush_events(mem);
+        self.flush_posts(mem);
     }
 
     /// Translates one device DMA address. With the IOMMU off (or no device table programmed)
