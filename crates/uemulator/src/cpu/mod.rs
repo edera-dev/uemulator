@@ -26,6 +26,7 @@ pub(crate) mod mca;
 pub(crate) mod mem;
 pub(crate) mod modes;
 pub(crate) mod mtrr;
+pub(crate) mod pmu;
 pub(crate) mod profile;
 mod protection;
 mod rdt;
@@ -444,6 +445,8 @@ pub(crate) struct Cpu {
     pub xcr0: u64,
     /// AMD SVM: host/guest switching state (see `svm.rs`).
     pub svm: svm::Svm,
+    /// Performance counters and the branch record (see `pmu.rs`).
+    pub pmu: pmu::Pmu,
     /// MONITOR address and whether a monitor is armed for the next MWAIT.
     pub monitor_address: u64,
     pub monitor_armed: bool,
@@ -748,11 +751,6 @@ impl Cpu {
         const MSR_AMD64_TOP_MEM: u32 = 0xc001_001a;
         const MSR_AMD64_TOP_MEM2: u32 = 0xc001_001d;
         const SYSCFG_INITIAL: u64 = (1 << 18) | (1 << 20);
-        /// The four legacy performance event selectors and counters, which Linux probes with a
-        /// write-and-read-back before it trusts a PMU. They store but never count (there is no PMU
-        /// model), so perf sees counters that stay at zero instead of a "broken PMU" warning.
-        const MSR_K7_PERF_FIRST: u32 = 0xc001_0000;
-        const MSR_K7_PERF_LAST: u32 = 0xc001_0007;
         /// Instruction-cache, data-cache and bus-unit configuration and the Zen 4 branch predictor
         /// control: Linux and Xen set workaround bits in these with rdmsr/wrmsr_safe depending on
         /// family and model. Storage only, so the read-modify-write sequences succeed quietly.
@@ -819,6 +817,7 @@ impl Cpu {
             spec_ctrl: 0,
             xcr0: xsave::XCR0_X87,
             svm: svm::Svm::new(),
+            pmu: pmu::Pmu::new(),
             monitor_address: 0,
             monitor_armed: false,
             monitor_snapshot: None,
@@ -843,7 +842,6 @@ impl Cpu {
             ]
             .into_iter()
             .chain((MSR_AMD64_IORR_FIRST..=MSR_AMD64_IORR_LAST).map(|msr| (msr, 0)))
-            .chain((MSR_K7_PERF_FIRST..=MSR_K7_PERF_LAST).map(|msr| (msr, 0)))
             .collect(),
             cpl: 0,
             xmm: [0; 16],
@@ -953,6 +951,13 @@ impl Cpu {
         let user_half_offset = TLB_ENTRIES_PER_MODE * core::mem::size_of::<TlbEntry>();
         self.tlb_active_base =
             self.tlb.as_ptr() as u64 + (cpl == USER_CPL) as u64 * user_half_offset as u64;
+        self.pmu_mode_changed();
+    }
+
+    /// Whether the next step runs a JIT block: 64-bit code with a JIT, unless a performance
+    /// counter or the branch record has to see every instruction (`pmu.rs`).
+    pub(crate) fn uses_jit(&self) -> bool {
+        self.jit.is_some() && self.is_long64() && !self.pmu.precise
     }
 
     pub fn now_ns(&self) -> u64 {
@@ -1077,12 +1082,17 @@ impl Cpu {
             }
         }
         if self.icount >= self.next_event {
+            self.pmu_deadline_reached();
             // `pause` pulled the deadline forward only to get here: no device work is due.
             if self.pause_resume_event != 0 {
                 self.next_event = core::mem::take(&mut self.pause_resume_event);
                 return BeforeStep::Yield;
             }
-            if let Some(reason) = self.service_events() {
+            let serviced = self.service_events();
+            // `service_events` pushed `next_event` a whole interval out; an earlier counter
+            // overflow must still stop the JIT's chained blocks in time.
+            self.next_event = self.next_event.min(self.pmu.deadline);
+            if let Some(reason) = serviced {
                 return BeforeStep::Exit(reason);
             }
             if self.multi && self.threads.is_none() {
@@ -1138,6 +1148,10 @@ impl Cpu {
                 error_code,
                 software,
             }) => {
+                // `icount` charged the faulting instruction, but it did not retire; `int n` did.
+                if !software {
+                    self.pmu.unretired += 1;
+                }
                 if self.svm_exception_exit(vector, error_code, software) {
                     return None;
                 }
@@ -1176,7 +1190,7 @@ impl Cpu {
             }
             self.interrupt_shadow = false;
             self.icount += 1;
-            let result = if self.jit.is_some() && self.is_long64() {
+            let result = if self.uses_jit() {
                 self.step_block()
             } else {
                 self.step()
@@ -1436,6 +1450,9 @@ impl Cpu {
                 trace.pop_front();
             }
             trace.push_back(self.rip);
+        }
+        if self.pmu.precise {
+            return self.exec_observed(&insn);
         }
         self.exec(&insn)
     }
@@ -1762,16 +1779,8 @@ mod cpu_tests {
         #[test]
         fn stored_only_msrs_are_seeded() {
             let h = harness();
-            let expected: [(u32, u64); 25] = [
+            let expected: [(u32, u64); 17] = [
                 (0x8b, 0x0b00_215a),
-                (0xc001_0000, 0),
-                (0xc001_0001, 0),
-                (0xc001_0002, 0),
-                (0xc001_0003, 0),
-                (0xc001_0004, 0),
-                (0xc001_0005, 0),
-                (0xc001_0006, 0),
-                (0xc001_0007, 0),
                 (0xc001_1021, 0),
                 (0xc001_1022, 0),
                 (0xc001_102a, 0),

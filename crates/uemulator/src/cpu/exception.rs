@@ -148,12 +148,24 @@ impl Cpu {
         error_code: Option<u32>,
         software: bool,
     ) -> Option<ExitReason> {
+        if self.pmu.precise {
+            let source = self.pmu_event_delivering();
+            let exit = self.deliver_chain(vector, error_code, software, !software);
+            self.pmu_event_delivered(source);
+            return exit;
+        }
         self.deliver_chain(vector, error_code, software, !software)
     }
 
     /// Delivers an external interrupt. Like `int n` it is not an exception, so a fault while
     /// delivering it never counts the interrupt's own vector as contributory.
     pub fn deliver_hardware_interrupt(&mut self, vector: u8) -> Option<ExitReason> {
+        if self.pmu.precise {
+            let source = self.pmu_event_delivering();
+            let exit = self.deliver_chain(vector, None, false, false);
+            self.pmu_event_delivered(source);
+            return exit;
+        }
         self.deliver_chain(vector, None, false, false)
     }
 
