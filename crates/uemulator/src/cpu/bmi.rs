@@ -56,7 +56,7 @@ pub(super) fn parallel_deposit(source: u64, mask: u64) -> u64 {
     let mut remaining = mask;
     let mut next_source_bit = 0;
     while remaining != 0 {
-        let lowest = remaining & remaining.wrapping_neg();
+        let lowest = remaining.isolate_lowest_one();
         if source & (1 << next_source_bit) != 0 {
             result |= lowest;
         }
@@ -72,7 +72,7 @@ pub(super) fn parallel_extract(source: u64, mask: u64) -> u64 {
     let mut remaining = mask;
     let mut next_result_bit = 0;
     while remaining != 0 {
-        let lowest = remaining & remaining.wrapping_neg();
+        let lowest = remaining.isolate_lowest_one();
         if source & lowest != 0 {
             result |= 1 << next_result_bit;
         }
@@ -115,7 +115,7 @@ impl Cpu {
                 let (result, carry) = match i.reg & 7 {
                     GROUP17_BLSR => (source & source.wrapping_sub(1), source == 0),
                     GROUP17_BLSMSK => (source ^ source.wrapping_sub(1), source == 0),
-                    GROUP17_BLSI => (source & source.wrapping_neg(), source != 0),
+                    GROUP17_BLSI => (source.isolate_lowest_one(), source != 0),
                     _ => return Err(Exception::invalid_opcode()),
                 };
                 let result = result & operand_mask;
