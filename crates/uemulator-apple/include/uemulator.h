@@ -19,6 +19,10 @@
 #define UA_OPTION_INPUT (1u << 9)
 // With UA_OPTION_DISPLAY: the screen is the guest's console, not the terminal.
 #define UA_OPTION_SCREEN_CONSOLE (1u << 10)
+// A TPM 2.0; its seeds and NV live in the NVRAM store.
+#define UA_OPTION_TPM (1u << 11)
+// The firmware enforces Secure Boot, enrolling its keys into the NVRAM store on first use.
+#define UA_OPTION_SECURE_BOOT (1u << 12)
 
 // ua_cursor_fn kinds: the guest has no pointer of its own (show the host's), hid it, or drew one.
 #define UA_CURSOR_HOST 0
@@ -90,6 +94,9 @@ typedef struct {
     // In order: vda, vdb, ... May be NULL with count 0.
     const ua_disk *disks;
     size_t disk_count;
+    // The machine's nvram.kv (UEFI variables, TPM state), created if missing; NULL keeps them in
+    // memory until the guest resets.
+    const char *nvram_path;
     uint32_t memory_mib;
     uint32_t cpus;
     uint32_t options;
@@ -131,6 +138,15 @@ int32_t ua_scroll(const ua_machine *machine, int32_t clicks);
 int32_t ua_release_all(const ua_machine *machine);
 // Asks the guest for a `width` x `height` screen, as a monitor hotplug would; the guest decides.
 int32_t ua_request_size(const ua_machine *machine, uint32_t width, uint32_t height);
+// machine.toml (the CLI's format) at `path` as a JSON object, an empty one when the file does not
+// exist; free it with ua_string_free. NULL on failure, with the message in `error`.
+char *ua_machine_load(const char *path, char *error, size_t error_capacity);
+// Merges `changes`, a JSON object (null removes a key), into machine.toml at `path` and writes it
+// back atomically; keys the app does not know are kept. 0, or -1 with the message in `error`.
+int32_t ua_machine_save(const char *path, const char *changes, char *error, size_t error_capacity);
+void ua_string_free(char *text);
+// A new, empty, sparse udisk image of `size_mib` at `path`; never replaces a file. 0, or -1.
+int32_t ua_disk_create(const char *path, uint64_t size_mib, char *error, size_t error_capacity);
 // Stops the guest, waits for its threads and frees the machine. No callback runs after it returns.
 void ua_destroy(ua_machine *machine);
 

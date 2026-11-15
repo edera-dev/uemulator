@@ -27,9 +27,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use uemulator::{
     BYTES_PER_PIXEL, BlockBackend, ClockMode, ConsoleKind, Cursor, Disk, DisplayHandle,
     DisplayMode, EmulatedMachine, Endpoint, ExitReason, Gateway, GatewayConfig, GatewayPolicy,
-    GpuLink, InputHandle, JitMode, MachineConfig, MemoryKeyValueStore, NetHandle, PointerButton,
-    RawImage, RemoteImage, ScreenMirror, SegmentAgent, SegmentDestination, SegmentStatus,
-    StopHandle, Udisk, UdiskOptions, WispClient, WispState, WispStatus, disk_io,
+    GpuLink, ImageStorage, InputHandle, JitMode, MachineConfig, MemoryKeyValueStore, NetHandle,
+    PointerButton, RawImage, RemoteImage, ScreenMirror, SegmentAgent, SegmentDestination,
+    SegmentStatus, StopHandle, Udisk, UdiskOptions, WispClient, WispState, WispStatus, disk_io,
 };
 
 const NS_PER_MS: f64 = 1_000_000.0;
@@ -183,6 +183,13 @@ unsafe extern "C" {
     /// with a synchronous range request, or a `File` read with `FileReaderSync`). Blocks until
     /// they arrive. Returns 0, or non-zero when the read failed.
     fn host_disk_read(source: i32, offset: f64, ptr: *mut u8, len: usize) -> i32;
+    /// Writes `ptr..ptr+len` at `offset` of a `DISK_WRITE_THROUGH` source; blocks until the host
+    /// has it. Returns 0, or non-zero when the write failed. Only the Apple app's page provides a
+    /// real one (`apple/WebEngine`); the web page never asks for write-through.
+    fn host_disk_write(source: i32, offset: f64, ptr: *const u8, len: usize) -> i32;
+    /// Makes every completed write of `source` durable (the udisk writer orders its map updates
+    /// on it). Returns 0, or non-zero on failure.
+    fn host_disk_flush(source: i32) -> i32;
     /// Copies up to `capacity` input event records (`EVENT_WORDS` `i32` each) to `ptr` and
     /// returns how many; never blocks.
     fn host_input_events(ptr: *mut i32, capacity: usize) -> usize;
@@ -331,15 +338,30 @@ unsafe fn take_buffer(ptr: *mut u8, len: usize) -> Vec<u8> {
     buffer
 }
 
+/// `uw_add_disk` modes. The values are what the page passed as a boolean before write-through
+/// existed, so its `read_only ? 1 : 0` still means the same.
+const DISK_OVERLAY: i32 = 0;
+const DISK_READ_ONLY: i32 = 1;
+const DISK_WRITE_THROUGH: i32 = 2;
+
 /// A disk for the next `uw_create`: the page's disk source `source` (`length` bytes; see
 /// `host_disk_read`), raw or udisk, read on demand. Disks attach in call order (`vda`, `vdb`, ...).
-/// With `read_only` 0 an in-memory udisk overlay takes the guest's writes, which are gone when
-/// the page stops the machine; otherwise the guest sees a read-only disk (the virtio-blk RO
-/// feature), which is what a CD image should be: an installer that finds its medium writable may
-/// offer it as an install target. Returns 0, or 1 with the message in `uw_error_*`.
+/// `mode` `DISK_OVERLAY`: an in-memory udisk overlay takes the guest's writes, which are gone when
+/// the page stops the machine. `DISK_READ_ONLY`: the guest sees a read-only disk (the virtio-blk
+/// RO feature), which is what a CD image should be: an installer that finds its medium writable
+/// may offer it as an install target. `DISK_WRITE_THROUGH`: writes go to the host
+/// (`host_disk_write`), which keeps them; the Apple app's machines. Returns 0, or 1 with the
+/// message in `uw_error_*`.
 #[unsafe(no_mangle)]
-pub extern "C" fn uw_add_disk(source: i32, length: f64, read_only: i32) -> i32 {
-    match streamed_disk(source, length as u64, read_only != 0) {
+pub extern "C" fn uw_add_disk(source: i32, length: f64, mode: i32) -> i32 {
+    let disk = match mode {
+        DISK_WRITE_THROUGH => host_disk(source, length as u64),
+        DISK_READ_ONLY | DISK_OVERLAY => {
+            streamed_disk(source, length as u64, mode == DISK_READ_ONLY)
+        }
+        _ => Err(format!("unknown disk mode {mode}")),
+    };
+    match disk {
         Ok(disk) => {
             PENDING_DISKS.with(|disks| disks.borrow_mut().push(disk));
             0
@@ -348,6 +370,59 @@ pub extern "C" fn uw_add_disk(source: i32, length: f64, read_only: i32) -> i32 {
             set_error(message);
             1
         }
+    }
+}
+
+/// A disk the host reads and writes for the guest, byte for byte: the host's file is the disk.
+struct HostImage {
+    source: i32,
+    length: u64,
+}
+
+impl ImageStorage for HostImage {
+    fn len(&self) -> u64 {
+        self.length
+    }
+
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> disk_io::Result<()> {
+        match unsafe { host_disk_read(self.source, offset as f64, buf.as_mut_ptr(), buf.len()) } {
+            0 => Ok(()),
+            _ => Err(disk_io::Error::other("reading the disk image failed")),
+        }
+    }
+
+    fn write_at(&mut self, offset: u64, data: &[u8]) -> disk_io::Result<()> {
+        match unsafe { host_disk_write(self.source, offset as f64, data.as_ptr(), data.len()) } {
+            0 => {
+                // A udisk grows its file as clusters are allocated.
+                self.length = self.length.max(offset + data.len() as u64);
+                Ok(())
+            }
+            _ => Err(disk_io::Error::other("writing the disk image failed")),
+        }
+    }
+
+    fn flush(&mut self) -> disk_io::Result<()> {
+        match unsafe { host_disk_flush(self.source) } {
+            0 => Ok(()),
+            _ => Err(disk_io::Error::other("flushing the disk image failed")),
+        }
+    }
+}
+
+fn host_disk(source: i32, length: u64) -> Result<Disk, String> {
+    if length == 0 {
+        return Err("the disk image is empty".into());
+    }
+    let mut image = HostImage { source, length };
+    match Udisk::probe(&mut image).map_err(|e| e.to_string())? {
+        Some(info) if info.backing.is_some() => Err(
+            "the disk image is an overlay; flatten it first with `uemulator disk convert`".into(),
+        ),
+        Some(_) => Ok(Disk::from_backend(
+            Udisk::open(image, None).map_err(|e| e.to_string())?,
+        )),
+        None => Ok(Disk::from_backend(RawImage::new(image))),
     }
 }
 

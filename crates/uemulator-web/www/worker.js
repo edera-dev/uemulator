@@ -19,7 +19,8 @@ const IDLE_WAIT_MS = 1;
 
 let wasm;
 let control;
-// Disk sources by the number `uw_add_disk` was given: { url } or { file }, and `readOnly`.
+// Disk sources by the number `uw_add_disk` was given: { url } or { file }, and `readOnly` or
+// `writeThrough` (a URL that takes the guest's writes: the Apple app's page, apple/WebEngine).
 const diskSources = [];
 let ring;
 let events;
@@ -211,6 +212,26 @@ const host = {
   },
   // Blocks the emulator until the bytes are here: the guest's disk request is served on this
   // thread inside `uw_run`. A worker may make synchronous requests (a page may not).
+  // Blocks like the reads: the guest's write completes when the app has it.
+  host_disk_write(source, offset, ptr, len) {
+    try {
+      // A copy: XHR refuses views on shared memory.
+      postToDisk(diskSources[source], `offset=${offset}`, memoryBytes(ptr, len).slice());
+      return 0;
+    } catch (error) {
+      postMessage({ type: "log", text: `disk write at ${offset} failed: ${error}` });
+      return 1;
+    }
+  },
+  host_disk_flush(source) {
+    try {
+      postToDisk(diskSources[source], "flush=1", null);
+      return 0;
+    } catch (error) {
+      postMessage({ type: "log", text: `disk flush failed: ${error}` });
+      return 1;
+    }
+  },
   host_disk_read(source, offset, ptr, len) {
     try {
       const bytes = readDiskSource(diskSources[source], offset, len);
@@ -224,6 +245,22 @@ const host = {
     }
   },
 };
+
+// `uw_add_disk`'s modes (DISK_* in src/lib.rs).
+const DISK_MODE = { OVERLAY: 0, READ_ONLY: 1, WRITE_THROUGH: 2 };
+
+function diskMode(source) {
+  if (source.readOnly) return DISK_MODE.READ_ONLY;
+  return source.writeThrough && source.url ? DISK_MODE.WRITE_THROUGH : DISK_MODE.OVERLAY;
+}
+
+// A synchronous POST to a write-through source: `?offset=N` with the bytes, or `?flush=1`.
+function postToDisk(source, query, body) {
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", `${source.url}?${query}`, false);
+  xhr.send(body);
+  if (xhr.status !== 200) throw new Error(`${source.url}: ${query} answered with ${xhr.status}`);
+}
 
 // One synchronous range request. A 200 instead of 206 means the server ignored the range and
 // sent the whole image, which would make every read a full download; that is refused.
@@ -323,7 +360,7 @@ async function boot(message) {
   const cmdlinePtr = upload(cmdline);
   for (const source of message.disks ?? []) {
     const index = diskSources.push(source) - 1;
-    if (wasm.uw_add_disk(index, diskLength(source), source.readOnly ? 1 : 0)) {
+    if (wasm.uw_add_disk(index, diskLength(source), diskMode(source))) {
       postMessage({ type: "exit", code: -2, message: `${source.label ?? "disk"}: ${lastError()}` });
       return;
     }

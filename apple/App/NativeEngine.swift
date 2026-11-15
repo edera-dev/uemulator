@@ -17,6 +17,8 @@ final class NativeEngine: MachineEngine, @unchecked Sendable {
     // Called on the main actor.
     var onOutput: (([UInt8]) -> Void)?
     var onState: ((EngineState) -> Void)?
+    // The library's log hook is not wired through the C ABI yet.
+    var onLog: ((String) -> Void)?
     // Main actor only.
     var screen: ScreenSurface?
 
@@ -78,7 +80,11 @@ final class NativeEngine: MachineEngine, @unchecked Sendable {
         let options = settings.options
         // C strings for the disks' paths, alive until ua_create has copied them.
         let paths = settings.disks.map { strdup($0.url.path) }
-        defer { paths.forEach { free($0) } }
+        let nvram = settings.nvram.map { strdup($0.path) } ?? nil
+        defer {
+            paths.forEach { free($0) }
+            free(nvram)
+        }
         let disks = zip(settings.disks, paths).map { ua_disk(path: $1, read_only: $0.readOnly ? 1 : 0) }
         let created: OpaquePointer? = disks.withUnsafeBufferPointer { disks in settings.kernel.withUnsafeBytes { kernel in
             settings.initrd.withUnsafeBytes { initrd in
@@ -90,6 +96,7 @@ final class NativeEngine: MachineEngine, @unchecked Sendable {
                             firmware: firmware.bindMemory(to: UInt8.self).baseAddress, firmware_len: firmware.count,
                             cmdline_append: cmdline,
                             disks: disks.baseAddress, disk_count: disks.count,
+                            nvram_path: nvram,
                             memory_mib: settings.memoryMib, cpus: settings.cpus, options: options,
                             cols: settings.cols, rows: settings.rows)
                         return ua_create(&config, NativeEngine.outputCallback, NativeEngine.exitCallback, context,

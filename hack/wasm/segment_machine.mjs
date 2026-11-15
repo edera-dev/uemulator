@@ -107,6 +107,8 @@ const host = {
     parentPort.postMessage({ type: "log", text: decoder.decode(bytes(ptr, len)) });
   },
   host_disk_read: () => 1,
+  host_disk_write: () => 1,
+  host_disk_flush: () => 1,
 };
 
 const { instance } = await WebAssembly.instantiate(readFileSync(wasmPath), { host });

@@ -37,12 +37,15 @@ ROOTFS = (f"{RELEASES}/alpine-minirootfs-{ALPINE_VERSION}-x86_64.tar.gz",
 # needs.
 NETBOOT_INITRAMFS = (f"{RELEASES}/netboot-{ALPINE_VERSION}/initramfs-virt",
                      "41d55a3fd650c99f5fa2a9dfed1eff3b441186831fd4f8d2223f717d8a28217d")
-# In load order (modules.dep: virtio_net needs net_failover, which needs failover), below
-# usr/lib/modules/VERSION/ in the netboot initramfs.
-NET_MODULES = ["kernel/net/core/failover.ko", "kernel/drivers/net/net_failover.ko",
-               "kernel/drivers/net/virtio_net.ko", "kernel/net/packet/af_packet.ko"]
+# What the virt kernel builds as modules and the demo needs, in load order (modules.dep:
+# virtio_net needs net_failover, which needs failover), below usr/lib/modules/VERSION/ in the
+# netboot initramfs: the NIC, packet sockets for udhcpc, and virtio_blk so a disk the machine is
+# given shows up as /dev/vda (without it `dd of=/dev/vda` quietly writes a file in /dev).
+DEMO_MODULES = ["kernel/net/core/failover.ko", "kernel/drivers/net/net_failover.ko",
+                "kernel/drivers/net/virtio_net.ko", "kernel/net/packet/af_packet.ko",
+                "kernel/drivers/block/virtio_blk.ko"]
 # Where /init finds them in the demo's initramfs.
-NET_MODULE_DIR = "lib/modules/net"
+MODULE_DIR = "lib/modules/demo"
 
 XEN_REF = os.path.join(os.path.dirname(os.path.abspath(__file__)), "demo-xen.ref")
 # Where Edera's image keeps them.
@@ -83,8 +86,8 @@ echo
 # The page's Network switch gives the machine a NIC on the segment this browser's tabs share
 # (docs/plans/13-web.md); one of the tabs answers DHCP. udhcpc gives up after about 10 s, which
 # only happens when no tab serves.
-for module in {" ".join(m.rsplit("/", 1)[1].removesuffix(".ko") for m in NET_MODULES)}; do
-    insmod /{NET_MODULE_DIR}/$module.ko 2>/dev/null
+for module in {" ".join(m.rsplit("/", 1)[1].removesuffix(".ko") for m in DEMO_MODULES)}; do
+    insmod /{MODULE_DIR}/$module.ko 2>/dev/null
 done
 ip link set lo up
 network="No network."
@@ -266,7 +269,7 @@ def newc_members(archive):
         offset = data_at + file_size + (-(data_at + file_size) % CPIO_ALIGN)
 
 
-def net_modules(netboot_initramfs_gz, wanted=NET_MODULES):
+def netboot_modules(netboot_initramfs_gz, wanted=DEMO_MODULES):
     """{file name: bytes} of `wanted` (paths below usr/lib/modules/VERSION/) from the netboot
     initramfs."""
     found = {}
@@ -280,7 +283,7 @@ def net_modules(netboot_initramfs_gz, wanted=NET_MODULES):
     return found
 
 
-def initramfs(rootfs_tar_gz, modules, init=INIT, module_dir=NET_MODULE_DIR):
+def initramfs(rootfs_tar_gz, modules, init=INIT, module_dir=MODULE_DIR):
     """The minirootfs, `modules` ({file name: bytes}) in `module_dir` and `init` as /init."""
     archive = Newc()
     with tarfile.open(fileobj=io.BytesIO(rootfs_tar_gz), mode="r:gz") as tar:
@@ -320,7 +323,7 @@ def main():
 
     kernel = fetch(*KERNEL, args.cache)
     rootfs = fetch(*ROOTFS, args.cache)
-    modules = net_modules(fetch(*NETBOOT_INITRAMFS, args.cache))
+    modules = netboot_modules(fetch(*NETBOOT_INITRAMFS, args.cache))
     xen, xen_version = fetch_xen(args.cache)
     files = {"vmlinuz-virt": kernel, "initramfs.gz": initramfs(rootfs, modules), "xen.gz": xen}
     for name, data in files.items():

@@ -12,3 +12,7 @@ crate-type = ["staticlib", "rlib"]
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 uemulator = { path = "../uemulator" }
+# machine.toml, the CLI's machine format, kept as an untyped table so keys the app does not know
+# survive it; JSON is how it crosses to Swift.
+toml = "1.1.8"
+serde_json = "1"

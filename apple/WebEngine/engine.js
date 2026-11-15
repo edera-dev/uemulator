@@ -153,9 +153,12 @@ async function boot(settings) {
     cols: settings.cols,
     rows: settings.rows,
     options: settings.options,
-    // { url, readOnly }: worker.js reads them with synchronous range requests, which the app's
-    // loopback server answers.
-    disks: (settings.disks ?? []).map((disk) => ({ url: new URL(disk.url, location.href).href, readOnly: disk.readOnly })),
+    // worker.js reads them with synchronous range requests, which the app's loopback server
+    // answers; a writable disk writes through to the app's file with synchronous POSTs to the
+    // same URL.
+    disks: (settings.disks ?? []).map((disk) => ({
+      url: new URL(disk.url, location.href).href, readOnly: disk.readOnly, writeThrough: !disk.readOnly,
+    })),
   }, [kernel, initrd, firmwareImage].filter(Boolean));
 }
 

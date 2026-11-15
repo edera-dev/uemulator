@@ -14,6 +14,7 @@ import WebKit
 final class WebKitEngine: NSObject, MachineEngine {
     var onOutput: (([UInt8]) -> Void)?
     var onState: ((EngineState) -> Void)?
+    var onLog: ((String) -> Void)?
     var screen: ScreenSurface?
 
     // Must sit in a window's view hierarchy (1x1, invisible): M0 ran it that way, and a web view in
@@ -28,6 +29,12 @@ final class WebKitEngine: NSObject, MachineEngine {
     // The boot message for the current run until its page connects.
     private var pendingBoot: String?
     private var active = false
+    // A stopped run's socket while its worker closes the machine (`stop`).
+    private var draining: BridgeSocket?
+    private var drainTimer: Timer?
+    private var startAfterDrain: MachineSettings?
+    // How long a stopping worker gets to close its disks before the page is blanked anyway.
+    private static let drainTimeout: TimeInterval = 5
     private var jit = true
 
     // `www/protocol.js`'s FIRMWARE and OPTION values, which `uw_create` takes.
@@ -86,6 +93,16 @@ final class WebKitEngine: NSObject, MachineEngine {
 
     func start(_ settings: MachineSettings) {
         stop()
+        // The previous machine is still closing its disks: this one loads the page after it.
+        if draining != nil {
+            startAfterDrain = settings
+            onState?(.starting)
+            return
+        }
+        begin(settings)
+    }
+
+    private func begin(_ settings: MachineSettings) {
         run += 1
         let run = run
         active = true
@@ -97,8 +114,9 @@ final class WebKitEngine: NSObject, MachineEngine {
         var disks: [[String: Any]] = []
         for (index, disk) in settings.disks.enumerated() {
             let path = prefix + "disk\(index)"
-            files.register(path, file: disk.url)
-            // The web build keeps a writable disk's writes in memory (a udisk overlay) until M4.
+            // A writable disk takes the guest's writes through the loopback server into the file
+            // (worker.js's write-through mode), as the native engine writes it directly.
+            files.register(path, file: disk.url, writable: !disk.readOnly)
             disks.append(["url": path, "readOnly": disk.readOnly])
         }
         if let firmware = settings.firmware { files.register(prefix + "firmware", firmware) }
@@ -129,17 +147,44 @@ final class WebKitEngine: NSObject, MachineEngine {
         }
     }
 
+    // Stopping asks the worker to stop and lets it finish: `uw_run` returns, drops the machine,
+    // and a udisk writes its map then (map updates wait for a flush or the close,
+    // docs/spec/uemulator-disk-format.md). Blanking the page at once would kill the worker first
+    // and lose whatever the guest wrote since its last flush. The UI sees Stopped immediately; the
+    // page goes when the worker says it exited, or after `drainTimeout`.
     func stop() {
+        startAfterDrain = nil
         guard active else { return }
         active = false
         pendingBoot = nil
-        socket?.send(text: Self.json(["type": "stop"]))
-        socket?.close()
-        socket = nil
+        if let socket {
+            socket.send(text: Self.json(["type": "stop"]))
+            draining = socket
+            self.socket = nil
+            let timer = Timer(timeInterval: Self.drainTimeout, repeats: false) { [weak self] _ in
+                MainActor.assumeIsolated { self?.finishDrain() }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            drainTimer = timer
+        } else {
+            finishDrain()
+        }
+        onState?(.stopped("Stopped"))
+    }
+
+    private func finishDrain() {
+        drainTimer?.invalidate()
+        drainTimer = nil
+        draining?.close()
+        draining = nil
+        // Synchronizes and closes the run's writable disks.
         files.removeAll(prefix: "run/")
         // Ends the page and its worker. The next start loads the engine page again.
         webView.loadHTMLString("", baseURL: nil)
-        onState?(.stopped("Stopped"))
+        if let settings = startAfterDrain {
+            startAfterDrain = nil
+            begin(settings)
+        }
     }
 
     func send(_ bytes: [UInt8]) {
@@ -255,7 +300,13 @@ final class WebKitEngine: NSObject, MachineEngine {
             self.receive(data)
         }
         socket.onText = { [weak self, weak socket] text in
-            guard let self, let socket, socket === self.socket else { return }
+            guard let self, let socket else { return }
+            if socket === self.draining {
+                // Any exit, the stop asked for or not: the machine is gone and its disks closed.
+                if text.contains("\"exit\"") { self.finishDrain() }
+                return
+            }
+            guard socket === self.socket else { return }
             self.handle(text)
         }
         socket.send(text: boot)
@@ -276,18 +327,22 @@ final class WebKitEngine: NSObject, MachineEngine {
             if !detail.isEmpty { reason += ": \(detail)" }
             finish(reason)
         case "log":
-            #if DEBUG
-            print("[engine] \(message["text"] as? String ?? "")")
-            #endif
+            onLog?(message["text"] as? String ?? "")
         default:
             break
         }
     }
 
     // The guest ended by itself (or the page failed): same teardown as stop, its own reason.
+    // The guest ended by itself, or the page failed: `uw_run` has returned (its disks are closed)
+    // or never will, so there is nothing to wait for.
     private func finish(_ reason: String) {
         guard active else { return }
-        stop()
+        active = false
+        pendingBoot = nil
+        socket?.close()
+        socket = nil
+        finishDrain()
         onState?(.stopped(reason))
     }
 

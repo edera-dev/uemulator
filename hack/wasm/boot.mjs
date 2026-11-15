@@ -179,6 +179,9 @@ const host = {
   },
   host_now_ms: () => performance.now(),
   host_log: (ptr, len) => console.error("log:", decoder.decode(bytes(ptr, len))),
+  // Never write-through here (boot.mjs attaches disks read-only or with an in-memory overlay).
+  host_disk_write: () => 1,
+  host_disk_flush: () => 1,
   host_disk_read(source, offset, ptr, len) {
     try {
       const data = diskSources[source].read(offset, len);

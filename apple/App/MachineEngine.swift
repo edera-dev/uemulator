@@ -8,6 +8,8 @@ protocol MachineEngine: ScreenInput {
     // Console bytes from the guest, batched.
     var onOutput: (([UInt8]) -> Void)? { get set }
     var onState: ((EngineState) -> Void)? { get set }
+    // Emulator diagnostics (the library's log hook, the web worker's failures).
+    var onLog: ((String) -> Void)? { get set }
     // Where the guest's screen goes, when the settings give it one. Set before `start`.
     var screen: ScreenSurface? { get set }
 
@@ -85,6 +87,8 @@ struct MachineSettings {
     var kernel: Data
     var initrd: Data
     var disks: [DiskImage] = []
+    // The machine's nvram.kv: UEFI variables and TPM state. Nil keeps them in memory.
+    var nvram: URL?
     // The UEFI firmware image; nil boots the kernel directly.
     var firmware: Data?
     var cmdlineAppend = ""
@@ -93,6 +97,8 @@ struct MachineSettings {
     var serialConsole = true
     var jit = true
     var display = DisplayChoice.terminal
+    var tpm = false
+    var secureBoot = false
     var cols: UInt16 = 80
     var rows: UInt16 = 25
 
@@ -103,6 +109,8 @@ struct MachineSettings {
         if serialConsole { options |= Option.serialConsole }
         if display.hasScreen { options |= Option.display | Option.input }
         if display == .screen { options |= Option.screenConsole }
+        if tpm { options |= Option.tpm }
+        if secureBoot { options |= Option.secureBoot }
         return options
     }
 
@@ -114,5 +122,7 @@ struct MachineSettings {
         static let display: UInt32 = 1 << 8
         static let input: UInt32 = 1 << 9
         static let screenConsole: UInt32 = 1 << 10
+        static let tpm: UInt32 = 1 << 11
+        static let secureBoot: UInt32 = 1 << 12
     }
 }

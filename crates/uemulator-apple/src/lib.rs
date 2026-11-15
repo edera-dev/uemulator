@@ -8,14 +8,16 @@
 
 #![cfg(target_vendor = "apple")]
 
+mod machine_file;
+
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::Mutex;
 use std::thread::JoinHandle;
 
 use uemulator::{
     BlockBackend, ConsoleHandle, ConsoleKind, Cursor, Disk, DisplayHandle, DisplayMode,
-    EmulatedMachine, Error, ExitReason, ImageFile, InputHandle, JitMode, MachineConfig,
-    PointerButton, RawImage, ScreenMirror, StopHandle, Udisk,
+    EmulatedMachine, Error, ExitReason, FileKeyValueStore, ImageFile, InputHandle, JitMode,
+    MachineConfig, PointerButton, RawImage, ScreenMirror, StopHandle, Udisk,
 };
 
 // `ua_config.options`: the web build's OPTION_* bits (crates/uemulator-web/src/lib.rs), so one set
@@ -30,6 +32,10 @@ const OPTION_DISPLAY: u32 = 1 << 8;
 const OPTION_INPUT: u32 = 1 << 9;
 /// With `OPTION_DISPLAY`: the screen is `/dev/console` (`MachineConfig::console_on_screen`).
 const OPTION_SCREEN_CONSOLE: u32 = 1 << 10;
+/// A TPM 2.0; its seeds and NV live in the NVRAM store (`ua_config.nvram_path`).
+const OPTION_TPM: u32 = 1 << 11;
+/// The firmware enforces Secure Boot, enrolling its keys into the NVRAM store on first use.
+const OPTION_SECURE_BOOT: u32 = 1 << 12;
 
 // `ua_cursor_fn` kinds, the library's `Cursor`: the web build's CURSOR_* values. Mirrored in
 // include/uemulator.h.
@@ -60,6 +66,7 @@ pub struct Config {
     cmdline_append: *const c_char,
     disks: *const DiskConfig,
     disk_count: usize,
+    nvram_path: *const c_char,
     memory_mib: u32,
     cpus: u32,
     options: u32,
@@ -131,6 +138,8 @@ struct Settings {
     cmdline_append: String,
     /// (path, read-only), opened when the machine is built.
     disks: Vec<(String, bool)>,
+    /// The machine's `nvram.kv`: UEFI variables and TPM state survive the app.
+    nvram_path: Option<String>,
     memory_mib: usize,
     cpus: usize,
     options: u32,
@@ -171,8 +180,16 @@ impl Settings {
                 })
                 .collect()
         };
+        let nvram_path = (!config.nvram_path.is_null())
+            .then(|| {
+                unsafe { CStr::from_ptr(config.nvram_path) }
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|path| !path.is_empty());
         Settings {
             disks,
+            nvram_path,
             kernel: bytes(config.kernel, config.kernel_len),
             initrd: bytes(config.initrd, config.initrd_len),
             firmware: (!firmware.is_empty()).then_some(firmware),
@@ -210,7 +227,17 @@ impl Settings {
                 .display(DisplayMode::Framebuffer)
                 .console_on_screen(has(OPTION_SCREEN_CONSOLE));
         }
-        config = config.input(has(OPTION_INPUT));
+        config = config
+            .input(has(OPTION_INPUT))
+            .tpm(has(OPTION_TPM))
+            .secure_boot(has(OPTION_SECURE_BOOT));
+        if let Some(path) = &self.nvram_path {
+            // Opened per machine build: `create`'s JIT fallback builds twice, and the store keeps
+            // its file open, so the first build's copy is dropped before the second opens it.
+            let store =
+                FileKeyValueStore::open(path).map_err(|e| Error::BadConfig(e.to_string()))?;
+            config = config.key_value_store(store);
+        }
         for (path, read_only) in &self.disks {
             config = config.disk(open_disk(path, *read_only)?);
         }
@@ -568,7 +595,7 @@ pub unsafe extern "C" fn ua_request_size(machine: *const Machine, width: u32, he
 
 /// # Safety
 /// `buffer` has `capacity` writable bytes, or is null.
-unsafe fn write_message(buffer: *mut c_char, capacity: usize, text: &str) {
+pub(crate) unsafe fn write_message(buffer: *mut c_char, capacity: usize, text: &str) {
     if buffer.is_null() || capacity == 0 {
         return;
     }
@@ -597,6 +624,7 @@ mod tests {
             cmdline_append: std::ptr::null(),
             disks: std::ptr::null(),
             disk_count: 0,
+            nvram_path: std::ptr::null(),
             memory_mib: 256,
             cpus: 1,
             options: OPTION_ACPI,

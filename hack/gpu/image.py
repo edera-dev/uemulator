@@ -275,7 +275,7 @@ def main():
     minirootfs = demo.fetch(*demo.ROOTFS, args.cache)
     netboot = demo.fetch(*demo.NETBOOT_INITRAMFS, args.cache)
     order = module_order(netboot)
-    modules = demo.net_modules(netboot, wanted=order)
+    modules = demo.netboot_modules(netboot, wanted=order)
     names = " ".join(os.path.basename(module).removesuffix(".ko") for module in order)
     initramfs = demo.initramfs(minirootfs, modules, init=INIT.replace("@MODULES@", names), module_dir=MODULE_DIR)
 
