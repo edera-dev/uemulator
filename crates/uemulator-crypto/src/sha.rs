@@ -879,7 +879,10 @@ mod sha_extensions {
     /// # Safety
     /// The CPU must have SHA, SSSE3 and SSE4.1 (`available`) with SSE enabled in CR4, and
     /// `block` must be 64 bytes.
-    #[target_feature(enable = "sha,ssse3,sse4.1")]
+    ///
+    /// No `#[target_feature]`: the body is all assembly, which LLVM assembles whatever features
+    /// are on, and since Rust 1.100 enabling any SSE feature on the soft-float firmware target is
+    /// a hard error (`x86_softfloat_sse`, rust-lang/rust#117938).
     pub unsafe fn sha256_compress(state: &mut [u32; 8], block: &[u8]) {
         debug_assert_eq!(block.len(), 64);
         let mut scratch = Scratch {
