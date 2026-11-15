@@ -41,18 +41,19 @@ rust_target() {
     esac
 }
 
-# Builds the given targets and lipos their archives into one at $1.
+# Builds the given targets and lipos their archives into one at $1. POSIX sh has no locals, so
+# the names here must not be ones a caller uses (`out` is the xcframework branch's).
 fat_library() {
-    out=$1
+    fat_output=$1
     shift
     archives=""
     for target in "$@"; do
         cargo_build -p uemulator-apple --target "$target"
         archives="$archives target/$target/release/$library"
     done
-    mkdir -p "$(dirname "$out")"
+    mkdir -p "$(dirname "$fat_output")"
     # shellcheck disable=SC2086 # one word per archive
-    lipo -create $archives -output "$out"
+    lipo -create $archives -output "$fat_output"
 }
 
 case "$1" in
