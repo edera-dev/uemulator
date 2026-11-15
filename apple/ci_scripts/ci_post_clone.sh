@@ -21,8 +21,10 @@ cd "$repo"
 rust_targets="aarch64-apple-darwin x86_64-apple-darwin aarch64-apple-ios aarch64-apple-ios-sim
 x86_64-apple-ios x86_64-unknown-none wasm32-unknown-unknown"
 
+# Checked by path, not on PATH: build-core.sh uses only $HOME/.cargo/bin, and a rustup elsewhere
+# (Homebrew's) may have no toolchain for this user.
 PATH="$HOME/.cargo/bin:$PATH"
-if ! command -v rustup >/dev/null; then
+if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
     curl --proto '=https' --tlsv1.2 --retry 3 -sSf https://sh.rustup.rs |
         sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path
 fi
