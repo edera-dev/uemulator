@@ -1,5 +1,6 @@
-//! The SMBIOS 3.0 table: BIOS, system, chassis, processor, the memory array with its one device
-//! and mapped ranges, system boot information and the end marker. Xen and Linux read the vendor
+//! The SMBIOS 3.0 table: BIOS, system, chassis, processor with its three cache levels, the
+//! memory array with its one device and mapped ranges, system boot information and the end
+//! marker. Xen and Linux read the vendor
 //! strings; Linux also counts the memory devices ("DMI: Memory slots populated") and tools like
 //! `dmidecode` and `lscpu` read the processor and memory structures. Layouts follow the DMTF
 //! SMBIOS 3.0 specification, section 7.
@@ -16,6 +17,7 @@ const TYPE_BIOS: u8 = 0;
 const TYPE_SYSTEM: u8 = 1;
 const TYPE_CHASSIS: u8 = 3;
 const TYPE_PROCESSOR: u8 = 4;
+const TYPE_CACHE: u8 = 7;
 const TYPE_MEMORY_ARRAY: u8 = 16;
 const TYPE_MEMORY_DEVICE: u8 = 17;
 const TYPE_MEMORY_ARRAY_MAPPED_ADDRESS: u8 = 19;
@@ -27,6 +29,8 @@ const BIOS_LENGTH: u8 = 0x18;
 const SYSTEM_LENGTH: u8 = 0x1b;
 const CHASSIS_LENGTH: u8 = 0x16;
 const PROCESSOR_LENGTH: u8 = 0x30;
+/// The SMBIOS 3.1 cache structure, with the 32-bit size fields.
+const CACHE_LENGTH: u8 = 0x1b;
 const MEMORY_ARRAY_LENGTH: u8 = 0x17;
 const MEMORY_DEVICE_LENGTH: u8 = 0x28;
 const MAPPED_ADDRESS_LENGTH: u8 = 0x1f;
@@ -39,6 +43,8 @@ const HANDLE_BIOS: u16 = 0x0000;
 const HANDLE_SYSTEM: u16 = 0x0100;
 const HANDLE_CHASSIS: u16 = 0x0300;
 const HANDLE_PROCESSOR: u16 = 0x0400;
+/// Cache structures take `HANDLE_FIRST_CACHE + level - 1`.
+const HANDLE_FIRST_CACHE: u16 = 0x0700;
 const HANDLE_MEMORY_ARRAY: u16 = 0x1000;
 const HANDLE_MEMORY_DEVICE: u16 = 0x1100;
 const HANDLE_FIRST_MAPPED_ADDRESS: u16 = 0x1300;
@@ -78,8 +84,46 @@ const PROCESSOR_MULTI_CORE: u16 = 1 << 3;
 const PROCESSOR_HARDWARE_THREAD: u16 = 1 << 4;
 const PROCESSOR_EXECUTE_PROTECTION: u16 = 1 << 5;
 const PROCESSOR_ENHANCED_VIRTUALIZATION: u16 = 1 << 6;
+/// Power/performance control: the CPPC MSRs and `_CPC`.
+const PROCESSOR_POWER_PERFORMANCE_CONTROL: u16 = 1 << 7;
+/// The socket designation of a Turin package. The upgrade byte stays "unknown": the socket name
+/// carries the information and no SMBIOS enumeration value is assumed for SP5.
+const PROCESSOR_SOCKET: &str = "SP5";
 /// Core and thread count bytes saturate here; the 3.0 words beside them carry larger counts.
 const COUNT_BYTE_OVERFLOW: u16 = 0xff;
+
+/// Levels the processor structure links to (L1, L2, L3).
+pub const CACHE_LEVELS: usize = 3;
+/// Cache configuration word: level minus one (2:0), internal (6:5 = 0), enabled (7), write-back
+/// (9:8 = 01).
+const CACHE_ENABLED: u16 = 1 << 7;
+const CACHE_WRITE_BACK: u16 = 1 << 8;
+/// SRAM type "Unknown" in both the supported and current type words.
+const CACHE_SRAM_UNKNOWN: u16 = 1 << 1;
+const CACHE_ERROR_CORRECTION_MULTI_BIT_ECC: u8 = 0x06;
+/// System cache type "Unified": L1 is reported as one structure, data plus instruction, as AMD
+/// firmware does.
+const CACHE_TYPE_UNIFIED: u8 = 0x05;
+const CACHE_ASSOCIATIVITY_UNKNOWN: u8 = 0x02;
+/// Size words: KiB in bits 14:0, or 64 KiB units with bit 15 set; 0xFFFF defers to the 32-bit
+/// field, which has the same layout with the granularity in bit 31.
+const CACHE_SIZE_64K_GRANULARITY_16: u16 = 1 << 15;
+const CACHE_SIZE_64K_GRANULARITY_32: u32 = 1 << 31;
+const CACHE_SIZE_FIELD_LIMIT: u64 = 1 << 15;
+const CACHE_SIZE_USE_32_BIT: u16 = 0xffff;
+const KIB_PER_64K_UNIT: u64 = 64;
+/// CPUID 0x8000_001D: type in EAX 4:0 (0 ends the list), level in 7:5, threads sharing minus one
+/// in 25:14; ways minus one in EBX 31:22, partitions minus one in 21:12, line size minus one in
+/// 11:0; sets minus one in ECX.
+const CPUID_CACHE_TYPE_MASK: u32 = 0x1f;
+const CPUID_CACHE_LEVEL_SHIFT: u32 = 5;
+const CPUID_CACHE_LEVEL_MASK: u32 = 0x7;
+const CPUID_CACHE_SHARING_SHIFT: u32 = 14;
+const CPUID_CACHE_SHARING_MASK: u32 = 0xfff;
+const CPUID_CACHE_WAYS_SHIFT: u32 = 22;
+const CPUID_CACHE_PARTITIONS_SHIFT: u32 = 12;
+const CPUID_CACHE_FIELD_MASK: u32 = 0x3ff;
+const CPUID_CACHE_LINE_MASK: u32 = 0xfff;
 
 const MEMORY_LOCATION_SYSTEM_BOARD: u8 = 0x03;
 const MEMORY_USE_SYSTEM: u8 = 0x03;
@@ -111,6 +155,42 @@ const LEGACY_WINDOW_END: u64 = MIB;
 /// brand), which the firmware reserves in its image.
 pub const MAX_TABLE_BYTES: usize = 2048;
 
+/// One cache level summed over the socket: every instance of every cache of that level (L1
+/// data and instruction together). `bytes == 0` means the level does not exist.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Cache {
+    pub bytes: u64,
+    /// Ways of the first cache of the level (L1 data for L1).
+    pub ways: u32,
+}
+
+/// The socket's caches from the subleaves of CPUID 0x8000_001D (ending at the first of type 0)
+/// for a package of `threads` logical processors: each cache occurs once per group of threads
+/// sharing it.
+pub fn socket_caches(subleaves: &[[u32; 4]], threads: u32) -> [Cache; CACHE_LEVELS] {
+    let mut caches = [Cache::default(); CACHE_LEVELS];
+    for &[eax, ebx, ecx, _] in subleaves {
+        if eax & CPUID_CACHE_TYPE_MASK == 0 {
+            break;
+        }
+        let level = (eax >> CPUID_CACHE_LEVEL_SHIFT & CPUID_CACHE_LEVEL_MASK) as usize;
+        let Some(cache) = level.checked_sub(1).and_then(|index| caches.get_mut(index)) else {
+            continue;
+        };
+        let sharing = (eax >> CPUID_CACHE_SHARING_SHIFT & CPUID_CACHE_SHARING_MASK) + 1;
+        let ways = (ebx >> CPUID_CACHE_WAYS_SHIFT & CPUID_CACHE_FIELD_MASK) + 1;
+        let partitions = (ebx >> CPUID_CACHE_PARTITIONS_SHIFT & CPUID_CACHE_FIELD_MASK) + 1;
+        let line = (ebx & CPUID_CACHE_LINE_MASK) + 1;
+        let sets = ecx as u64 + 1;
+        let instances = threads.div_ceil(sharing).max(1) as u64;
+        cache.bytes += ways as u64 * partitions as u64 * line as u64 * sets * instances;
+        if cache.ways == 0 {
+            cache.ways = ways;
+        }
+    }
+    caches
+}
+
 /// The processor as CPUID reports it. One socket holds every logical processor.
 #[derive(Clone, Copy, Debug)]
 pub struct Processor {
@@ -122,6 +202,8 @@ pub struct Processor {
     pub cores: u16,
     pub threads: u16,
     pub mhz: u16,
+    /// L1, L2 and L3 of the whole socket.
+    pub caches: [Cache; CACHE_LEVELS],
 }
 
 /// What the table describes.
@@ -240,8 +322,10 @@ fn chassis() -> Vec<u8> {
 }
 
 fn processor(cpu: &Processor) -> Vec<u8> {
-    let mut characteristics =
-        PROCESSOR_64_BIT | PROCESSOR_EXECUTE_PROTECTION | PROCESSOR_ENHANCED_VIRTUALIZATION;
+    let mut characteristics = PROCESSOR_64_BIT
+        | PROCESSOR_EXECUTE_PROTECTION
+        | PROCESSOR_ENHANCED_VIRTUALIZATION
+        | PROCESSOR_POWER_PERFORMANCE_CONTROL;
     if cpu.cores > 1 {
         characteristics |= PROCESSOR_MULTI_CORE;
     }
@@ -263,8 +347,13 @@ fn processor(cpu: &Processor) -> Vec<u8> {
         PROCESSOR_STATUS_POPULATED_ENABLED,
         PROCESSOR_UPGRADE_UNKNOWN,
     ]);
-    for _cache in 0..3 {
-        body.extend_from_slice(&HANDLE_NONE.to_le_bytes());
+    for (index, cache) in cpu.caches.iter().enumerate() {
+        let handle = if cache.bytes == 0 {
+            HANDLE_NONE
+        } else {
+            cache_handle(index)
+        };
+        body.extend_from_slice(&handle.to_le_bytes());
     }
     body.extend_from_slice(&[0, 0, 0]);
     body.extend_from_slice(&[
@@ -283,10 +372,75 @@ fn processor(cpu: &Processor) -> Vec<u8> {
         HANDLE_PROCESSOR,
         &body,
         &[
-            "CPU 0",
+            PROCESSOR_SOCKET,
             "Advanced Micro Devices, Inc.",
             brand_text(&cpu.brand),
         ],
+    )
+}
+
+fn cache_handle(index: usize) -> u16 {
+    HANDLE_FIRST_CACHE + index as u16
+}
+
+/// The 16-bit and 32-bit size fields for `bytes`.
+fn cache_size_fields(bytes: u64) -> (u16, u32) {
+    let kib = bytes.div_ceil(KIB);
+    if kib < CACHE_SIZE_FIELD_LIMIT {
+        return (kib as u16, kib as u32);
+    }
+    let units = kib.div_ceil(KIB_PER_64K_UNIT);
+    let wide = CACHE_SIZE_64K_GRANULARITY_32 | units.min(u32::MAX as u64 >> 1) as u32;
+    if units < CACHE_SIZE_FIELD_LIMIT {
+        (CACHE_SIZE_64K_GRANULARITY_16 | units as u16, wide)
+    } else {
+        (CACHE_SIZE_USE_32_BIT, wide)
+    }
+}
+
+/// The associativity byte for a way count; the encoding is not in way order.
+fn cache_associativity(ways: u32) -> u8 {
+    match ways {
+        2 => 0x04,
+        4 => 0x05,
+        8 => 0x07,
+        16 => 0x08,
+        12 => 0x09,
+        24 => 0x0a,
+        32 => 0x0b,
+        48 => 0x0c,
+        64 => 0x0d,
+        20 => 0x0e,
+        _ => CACHE_ASSOCIATIVITY_UNKNOWN,
+    }
+}
+
+/// Type 7 for the cache level `index + 1`.
+fn cache(index: usize, cache: &Cache) -> Vec<u8> {
+    let (size16, size32) = cache_size_fields(cache.bytes);
+    let configuration = index as u16 | CACHE_ENABLED | CACHE_WRITE_BACK;
+    let mut body = Vec::new();
+    body.push(1); // socket designation: string 1
+    body.extend_from_slice(&configuration.to_le_bytes());
+    body.extend_from_slice(&size16.to_le_bytes()); // maximum size
+    body.extend_from_slice(&size16.to_le_bytes()); // installed size
+    body.extend_from_slice(&CACHE_SRAM_UNKNOWN.to_le_bytes()); // supported SRAM type
+    body.extend_from_slice(&CACHE_SRAM_UNKNOWN.to_le_bytes()); // current SRAM type
+    body.push(0); // speed: unknown
+    body.extend_from_slice(&[
+        CACHE_ERROR_CORRECTION_MULTI_BIT_ECC,
+        CACHE_TYPE_UNIFIED,
+        cache_associativity(cache.ways),
+    ]);
+    body.extend_from_slice(&size32.to_le_bytes()); // maximum size 2
+    body.extend_from_slice(&size32.to_le_bytes()); // installed size 2
+    let name = ["L1 - Cache", "L2 - Cache", "L3 - Cache"][index];
+    structure(
+        TYPE_CACHE,
+        CACHE_LENGTH,
+        cache_handle(index),
+        &body,
+        &[name],
     )
 }
 
@@ -388,6 +542,11 @@ pub fn build_table(machine: &Machine) -> Vec<u8> {
     table.extend(system());
     table.extend(chassis());
     table.extend(processor(&machine.processor));
+    for (index, level) in machine.processor.caches.iter().enumerate() {
+        if level.bytes != 0 {
+            table.extend(cache(index, level));
+        }
+    }
     table.extend(memory_array(installed));
     table.extend(memory_device(installed));
     for (index, range) in ranges.iter().enumerate() {
@@ -464,6 +623,20 @@ mod tests {
             cores,
             threads,
             mhz: 1000,
+            caches: [
+                Cache {
+                    bytes: 80 * KIB * cores as u64,
+                    ways: 12,
+                },
+                Cache {
+                    bytes: MIB * cores as u64,
+                    ways: 16,
+                },
+                Cache {
+                    bytes: 32 * MIB,
+                    ways: 16,
+                },
+            ],
         }
     }
 
@@ -546,8 +719,8 @@ mod tests {
         let table = table_for(&TWO_GIB, 1, 1);
         let kinds: Vec<u8> = structures(&table).iter().map(|(f, _)| f[0]).collect();
         // SMBIOS 3.0 section 6.2 requires types 0, 1, 3, 4, 7, 9, 16, 17, 19 and 32; there are no
-        // caches (7) or expansion slots (9) to describe.
-        assert_eq!(kinds, [0, 1, 3, 4, 16, 17, 19, 32, 127]);
+        // expansion slots (9) to describe.
+        assert_eq!(kinds, [0, 1, 3, 4, 7, 7, 7, 16, 17, 19, 32, 127]);
     }
 
     #[test]
@@ -614,8 +787,98 @@ mod tests {
         let characteristics = u16_at(cpu, 0x26);
         assert_eq!(
             characteristics,
-            (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6)
+            (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7)
         );
+        assert_eq!(strings[cpu[4] as usize - 1], "SP5", "socket");
+    }
+
+    #[test]
+    fn processor_links_one_cache_structure_per_level() {
+        let table = table_for(&TWO_GIB, 16, 32);
+        let (cpu, _) = &of_type(&table, TYPE_PROCESSOR)[0];
+        let caches = of_type(&table, TYPE_CACHE);
+        assert_eq!(caches.len(), 3);
+        for (level, (cache, strings)) in caches.iter().enumerate() {
+            assert_eq!(cache.len(), 0x1b);
+            assert_eq!(
+                u16_at(cpu, 0x1a + 2 * level),
+                u16_at(cache, 2),
+                "L{}",
+                level + 1
+            );
+            assert_eq!(
+                u16_at(cache, 5),
+                level as u16 | 1 << 7 | 1 << 8,
+                "configuration"
+            );
+            assert_eq!(
+                strings[cache[4] as usize - 1],
+                format!("L{} - Cache", level + 1)
+            );
+        }
+        let size = |cache: &[u8]| (u16_at(cache, 7), u16_at(cache, 9), u32_at(cache, 0x17));
+        // 16 x 80 KiB of L1 and 16 MiB of L2 fit the KiB field; 32 MiB of L3 needs 64 KiB units.
+        assert_eq!(size(caches[0].0), (1280, 1280, 1280));
+        assert_eq!(size(caches[1].0), (16384, 16384, 16384));
+        assert_eq!(
+            size(caches[2].0),
+            (0x8000 | 512, 0x8000 | 512, 0x8000_0000 | 512)
+        );
+        assert_eq!(caches[0].0[0x12], 0x09, "12-way");
+        assert_eq!(caches[2].0[0x12], 0x08, "16-way");
+        assert_eq!(
+            u32_at(caches[2].0, 0x13),
+            u32_at(caches[2].0, 0x17),
+            "max = installed"
+        );
+    }
+
+    #[test]
+    fn caches_too_large_for_the_16_bit_field_use_the_32_bit_one() {
+        assert_eq!(cache_size_fields(4 * GIB), (0xffff, 0x8000_0000 | 65536));
+    }
+
+    #[test]
+    fn socket_caches_count_each_cache_once_per_sharing_group() {
+        // Turin's leaves for 32 threads (SMT2): L1d 48 KiB 12-way, L1i 32 KiB 8-way, L2 1 MiB
+        // 16-way, all per core; L3 32 MiB 16-way shared by 16 threads.
+        let leaf = |kind: u32, level: u32, sharing: u32, ways: u32, bytes: u32| {
+            let sets = bytes / (ways * 64);
+            [
+                kind | level << 5 | 1 << 8 | (sharing - 1) << 14,
+                (ways - 1) << 22 | 63,
+                sets - 1,
+                0,
+            ]
+        };
+        let subleaves = [
+            leaf(1, 1, 2, 12, 48 << 10),
+            leaf(2, 1, 2, 8, 32 << 10),
+            leaf(3, 2, 2, 16, 1 << 20),
+            leaf(3, 3, 16, 16, 32 << 20),
+            [0; 4],
+        ];
+        let caches = socket_caches(&subleaves, 32);
+        assert_eq!(
+            caches,
+            [
+                Cache {
+                    bytes: 16 * 80 * KIB,
+                    ways: 12
+                },
+                Cache {
+                    bytes: 16 * MIB,
+                    ways: 16
+                },
+                Cache {
+                    bytes: 64 * MIB,
+                    ways: 16
+                },
+            ]
+        );
+        // fewer threads than share the L3: still one L3
+        assert_eq!(socket_caches(&subleaves, 1)[2].bytes, 32 * MIB);
+        assert_eq!(socket_caches(&[[0; 4]], 4), [Cache::default(); 3]);
     }
 
     #[test]

@@ -70,6 +70,10 @@ const CPUID_EXTENDED_APIC_ID: u32 = 0x8000_001e;
 const THREADS_PER_CORE_SHIFT: u32 = 8;
 const THREADS_PER_CORE_MASK: u32 = 0xff;
 const HZ_PER_MHZ: u64 = 1_000_000;
+/// Cache properties, one cache per subleaf until one of type 0 (AMD APM vol. 3, CPUID
+/// Fn8000_001D). Zen has four (L1d, L1i, L2, L3); the bound only stops a runaway loop.
+const CPUID_CACHE_PROPERTIES: u32 = 0x8000_001d;
+const CACHE_SUBLEAVES_LIMIT: u32 = 8;
 
 /// Logical processors in the package, from CPUID: the library starts every vCPU it has, and
 /// they all sit in the one package it reports.
@@ -92,6 +96,9 @@ pub fn smbios_processor(tsc_hz: u64) -> crate::smbios::Processor {
     let threads_per_core = ((cpuid(CPUID_EXTENDED_APIC_ID, 0)[1] >> THREADS_PER_CORE_SHIFT)
         & THREADS_PER_CORE_MASK)
         + 1;
+    let subleaves: alloc::vec::Vec<[u32; 4]> = (0..CACHE_SUBLEAVES_LIMIT)
+        .map(|subleaf| cpuid(CPUID_CACHE_PROPERTIES, subleaf))
+        .collect();
     crate::smbios::Processor {
         signature,
         feature_edx,
@@ -99,6 +106,7 @@ pub fn smbios_processor(tsc_hz: u64) -> crate::smbios::Processor {
         cores: (threads / threads_per_core).max(1) as u16,
         threads: threads as u16,
         mhz: (tsc_hz / HZ_PER_MHZ).min(u16::MAX as u64) as u16,
+        caches: crate::smbios::socket_caches(&subleaves, threads),
     }
 }
 
