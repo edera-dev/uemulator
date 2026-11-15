@@ -782,6 +782,7 @@ impl Cpu {
         let (jump_cache, valid) = (jit.jump_cache_base(), jit.valid_base());
         self.jit = Some(jit);
         let code = code?;
+        self.shadow_stack_on = self.shadow_stack_active();
         let run_block: extern "C" fn(*mut Cpu, u64, u64, u64) -> u64 =
             unsafe { std::mem::transmute(enter as usize) };
         let exit_code = run_block(self as *mut Cpu, code, jump_cache, valid);

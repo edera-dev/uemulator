@@ -340,6 +340,12 @@ pub(crate) const LARGE_PAGE_EMPTY: LargePage = LargePage {
 
 /// Never equals a page-aligned address, so an empty tag always misses.
 pub(crate) const TLB_TAG_INVALID: u64 = u64::MAX;
+/// Bit 0 of a write tag that only shadow-stack accesses (`cet.rs`) may use: the page is a
+/// shadow-stack page of the TLB half's privilege, RAM-backed and holding no translated code.
+/// Ordinary stores compare `tag_w` with a page-aligned address, which never has the bit, so they
+/// miss and walk into the #PF a read-only page gives; shadow-stack pushes and pops (including the
+/// JIT's inline `call` and `ret`) compare with the page plus this bit and skip the walk.
+pub(crate) const TLB_TAG_SHADOW_STACK: u64 = 1;
 pub(crate) const TLB_EMPTY: TlbEntry = TlbEntry {
     tag_r: TLB_TAG_INVALID,
     tag_w: TLB_TAG_INVALID,
@@ -427,6 +433,12 @@ pub(crate) struct Cpu {
     /// polls it after stores and `helper_exec` reports it, so the running block stops before it
     /// can execute stale instructions; `step_block` clears it.
     pub block_exit_requested: bool,
+    /// `shadow_stack_active()` as of entering the running chain of JIT blocks, which generated
+    /// near calls and returns test to decide whether to touch the shadow stack. `step_block`
+    /// sets it; within a chain it cannot go stale because everything that changes the answer
+    /// (a CPL change, mov to CR0/CR4, wrmsr, VMRUN, #VMEXIT) ends the block through the run loop.
+    /// A byte the generated code reads with one load, rather than CR4, CPL and U_CET/S_CET.
+    pub shadow_stack_on: bool,
     /// Instructions the JIT already added to `icount` in the middle of a block, before
     /// rdtsc/port I/O, so those read an up-to-date clock. `step_block` subtracts it from the
     /// block's total.
@@ -957,6 +969,7 @@ impl Cpu {
             pause_count: 0,
             in_exclusive: false,
             block_exit_requested: false,
+            shadow_stack_on: false,
             prepaid_icount: 0,
             slow_access_insn: 0,
             trace: None,
@@ -1006,16 +1019,12 @@ impl Cpu {
     }
 
     /// Whether the next step runs a JIT block: 64-bit code with a JIT, unless a performance
-    /// counter or the branch record has to see every instruction (`pmu.rs`), something may raise
-    /// a #DB (`debug.rs`), or the current privilege level has a shadow stack, which generated
-    /// near calls and returns would skip (`cet.rs`). The one predicate for interpreter or JIT:
+    /// counter or the branch record has to see every instruction (`pmu.rs`) or something may
+    /// raise a #DB (`debug.rs`). Shadow stacks do not matter: generated near calls and returns
+    /// use them when `shadow_stack_on` says so. The one predicate for interpreter or JIT:
     /// `dispatch_step` and `--verify` decide by it.
     pub(crate) fn uses_jit(&self) -> bool {
-        self.jit.is_some()
-            && self.is_long64()
-            && !self.pmu.precise
-            && !self.debug_slow_path()
-            && !self.shadow_stack_active()
+        self.jit.is_some() && self.is_long64() && !self.pmu.precise && !self.debug_slow_path()
     }
 
     pub fn now_ns(&self) -> u64 {

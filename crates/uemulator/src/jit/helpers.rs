@@ -304,6 +304,13 @@ pub(crate) fn is_inline_terminator(insn: &Insn) -> bool {
     ) || (insn.op == 0xff && matches!(insn.reg & 7, 2 | 4))
 }
 
+/// rdsspd/rdsspq (`f3 0f 1e /1`, register form). It sits in the `0f 18..1f` hint-nop group the
+/// block compilers emit nothing for, but with a shadow stack in use it writes SSP, so they leave
+/// it to the interpreter (rare: a context switch, a stack unwinder).
+pub(crate) fn is_rdssp(insn: &Insn) -> bool {
+    insn.op == 0x11e && insn.rep == 1 && insn.md == 3 && insn.reg & 7 == 1
+}
+
 /// Register forms of `0f 01` (group 7) that the block compilers continue past.
 pub(crate) const MODRM_SWAPGS: u8 = 0xf8;
 pub(crate) const MODRM_RDTSCP: u8 = 0xf9;

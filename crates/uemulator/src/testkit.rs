@@ -323,6 +323,8 @@ pub(crate) struct Snapshot {
     pub cpl: u8,
     pub icount: u64,
     pub pkru: u32,
+    /// The shadow-stack pointer (`cet.rs`).
+    pub ssp: u64,
 }
 
 impl Harness {
@@ -346,6 +348,7 @@ impl Harness {
             cpl: cpu.cpl,
             icount: cpu.icount,
             pkru: cpu.pkru,
+            ssp: cpu.cet.ssp,
         }
     }
 }

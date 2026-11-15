@@ -13,11 +13,14 @@
 //! A machine has all of this only with `MachineConfig::shadow_stacks` (`Cpu::has_shadow_stacks`);
 //! without it CR4.CET is reserved and the MSRs #GP, so none of the paths below can switch on.
 //!
-//! The JIT does not know about any of this: `Cpu::uses_jit` keeps the run loop on the
-//! interpreter while a shadow stack is in use at the current CPL. What can switch one on (a CPL
-//! change, mov to CR4, wrmsr, VMRUN and #VMEXIT) always ends a block and goes back to the run
-//! loop, so a chain of blocks never runs into one. xrstors can load U_CET, but it runs at CPL 0
-//! and U_CET only matters at CPL 3, which takes a CPL change to reach.
+//! The JIT compiles near `call` and `ret` with their shadow-stack push and pop inline; every
+//! other instruction here runs in the interpreter through `helper_exec`. Generated code asks
+//! `Cpu::shadow_stack_on`, which `step_block` sets from `shadow_stack_active` on every entry from
+//! the run loop. What can change the answer (a CPL change, mov to CR0/CR4, wrmsr, VMRUN and
+//! #VMEXIT) always ends a block and goes back to the run loop, so a chain of blocks never runs
+//! with a stale one. xrstors can load U_CET, but it runs at CPL 0 and U_CET only matters at CPL
+//! 3, which takes a CPL change to reach. Shadow-stack accesses hit the soft TLB through a write
+//! tag of their own (`TLB_TAG_SHADOW_STACK`, filled by `shadow_stack_translate`).
 
 use super::decode::Insn;
 use super::exception::Exception;

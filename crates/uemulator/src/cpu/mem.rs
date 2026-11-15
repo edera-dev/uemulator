@@ -122,6 +122,12 @@ pub(super) fn write_tag_page(entry: &TlbEntry, ram_base: u64) -> usize {
         >> PAGE_SHIFT) as usize
 }
 
+/// Whether any tag of `entry` is for `page` (a write tag may carry `TLB_TAG_SHADOW_STACK`), so
+/// a refill for another kind of access keeps them and the shared addend.
+fn entry_maps_page(entry: &TlbEntry, page: u64) -> bool {
+    entry.tag_r == page || entry.tag_x == page || entry.tag_w & !TLB_TAG_SHADOW_STACK == page
+}
+
 /// Slot of `linear` in `Cpu::tlb`: direct-mapped by page number, in the user half if `user`.
 /// The JIT's inline probe computes the same index.
 #[inline]
@@ -791,8 +797,7 @@ impl Cpu {
             let write_protect = self.cr0 & CR0_WP != 0;
             // Keep the other tags if the slot already maps this page, so a read refill does not
             // drop the page's exec tag and vice versa.
-            let mut refilled = if entry.tag_r == page || entry.tag_w == page || entry.tag_x == page
-            {
+            let mut refilled = if entry_maps_page(&entry, page) {
                 entry
             } else {
                 TLB_EMPTY
@@ -842,8 +847,9 @@ impl Cpu {
     /// page. Such an access is allowed only on a shadow-stack page (`TLB_FLAG_SHADOW_STACK`) of
     /// its own privilege: `user` accesses (CPL 3, wruss) need a user page, supervisor ones a
     /// supervisor page, and SMAP does not apply. Any fault is a #PF with the shadow-stack bit,
-    /// and the write bit for a store. Shadow-stack accesses always walk: the soft TLB keeps no
-    /// tag for them, and a page that is one has no write tag (it is read-only).
+    /// and the write bit for a store. A page that passed is cached in the TLB half of `user`
+    /// with the shadow-stack write tag (`TLB_TAG_SHADOW_STACK`), which serves reads and writes
+    /// alike, here and in the JIT's inline `call`/`ret`.
     ///
     /// Not modelled: a nested page must be writable for a shadow-stack access too, and a store
     /// would set the nested Dirty bit. The walk here asks the nested tables for read access, so
@@ -885,6 +891,14 @@ impl Cpu {
             let page = self.nested_translate(linear & !PAGE_OFFSET_MASK, access, false)?;
             return Ok(page | (linear & PAGE_OFFSET_MASK));
         }
+        let linear_page = linear & !PAGE_OFFSET_MASK;
+        let slot = tlb_slot(linear, user);
+        let entry = self.tlb[slot];
+        if entry.tag_w == linear_page | TLB_TAG_SHADOW_STACK {
+            return Ok(linear
+                .wrapping_add(entry.addend)
+                .wrapping_sub(self.ram_base));
+        }
         let (page, flags) = self.walk(linear, AccessKind::Read, user).map_err(mark)?;
         if flags & TLB_FLAG_SHADOW_STACK == 0 || (flags & TLB_FLAG_USER != 0) != user {
             return Err(mark(self.page_fault(
@@ -894,6 +908,28 @@ impl Cpu {
                 true,
                 false,
             )));
+        }
+        // Cached on the same terms as an ordinary write tag (`translate`): RAM, no translated
+        // code (a store there must reach `code_written`), Dirty not withheld by the nested
+        // tables, and no protection key restriction.
+        let key_restricted = self.cr4 & CR4_PKE != 0
+            && flags & TLB_FLAG_USER != 0
+            && self.protection_key_rights(
+                ((flags >> TLB_FLAG_PROTECTION_KEY_SHIFT) & TLB_FLAG_PROTECTION_KEY_MASK) as u8,
+            ) != 0;
+        if self.ram.contains(page, PAGE_SIZE)
+            && flags & TLB_FLAG_DIRTY != 0
+            && !key_restricted
+            && self.page_has_code[(page >> PAGE_SHIFT) as usize] == 0
+        {
+            let mut refilled = if entry_maps_page(&entry, linear_page) {
+                entry
+            } else {
+                TLB_EMPTY
+            };
+            refilled.addend = (self.ram_base + page).wrapping_sub(linear_page);
+            refilled.tag_w = linear_page | TLB_TAG_SHADOW_STACK;
+            self.tlb[slot] = refilled;
         }
         Ok(page | (linear & PAGE_OFFSET_MASK))
     }

@@ -46,11 +46,12 @@ use std::mem::{offset_of, size_of};
 use super::a64::*;
 use super::helpers::*;
 use super::native::LinkSite;
+use crate::cpu::cet::Cet;
 use crate::cpu::decode::{Insn, NO_REG, VEX_OP_FLAG};
 use crate::cpu::flags::{AC, CF, IF, LazyFlagsOp, SZP_CF_OF_SRC_CF_BIT};
 use crate::cpu::xsave::{XCR0_AVX, XCR0_AVX512, XCR0_SSE};
 use crate::cpu::{CR0_EM, CR0_TS, CR4_OSFXSR, CR4_OSXSAVE};
-use crate::cpu::{Cpu, SEG_FS, SEG_GS, Seg, TLB_ENTRIES_PER_MODE, TlbEntry};
+use crate::cpu::{Cpu, SEG_FS, SEG_GS, Seg, TLB_ENTRIES_PER_MODE, TLB_TAG_SHADOW_STACK, TlbEntry};
 
 // Byte offsets into the `#[repr(C)]` `Cpu` and `TlbEntry`, burned into the generated code.
 // `offset_of!` makes them follow field moves; the generated code only breaks if a field's
@@ -115,6 +116,12 @@ const SEG_STRIDE: u32 = size_of::<Seg>() as u32;
 const GS_BASE_OFFSET: u32 = SEG_BASE_OFFSET + SEG_STRIDE * SEG_GS as u32;
 const KGSBASE_OFFSET: u32 = offset_of!(Cpu, kgsbase) as u32;
 const CPL_OFFSET: u32 = offset_of!(Cpu, cpl) as u32;
+const SHADOW_STACK_ON_OFFSET: u32 = offset_of!(Cpu, shadow_stack_on) as u32;
+const SSP_OFFSET: u32 = (offset_of!(Cpu, cet) + offset_of!(Cet, ssp)) as u32;
+// `ldrb` reaches 4 KiB, a scaled 64-bit `ldr`/`str` 32 KiB.
+const _: () = assert!(SHADOW_STACK_ON_OFFSET < 4096 && SSP_OFFSET < 32 * 1024);
+/// Bytes a near call pushes on the shadow stack in 64-bit mode, the only mode compiled.
+const SHADOW_STACK_ENTRY: u32 = 8;
 
 const TLB_TAG_READ_OFFSET: u32 = offset_of!(TlbEntry, tag_r) as u32;
 const TLB_TAG_WRITE_OFFSET: u32 = offset_of!(TlbEntry, tag_w) as u32;
@@ -243,6 +250,10 @@ enum SlowAccess {
     /// A whole-instruction fallback (`vector_move`): the inline probe, an alignment or SSE gate
     /// check failed, so run the instruction in the interpreter, which raises the right fault.
     Exec,
+    /// `Exec` for a control transfer (`shadow_stack_push`/`shadow_stack_pop`): the interpreter
+    /// runs the whole instruction, leaving `Cpu::rip` at its target, and the block ends there.
+    /// `resume` is unused.
+    ExecAndLeave,
     Load {
         dst: u32,
         size: u8,
@@ -743,6 +754,11 @@ impl<'a> Gen<'a> {
     ///
     /// Nothing here sets the host flags, so a live NZCV survives a fast-path access.
     fn tlb_probe(&mut self, size: u8, tag_offset: u32, slow: Label) {
+        self.tlb_probe_tagged(size, tag_offset, slow, 0);
+    }
+
+    /// `tlb_probe` for a tag that is the page plus `tag_bits` (`TLB_TAG_SHADOW_STACK`).
+    fn tlb_probe_tagged(&mut self, size: u8, tag_offset: u32, slow: Label, tag_bits: u64) {
         let entry = SCRATCH_A;
         let tag = SCRATCH_B;
         let page = SCRATCH_C;
@@ -755,6 +771,10 @@ impl<'a> Gen<'a> {
         } else {
             self.asm.add_imm(page, ADDRESS, size as u32 - 1, true);
             self.and_constant(page, page, !PAGE_MASK);
+        }
+        if tag_bits != 0 {
+            // The page is aligned, so the add is an or (and, unlike `adds`, keeps NZCV).
+            self.asm.add_imm(page, page, tag_bits as u32, true);
         }
         self.asm.eor(page, tag, page, true);
         self.asm.cbnz(page, slow, true);
@@ -875,6 +895,78 @@ impl<'a> Gen<'a> {
         });
     }
 
+    /// CET: with a shadow stack in use, pushes the return address `return_rip` on it too. Whether
+    /// one is in use is read at run time (`Cpu::shadow_stack_on`, one byte), not made part of the
+    /// block: blocks are keyed by physical address alone and shared by every vCPU, and the same
+    /// code can run with and without one (before and after a kernel turns CET on, in a guest of
+    /// a hypervisor that uses it), so a translation-time answer would have to join the key, the
+    /// jump cache and the direct links. The access probes the TLB for the shadow-stack write tag
+    /// (`TLB_TAG_SHADOW_STACK`); on a miss the interpreter runs the whole call again
+    /// (`SlowAccess::ExecAndLeave`), walking, faulting or filling the tag. That is only right
+    /// while nothing of the call is committed: emit this after the ordinary push's store and
+    /// before rsp is written. Keeps `ADDRESS` (through x0); leaves the return address in `VALUE`.
+    fn shadow_stack_push(&mut self, return_rip: u64, insn_index: u32, rip: u64) {
+        let skip = self.asm.label();
+        let fallback = self.shadow_stack_fallback(insn_index, rip);
+        self.asm.ldrb(SCRATCH_A, CPU, SHADOW_STACK_ON_OFFSET);
+        self.asm.cbz(SCRATCH_A, skip, false);
+        // The ordinary push's slow path may have clobbered `VALUE`.
+        self.rip_to(VALUE, return_rip);
+        self.asm.mov(0, ADDRESS);
+        self.asm.ldr(ADDRESS, CPU, SSP_OFFSET);
+        self.asm.sub_imm(ADDRESS, ADDRESS, SHADOW_STACK_ENTRY, true);
+        self.tlb_probe_tagged(8, TLB_TAG_WRITE_OFFSET, fallback, TLB_TAG_SHADOW_STACK);
+        self.asm.ldr(SCRATCH_B, SCRATCH_A, TLB_ADDEND_OFFSET);
+        if self.ordered_memory {
+            self.asm.add(SCRATCH_B, ADDRESS, SCRATCH_B, true);
+            self.asm.stlr(VALUE, SCRATCH_B, 8);
+        } else {
+            self.asm.str_r(VALUE, ADDRESS, SCRATCH_B, 8);
+        }
+        self.asm.str(ADDRESS, CPU, SSP_OFFSET);
+        self.asm.mov(ADDRESS, 0);
+        self.asm.bind(skip);
+    }
+
+    /// The shadow-stack half of a near `ret` whose target is in `VALUE`: pops the shadow stack's
+    /// copy and compares, leaving a mismatch (#CP) to the interpreter like a TLB miss; see
+    /// `shadow_stack_push`. Keeps `ADDRESS` (through x0) and `VALUE`; clobbers x1.
+    fn shadow_stack_pop(&mut self, insn_index: u32, rip: u64) {
+        let skip = self.asm.label();
+        let fallback = self.shadow_stack_fallback(insn_index, rip);
+        self.asm.ldrb(SCRATCH_A, CPU, SHADOW_STACK_ON_OFFSET);
+        self.asm.cbz(SCRATCH_A, skip, false);
+        self.asm.mov(0, ADDRESS);
+        self.asm.ldr(ADDRESS, CPU, SSP_OFFSET);
+        self.tlb_probe_tagged(8, TLB_TAG_WRITE_OFFSET, fallback, TLB_TAG_SHADOW_STACK);
+        self.asm.ldr(SCRATCH_B, SCRATCH_A, TLB_ADDEND_OFFSET);
+        if self.ordered_memory {
+            self.asm.add(SCRATCH_B, ADDRESS, SCRATCH_B, true);
+            self.asm.ldar(1, SCRATCH_B, 8);
+        } else {
+            self.asm.ldr_r(1, ADDRESS, SCRATCH_B, 8, false);
+        }
+        self.asm.eor(1, 1, VALUE, true);
+        self.asm.cbnz(1, fallback, true);
+        self.asm.add_imm(ADDRESS, ADDRESS, SHADOW_STACK_ENTRY, true);
+        self.asm.str(ADDRESS, CPU, SSP_OFFSET);
+        self.asm.mov(ADDRESS, 0);
+        self.asm.bind(skip);
+    }
+
+    fn shadow_stack_fallback(&mut self, insn_index: u32, rip: u64) -> Label {
+        let entry = self.asm.label();
+        let resume = self.asm.label();
+        self.slow_paths.push(SlowPath {
+            entry,
+            resume,
+            access: SlowAccess::ExecAndLeave,
+            insn_index,
+            rip,
+        });
+        entry
+    }
+
     /// Self-modifying code: after a store that may have invalidated this very block, stop before
     /// the next instruction. The store itself retired, so the exit counts `insn_index + 1`.
     fn smc_check(&mut self, insn_index: u32, next_rip: u64) {
@@ -906,6 +998,19 @@ impl<'a> Gen<'a> {
         let slow_paths = std::mem::take(&mut self.slow_paths);
         for slow in slow_paths {
             self.asm.bind(slow.entry);
+            if matches!(slow.access, SlowAccess::ExecAndLeave) {
+                let insn = &self.insns[slow.insn_index as usize] as *const Insn as u64;
+                let pair = self.asm.literal_pair(insn, slow.rip);
+                self.asm.mov(0, CPU);
+                self.asm.adr(1, pair);
+                self.call(self.addrs.exec);
+                let done = self.asm.label();
+                self.asm.cbz(0, done, true);
+                self.fail_exit(slow.insn_index);
+                self.asm.bind(done);
+                self.exit_ok(slow.insn_index + 1);
+                continue;
+            }
             if matches!(slow.access, SlowAccess::Exec) {
                 // Not `helper`: that pays for the instructions before this one at translation time,
                 // which a path that is only sometimes taken cannot do. The exit stub works out the
@@ -924,7 +1029,7 @@ impl<'a> Gen<'a> {
             let info = self.asm.literal_pair(slow.rip, slow.insn_index as u64);
             self.asm.adr(SLOW_INFO, info);
             match slow.access {
-                SlowAccess::Exec => unreachable!("handled above"),
+                SlowAccess::Exec | SlowAccess::ExecAndLeave => unreachable!("handled above"),
                 SlowAccess::Load {
                     dst,
                     size,
@@ -2341,6 +2446,7 @@ impl<'a> Gen<'a> {
                         self.asm.sub_imm(ADDRESS, ADDRESS, PUSH_POP_SIZE, true);
                         self.rip_to(VALUE, next_rip);
                         self.stack_store(insn_index, rip);
+                        self.shadow_stack_push(next_rip, insn_index, rip);
                         self.store_gpr(RSP, ADDRESS);
                         self.asm.mov(1, SAVED_OPERAND);
                         self.chain_exit(retired);
@@ -2526,7 +2632,7 @@ impl<'a> Gen<'a> {
             // nop, prefetchw, prefetch/hint-nop group (`xchg r8, rax` with REX.B is not a nop)
             0x90 | 0x10d | 0x118..=0x11f => {
                 // `f3 90` is pause: an SVM guest can intercept it, so it goes through `exec`
-                if insn.op == 0x90 && (insn.rex & REX_B != 0 || insn.rep != 0) {
+                if insn.op == 0x90 && (insn.rex & REX_B != 0 || insn.rep != 0) || is_rdssp(&insn) {
                     return false;
                 }
             }
@@ -2550,6 +2656,10 @@ impl<'a> Gen<'a> {
                 self.asm.sub_imm(ADDRESS, ADDRESS, PUSH_POP_SIZE, true);
                 self.rip_to(VALUE, next_rip);
                 self.stack_store(insn_index, rip);
+                // `call` to the next instruction (getting rip) leaves the shadow stack alone.
+                if insn.imm != 0 {
+                    self.shadow_stack_push(next_rip, insn_index, rip);
+                }
                 self.store_gpr(RSP, ADDRESS);
                 self.chain_to(next_rip.wrapping_add(insn.imm as u64), retired);
                 self.inlined += 1;
@@ -2559,6 +2669,7 @@ impl<'a> Gen<'a> {
             0xc3 => {
                 self.load_gpr(ADDRESS, RSP);
                 self.stack_load(VALUE, insn_index, rip);
+                self.shadow_stack_pop(insn_index, rip);
                 self.asm.add_imm(ADDRESS, ADDRESS, PUSH_POP_SIZE, true);
                 self.store_gpr(RSP, ADDRESS);
                 self.asm.mov(1, VALUE);

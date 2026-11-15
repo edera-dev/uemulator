@@ -385,6 +385,48 @@ mod pages {
     }
 }
 
+mod tlb {
+    use super::*;
+
+    fn write_tag_of(h: &Harness, linear: u64, user: bool) -> u64 {
+        let index = (linear >> 12) as usize % TLB_ENTRIES_PER_MODE;
+        h.cpu.tlb[index + user as usize * TLB_ENTRIES_PER_MODE].tag_w
+    }
+
+    #[test]
+    fn a_shadow_stack_access_caches_the_page_with_the_shadow_stack_tag() {
+        let mut h = kernel_shadow_stack(CALL_THEN_STOP);
+        assert_eq!(h.run(10), Stop::Halted);
+        let page = (SHADOW_TOP - 8) & !0xfff;
+        assert_eq!(write_tag_of(&h, page, false), page | TLB_TAG_SHADOW_STACK);
+        // A user shadow-stack access caches nothing in the supervisor half, and the reverse.
+        let mut h = kernel_shadow_stack(&[HLT]);
+        make_shadow_stack_region(&mut h, SHADOW_REGION, true);
+        h.cpu.shadow_stack_translate(page, true, true).unwrap();
+        assert_eq!(write_tag_of(&h, page, true), page | TLB_TAG_SHADOW_STACK);
+        assert_eq!(write_tag_of(&h, page, false), TLB_TAG_INVALID);
+    }
+
+    #[test]
+    fn a_shadow_stack_page_holding_code_is_not_cached() {
+        let mut h = kernel_shadow_stack(&[HLT]);
+        let page = (SHADOW_TOP - 8) & !0xfff;
+        h.cpu.page_has_code.set((page >> 12) as usize, 1);
+        h.cpu.shadow_stack_translate(page, false, true).unwrap();
+        assert_eq!(write_tag_of(&h, page, false), TLB_TAG_INVALID);
+    }
+
+    #[test]
+    fn a_read_refill_keeps_the_shadow_stack_tag() {
+        let mut h = kernel_shadow_stack(LOAD);
+        let page = (SHADOW_TOP - 8) & !0xfff;
+        h.cpu.shadow_stack_translate(page, false, true).unwrap();
+        h.cpu.gpr[RAX] = page;
+        assert_eq!(h.run(10), Stop::Halted);
+        assert_eq!(write_tag_of(&h, page, false), page | TLB_TAG_SHADOW_STACK);
+    }
+}
+
 mod near_transfers {
     use super::*;
 
@@ -926,42 +968,343 @@ mod xsaves_state {
 }
 
 mod jit {
-    use super::*;
-    use crate::testkit::assert_jit_matches_interpreter;
+    //! Generated near calls and returns push and pop the shadow stack inline (`jit/emit.rs`,
+    //! `emit_x64.rs`, `emit_wasm.rs`); everything else about shadow stacks runs in the
+    //! interpreter through `helper_exec`. Each case must leave the same state as the interpreter.
 
-    #[test]
-    fn the_run_loop_keeps_shadow_stack_code_on_the_interpreter() {
-        let mut h = kernel_shadow_stack(&[HLT]);
-        h.enable_jit();
-        assert!(!h.cpu.uses_jit());
-        let mut h = harness(&[HLT]);
-        let jit = h.enable_jit();
-        enable_cet(&mut h);
+    use super::*;
+    use crate::testkit::{STACK_TOP, assert_jit_matches_interpreter, run_both};
+
+    // mov ecx, 100; 1: call f; dec ecx; jnz 1b; hlt; f: call g; ret; g: endbr64; ret
+    const NESTED_CALL_LOOP: &[u8] = &[
+        0xb9, 0x64, 0x00, 0x00, 0x00, 0xe8, 0x05, 0x00, 0x00, 0x00, 0xff, 0xc9, 0x75, 0xf7, 0xf4,
+        0xe8, 0x01, 0x00, 0x00, 0x00, 0xc3, 0xf3, 0x0f, 0x1e, 0xfa, 0xc3,
+    ];
+    // call rbx; call qword ptr [rax]; hlt; g: ret
+    const INDIRECT_CALLS: &[u8] = &[0xff, 0xd3, 0xff, 0x10, 0xf4, 0xc3];
+    /// Offset of `g` in `INDIRECT_CALLS`.
+    const INDIRECT_CALLS_TARGET: u64 = 5;
+    // call g; hlt; g: rdsspq rax; incsspq rcx; ret
+    const SKIP_THEN_RET: &[u8] = &[
+        0xe8, 0x01, 0x00, 0x00, 0x00, 0xf4, 0xf3, 0x48, 0x0f, 0x1e, 0xc8, 0xf3, 0x48, 0x0f, 0xae,
+        0xe9, 0xc3,
+    ];
+    // call g; hlt; hlt; g: rdsspq rax; mov rbx, [rsp]; inc rbx; mov [rsp], rbx;
+    // wrssq [rax], rbx; ret
+    const REWRITE_BOTH_RETURN_ADDRESSES: &[u8] = &[
+        0xe8, 0x02, 0x00, 0x00, 0x00, 0xf4, 0xf4, 0xf3, 0x48, 0x0f, 0x1e, 0xc8, 0x48, 0x8b, 0x1c,
+        0x24, 0x48, 0xff, 0xc3, 0x48, 0x89, 0x1c, 0x24, 0x48, 0x0f, 0x38, 0xf6, 0x18, 0xc3,
+    ];
+    // call g; hlt; g: mov qword ptr [rax], rbx; ret
+    const CALL_THEN_STORE: &[u8] = &[0xe8, 0x01, 0x00, 0x00, 0x00, 0xf4, 0x48, 0x89, 0x18, 0xc3];
+    // wrmsr; call g; hlt; g: ret
+    const WRMSR_THEN_CALL: &[u8] = &[0x0f, 0x30, 0xe8, 0x01, 0x00, 0x00, 0x00, 0xf4, 0xc3];
+    // mov cr4, rax; call g; hlt; g: ret
+    const MOV_CR4_THEN_CALL: &[u8] = &[0x0f, 0x22, 0xe0, 0xe8, 0x01, 0x00, 0x00, 0x00, 0xf4, 0xc3];
+    // call g; iretq; g: ret
+    const HANDLER_CALLS_THEN_IRETQ: &[u8] = &[0xe8, 0x02, 0x00, 0x00, 0x00, 0x48, 0xcf, 0xc3];
+    // endbr64; rdsspq rax; hlt
+    const ENDBR_THEN_RDSSP: &[u8] = &[0xf3, 0x0f, 0x1e, 0xfa, 0xf3, 0x48, 0x0f, 0x1e, 0xc8, 0xf4];
+    const HANDLER_VECTOR: u8 = 0x40;
+
+    fn kernel_setup(h: &mut Harness) {
+        enable_cet(h);
+        make_shadow_stack_region(h, SHADOW_REGION, false);
+        h.cpu.cet.s_cet = CET_SH_STK_EN;
+        h.cpu.cet.ssp = SHADOW_TOP;
+    }
+
+    /// The whole boot identity map user-accessible, the shadow-stack region a user shadow stack,
+    /// and the CPU at CPL 3 with SSP on it.
+    fn user_setup(h: &mut Harness) {
+        enable_cet(h);
+        let pml4 = h.cpu.cr3 & PTE_ADDRESS_BITS;
+        let pml4_entry = h.read_u64(pml4);
+        h.write_u64(pml4, pml4_entry | PTE_U);
+        let pdpt = pml4_entry & PTE_ADDRESS_BITS;
+        for gib in 0..4 {
+            let pdpt_entry = h.read_u64(pdpt + gib * 8);
+            h.write_u64(pdpt + gib * 8, pdpt_entry | PTE_U);
+            let pd = pdpt_entry & PTE_ADDRESS_BITS;
+            for slot in 0..512 {
+                let entry = h.read_u64(pd + slot * 8);
+                h.write_u64(pd + slot * 8, entry | PTE_U);
+            }
+        }
+        make_shadow_stack_region(h, SHADOW_REGION, true);
         h.cpu.cet.u_cet = CET_SH_STK_EN;
-        assert_eq!(
-            h.cpu.uses_jit(),
-            jit,
-            "only the current level's shadow stack counts"
-        );
+        h.cpu.cet.ssp = SHADOW_TOP;
+        enter_user_mode(h);
+    }
+
+    /// Runs `code` on both engines and checks the interpreter stopped with `expected`, so a case
+    /// cannot pass by both engines failing early the same way.
+    #[track_caller]
+    fn assert_both_stop(code: &[u8], expected: Stop, setup: impl Fn(&mut Harness)) {
+        assert_jit_matches_interpreter(code, &setup);
+        assert_eq!(run_both(code, &setup).interpreter_stop, expected);
     }
 
     #[test]
     fn calls_and_returns_match_with_and_without_a_shadow_stack() {
-        assert_jit_matches_interpreter(CALL_LOOP, |h| {
-            enable_cet(h);
-            make_shadow_stack_region(h, SHADOW_REGION, false);
-            h.cpu.cet.s_cet = CET_SH_STK_EN;
-            h.cpu.cet.ssp = SHADOW_TOP;
-        });
-        assert_jit_matches_interpreter(CALL_LOOP, |h| {
+        assert_both_stop(CALL_LOOP, Stop::Halted, kernel_setup);
+        assert_both_stop(NESTED_CALL_LOOP, Stop::Halted, kernel_setup);
+        assert_both_stop(NESTED_CALL_LOOP, Stop::Halted, |h| {
             enable_cet(h);
             h.cpu.cet.ssp = SHADOW_TOP;
         });
-        assert_jit_matches_interpreter(CALL_TAMPERED_RET, |h| {
-            enable_cet(h);
-            make_shadow_stack_region(h, SHADOW_REGION, false);
-            h.cpu.cet.s_cet = CET_SH_STK_EN;
+        assert_both_stop(CALL_NEXT, Stop::Halted, kernel_setup);
+    }
+
+    #[test]
+    fn a_changed_return_address_is_control_protection() {
+        assert_both_stop(
+            CALL_TAMPERED_RET,
+            control_protection_stop(CP_NEAR_RET),
+            kernel_setup,
+        );
+        // call g; hlt; g: mov [rsp], rbx; ret, with rbx the address of the hlt: a return to
+        // the right place through a different stack slot value is still a mismatch only if the
+        // value differs, so this one matches.
+        assert_both_stop(CALL_THEN_STORE, Stop::Halted, |h| {
+            kernel_setup(h);
+            h.cpu.gpr[RAX] = SCRATCH;
+            h.cpu.gpr[RBX] = 0x1234;
+        });
+    }
+
+    #[test]
+    fn user_mode_calls_and_returns_use_the_user_shadow_stack() {
+        let hlt_at_cpl3 = fault(VECTOR_GENERAL_PROTECTION, Some(0));
+        assert_both_stop(NESTED_CALL_LOOP, hlt_at_cpl3, user_setup);
+        assert_both_stop(
+            CALL_TAMPERED_RET,
+            control_protection_stop(CP_NEAR_RET),
+            user_setup,
+        );
+        // A supervisor shadow-stack page is no user shadow stack.
+        assert_both_stop(
+            CALL_RET,
+            fault(
+                VECTOR_PAGE_FAULT,
+                Some(PF_P | PF_W | PF_U | PF_SHADOW_STACK_BIT),
+            ),
+            |h| {
+                user_setup(h);
+                make_shadow_stack_region(h, SHADOW_REGION, false);
+                let [_, _, pde] = identity_map_entries(h, SHADOW_REGION);
+                let leaf = read_pte(&h.cpu, pde);
+                write_pte(&mut h.cpu, pde, leaf & !PTE_U);
+                h.cpu.flush_tlb();
+            },
+        );
+    }
+
+    #[test]
+    fn indirect_calls_push_on_the_shadow_stack() {
+        assert_both_stop(INDIRECT_CALLS, Stop::Halted, |h| {
+            kernel_setup(h);
+            h.cpu.gpr[RBX] = CODE_BASE + INDIRECT_CALLS_TARGET;
+            h.write_u64(SCRATCH, CODE_BASE + INDIRECT_CALLS_TARGET);
+            h.cpu.gpr[RAX] = SCRATCH;
+        });
+    }
+
+    #[test]
+    fn a_shadow_stack_on_an_ordinary_page_faults() {
+        assert_both_stop(
+            CALL_RET,
+            fault(VECTOR_PAGE_FAULT, Some(PF_P | PF_W | PF_SHADOW_STACK_BIT)),
+            |h| {
+                kernel_setup(h);
+                h.cpu.cet.ssp = SCRATCH + 0x1000;
+            },
+        );
+    }
+
+    #[test]
+    fn ordinary_stores_to_a_cached_shadow_stack_page_fault() {
+        // The call caches the page's shadow-stack tag; the store must still miss it.
+        assert_both_stop(
+            CALL_THEN_STORE,
+            fault(VECTOR_PAGE_FAULT, Some(PF_P | PF_W)),
+            |h| {
+                kernel_setup(h);
+                h.cpu.gpr[RAX] = SHADOW_TOP - 0x100;
+            },
+        );
+        assert_both_stop(STORE, fault(VECTOR_PAGE_FAULT, Some(PF_P | PF_W)), |h| {
+            kernel_setup(h);
+            h.cpu.gpr[RAX] = SHADOW_TOP - 8;
+        });
+        assert_both_stop(LOAD, Stop::Halted, |h| {
+            kernel_setup(h);
+            h.write_u64(SHADOW_TOP - 8, 0x55);
+            h.cpu.gpr[RAX] = SHADOW_TOP - 8;
+        });
+    }
+
+    #[test]
+    fn a_slow_ordinary_push_before_a_cached_shadow_stack_push() {
+        // The shadow-stack page is in the TLB and the stack page is not: the push's slow path
+        // runs and the shadow-stack push after it takes the inline path.
+        let setup = |h: &mut Harness| {
+            kernel_setup(h);
+            h.cpu.flush_tlb();
+            h.cpu
+                .shadow_stack_translate(SHADOW_TOP - 8, false, true)
+                .unwrap();
+        };
+        assert_both_stop(CALL_THEN_STOP, Stop::Halted, setup);
+        assert_both_stop(INDIRECT_CALLS, Stop::Halted, |h| {
+            setup(h);
+            h.cpu.gpr[RBX] = CODE_BASE + INDIRECT_CALLS_TARGET;
+            h.write_u64(SCRATCH, CODE_BASE + INDIRECT_CALLS_TARGET);
+            h.cpu.gpr[RAX] = SCRATCH;
+        });
+    }
+
+    #[test]
+    fn an_entry_straddling_two_shadow_stack_pages_takes_the_slow_path() {
+        // incsspd leaves SSP 4-byte aligned; the next 8-byte entry crosses the page below.
+        assert_both_stop(NESTED_CALL_LOOP, Stop::Halted, |h| {
+            kernel_setup(h);
+            h.cpu.cet.ssp = SHADOW_TOP + 4;
+        });
+    }
+
+    #[test]
+    fn ordered_memory_takes_the_same_shadow_stack_path() {
+        let ordered = |h: &mut Harness| {
+            kernel_setup(h);
+            h.cpu.ordered_memory = true;
+        };
+        let mut interpreter = Harness::new(NESTED_CALL_LOOP);
+        ordered(&mut interpreter);
+        assert_eq!(interpreter.run(1_000_000), Stop::Halted);
+        let mut jitted = Harness::new(NESTED_CALL_LOOP);
+        ordered(&mut jitted);
+        if !jitted.enable_jit() {
+            return;
+        }
+        jitted.cpu.jit.as_mut().unwrap().set_ordered_memory(true);
+        assert_eq!(jitted.run(1_000_000), Stop::Halted);
+        assert_eq!(jitted.snapshot(), interpreter.snapshot());
+        assert_eq!(
+            jitted.read(SHADOW_REGION, 0x2000),
+            interpreter.read(SHADOW_REGION, 0x2000)
+        );
+    }
+
+    #[test]
+    fn every_shadow_stack_instruction_matches() {
+        assert_both_stop(RDSSPQ, Stop::Halted, kernel_setup);
+        assert_both_stop(RDSSPD, Stop::Halted, |h| {
+            kernel_setup(h);
+            h.cpu.gpr[RAX] = u64::MAX;
+        });
+        assert_both_stop(RDSSPQ, Stop::Halted, |h| {
             h.cpu.cet.ssp = SHADOW_TOP;
+            h.cpu.gpr[RAX] = 0x1234;
+        });
+        assert_both_stop(ENDBR_THEN_RDSSP, Stop::Halted, kernel_setup);
+        assert_both_stop(INCSSPQ, Stop::Halted, |h| {
+            kernel_setup(h);
+            h.cpu.gpr[RCX] = 3;
+        });
+        assert_both_stop(INCSSPQ, fault(VECTOR_INVALID_OPCODE, None), |h| {
+            enable_cet(h);
+        });
+        assert_both_stop(WRSSQ, Stop::Halted, |h| {
+            kernel_setup(h);
+            h.cpu.cet.s_cet |= CET_WR_SHSTK_EN;
+            h.cpu.gpr[RAX] = SHADOW_TOP - 8;
+            h.cpu.gpr[RBX] = 0xabcd;
+        });
+        assert_both_stop(WRSSQ, fault(VECTOR_INVALID_OPCODE, None), |h| {
+            kernel_setup(h);
+            h.cpu.gpr[RAX] = SHADOW_TOP - 8;
+        });
+        assert_both_stop(WRUSSQ, Stop::Halted, |h| {
+            enable_cet(h);
+            make_shadow_stack_region(h, SHADOW_REGION, true);
+            h.cpu.gpr[RAX] = SHADOW_TOP - 8;
+            h.cpu.gpr[RBX] = 0xabcd;
+        });
+        assert_both_stop(SETSSBSY, Stop::Halted, |h| {
+            kernel_setup(h);
+            h.cpu.cet.ssp = 0;
+            h.cpu.cet.pl_ssp[0] = OTHER_SHADOW_TOP - 8;
+            put_token(h, OTHER_SHADOW_TOP - 8, false);
+        });
+        assert_both_stop(SETSSBSY, control_protection_stop(CP_SETSSBSY), |h| {
+            kernel_setup(h);
+            h.cpu.cet.pl_ssp[0] = OTHER_SHADOW_TOP - 8;
+            put_token(h, OTHER_SHADOW_TOP - 8, true);
+        });
+        assert_both_stop(CLRSSBSY, Stop::Halted, |h| {
+            kernel_setup(h);
+            put_token(h, OTHER_SHADOW_TOP - 8, true);
+            h.cpu.gpr[RAX] = OTHER_SHADOW_TOP - 8;
+        });
+        assert_both_stop(RSTORSSP_SAVEPREVSSP, Stop::Halted, |h| {
+            kernel_setup(h);
+            h.write_u64(OTHER_SHADOW_TOP - 8, OTHER_SHADOW_TOP | 1);
+            h.cpu.gpr[RAX] = OTHER_SHADOW_TOP - 8;
+        });
+        assert_both_stop(RSTORSSP, control_protection_stop(CP_RSTORSSP), |h| {
+            kernel_setup(h);
+            h.write_u64(OTHER_SHADOW_TOP - 8, SHADOW_TOP | 1);
+            h.cpu.gpr[RAX] = OTHER_SHADOW_TOP - 8;
+        });
+    }
+
+    #[test]
+    fn interpreted_shadow_stack_instructions_and_inline_returns_agree() {
+        // incssp drops the entry the call pushed, so the inline ret meets the next one.
+        assert_both_stop(SKIP_THEN_RET, control_protection_stop(CP_NEAR_RET), |h| {
+            kernel_setup(h);
+            h.cpu.gpr[RCX] = 1;
+        });
+        // wrss rewrites the shadow stack's copy the way the code rewrites the stack's.
+        assert_both_stop(REWRITE_BOTH_RETURN_ADDRESSES, Stop::Halted, |h| {
+            kernel_setup(h);
+            h.cpu.cet.s_cet |= CET_WR_SHSTK_EN;
+        });
+    }
+
+    #[test]
+    fn turning_shadow_stacks_on_between_blocks_reaches_the_next_call() {
+        assert_both_stop(WRMSR_THEN_CALL, Stop::Halted, |h| {
+            kernel_setup(h);
+            h.cpu.cet.s_cet = 0;
+            h.cpu.gpr[RCX] = MSR_S_CET as u64;
+            h.cpu.gpr[RAX] = CET_SH_STK_EN;
+            h.cpu.gpr[2] = 0;
+        });
+        assert_both_stop(MOV_CR4_THEN_CALL, Stop::Halted, |h| {
+            kernel_setup(h);
+            h.cpu.gpr[RAX] = h.cpu.cr4;
+            h.cpu.cr4 &= !CR4_CET;
+        });
+        let mut h = harness(MOV_CR4_THEN_CALL);
+        kernel_setup(&mut h);
+        h.cpu.gpr[RAX] = h.cpu.cr4;
+        h.cpu.cr4 &= !CR4_CET;
+        h.enable_jit();
+        assert_eq!(h.run(100), Stop::Halted);
+        assert_eq!(h.read_u64(SHADOW_TOP - 8), CODE_BASE + 8, "the call pushed");
+    }
+
+    #[test]
+    fn calls_inside_an_event_handler_and_its_iretq() {
+        assert_both_stop(&[HLT], Stop::Halted, |h| {
+            kernel_setup(h);
+            install_idt(h);
+            install_tss(h, [STACK_TOP, 0, 0], [0; 7]);
+            set_gate(h, HANDLER_VECTOR, Gate::interrupt(SIDE_CODE));
+            h.write(SIDE_CODE, HANDLER_CALLS_THEN_IRETQ);
+            assert_eq!(h.cpu.deliver_event(HANDLER_VECTOR, None, false), None);
         });
     }
 
@@ -970,5 +1313,12 @@ mod jit {
         let mut h = kernel_shadow_stack(CALL_TAMPERED_RET);
         h.enable_jit();
         assert_eq!(h.run(100), control_protection_stop(CP_NEAR_RET));
+    }
+
+    #[test]
+    fn shadow_stack_code_runs_in_the_jit() {
+        let mut h = kernel_shadow_stack(&[HLT]);
+        let jit = h.enable_jit();
+        assert_eq!(h.cpu.uses_jit(), jit);
     }
 }

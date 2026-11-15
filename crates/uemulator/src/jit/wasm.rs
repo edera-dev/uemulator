@@ -1465,6 +1465,7 @@ impl Cpu {
         // SAFETY: the host put a function of this type in the slot (`CompiledBlock::function`).
         let run_block: extern "C" fn(*mut Cpu) -> u64 =
             unsafe { core::mem::transmute(slot as usize) };
+        self.shadow_stack_on = self.shadow_stack_active();
         let icount_before = self.icount;
         let exit_code = run_block(self as *mut Cpu);
         let done = exit_code >> helpers::EXIT_COUNT_SHIFT;

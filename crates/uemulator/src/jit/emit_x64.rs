@@ -25,12 +25,13 @@ use std::mem::{offset_of, size_of};
 use super::helpers::*;
 use super::native::LinkSite;
 use super::x64::*;
+use crate::cpu::cet::Cet;
 use crate::cpu::decode::{Insn, NO_REG, VEX_OP_FLAG};
 use crate::cpu::flags::{AC, IF, LazyFlagsOp, SZP_CF_OF_SRC_CF_BIT, SZP_CF_OF_SRC_OF_BIT};
 use crate::cpu::xsave::{XCR0_AVX, XCR0_AVX512, XCR0_SSE};
 use crate::cpu::{
     CR0_EM, CR0_TS, CR4_OSFXSR, CR4_OSXSAVE, Cpu, SEG_FS, SEG_GS, Seg, TLB_ENTRIES_PER_MODE,
-    TlbEntry,
+    TLB_TAG_SHADOW_STACK, TlbEntry,
 };
 
 // Offsets into `Cpu` baked into generated code. They come from `offset_of!`, so they always match
@@ -100,6 +101,10 @@ const SEG_SIZE: i32 = size_of::<Seg>() as i32;
 const GS_BASE: i32 = SEG_BASE + SEG_SIZE * SEG_GS as i32;
 const KGSBASE: i32 = offset_of!(Cpu, kgsbase) as i32;
 const CPL: i32 = offset_of!(Cpu, cpl) as i32;
+const SHADOW_STACK_ON: i32 = offset_of!(Cpu, shadow_stack_on) as i32;
+const SSP: i32 = (offset_of!(Cpu, cet) + offset_of!(Cet, ssp)) as i32;
+/// Bytes a near call pushes on the shadow stack in 64-bit mode, the only mode compiled.
+const SHADOW_STACK_ENTRY: i32 = 8;
 const EFLAGS: i32 = offset_of!(Cpu, eflags) as i32;
 
 const _: () = assert!(size_of::<LazyFlagsOp>() == 1);
@@ -244,6 +249,10 @@ enum SlowKind {
     /// A whole-instruction fallback (`vector_move`): the probe or a gate check failed, so the
     /// interpreter runs the instruction and raises the right fault.
     Exec,
+    /// `Exec` for a near call or ret whose shadow-stack access missed the TLB or found another
+    /// return address (`shadow_stack_push`/`shadow_stack_pop`): the interpreter runs the whole
+    /// instruction, leaving `Cpu::rip` at its target, and the block ends. `resume` is unused.
+    ExecAndLeave,
     Ld {
         dst: u8,
         size: u8,
@@ -584,6 +593,11 @@ impl<'a> Gen<'a> {
     /// Inline mirror of the fast path in `Cpu::mem_read`/`mem_write`. Jumps to `slow` on a miss;
     /// on a hit falls through with `SCRATCH_A` pointing at the TLB entry. Clobbers host flags.
     fn tlb_probe(&mut self, size: u8, tag_offset: i32, slow: Label) {
+        self.tlb_probe_tagged(size, tag_offset, slow, 0);
+    }
+
+    /// `tlb_probe` for a tag that is the page plus `tag_bits` (`TLB_TAG_SHADOW_STACK`).
+    fn tlb_probe_tagged(&mut self, size: u8, tag_offset: i32, slow: Label, tag_bits: u64) {
         self.live = false;
         self.a.mov_rr(SCRATCH_A, ADDR, true);
         self.a.shift_ri(SHR, SCRATCH_A, PAGE_SHIFT, true);
@@ -602,6 +616,9 @@ impl<'a> Gen<'a> {
             self.a.lea(SCRATCH_C, mem(ADDR, size as i32 - 1));
         }
         self.a.alu_ri(AND, SCRATCH_C, PAGE_MASK, true);
+        if tag_bits != 0 {
+            self.a.alu_ri(OR, SCRATCH_C, tag_bits as i32, true);
+        }
         self.a.cmp_mr(mem(SCRATCH_A, tag_offset), SCRATCH_C);
         self.a.jcc(NE, slow);
     }
@@ -685,6 +702,64 @@ impl<'a> Gen<'a> {
         });
     }
 
+    /// CET: with a shadow stack in use, pushes the return address `return_rip` on it too. The
+    /// run-time test of `Cpu::shadow_stack_on`, the shadow-stack TLB tag and the whole-instruction
+    /// fallback are explained at `shadow_stack_push` in `emit.rs`. Emit after the ordinary push's
+    /// store and before rsp is written. Keeps `ADDR` (through `SCRATCH_D`).
+    fn shadow_stack_push(&mut self, return_rip: u64, insn_index: u32, rip: u64) {
+        let skip = self.a.label();
+        let fallback = self.shadow_stack_fallback(insn_index, rip);
+        self.a.cmp_m8_imm(mem(CPU, SHADOW_STACK_ON), 0);
+        self.a.jcc(E, skip);
+        // The ordinary push's slow path clobbers `VALUE`.
+        self.rip_to(VALUE, return_rip);
+        self.a.mov_rr(SCRATCH_D, ADDR, true);
+        self.a.ld(ADDR, mem(CPU, SSP));
+        self.a.lea(ADDR, mem(ADDR, -SHADOW_STACK_ENTRY));
+        self.tlb_probe_tagged(8, TLB_TAG_WRITE, fallback, TLB_TAG_SHADOW_STACK);
+        self.a.ld(SCRATCH_B, mem(SCRATCH_A, TLB_ADDEND));
+        self.a.st(mem_idx(ADDR, SCRATCH_B, 0, 0), VALUE, 8);
+        self.a.st(mem(CPU, SSP), ADDR, 8);
+        self.a.mov_rr(ADDR, SCRATCH_D, true);
+        self.a.bind(skip);
+        self.live = false;
+    }
+
+    /// The shadow-stack half of a near `ret` whose target is in `VALUE`: pops the shadow stack's
+    /// copy and compares, leaving a mismatch (#CP) to the interpreter like a TLB miss. Keeps
+    /// `ADDR` and `VALUE`.
+    fn shadow_stack_pop(&mut self, insn_index: u32, rip: u64) {
+        let skip = self.a.label();
+        let fallback = self.shadow_stack_fallback(insn_index, rip);
+        self.a.cmp_m8_imm(mem(CPU, SHADOW_STACK_ON), 0);
+        self.a.jcc(E, skip);
+        self.a.mov_rr(SCRATCH_D, ADDR, true);
+        self.a.ld(ADDR, mem(CPU, SSP));
+        self.tlb_probe_tagged(8, TLB_TAG_WRITE, fallback, TLB_TAG_SHADOW_STACK);
+        self.a.ld(SCRATCH_B, mem(SCRATCH_A, TLB_ADDEND));
+        self.a.ld(SCRATCH_C, mem_idx(ADDR, SCRATCH_B, 0, 0));
+        self.a.alu_rr(CMP, SCRATCH_C, VALUE, true);
+        self.a.jcc(NE, fallback);
+        self.a.lea(ADDR, mem(ADDR, SHADOW_STACK_ENTRY));
+        self.a.st(mem(CPU, SSP), ADDR, 8);
+        self.a.mov_rr(ADDR, SCRATCH_D, true);
+        self.a.bind(skip);
+        self.live = false;
+    }
+
+    fn shadow_stack_fallback(&mut self, insn_index: u32, rip: u64) -> Label {
+        let slow = self.a.label();
+        let resume = self.a.label();
+        self.slows.push(Slow {
+            slow,
+            resume,
+            kind: SlowKind::ExecAndLeave,
+            insn_index,
+            rip,
+        });
+        slow
+    }
+
     /// After a store: if it invalidated translated code (`Cpu::code_written` sets
     /// `block_exit_requested`), leave the block so the rest of it does not run from stale code.
     fn smc_check(&mut self, insn_index: u32, next: u64) {
@@ -723,6 +798,20 @@ impl<'a> Gen<'a> {
         let slows = std::mem::take(&mut self.slows);
         for slow in slows {
             self.a.bind(slow.slow);
+            if matches!(slow.kind, SlowKind::ExecAndLeave) {
+                let insn = &self.insns[slow.insn_index as usize] as *const Insn as u64;
+                self.a.mov_rr(ARGS[0], CPU, true);
+                self.a.mov_imm(ARGS[1], insn);
+                self.rip_to(ARGS[2], slow.rip);
+                self.call(self.addrs.exec);
+                let done = self.a.label();
+                self.a.test_rr(ACC, ACC, true);
+                self.a.jcc(E, done);
+                self.fail_exit(slow.insn_index);
+                self.a.bind(done);
+                self.exit_ok(slow.insn_index + 1);
+                continue;
+            }
             if matches!(slow.kind, SlowKind::Exec) {
                 // Not `helper`: that pays for the instructions before this one at translation time,
                 // which a path that is only sometimes taken cannot do. `exit_fail` works out the
@@ -753,7 +842,7 @@ impl<'a> Gen<'a> {
             self.a.mov_rr(ARGS[1], SAVED_ADDR, true);
             let fail = self.a.label();
             match slow.kind {
-                SlowKind::Exec => unreachable!("handled above"),
+                SlowKind::Exec | SlowKind::ExecAndLeave => unreachable!("handled above"),
                 SlowKind::Ld {
                     dst,
                     size,
@@ -1837,6 +1926,7 @@ impl<'a> Gen<'a> {
                         self.a.lea(ADDR, mem(ADDR, -PUSH_POP_SIZE));
                         self.rip_to(VALUE, next);
                         self.stack_store(insn_index, rip);
+                        self.shadow_stack_push(next, insn_index, rip);
                         self.st_gpr(GUEST_RSP, ADDR);
                         self.a.mov_rr(OPERAND, SAVED_OPERAND, true);
                         self.chain_exit(retired);
@@ -2008,7 +2098,9 @@ impl<'a> Gen<'a> {
             // with REX.B is xchg r8, rax.
             0x90 | 0x10d | 0x118..=0x11f => {
                 // `f3 90` is pause: an SVM guest can intercept it, so it goes through `exec`
-                if insn.op == 0x90 && (insn.rex & GUEST_REX_B != 0 || insn.rep != 0) {
+                if insn.op == 0x90 && (insn.rex & GUEST_REX_B != 0 || insn.rep != 0)
+                    || is_rdssp(&insn)
+                {
                     return false;
                 }
             }
@@ -2032,6 +2124,10 @@ impl<'a> Gen<'a> {
                 self.a.lea(ADDR, mem(ADDR, -PUSH_POP_SIZE));
                 self.rip_to(VALUE, next);
                 self.stack_store(insn_index, rip);
+                // `call` to the next instruction (getting rip) leaves the shadow stack alone.
+                if insn.imm != 0 {
+                    self.shadow_stack_push(next, insn_index, rip);
+                }
                 self.st_gpr(GUEST_RSP, ADDR);
                 self.chain_to(next.wrapping_add(insn.imm as u64), retired);
                 self.inlined += 1;
@@ -2041,6 +2137,7 @@ impl<'a> Gen<'a> {
             0xc3 => {
                 self.ld_gpr(ADDR, GUEST_RSP);
                 self.stack_load(VALUE, insn_index, rip);
+                self.shadow_stack_pop(insn_index, rip);
                 self.a.lea(ADDR, mem(ADDR, PUSH_POP_SIZE));
                 self.st_gpr(GUEST_RSP, ADDR);
                 self.a.mov_rr(OPERAND, VALUE, true);

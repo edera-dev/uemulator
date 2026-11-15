@@ -37,12 +37,13 @@ use super::wasm_encode::{
     BLOCK_I64, BLOCK_TYPE, BLOCK_VOID, COND_TYPE, Code, EXEC_TYPE, Function, LINK_TYPE, LOAD_TYPE,
     STORE_TYPE, module_of_type, op, simd,
 };
+use crate::cpu::cet::Cet;
 use crate::cpu::decode::{Insn, NO_REG, VEX_OP_FLAG};
 use crate::cpu::flags::LazyFlagsOp;
 use crate::cpu::xsave::{XCR0_AVX, XCR0_AVX512, XCR0_SSE};
 use crate::cpu::{
     CR0_EM, CR0_TS, CR4_OSFXSR, CR4_OSXSAVE, Cpu, SEG_FS, SEG_GS, Seg, TLB_ENTRIES_PER_MODE,
-    TlbEntry,
+    TLB_TAG_SHADOW_STACK, TlbEntry,
 };
 
 // Offsets into `Cpu` baked into generated code; see the same list in `emit_x64.rs`. They come from
@@ -98,6 +99,10 @@ const LANE_MASK_BITS: i64 = 16;
 const MOVD_TO_VECTOR: u16 = 0x16e;
 const MOVD_FROM_VECTOR: u16 = 0x17e;
 const SEG_SIZE: u32 = size_of::<Seg>() as u32;
+const SHADOW_STACK_ON: u32 = offset_of!(Cpu, shadow_stack_on) as u32;
+const SSP: u32 = (offset_of!(Cpu, cet) + offset_of!(Cet, ssp)) as u32;
+/// Bytes a near call pushes on the shadow stack in 64-bit mode, the only mode compiled.
+const SHADOW_STACK_ENTRY: i64 = 8;
 
 const _: () = assert!(size_of::<LazyFlagsOp>() == 1);
 const _: () = assert!(offset_of!(Cpu, lazy_size) == offset_of!(Cpu, lazy_op) + 1);
@@ -1288,6 +1293,11 @@ impl<'a> Gen<'a> {
     /// matches (the next page maps to a different slot) and takes the slow path, which splits it.
     /// `TLB_TAG_INVALID` has low bits set, so it never equals a page-aligned value.
     fn tlb_probe(&mut self, size: u8, tag_offset: u32) {
+        self.tlb_probe_tagged(size, tag_offset, 0);
+    }
+
+    /// `tlb_probe` for a tag that is the page plus `tag_bits` (`TLB_TAG_SHADOW_STACK`).
+    fn tlb_probe_tagged(&mut self, size: u8, tag_offset: u32, tag_bits: u64) {
         self.c
             .local_get(ADDR)
             .i64_const(PAGE_SHIFT)
@@ -1307,10 +1317,11 @@ impl<'a> Gen<'a> {
         if size > 1 {
             self.c.i64_const(size as i64 - 1).op(op::I64_ADD);
         }
-        self.c
-            .i64_const(PAGE_MASK_NEG)
-            .op(op::I64_AND)
-            .op(op::I64_EQ);
+        self.c.i64_const(PAGE_MASK_NEG).op(op::I64_AND);
+        if tag_bits != 0 {
+            self.c.i64_const(tag_bits as i64).op(op::I64_OR);
+        }
+        self.c.op(op::I64_EQ);
     }
 
     /// The host address of `ADDR` through the entry `tlb_probe` selected: `la + addend`, wrapped to
@@ -2767,6 +2778,117 @@ impl<'a> Gen<'a> {
             .mem(op::I64_STORE, register_offset(GUEST_RSP, false));
     }
 
+    /// A near call's push of the return address in local `VALUE`, on the shadow stack too when
+    /// `shadow` (not for `call` to the next instruction, which leaves it alone).
+    fn push_return_address(&mut self, index: u32, rip: u64, shadow: bool) {
+        self.read_reg(GUEST_RSP, false, 8);
+        self.c
+            .i64_const(-PUSH_POP_SIZE)
+            .op(op::I64_ADD)
+            .local_set(ADDR);
+        self.mem_store(8, VALUE, index, rip, true);
+        if shadow {
+            self.shadow_stack_push(index, rip);
+        }
+        self.c
+            .local_get(CPU)
+            .local_get(ADDR)
+            .mem(op::I64_STORE, register_offset(GUEST_RSP, false));
+    }
+
+    /// A near `ret`'s pop of its target into local `VALUE`, checked against the shadow stack.
+    fn pop_return_address(&mut self, index: u32, rip: u64) {
+        self.read_reg(GUEST_RSP, false, 8);
+        self.c.local_set(ADDR);
+        self.mem_load(8, false, index, rip, true);
+        self.c.local_set(VALUE);
+        self.shadow_stack_pop(index, rip);
+        self.c
+            .local_get(CPU)
+            .local_get(ADDR)
+            .i64_const(PUSH_POP_SIZE)
+            .op(op::I64_ADD)
+            .mem(op::I64_STORE, register_offset(GUEST_RSP, false));
+    }
+
+    /// CET: with a shadow stack in use, pushes local `VALUE` on it too. The run-time test of
+    /// `Cpu::shadow_stack_on`, the shadow-stack TLB tag and the whole-instruction fallback are
+    /// explained at `shadow_stack_push` in `emit.rs`. Runs after the ordinary push's store and
+    /// before rsp is written; keeps `ADDR` (through `SCRATCH_B`).
+    fn shadow_stack_push(&mut self, index: u32, rip: u64) {
+        self.c
+            .local_get(CPU)
+            .mem(op::I32_LOAD8_U, SHADOW_STACK_ON)
+            .begin_if(BLOCK_VOID);
+        self.c.local_get(ADDR).local_set(SCRATCH_B);
+        self.c
+            .local_get(CPU)
+            .mem(op::I64_LOAD, SSP)
+            .i64_const(SHADOW_STACK_ENTRY)
+            .op(op::I64_SUB)
+            .local_set(ADDR);
+        self.tlb_probe_tagged(8, TLB_TAG_WRITE, TLB_TAG_SHADOW_STACK);
+        self.c.begin_if(BLOCK_VOID);
+        self.host_address();
+        self.c.local_get(VALUE).mem(op::I64_STORE, 0);
+        self.c
+            .local_get(CPU)
+            .local_get(ADDR)
+            .mem(op::I64_STORE, SSP);
+        self.c.op(op::ELSE);
+        self.leave_through_interpreter(index, rip);
+        self.end();
+        self.c.local_get(SCRATCH_B).local_set(ADDR);
+        self.end();
+    }
+
+    /// The shadow-stack half of a near `ret` whose target is in local `VALUE`: pops the shadow
+    /// stack's copy and compares, leaving a mismatch (#CP) to the interpreter like a TLB miss.
+    /// Keeps `ADDR` (through `SCRATCH_B`).
+    fn shadow_stack_pop(&mut self, index: u32, rip: u64) {
+        self.c
+            .local_get(CPU)
+            .mem(op::I32_LOAD8_U, SHADOW_STACK_ON)
+            .begin_if(BLOCK_VOID);
+        self.c.local_get(ADDR).local_set(SCRATCH_B);
+        self.c.local_get(CPU).mem(op::I64_LOAD, SSP).local_set(ADDR);
+        self.tlb_probe_tagged(8, TLB_TAG_WRITE, TLB_TAG_SHADOW_STACK);
+        self.c.begin_if(BLOCK_VOID);
+        self.host_address();
+        self.c
+            .mem(op::I64_LOAD, 0)
+            .local_get(VALUE)
+            .op(op::I64_NE)
+            .begin_if(BLOCK_VOID);
+        self.leave_through_interpreter(index, rip);
+        self.end();
+        self.c
+            .local_get(CPU)
+            .local_get(ADDR)
+            .i64_const(SHADOW_STACK_ENTRY)
+            .op(op::I64_ADD)
+            .mem(op::I64_STORE, SSP);
+        self.c.op(op::ELSE);
+        self.leave_through_interpreter(index, rip);
+        self.end();
+        self.c.local_get(SCRATCH_B).local_set(ADDR);
+        self.end();
+    }
+
+    /// Runs control transfer `index` again in the interpreter from scratch and leaves the block
+    /// at the target it sets. Only right while nothing of the instruction is committed yet.
+    fn leave_through_interpreter(&mut self, index: u32, rip: u64) {
+        self.materialize_flags();
+        let insn = &self.insns[index as usize] as *const Insn as usize as i32;
+        self.c.local_get(CPU).i32_const(insn);
+        self.rip_to(rip);
+        self.c
+            .i32_const(self.addrs.exec as i32)
+            .call_indirect(EXEC_TYPE);
+        self.check_status(index, true);
+        self.exit_ok(index + 1);
+    }
+
     /// `pop` into local `VALUE`; `rsp` moves after the load succeeded.
     fn pop_value(&mut self, index: u32, rip: u64) {
         self.read_reg(GUEST_RSP, false, 8);
@@ -3186,7 +3308,7 @@ impl<'a> Gen<'a> {
                         self.c.local_set(SCRATCH);
                         self.rip_to(next);
                         self.c.local_set(VALUE);
-                        self.push_value(k, rip);
+                        self.push_return_address(k, rip, true);
                         self.chain_to_local(SCRATCH, retired);
                         self.inlined += 1;
                         return true;
@@ -3308,7 +3430,9 @@ impl<'a> Gen<'a> {
             // nop, prefetchw (0f 0d), and the 0f 18..1f hint/nop group. 0x90 with REX.B is xchg
             // r8, rax, and `f3 90` is pause, which an SVM guest can intercept.
             0x90 | 0x10d | 0x118..=0x11f => {
-                if insn.op == 0x90 && (insn.rex & GUEST_REX_B != 0 || insn.rep != 0) {
+                if insn.op == 0x90 && (insn.rex & GUEST_REX_B != 0 || insn.rep != 0)
+                    || is_rdssp(&insn)
+                {
                     return false;
                 }
             }
@@ -3336,13 +3460,14 @@ impl<'a> Gen<'a> {
             0xe8 => {
                 self.rip_to(next);
                 self.c.local_set(VALUE);
-                self.push_value(k, rip);
+                // `call` to the next instruction (getting rip) leaves the shadow stack alone.
+                self.push_return_address(k, rip, insn.imm != 0);
                 self.chain_to(next.wrapping_add(insn.imm as u64), retired);
                 self.inlined += 1;
                 return true;
             }
             0xc3 => {
-                self.pop_value(k, rip);
+                self.pop_return_address(k, rip);
                 self.chain_to_local(VALUE, retired);
                 self.inlined += 1;
                 return true;
