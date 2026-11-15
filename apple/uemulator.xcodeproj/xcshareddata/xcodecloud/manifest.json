@@ -1,0 +1,9 @@
+{
+  "id" : "706e5f24-b642-40e3-bc6c-b4b145963786",
+  "targets" : [
+    {
+      "id" : "3f2e3174-b40b-4dbc-bebe-d58e5424ee1e",
+      "name" : "uemulator"
+    }
+  ]
+}
