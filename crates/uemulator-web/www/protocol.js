@@ -93,6 +93,7 @@ export const OPTION = {
   SCREEN_CONSOLE: 1 << 10,
   TPM: 1 << 11,
   SECURE_BOOT: 1 << 12,
+  NO_SMT: 1 << 13,
 };
 // What a wisp ring record carries: the WISP_EVENT_* constants in src/lib.rs. A record is its
 // payload's length (u32 little-endian), the event (u8), then the payload: a server message for

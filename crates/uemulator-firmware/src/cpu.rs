@@ -62,9 +62,11 @@ pub fn wrmsr(msr: u32, value: u64) {
 const CPUID_SIGNATURE: u32 = 1;
 const CPUID_BRAND_FIRST: u32 = 0x8000_0002;
 const CPUID_BRAND_LEAVES: u32 = 3;
-/// ECX bits 7:0: logical processors in the package minus one (AMD APM vol. 3, CPUID Fn8000_0008).
-const CPUID_ADDRESS_SIZES: u32 = 0x8000_0008;
-const LOGICAL_PROCESSORS_MINUS_ONE_MASK: u32 = 0xff;
+/// Subleaf 1 (the package level) EBX bits 15:0: logical processors in the package. The 8-bit
+/// count of Fn8000_0008 ECX saturates at 256, below what the library can have.
+const CPUID_EXTENDED_TOPOLOGY: u32 = 0xb;
+const TOPOLOGY_SUBLEAF_PACKAGE: u32 = 1;
+const TOPOLOGY_LOGICAL_PROCESSORS_MASK: u32 = 0xffff;
 /// EBX bits 15:8: threads per core minus one (CPUID Fn8000_001E).
 const CPUID_EXTENDED_APIC_ID: u32 = 0x8000_001e;
 const THREADS_PER_CORE_SHIFT: u32 = 8;
@@ -74,7 +76,8 @@ const HZ_PER_MHZ: u64 = 1_000_000;
 /// Logical processors in the package, from CPUID: the library starts every vCPU it has, and
 /// they all sit in the one package it reports.
 pub fn logical_processors() -> u32 {
-    (cpuid(CPUID_ADDRESS_SIZES, 0)[2] & LOGICAL_PROCESSORS_MINUS_ONE_MASK) + 1
+    (cpuid(CPUID_EXTENDED_TOPOLOGY, TOPOLOGY_SUBLEAF_PACKAGE)[1] & TOPOLOGY_LOGICAL_PROCESSORS_MASK)
+        .max(1)
 }
 
 /// The processor structure's contents, from CPUID and the TSC rate (which is the clock the

@@ -135,6 +135,9 @@ pub const OPTION_TPM: u32 = 1 << 11;
 /// other firmware, which would refuse it. The keys are enrolled again on every page load: the
 /// page keeps no variables.
 pub const OPTION_SECURE_BOOT: u32 = 1 << 12;
+/// One thread per core instead of SMT pairs (`MachineConfig::smt`). Inverted so a caller that
+/// predates it gets the library's default.
+pub const OPTION_NO_SMT: u32 = 1 << 13;
 
 // Input event kinds in the page's event ring, as `www/protocol.js` numbers them.
 /// A key by USB HID usage; then pressed (1) or released (0).
@@ -550,6 +553,7 @@ pub unsafe extern "C" fn uw_create(
         // Without a `thread_spawner` the vCPUs take turns on this thread, which the JIT needs
         // anyway (its function table belongs to this instance; `docs/plans/13-web.md`).
         .cpus(cpus as usize)
+        .smt(!option(OPTION_NO_SMT))
         // Blocks are compiled to WebAssembly modules the page instantiates; without the page's
         // `host_jit_*` imports working, `Auto` falls back to the interpreter.
         .jit(if option(OPTION_JIT) {

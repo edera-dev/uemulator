@@ -21,7 +21,8 @@ impl MachineConfig {
     pub fn console(self, k: ConsoleKind) -> Self;       // Virtio (default, resizable hvc0, repeatable) | Serial (ttyS0, once); first = primary; handles via EmulatedMachine::consoles()
     pub fn reboot(self, on: bool) -> Self;              // true (default): guest reset restarts the machine in place; false: ExitReason::Reset
     pub fn log(self, f: impl Fn(&str) + Send + 'static) -> Self;
-    pub fn cpus(self, n: usize) -> Self;                // 1 (default) to 64 vCPUs
+    pub fn cpus(self, n: usize) -> Self;                // 1 (default) to 384 vCPUs
+    pub fn smt(self, on: bool) -> Self;                 // even counts as two-thread cores (default on)
     pub fn smp(self, mode: SmpMode) -> Self;            // Auto (default): a host thread per vCPU when possible | Timeshare | Threads (error if impossible)
     pub fn thread_spawner(self, spawn: impl Fn(Box<dyn FnOnce() + Send>) + Send + Sync + 'static) -> Self; // freestanding hosts: how to start a thread
 }

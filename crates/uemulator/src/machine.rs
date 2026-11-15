@@ -144,9 +144,12 @@ pub enum DisplayMode {
 }
 
 pub const MIN_CPUS: usize = 1;
-/// The APIC id fits one byte in xAPIC mode, and the I/O APIC and IPI routing keep one bit per
-/// vCPU in a `u64`.
-pub const MAX_CPUS: usize = 64;
+/// The threads of the largest EPYC 9005 package (192 cores, SMT2), so the brand string can always
+/// name a part with as many cores (`cpu/profile.rs`), and the most the tests boot. APIC ids are
+/// the vCPU numbers, so from 255 up they exist only in x2APIC mode: the MADT lists those
+/// processors as x2APIC entries, and a guest needs interrupt remapping (`iommu`) to point device
+/// interrupts at them; Linux without it brings up only the processors below 255.
+pub const MAX_CPUS: usize = crate::cpu::profile::MAX_LOGICAL_PROCESSORS as usize;
 pub const MIN_MEMORY_MIB: usize = 64;
 /// The most RAM the guest can address: its physical address space is 40 bits (CPUID
 /// MAXPHYADDR), and the 1 GiB PCI hole below 4 GiB is not RAM. RAM past 3 GiB is placed from
@@ -192,6 +195,7 @@ pub struct MachineConfig {
     hypervisor_cmdline: Option<String>,
     memory_mib: usize,
     cpus: usize,
+    smt: bool,
     disks: Vec<Disk>,
     net_macs: Vec<[u8; 6]>,
     consoles: Vec<ConsoleKind>,
@@ -236,6 +240,7 @@ impl Default for MachineConfig {
             hypervisor_cmdline: None,
             memory_mib: DEFAULT_MEMORY_MIB,
             cpus: MIN_CPUS,
+            smt: true,
             disks: Vec::new(),
             net_macs: Vec::new(),
             consoles: Vec::new(),
@@ -488,6 +493,16 @@ impl MachineConfig {
         self
     }
 
+    /// Simultaneous multithreading, on by default as on Turin: an even `cpus` count is presented
+    /// as cores of two threads each (vCPUs 0 and 1 share core 0, and so on), an odd one as one
+    /// thread per core. Off gives every vCPU a core of its own. Either way the guest sees one
+    /// package whose brand string names the smallest EPYC 9005 part with that many cores, and
+    /// vCPU `n` has APIC id `n`.
+    pub fn smt(mut self, on: bool) -> Self {
+        self.smt = on;
+        self
+    }
+
     /// Chooses between a host thread per vCPU and taking turns (see `SmpMode`). Only matters with
     /// more than one vCPU.
     pub fn smp(mut self, mode: SmpMode) -> Self {
@@ -733,6 +748,7 @@ struct RebootImage {
     virtio_consoles: Vec<ConsoleHandle>,
     iommu: bool,
     cpus: usize,
+    smt: bool,
     acpi: Option<AcpiConfig>,
     key_value_store: Option<SharedKeyValueStore>,
     rng: Option<RngSource>,
@@ -939,6 +955,7 @@ fn mirrored_devices(main: &mut DevConfig, main_uart: &ConsoleHandle) -> (DevConf
             Arc::new(Mutex::new(store))
         }),
         cpus: main.cpus,
+        smt: main.smt,
         // Verification always runs on a seeded stream, so cloning gives the twin the same bytes.
         rng: main.rng.clone(),
         // Seeded under verify, like the rng: the twin's TPM answers GetRandom with the same bytes.
@@ -1059,6 +1076,7 @@ impl Vcpu {
                 iommu: image.iommu,
                 key_value_store: image.key_value_store.clone(),
                 cpus: image.cpus,
+                smt: image.smt,
                 rng: image.rng.clone(),
                 tpm: image.tpm.clone(),
                 display,
@@ -1562,6 +1580,7 @@ impl EmulatedMachine {
             iommu: cfg.iommu,
             key_value_store: cfg.key_value_store.clone(),
             cpus: cfg.cpus,
+            smt: cfg.smt,
             rng: rng.clone(),
             tpm: tpm.clone(),
             display: display_devices(
@@ -1594,6 +1613,7 @@ impl EmulatedMachine {
                     virtio_consoles: devcfg.virtio_consoles.clone(),
                     iommu: cfg.iommu,
                     cpus: cfg.cpus,
+                    smt: cfg.smt,
                     acpi,
                     key_value_store: cfg.key_value_store,
                     rng: devcfg.rng.clone(),

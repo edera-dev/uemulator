@@ -27,6 +27,7 @@ fn with_topology(logical: u32, threads: u32, x2apic_id: u32) -> Harness {
         logical_processors: logical,
         threads_per_core: threads,
         x2apic_id,
+        brand: harness.cpu.topology.brand,
     };
     harness
 }
@@ -297,9 +298,9 @@ fn brand_string_spans_three_leaves() {
         }
     }
     assert_eq!(brand.len(), 48);
-    assert!(brand.starts_with(b"AMD EPYC-Turin Processor\0"));
+    assert!(brand.starts_with(b"AMD EPYC 9015 8-Core Processor\0"));
     assert!(
-        brand[24..].iter().all(|&byte| byte == 0),
+        brand[30..].iter().all(|&byte| byte == 0),
         "the rest is NUL padding"
     );
 }
@@ -615,4 +616,95 @@ fn leaf_0x80000026_agrees_with_the_other_topology_leaves() {
             assert_eq!(x2apic_id >> levels[1][0], llc_id, "{logical}/{threads}");
         }
     }
+}
+
+/// The machine's shapes as `profile.rs` builds them, up to the largest package: every topology
+/// leaf, read on every processor, describes the same cores, threads and complexes, and the full
+/// x2APIC id (past 255) comes back wherever a leaf has room for it.
+#[test]
+fn every_processor_of_every_machine_shape_reads_one_consistent_topology() {
+    use crate::cpu::profile::{CpuProfile, MAX_LOGICAL_PROCESSORS};
+    let mut h = blank();
+    for logical in 1..=MAX_LOGICAL_PROCESSORS {
+        for smt in [false, true] {
+            let profile = CpuProfile::new(logical, smt);
+            let threads = profile.threads_per_core;
+            let paired = smt && logical % 2 == 0;
+            assert_eq!(threads, if paired { 2 } else { 1 }, "{logical} smt {smt}");
+            let mut cores_seen = alloc::collections::BTreeMap::<u32, u32>::new();
+            for x2apic_id in 0..logical {
+                h.cpu.topology = profile.topology(x2apic_id);
+                let shape = format!("{logical} smt {smt} id {x2apic_id}");
+
+                let [_, ebx, _, edx] = cpuid(&mut h, 1, 0);
+                assert_eq!((ebx >> 16) & 0xff, logical.min(0xff), "{shape}");
+                assert_eq!(ebx >> 24, x2apic_id & 0xff, "{shape}");
+                assert_eq!(edx >> 28 & 1, (logical > 1) as u32, "HTT {shape}");
+
+                let [smt_shift, smt_count, _, smt_id] = cpuid(&mut h, 0xb, 0);
+                let [package_shift, package_count, _, package_id] = cpuid(&mut h, 0xb, 1);
+                assert_eq!((smt_count, package_count), (threads, logical), "{shape}");
+                assert_eq!((smt_id, package_id), (x2apic_id, x2apic_id), "{shape}");
+                assert_eq!(1 << smt_shift, threads, "{shape}");
+                assert!(1u32 << package_shift >= logical, "{shape}");
+                assert_eq!(x2apic_id >> package_shift, 0, "one package {shape}");
+
+                let [_, _, ecx, _] = cpuid(&mut h, 0x8000_0008, 0);
+                assert_eq!(ecx & 0xff, (logical - 1).min(0xff), "{shape}");
+                assert!(1u32 << (ecx >> 12 & 0xf) >= logical, "ApicIdSize {shape}");
+
+                let [apic_id, core, node, _] = cpuid(&mut h, 0x8000_001e, 0);
+                let core_id = x2apic_id >> smt_shift;
+                assert_eq!(apic_id, x2apic_id, "{shape}");
+                assert_eq!((core >> 8 & 0xff) + 1, threads, "{shape}");
+                assert_eq!(core & 0xff, core_id & 0xff, "{shape}");
+                assert_eq!(node, 0, "one node {shape}");
+                *cores_seen.entry(core_id).or_default() += 1;
+
+                let levels: Vec<[u32; 4]> = (0..4).map(|n| cpuid(&mut h, 0x8000_0026, n)).collect();
+                for level in &levels {
+                    assert_eq!(level[3], x2apic_id, "{shape}");
+                }
+                assert_eq!(
+                    (levels[0][0], levels[0][1]),
+                    (smt_shift, threads),
+                    "{shape}"
+                );
+                assert_eq!(levels[3][1], logical, "{shape}");
+                let l1_sharing = (cpuid(&mut h, 0x8000_001d, 0)[0] >> 14 & 0xfff) + 1;
+                let l3_sharing = (cpuid(&mut h, 0x8000_001d, 3)[0] >> 14 & 0xfff) + 1;
+                assert_eq!(l1_sharing, threads, "{shape}");
+                assert_eq!(levels[1][1], l3_sharing, "{shape}");
+                assert_eq!(
+                    l3_sharing,
+                    (8 * threads).min(logical),
+                    "8 cores per L3 {shape}"
+                );
+                assert_eq!(
+                    x2apic_id >> levels[1][0],
+                    x2apic_id >> l3_sharing.next_power_of_two().trailing_zeros(),
+                    "complex and LLC ids agree {shape}"
+                );
+            }
+            assert_eq!(
+                cores_seen.len() as u32,
+                logical / threads,
+                "{logical} smt {smt}"
+            );
+            assert!(cores_seen.values().all(|&count| count == threads));
+        }
+    }
+}
+
+#[test]
+fn the_brand_leaves_spell_out_the_profiles_part() {
+    let mut h = blank();
+    h.cpu.topology = crate::cpu::profile::CpuProfile::new(256, true).topology(255);
+    let brand: Vec<u8> = (0x8000_0002..=0x8000_0004)
+        .flat_map(|leaf| cpuid(&mut h, leaf, 0))
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    let text = b"AMD EPYC 9755 128-Core Processor";
+    assert_eq!(&brand[..text.len()], text);
+    assert!(brand[text.len()..].iter().all(|&byte| byte == 0));
 }

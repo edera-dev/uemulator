@@ -66,6 +66,7 @@ Add only where the behaviour is real in this implementation and testable:
 ### F. Identity (last, small)
 
 - `CpuProfile { signature, brand, logical processors, cache sizes, feature set }` in `cpu/profile.rs`, Genoa expressed as one profile with no behaviour change, then a Ryzen 5 7000-class profile (model per the PPR for the chosen SKU, brand `AMD Ryzen 5 7600X 6-Core Processor` style, 6 cores 12 threads, 32 KiB L1, 1 MiB L2 per core, 32 MiB L3) selected by `MachineConfig::cpu_model`; CLI `--cpu-model`. The feature bits come from sections A-E, so the profile only chooses which are on; a profile cannot enable a bit the emulator lacks (checked by a test that walks every profile and asserts each advertised bit has a registered implementation).
+- Done so far: `CpuProfile` (`cpu/profile.rs`) with the logical processor count, threads per core and brand, built from `MachineConfig::cpus` and `MachineConfig::smt`. Signature, caches and feature set are still the one Turin model's.
 - Flip the default only after the guest check below passes: family and model drive Linux and Xen erratum, mitigation and perf-driver selection, so the identity change is the riskiest one-line change in the list.
 
 ## Zen 5 Turin model (the current identity)
@@ -74,9 +75,9 @@ The emulated CPU presents a 2024 AMD server core, an EPYC 9005 "Turin" (Zen 5), 
 
 Identity and sources:
 - Signature `0x00B00F21`: family 1Ah, model 02h, stepping 1, the Turin (classic, Zen 5) die. Linux's `bsp_init_amd` names family 1Ah models 00h-2Fh, 40h-4Fh and 60h-7Fh Zen 5, and `init_amd_zen5` keeps RDSEED only when model, stepping and microcode revision match `zen5_rdseed_microcode`, whose entry for 1Ah/02h/1 is revision `0x0b00215a`; PATCH_LEVEL (MSR 0x8b) reports exactly that. Model 11h stepping 0 in the same table is Turin Dense (Zen 5c). QEMU's `EPYC-Turin` uses model 0 stepping 0, which is in no kernel table and would cost RDSEED, so only its feature list and cache sizes were used as a cross-check (`../ext/qemu-uplink/target/i386/cpu.c`).
-- Brand "AMD EPYC-Turin Processor" (QEMU's name; SKU strings carry core counts, which would be wrong for a configurable machine).
+- Brand: the smallest EPYC 9005 part with at least as many cores as the machine has (`cpu/profile.rs`: 9015, 9115, 9255, 9335, 9365, 9455, 9535, 9565, 9655, 9755, then the Turin Dense 9825, 9845, 9965 above 128 cores, whose model 11h the signature does not follow), so the guest never sees more cores than the name says, as in a VM on that part. It was QEMU's "AMD EPYC-Turin Processor" while the core count was fixed nowhere.
 - Caches per core complex die: L1D 48 KiB 12-way, L1I 32 KiB 8-way, L2 1 MiB 16-way per core, L3 32 MiB 16-way shared by 16 threads (QEMU's `epyc_turin_cache_info` agrees). TLBs from public Zen 5 microarchitecture descriptions, not a CPUID dump: L1 DTLB 96, L1 ITLB 64, L2 ITLB 2048; the L2 DTLB keeps 3072 because the 4096 Zen 5 is said to have does not fit the 12-bit field of leaf 0x8000_0006. The field widths are asserted at compile time.
-- Topology: leaf 0x8000_0026 (core, complex, die, socket) is new; Linux prefers it to 0xB. The complex level is the 16 threads behind one L3, the same number leaf 0x8000_001D reports, so Linux's tile and LLC domains agree; the max extended leaf is 0x8000_0026 with 0x22-0x25 zero. Tests walk 1-64 processors with SMT on and off.
+- Topology: leaf 0x8000_0026 (core, complex, die, socket) is new; Linux prefers it to 0xB. The complex level is the threads of the 8 cores behind one L3, the same number leaf 0x8000_001D reports, so Linux's tile and LLC domains agree; the max extended leaf is 0x8000_0026 with 0x22-0x25 zero. SMT2 is on by default (`MachineConfig::smt`): an even vCPU count is cores of two threads. Tests walk every processor of 1-384 vCPUs with SMT on and off.
 
 Speculation-control bits (all in the AMD spelling; the Intel leaf 7 EDX bits and `IA32_ARCH_CAPABILITIES`/`IA32_FLUSH_CMD` are gone, as on real AMD parts):
 

@@ -138,9 +138,16 @@ pub struct HardwareArgs {
     /// Guest memory in MiB, 64 to 1047552 (1 TiB less the PCI hole) [default: 2048, 3072 for a fedora install]
     #[arg(long, short = 'm')]
     pub memory: Option<usize>,
-    /// Guest vCPUs, 1 to 64 (each runs on its own host thread unless `--smp timeshare`) [default: 1]
+    /// Guest vCPUs, 1 to 384 (each runs on its own host thread unless `--smp timeshare`). Linux
+    /// brings up vCPU 255 and later only with `--iommu` (interrupt remapping) [default: 1]
     #[arg(long)]
     pub cpus: Option<usize>,
+    /// Present an even vCPU count as cores of two threads, as on an EPYC 9005 (an odd count
+    /// always gets a core per vCPU); `--smt=false` gives every vCPU a core of its own
+    /// [default: true]
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = BOOL_FLAG_DEFAULT,
+        value_name = "BOOL")]
+    pub smt: Option<bool>,
     /// How the vCPUs run: a host thread each on the host clock (auto, threads) or in turns on one
     /// thread, deterministically (timeshare) [default: auto]
     #[arg(long, value_enum, value_name = "MODE")]
@@ -401,6 +408,9 @@ pub struct Settings {
     pub memory: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpus: Option<usize>,
+    /// `None` is the library's default (on), so machines saved before the choice existed get it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub smt: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub smp: Option<SmpArg>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -505,6 +515,9 @@ impl Settings {
         }
         if hardware.cpus.is_some() {
             self.cpus = hardware.cpus;
+        }
+        if hardware.smt.is_some() {
+            self.smt = hardware.smt;
         }
         if hardware.smp.is_some() {
             self.smp = hardware.smp;
@@ -829,6 +842,7 @@ mod tests {
         let settings = Settings {
             memory: Some(4096),
             cpus: Some(4),
+            smt: Some(false),
             smp: Some(SmpArg::Timeshare),
             cmdline: Some("console=hvc0".into()),
             append: None,

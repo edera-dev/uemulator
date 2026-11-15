@@ -722,6 +722,9 @@ pub fn describe(machine: &Machine) -> String {
     if let Some(cpus) = settings.cpus {
         out.push_str(&format!("  cpus      {cpus}\n"));
     }
+    if let Some(smt) = settings.smt {
+        out.push_str(&format!("  smt       {}\n", if smt { "on" } else { "off" }));
+    }
     if let Some(smp) = settings.smp {
         out.push_str(&format!("  smp       {smp:?}\n").to_lowercase());
     }

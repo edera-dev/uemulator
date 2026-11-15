@@ -3020,8 +3020,8 @@ mod cpus {
     }
 
     #[test]
-    fn the_count_must_be_between_1_and_64() {
-        for cpus in [0, 65] {
+    fn the_count_must_be_between_1_and_384() {
+        for cpus in [0, 385] {
             let message = expect_config_error(EmulatedMachine::new(
                 MachineConfig::new()
                     .kernel(fake_bzimage(&[0xf4]))
@@ -3030,7 +3030,7 @@ mod cpus {
             ));
             assert!(message.contains("cpus"), "{message}");
         }
-        for cpus in [1, 64] {
+        for cpus in [1, 384] {
             assert!(
                 EmulatedMachine::new(
                     MachineConfig::new()
@@ -3041,6 +3041,103 @@ mod cpus {
                 .is_ok()
             );
         }
+    }
+
+    // AP, real mode, started at 0800:0000 with DS 0: mov eax, 0x8000001e; cpuid;
+    // mov si, ax; shl si, 1; mov [si + 0x2000], bx; lock inc word [0x1000]; hlt (and hlt padding)
+    const AP_REPORTS_ITS_CORE: [u8; 24] = [
+        0x66, 0xb8, 0x1e, 0x00, 0x00, 0x80, 0x0f, 0xa2, 0x89, 0xc6, 0xd1, 0xe6, 0x89, 0x9c, 0x00,
+        0x20, 0xf0, 0xff, 0x06, 0x00, 0x10, 0xf4, 0xf4, 0xf4,
+    ];
+    /// Where AP n leaves the low half of its leaf 0x8000_001E EBX: 0x2000 + 2 * n.
+    const CORE_REPORTS: u32 = 0x2000;
+    /// ICR shorthand "all excluding self" (bits 19:18).
+    const ICR_ALL_EXCLUDING_SELF: u32 = 3 << 18;
+
+    /// wait: pause; cmp word [0x1000], count; jne wait
+    fn wait_for_count(count: u16) -> Vec<u8> {
+        let mut code = vec![0xf3, 0x90, 0x66, 0x81, 0x3c, 0x25, 0x00, 0x10, 0x00, 0x00];
+        code.extend_from_slice(&count.to_le_bytes());
+        code.extend_from_slice(&[0x75, 0xf2]);
+        code
+    }
+
+    /// A kernel that starts the last vCPU on its own (by its x2APIC id, past 255 on a large
+    /// machine), then every AP with one broadcast. Each AP stores the core id and thread count
+    /// leaf 0x8000_001E gives it and counts itself in; the first processor checks every AP's
+    /// entry against `cpus` vCPUs of `threads_per_core` threads and says "ok", or halts for good
+    /// on the first mismatch.
+    fn start_every_cpu(cpus: u32, threads_per_core: u32) -> Vec<u8> {
+        let mut code = ENABLE_X2APIC.to_vec();
+        for (index, chunk) in AP_REPORTS_ITS_CORE.chunks(4).enumerate() {
+            code.extend(store_dword(
+                AP_CODE_ADDRESS as u32 + 4 * index as u32,
+                u32::from_le_bytes(chunk.try_into().unwrap()),
+            ));
+        }
+        code.extend(send_icr(cpus - 1, ICR_INIT_LOW));
+        code.extend(send_icr(cpus - 1, ICR_STARTUP_LOW));
+        code.extend(wait_for_count(1));
+        code.extend(send_icr(0, ICR_INIT_LOW | ICR_ALL_EXCLUDING_SELF));
+        code.extend(send_icr(0, ICR_STARTUP_LOW | ICR_ALL_EXCLUDING_SELF));
+        // the last AP has counted itself twice
+        code.extend(wait_for_count(cpus as u16));
+        // mov ecx, 1
+        // check: mov eax, ecx; shr eax, smt_shift; and eax, 0xff; or eax, (threads - 1) << 8;
+        // cmp ax, [rcx * 2 + 0x2000]; jne fail; inc ecx; cmp ecx, cpus; jne check; jmp done
+        // fail: cli; hlt; jmp fail
+        // done:
+        let smt_shift = threads_per_core.trailing_zeros() as u8;
+        let mut check = vec![
+            0xb9, 0x01, 0x00, 0x00, 0x00, 0x89, 0xc8, 0xc1, 0xe8, smt_shift, 0x25, 0xff, 0x00,
+            0x00, 0x00, 0x0d,
+        ];
+        check.extend_from_slice(&((threads_per_core - 1) << 8).to_le_bytes());
+        check.extend_from_slice(&[0x66, 0x3b, 0x04, 0x4d]);
+        check.extend_from_slice(&CORE_REPORTS.to_le_bytes());
+        check.extend_from_slice(&[0x75, 0x0c, 0xff, 0xc1, 0x81, 0xf9]);
+        check.extend_from_slice(&cpus.to_le_bytes());
+        check.extend_from_slice(&[0x75, 0xdd, 0xeb, 0x04, 0xfa, 0xf4, 0xeb, 0xfc]);
+        code.extend(check);
+        code.extend(SAY_OK_AND_RESET);
+        code
+    }
+
+    /// Every vCPU of the largest machine starts and reads the topology its number implies: SMT
+    /// pairs for an even count, single-threaded cores for an odd one or with SMT off, x2APIC ids
+    /// up to 383. Both ways of running vCPUs: the threaded one has a host thread per vCPU.
+    #[test]
+    fn every_cpu_of_a_large_machine_starts_and_sees_its_core() {
+        for (cpus, smt, threads_per_core) in [(384, true, 2), (384, false, 1), (299, true, 1)] {
+            let timeshare = run_machine(
+                fake_bzimage(&start_every_cpu(cpus, threads_per_core)),
+                JitMode::Auto,
+                GENEROUS_LIMIT,
+                |config| config.cpus(cpus as usize).smt(smt),
+            );
+            assert_eq!(timeshare.text(), "ok", "{cpus} {smt}: {:?}", timeshare.exit);
+            assert_eq!(timeshare.exit, ExitReason::Reset);
+        }
+        let threaded = run_machine(
+            fake_bzimage(&start_every_cpu(384, 2)),
+            JitMode::Auto,
+            GENEROUS_LIMIT,
+            |config| on_threads(config.cpus(384)),
+        );
+        assert_eq!(threaded.text(), "ok", "{:?}", threaded.exit);
+        assert_eq!(threaded.exit, ExitReason::Reset);
+    }
+
+    #[test]
+    fn the_large_machine_kernel_notices_a_wrong_core_report() {
+        // Checking for SMT pairs on a machine without SMT must not say "ok".
+        let run = run_machine(
+            fake_bzimage(&start_every_cpu(4, 2)),
+            JitMode::Off,
+            WATCHDOG_LIMIT,
+            |config| config.cpus(4).smt(false),
+        );
+        assert_eq!(run.text(), "", "{:?}", run.exit);
     }
 
     #[test]

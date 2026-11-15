@@ -1280,6 +1280,38 @@ mod tests {
     }
 
     #[test]
+    fn smt_is_unset_by_default_and_every_machine_command_takes_it() {
+        assert_eq!(hardware(&[]).smt, None);
+        assert_eq!(hardware(&["--smt"]).smt, Some(true));
+        assert_eq!(hardware(&["--smt=false"]).smt, Some(false));
+        for command in ["create", "edit", "boot"] {
+            let mut argv = vec!["quick", command, "m", "--smt=false"];
+            if command == "create" {
+                argv.extend(["--install", "alpine"]);
+            }
+            let hardware = match parse(&argv).unwrap().cmd {
+                Cmd::Quick {
+                    cmd:
+                        QuickCmd::Create { hardware, .. }
+                        | QuickCmd::Edit { hardware, .. }
+                        | QuickCmd::Boot { hardware, .. },
+                } => hardware,
+                _ => unreachable!(),
+            };
+            assert_eq!(hardware.smt, Some(false), "quick {command}");
+        }
+        let mut settings = Settings::default();
+        settings.add(
+            &hardware(&["--smt=false"]),
+            &LinuxArgs::default(),
+            Vec::new(),
+        );
+        assert_eq!(settings.smt, Some(false));
+        settings.add(&hardware(&[]), &LinuxArgs::default(), Vec::new());
+        assert_eq!(settings.smt, Some(false), "kept when not given");
+    }
+
+    #[test]
     fn boolean_options_take_an_optional_value_only_after_an_equals_sign() {
         assert_eq!(hardware(&[]).disable_jit, None);
         assert_eq!(hardware(&["--disable-jit"]).disable_jit, Some(true));

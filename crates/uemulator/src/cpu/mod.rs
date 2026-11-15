@@ -26,6 +26,7 @@ pub(crate) mod mca;
 pub(crate) mod mem;
 pub(crate) mod modes;
 pub(crate) mod mtrr;
+pub(crate) mod profile;
 mod protection;
 pub(crate) mod smp;
 #[cfg(test)]
@@ -635,6 +636,8 @@ struct MachineParts {
     dev: DevHandle,
     ram_bytes: usize,
     cpu_count: u32,
+    /// What CPUID reports, `x2apic_id` included.
+    topology: cpuid::CpuTopology,
     /// The bootstrap processor builds its own decode cache; a secondary gets one from the
     /// scheduler (time-sharing) or `give_private_caches` (threads).
     with_decode_cache: bool,
@@ -658,6 +661,7 @@ impl Cpu {
         let ram_bytes = ram.len();
         let pages = ram_bytes >> PAGE_SHIFT;
         let cpu_count = dev_config.cpus.max(1) as u32;
+        let profile = profile::CpuProfile::new(cpu_count, dev_config.smt);
         let devices = DevHandle::new(Devices::new(console, dev_config));
         let parts = MachineParts {
             ram,
@@ -665,6 +669,7 @@ impl Cpu {
             dev: devices,
             ram_bytes,
             cpu_count,
+            topology: profile.topology(0),
             with_decode_cache: true,
         };
         Self::build(parts, boot, stop, log)
@@ -685,14 +690,17 @@ impl Cpu {
             dev: bsp.dev.for_cpu(index as usize),
             ram_bytes: bsp.ram.len(),
             cpu_count: bsp.cpu_count,
+            // The local APIC id is the vCPU number, and `profile.rs` numbers the threads so that
+            // the x2APIC id CPUID reports is too.
+            topology: cpuid::CpuTopology {
+                x2apic_id: index,
+                ..bsp.topology
+            },
             with_decode_cache: false,
         };
         let mut cpu = Self::build(parts, boot, bsp.stop.clone(), bsp.log.clone());
         cpu.ram_base = bsp.ram_base;
         cpu.cpu_index = index;
-        // The local APIC id is the vCPU number, and one thread per core keeps it equal to the
-        // x2APIC id CPUID reports.
-        cpu.topology.x2apic_id = index;
         cpu.cpu_count = bsp.cpu_count;
         cpu.multi = true;
         cpu.wall_clock = bsp.wall_clock.clone();
@@ -713,6 +721,7 @@ impl Cpu {
             dev,
             ram_bytes,
             cpu_count,
+            topology,
             with_decode_cache,
         } = parts;
         // Stored-only MSRs; names follow Linux's msr-index.h.
@@ -806,10 +815,7 @@ impl Cpu {
             sfmask: 0,
             kgsbase: 0,
             tsc_aux: 0,
-            topology: cpuid::CpuTopology {
-                logical_processors: cpu_count,
-                ..cpuid::CpuTopology::SINGLE_PROCESSOR
-            },
+            topology,
             spec_ctrl: 0,
             xcr0: xsave::XCR0_X87,
             svm: svm::Svm::new(),

@@ -190,6 +190,9 @@ fn build_config(
     if let Some(cpus) = settings.cpus {
         cfg = cfg.cpus(cpus);
     }
+    if let Some(smt) = settings.smt {
+        cfg = cfg.smt(smt);
+    }
     if let Some(smp) = settings.smp {
         cfg = cfg.smp(match smp {
             SmpArg::Auto => SmpMode::Auto,

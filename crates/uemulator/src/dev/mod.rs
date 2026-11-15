@@ -197,6 +197,9 @@ pub(crate) struct DevConfig {
     pub key_value_store: Option<SharedKeyValueStore>,
     /// How many vCPUs, so how many local APICs; 0 is taken as 1 (the default).
     pub cpus: usize,
+    /// Pairs the vCPUs into two-thread cores when their count is even (`cpu::profile`). Only the
+    /// CPUs read it: the APIC ids are the vCPU numbers either way.
+    pub smt: bool,
     /// Adds a virtio-rng function, last in slot order, fed by this source.
     pub rng: Option<RngSource>,
     /// Adds the screen (`DISPLAY_FUNCTIONS` functions) after the NICs.
@@ -523,18 +526,21 @@ impl Devices {
             only.accept(interrupt);
             return;
         }
-        let mut targets = 0u64;
-        for (index, lapic) in self.lapics.iter().enumerate() {
-            if lapic.hardware_enabled() && lapic.matches_destination(interrupt) {
-                targets |= 1 << index;
-            }
-        }
-        if interrupt.delivery_mode == apic::DELIVERY_LOWEST_PRIORITY && targets.count_ones() > 1 {
+        let addressed =
+            |lapic: &Lapic| lapic.hardware_enabled() && lapic.matches_destination(interrupt);
+        if interrupt.delivery_mode == apic::DELIVERY_LOWEST_PRIORITY
+            && self
+                .lapics
+                .iter()
+                .filter(|lapic| addressed(lapic))
+                .nth(1)
+                .is_some()
+        {
             let count = self.lapics.len();
             let mut best: Option<(u8, usize)> = None;
             for step in 0..count {
                 let index = (self.lowest_priority_cursor + step) % count;
-                if targets >> index & 1 == 0 {
+                if !addressed(&self.lapics[index]) {
                     continue;
                 }
                 let priority = self.lapics[index].arbitration_priority();
@@ -544,11 +550,14 @@ impl Devices {
             }
             if let Some((_, chosen)) = best {
                 self.lowest_priority_cursor = chosen + 1;
-                targets = 1 << chosen;
+                self.lapics[chosen].accept_addressed(interrupt);
             }
+            return;
         }
-        for (index, lapic) in self.lapics.iter_mut().enumerate() {
-            if targets >> index & 1 != 0 {
+        // Accepting changes only the accepting APIC, so testing each one just before it accepts
+        // addresses the same set as testing them all first (an INIT may reset what it matched on).
+        for lapic in &mut self.lapics {
+            if addressed(lapic) {
                 lapic.accept_addressed(interrupt);
             }
         }
