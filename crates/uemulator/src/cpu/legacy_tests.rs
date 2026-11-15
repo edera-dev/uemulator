@@ -982,3 +982,38 @@ fn an_expand_down_segment_accepts_only_offsets_above_the_limit() {
     );
     assert_eq!(h.cpu.gpr[RBX], 0, "[0x1000] is not");
 }
+
+#[test]
+fn a_task_with_its_t_bit_set_traps_before_its_first_instruction() {
+    const TSS_TRAP_WORD: usize = 100;
+    const DR6_TASK_SWITCH: u64 = 1 << 15;
+    // mov eax, 7; jmp far 0x30:0
+    let code = [
+        0xb8, 0x07, 0x00, 0x00, 0x00, 0xea, 0x00, 0x00, 0x00, 0x00, 0x30, 0x00,
+    ];
+    let mut h = prot(&code);
+    install_legacy_tss(&mut h, KERNEL_STACK as u32, LEGACY_DS);
+    let mut tss = [0u8; 0x68];
+    tss[32..36].copy_from_slice(&(HANDLER as u32).to_le_bytes());
+    tss[36..40].copy_from_slice(&2u32.to_le_bytes());
+    tss[56..60].copy_from_slice(&(KERNEL_STACK as u32).to_le_bytes());
+    tss[72..76].copy_from_slice(&(LEGACY_DS as u32).to_le_bytes());
+    tss[76..80].copy_from_slice(&(LEGACY_CS as u32).to_le_bytes());
+    tss[80..84].copy_from_slice(&(LEGACY_DS as u32).to_le_bytes());
+    tss[84..88].copy_from_slice(&(LEGACY_DS as u32).to_le_bytes());
+    tss[TSS_TRAP_WORD] = 1;
+    h.write(LEGACY_SECOND_TSS_BASE, &tss);
+    h.write(HANDLER, &[0xb8, 0x99, 0, 0, 0, 0xf4]);
+    assert_eq!(
+        h.run(100),
+        Stop::Fault {
+            vector: 1,
+            error_code: None,
+            software: false
+        }
+    );
+    assert_eq!(h.cpu.tr.sel, LEGACY_SECOND_TSS);
+    assert_eq!(h.cpu.rip, HANDLER, "a trap, before the new task runs");
+    assert_ne!(h.cpu.dr[6] & DR6_TASK_SWITCH, 0);
+    assert_eq!(h.cpu.gpr[RAX], 0);
+}

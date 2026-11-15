@@ -1197,3 +1197,114 @@ fn four_vcpus_running_the_same_pages_at_once_translate_each_block_once() {
         assert_eq!(stats.resets, 0);
     }
 }
+
+/// The INVLPGB test's notes (the worker is ready at +0x30 and the flush done at +0x34 in the
+/// code below): what the worker read before and after the flush, and the two physical pages
+/// `SHOOTDOWN_VIRTUAL` maps to before and after.
+const SHOOTDOWN_BEFORE: u64 = STALE_DATA + 0x38;
+const SHOOTDOWN_AFTER: u64 = STALE_DATA + 0x3c;
+const SHOOTDOWN_OLD_PAGE: u64 = STALE_DATA + 0x5000;
+const SHOOTDOWN_NEW_PAGE: u64 = STALE_DATA + 0x6000;
+const SHOOTDOWN_OLD_VALUE: u32 = 0x11;
+const SHOOTDOWN_NEW_VALUE: u32 = 0x22;
+/// The page the worker reads. Its page number's low bits differ from those of every page the
+/// worker touches (the notes, its code and stack), so the direct-mapped soft TLB keeps its
+/// translation until something drops it.
+const SHOOTDOWN_VIRTUAL: u64 = 0x0000_2000_0003_5000;
+/// Pages at the start of the table pool `identity_paging` allocates from: more than it uses.
+const SHOOTDOWN_TABLE_PAGES: u64 = 16;
+/// rAX bit 0 of INVLPGB: the address in rAX is valid.
+const INVLPGB_VA_VALID: u64 = 1;
+
+// The worker caches the translation of [rbx] (SHOOTDOWN_VIRTUAL), says so, waits for the flush and reads
+// it again:
+//   mov eax, [rbx]; mov [BEFORE], eax; mov dword [READY], 1
+//   wait: pause; cmp dword [FLUSHED], 0; je wait
+//   mov eax, [rbx]; mov [AFTER], eax; lock inc dword [EXITED]; cli; hlt
+const SHOOTDOWN_WORKER: [u8; 51] = [
+    0x8b, 0x03, 0x89, 0x04, 0x25, 0x38, 0x00, 0x40, 0x00, 0xc7, 0x04, 0x25, 0x30, 0x00, 0x40, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0xf3, 0x90, 0x83, 0x3c, 0x25, 0x34, 0x00, 0x40, 0x00, 0x00, 0x74, 0xf4,
+    0x8b, 0x03, 0x89, 0x04, 0x25, 0x3c, 0x00, 0x40, 0x00, 0xf0, 0xff, 0x04, 0x25, 0x18, 0x00, 0x40,
+    0x00, 0xfa, 0xf4,
+];
+// The bootstrap processor waits for it, repoints the page table entry at rdi to rsi, broadcasts
+// the invalidation of rAX and waits for it, then lets the worker go:
+//   wait: pause; cmp dword [READY], 0; je wait
+//   mov [rdi], rsi; invlpgb; tlbsync; mov dword [FLUSHED], 1
+//   wait2: pause; cmp dword [EXITED], 1; jne wait2; cli; hlt
+const SHOOTDOWN_BSP: [u8; 46] = [
+    0xf3, 0x90, 0x83, 0x3c, 0x25, 0x30, 0x00, 0x40, 0x00, 0x00, 0x74, 0xf4, 0x48, 0x89, 0x37, 0x0f,
+    0x01, 0xfe, 0x0f, 0x01, 0xff, 0xc7, 0x04, 0x25, 0x34, 0x00, 0x40, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0xf3, 0x90, 0x83, 0x3c, 0x25, 0x18, 0x00, 0x40, 0x00, 0x01, 0x75, 0xf4, 0xfa, 0xf4,
+];
+/// Where `invlpgb; tlbsync` sit in `SHOOTDOWN_BSP`.
+const SHOOTDOWN_BSP_FLUSH: core::ops::Range<usize> = 15..21;
+
+/// The last-level page table entry for `linear` in `cpu`'s 4-level tables.
+fn leaf_entry(cpu: &Cpu, linear: u64) -> u64 {
+    use super::test_support::{PTE_ADDRESS_BITS, read_pte};
+    const TABLE_LEVELS_ABOVE_LEAF: u32 = 3;
+    let index = |level: u32| ((linear >> (12 + 9 * level)) & 0x1ff) * 8;
+    let mut table = cpu.cr3 & PTE_ADDRESS_BITS;
+    for level in (1..=TABLE_LEVELS_ABOVE_LEAF).rev() {
+        table = read_pte(cpu, table + index(level)) & PTE_ADDRESS_BITS;
+    }
+    table + index(0)
+}
+
+/// Runs the shootdown on two threaded vCPUs and returns what the worker read after it.
+fn worker_reads_after_a_remap(bsp_code: &[u8], jit: bool) -> u32 {
+    use super::test_support::PTE_PRESENT_WRITABLE_USER;
+    let run = run_threads_with(
+        bsp_code,
+        2,
+        jit,
+        |cpu| {
+            place(cpu, STALE_WORKER_CODE, &SHOOTDOWN_WORKER);
+            place(cpu, SHOOTDOWN_OLD_PAGE, &SHOOTDOWN_OLD_VALUE.to_le_bytes());
+            place(cpu, SHOOTDOWN_NEW_PAGE, &SHOOTDOWN_NEW_VALUE.to_le_bytes());
+            // The bootstrap processor rewrites a page table entry, so the tables are mapped too.
+            let mut mappings = vec![(SHOOTDOWN_VIRTUAL, SHOOTDOWN_OLD_PAGE)];
+            mappings.extend((0..SHOOTDOWN_TABLE_PAGES).map(|page| {
+                let address = super::test_support::TABLE_POOL + page * 0x1000;
+                (address, address)
+            }));
+            identity_paging(cpu, &mappings);
+        },
+        |cpus| {
+            let (bsp, others) = cpus.split_first_mut().unwrap();
+            bsp.gpr[crate::testkit::RDI] = leaf_entry(bsp, SHOOTDOWN_VIRTUAL);
+            bsp.gpr[crate::testkit::RSI] = SHOOTDOWN_NEW_PAGE | PTE_PRESENT_WRITABLE_USER;
+            bsp.gpr[crate::testkit::RAX] = SHOOTDOWN_VIRTUAL | INVLPGB_VA_VALID;
+            bsp.gpr[crate::testkit::RCX] = 0;
+            bsp.gpr[crate::testkit::RDX] = 0;
+            let worker = &mut others[0];
+            start_in_long_mode(worker, bsp, STALE_WORKER_CODE, STALE_WORKER_STACKS + 0x1000);
+            worker.gpr[crate::testkit::RBX] = SHOOTDOWN_VIRTUAL;
+        },
+    );
+    assert_thread_shutdown(&run);
+    assert_eq!(run.read_u32(SHOOTDOWN_BEFORE), SHOOTDOWN_OLD_VALUE);
+    run.read_u32(SHOOTDOWN_AFTER)
+}
+
+/// Linux 6.15+ on Zen 3 and later: a TLB shootdown is INVLPGB on the CPU that changed the page
+/// tables, then TLBSYNC, with no IPI. The other vCPU, which cached the old translation and is
+/// running, must not see it afterwards; without the instruction it does.
+#[test]
+fn invlpgb_and_tlbsync_drop_another_running_vcpus_stale_translation() {
+    both_engines(|jit| {
+        let mut without_flush = SHOOTDOWN_BSP.to_vec();
+        without_flush.splice(SHOOTDOWN_BSP_FLUSH, [0x90; 6]);
+        assert_eq!(
+            worker_reads_after_a_remap(&without_flush, jit),
+            SHOOTDOWN_OLD_VALUE,
+            "jit {jit}: the worker's TLB really holds the old page"
+        );
+        assert_eq!(
+            worker_reads_after_a_remap(&SHOOTDOWN_BSP, jit),
+            SHOOTDOWN_NEW_VALUE,
+            "jit {jit}"
+        );
+    });
+}

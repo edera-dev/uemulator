@@ -41,6 +41,8 @@
 
 - Zen 5 CPU model done, replacing Zen 4 (see 03, "CPUID/MSR contract" and "Speculation control", and 21, "Zen 5 Turin model"): family 1Ah model 02h stepping 1 (EPYC 9005 Turin), Zen 5 caches and leaf 0x80000026, Turin's speculation controls in the AMD spelling only (automatic IBRS, SBPB, PSFD, BTC_NO...), AVX-VNNI, MOVDIRI, MOVDIR64B, AVX512_VP2INTERSECT and PREFETCHI. Linux 6.18 reports no vulnerability as "Vulnerable" without `mitigations=off`, which the default command line no longer passes; boot time is unchanged.
 
+- Debug registers, BPEXT, bus-lock detect and INVLPGB/TLBSYNC done (see 21, "Zen 5 Turin model"): hardware breakpoints, watchpoints, single-step, general detect and the T bit raise #DB on both engines (the run loop interprets while any is armed), split locks trap under DEBUGCTL.BLD without slowing the JIT, and INVLPGB invalidates every vCPU (a threaded test shows another running vCPU's stale translation gone).
+
 - UMIP, SMEP/SMAP, PCID/INVPCID, MONITOR/MWAIT, RDTSCP done (see 03).
 
 - VEX decoding, BMI1 and BMI2 done (see 03, "VEX and BMI").

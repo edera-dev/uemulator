@@ -132,6 +132,14 @@ fn escalates_to_double_fault(first: FaultClass, second: FaultClass) -> bool {
     )
 }
 
+/// Fault-class exceptions: everything below 32 except #DB, NMI, #BP and #OF (traps or not
+/// exceptions) and #DF and #MC (aborts), as KVM's `exception_type` classifies them.
+fn sets_resume_flag(vector: u8) -> bool {
+    const NOT_FAULTS: u32 = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 8) | (1 << 18);
+    const EXCEPTION_VECTORS: u8 = 32;
+    vector < EXCEPTION_VECTORS && NOT_FAULTS >> vector & 1 == 0
+}
+
 fn idt_error_code(vector: u8) -> u32 {
     vector as u32 * 8 + IDT_ERROR_CODE_FLAG
 }
@@ -147,6 +155,14 @@ impl Cpu {
         error_code: Option<u32>,
         software: bool,
     ) -> Option<ExitReason> {
+        // A fault-class exception pushes RF set, so the instruction it returns to does not hit
+        // its instruction breakpoint a second time (SDM 18.3.1.1; KVM's `inject_pending_event`
+        // does the same for what it injects). #DB is not one: an instruction breakpoint leaves RF
+        // to the handler.
+        if !software && sets_resume_flag(vector) {
+            self.materialize_lazy_flags();
+            self.eflags |= RF;
+        }
         self.deliver_chain(vector, error_code, software, !software)
     }
 
@@ -820,6 +836,31 @@ mod tests {
                     ss: KERNEL_DS as u64,
                 }
             );
+        }
+
+        #[test]
+        fn a_fault_pushes_rf_set_and_traps_and_interrupts_push_it_as_it_was() {
+            const VECTOR_DEBUG: u8 = 1;
+            const VECTOR_BREAKPOINT: u8 = 3;
+            for (vector, error_code, software, rf) in [
+                (VECTOR_GENERAL_PROTECTION, Some(0), false, RF),
+                (VECTOR_PAGE_FAULT, Some(0), false, RF),
+                (VECTOR_INVALID_OPCODE, None, false, RF),
+                (VECTOR_DEBUG, None, false, 0),
+                (VECTOR_BREAKPOINT, None, true, 0),
+                (0x20, None, false, 0),
+            ] {
+                let mut h = base();
+                h.cpu.deliver_event(vector, error_code, software);
+                let rsp = h.cpu.gpr[GPR_RSP];
+                let frame = read_frame(&h, rsp, error_code.is_some());
+                assert_eq!(frame.rflags & RF, rf, "vector {vector}");
+                assert_eq!(
+                    h.cpu.eflags & RF,
+                    0,
+                    "vector {vector}: cleared in the handler"
+                );
+            }
         }
 
         #[test]

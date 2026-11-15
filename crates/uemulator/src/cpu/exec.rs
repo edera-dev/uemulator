@@ -307,6 +307,9 @@ impl Cpu {
     /// `cmpxchg16b` with a LOCK prefix on a vCPU that shares memory: one 16-byte host atomic.
     fn locked_cmpxchg16b(&mut self, address: u64, next: u64) -> ExecResult<()> {
         const OPERAND_BYTES: u64 = 16;
+        if self.debug.watch_accesses {
+            self.watch_access(address, OPERAND_BYTES, true);
+        }
         let physical = self.translate(address, mem::AccessKind::Write, false)?;
         let host = unsafe { self.ram.base().add(physical as usize) };
         if !self.ram.contains(physical, OPERAND_BYTES) || host as usize & 15 != 0 {
@@ -446,7 +449,7 @@ impl Cpu {
     /// Whether `exec` has to run this instruction as an atomic read-modify-write: it carries a
     /// LOCK prefix, or it is `xchg` with a memory operand, which is locked implicitly (SDM
     /// vol. 2, XCHG).
-    fn is_locked(i: &Insn) -> bool {
+    pub(super) fn is_locked(i: &Insn) -> bool {
         i.lock || (matches!(i.op, 0x86 | 0x87) && i.md != 3)
     }
 
@@ -455,6 +458,9 @@ impl Cpu {
     /// remembers where and what, for `locked_store`.
     fn locked_load(&mut self, linear: u64, size: u8) -> ExecResult<u64> {
         self.check_operand_extent(size, true)?;
+        if self.debug.watch_accesses {
+            self.watch_access(linear, size as u64, true);
+        }
         if (linear & PAGE_OFFSET_MASK) + size as u64 > PAGE_SIZE {
             self.rmw = Rmw::NeedsExclusive;
             return Err(Exception::AtomicRetry);
@@ -938,7 +944,8 @@ impl Cpu {
         if copies {
             elements = elements.min(room(src_linear));
         }
-        if elements == 0 {
+        // The bulk copy skips the per-access breakpoint checks and the per-iteration pause.
+        if elements == 0 || self.debug.watch_accesses {
             return Ok(0);
         }
         let bytes = elements * element;
@@ -1099,7 +1106,7 @@ impl Cpu {
                     break;
                 }
             }
-            if iterations >= slice && self.gpr[GPR_RCX] & amask != 0 {
+            if (iterations >= slice || self.rep_must_pause()) && self.gpr[GPR_RCX] & amask != 0 {
                 // RIP stays on the instruction; the run loop re-executes it after servicing events.
                 self.icount += iterations;
                 return Ok(());
@@ -1252,7 +1259,9 @@ impl Cpu {
         // set_cpl also switches to the user or supervisor half of the soft TLB.
         self.set_cpl(new_cpl);
         // IF and IOPL are gated by the CPL iretq started at, not the one it returns to.
-        let loadable = self.loadable_eflags(old_cpl);
+        // RF is loaded too (popf never loads it): a #DB handler sets it in the frame to step
+        // over the instruction breakpoint it returns to.
+        let loadable = self.loadable_eflags(old_cpl) | RF;
         let current = self.eflags_full();
         self.eflags = ((current & !loadable) | (new_rflags & loadable)) | RESERVED_ONE;
         self.lazy_op = LazyFlagsOp::Eflags;
@@ -1308,6 +1317,12 @@ impl Cpu {
     /// pushed return address is right. Opcodes are `Insn::op`: one-byte opcodes as is, `0f xx` as
     /// `0x1xx`.
     pub fn exec(&mut self, i: &Insn) -> ExecResult<()> {
+        if self.debug.debugctl & super::debug::DEBUGCTL_BUS_LOCK_DETECT != 0
+            && !self.debug.watch_accesses
+            && Self::is_locked(i)
+        {
+            return self.exec_detecting_bus_lock(i);
+        }
         if self.ordered_memory && self.rmw == Rmw::Off && Self::is_locked(i) {
             return self.exec_locked(i);
         }
@@ -1486,6 +1501,7 @@ impl Cpu {
                 // a mov ss / mov rsp pair is atomic.
                 if idx == SEG_SS {
                     self.interrupt_shadow = true;
+                    self.debug.mov_ss_shadow = true;
                 }
             }
             // pop r/m (only /0; the other encodings are XOP)
@@ -1880,6 +1896,9 @@ impl Cpu {
     /// always is; otherwise every bit the access covers in the TSS I/O permission bitmap must be
     /// clear, and the bitmap must lie inside the TSS limit (SDM 3A 20.5; QEMU `check_io`).
     pub(super) fn check_io_permission(&mut self, port: u16, size: u8) -> ExecResult<()> {
+        if self.debug.watch_accesses {
+            self.watch_io(port, size);
+        }
         if self.cpl <= self.iopl() {
             return Ok(());
         }
@@ -11114,13 +11133,14 @@ mod exec_tests {
         let f = run_flags(1, 1, image_with(IF | (3 << IOPL_SHIFT)));
         assert_eq!(f & IF, IF);
         assert_eq!(f & IOPL, 1 << IOPL_SHIFT);
-        // RF and VM are never loaded; the arithmetic flags and DF/TF/NT/AC/ID always are.
+        // VM is never loaded in 64-bit mode; RF (unlike popf), the arithmetic flags and
+        // DF/TF/NT/AC/ID always are.
         let f = run_flags(
             0,
             0,
             image_with(RF | VM | DF | TF | NT | AC | EFLAGS_ID | CF | OF),
         );
-        assert_eq!(f & (RF | VM), 0);
+        assert_eq!(f & (RF | VM), RF);
         assert_eq!(
             f & (DF | TF | NT | AC | EFLAGS_ID | CF | OF),
             DF | TF | NT | AC | EFLAGS_ID | CF | OF
@@ -14040,14 +14060,15 @@ mod exec_tests {
     fn pushfq_pushes_the_flags_image_without_rf_and_vm() {
         let mut pair = Pair::new(code::PUSHFQ);
         pair.halted(|h| {
-            h.cpu.eflags = RESERVED_ONE | IF | DF | TF | NT | AC | EFLAGS_ID | RF | VM | IOPL_ONE;
+            // Not TF: it would single-step the pushfq.
+            h.cpu.eflags = RESERVED_ONE | IF | DF | NT | AC | EFLAGS_ID | RF | VM | IOPL_ONE;
             h.cpu.set_eflags_arith(CF | ZF | OF);
         });
         let image = pair.interp.read_u64(STACK_TOP - 8);
         assert_eq!(pair.reg(RSP), STACK_TOP - 8);
         assert_eq!(
             image,
-            RESERVED_ONE | IF | DF | TF | NT | AC | EFLAGS_ID | IOPL_ONE | CF | ZF | OF,
+            RESERVED_ONE | IF | DF | NT | AC | EFLAGS_ID | IOPL_ONE | CF | ZF | OF,
             "RF and VM read as zero in the pushed image"
         );
         // Bit 1 reads as one even when everything else is clear.
@@ -14077,8 +14098,9 @@ mod exec_tests {
         assert_eq!(flags & !RESERVED_ONE, loaded, "RF and VM stay clear");
         assert_eq!(flags & RESERVED_ONE, RESERVED_ONE);
         assert_eq!(pair.reg(RSP), STACK_TOP - 0x38);
-        // Clearing works too, and bit 1 cannot be cleared.
-        let pair = run_flag_instruction(code::POPFQ, 0, ALL_POPF_BITS & !RF & !VM, 0);
+        // Clearing works too, and bit 1 cannot be cleared. TF starts clear: set, it would
+        // single-step the popfq.
+        let pair = run_flag_instruction(code::POPFQ, 0, ALL_POPF_BITS & !RF & !VM & !TF, 0);
         assert_eq!(pair.cpu().eflags_full(), RESERVED_ONE);
     }
 
@@ -14420,10 +14442,12 @@ mod exec_tests {
         // prefetch/prefetchw are executed as hints in sys.rs's `prefetchw_is_a_hint_that_never_faults`
         const PREFETCHW: u64 = 1 << 8;
         const TOPOEXT: u64 = 1 << 22;
+        // the address masks are tested in debug_tests.rs
+        const BPEXT: u64 = 1 << 26;
         assert_eq!(
-            ecx & !(LAHF_SAHF | LZCNT_ABM | SVM | PREFETCHW | TOPOEXT),
+            ecx & !(LAHF_SAHF | LZCNT_ABM | SVM | PREFETCHW | TOPOEXT | BPEXT),
             0,
-            "nothing beyond lahf, svm, abm, prefetchw and the topology leaves"
+            "nothing beyond lahf, svm, abm, prefetchw, the topology leaves and bpext"
         );
     }
 

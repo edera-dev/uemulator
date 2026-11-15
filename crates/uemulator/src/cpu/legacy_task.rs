@@ -29,6 +29,9 @@ const TSS_EFLAGS: u64 = 36;
 const TSS_GPRS: u64 = 40;
 const TSS_SEGMENTS: u64 = 72;
 const TSS_LDT: u64 = 96;
+/// The word holding the T (debug trap) bit, bit 0, and the I/O map base above it.
+const TSS_TRAP_WORD: u64 = 100;
+const TSS_TRAP_BIT: u64 = 1;
 const TSS_MIN_LIMIT: u64 = 0x67;
 /// TSS segment slots in memory order.
 const TSS_SEGMENT_ORDER: [usize; 6] = [SEG_ES, SEG_CS, SEG_SS, SEG_DS, SEG_FS, SEG_GS];
@@ -149,6 +152,7 @@ impl Cpu {
             *value = self.read_sys(base.wrapping_add(TSS_SEGMENTS + 4 * slot as u64), 2)? as u16;
         }
         let incoming_ldt = self.read_sys(base.wrapping_add(TSS_LDT), 2)? as u16;
+        let debug_trap = self.read_sys(base.wrapping_add(TSS_TRAP_WORD), 2)? & TSS_TRAP_BIT != 0;
         if leaves_busy {
             self.write_sys(base.wrapping_add(TSS_LINK), 2, old_selector as u64)?;
             incoming_flags |= NT;
@@ -180,6 +184,9 @@ impl Cpu {
             let linear = self.stack_linear(sp)?;
             self.write_sys(linear, 4, code as u64)?;
             self.set_stack_pointer(sp);
+        }
+        if debug_trap {
+            self.note_task_switch_trap();
         }
         Ok(())
     }

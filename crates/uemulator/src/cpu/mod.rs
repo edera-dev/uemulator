@@ -10,11 +10,15 @@ mod bios;
 mod bios_keys;
 mod bmi;
 mod cpuid;
+pub(crate) mod debug;
+#[cfg(test)]
+mod debug_tests;
 pub(crate) mod decode;
 pub(crate) mod exception;
 mod exec;
 pub(crate) mod flags;
 mod fpu;
+mod invlpgb;
 pub(crate) mod legacy;
 mod legacy_flow;
 #[cfg(test)]
@@ -452,6 +456,12 @@ pub(crate) struct Cpu {
     /// IA32_SYSENTER_CS, _ESP, _EIP (MSRs 0x174..=0x176).
     pub sysenter: [u64; 3],
     pub dr: [u64; 8],
+    /// DEBUGCTL, the BPEXT masks and the #DB traps of the running instruction (`debug.rs`).
+    pub debug: debug::DebugState,
+    /// INVLPGBs any time-shared vCPU has run (machine-wide, moved by `swap_shared`) and how many
+    /// of them this vCPU has caught up with (`invlpgb.rs`).
+    pub tlb_shootdown_epoch: u64,
+    pub tlb_shootdown_seen: u64,
     /// MSRs that are only stored: a read returns the last write and writes are accepted.
     /// An MSR that is neither handled in `rdmsr`/`wrmsr` nor listed here raises #GP, which
     /// the kernel's `rdmsr_safe` probing depends on. Seeded in `Cpu::new`.
@@ -724,9 +734,6 @@ impl Cpu {
         const MSR_UCODE_REV: u32 = 0x8b;
         const UCODE_REV_TURIN: u64 = 0x0b00_215a;
         const MSR_K7_HWCR: u32 = 0xc001_0015;
-        /// IA32_DEBUGCTL: a KVM host saves and restores it around every guest run. Stored only (no
-        /// branch recording).
-        const MSR_IA32_DEBUGCTL: u32 = 0x1d9;
         const MSR_AMD64_NB_CFG: u32 = 0xc001_001f;
         const MSR_AMD64_LS_CFG: u32 = 0xc001_1020;
         const MSR_AMD64_DE_CFG: u32 = 0xc001_1029;
@@ -820,9 +827,11 @@ impl Cpu {
             pat: PAT_POWER_ON_DEFAULT,
             sysenter: [0; 3],
             dr: [0, 0, 0, 0, 0, 0, DR6_RESET, DR7_RESET],
+            debug: Default::default(),
+            tlb_shootdown_epoch: 0,
+            tlb_shootdown_seen: 0,
             msr_misc: [
                 (MSR_UCODE_REV, UCODE_REV_TURIN),
-                (MSR_IA32_DEBUGCTL, 0),
                 (MSR_K7_HWCR, HWCR_INITIAL),
                 (MSR_AMD64_NB_CFG, 0),
                 (MSR_AMD64_LS_CFG, 0),
@@ -1165,11 +1174,7 @@ impl Cpu {
             }
             self.interrupt_shadow = false;
             self.icount += 1;
-            let result = if self.jit.is_some() && self.is_long64() {
-                self.step_block()
-            } else {
-                self.step()
-            };
+            let result = self.dispatch_step();
             if let Some(reason) = self.after_step(result) {
                 return Slice::Exit(reason);
             }
@@ -1420,13 +1425,18 @@ impl Cpu {
 
     pub(crate) fn step(&mut self) -> ExecResult<()> {
         let insn = self.fetch_decode()?;
+        self.trace_step();
+        self.exec(&insn)
+    }
+
+    /// Records the instruction about to run in `trace`, when tracing.
+    pub(crate) fn trace_step(&mut self) {
         if let Some(trace) = &mut self.trace {
             if trace.len() >= TRACE_CAPACITY {
                 trace.pop_front();
             }
             trace.push_back(self.rip);
         }
-        self.exec(&insn)
     }
 
     pub fn dump_regs(&self) -> String {
@@ -1751,7 +1761,7 @@ mod cpu_tests {
         #[test]
         fn stored_only_msrs_are_seeded() {
             let h = harness();
-            let expected: [(u32, u64); 25] = [
+            let expected: [(u32, u64); 24] = [
                 (0x8b, 0x0b00_215a),
                 (0xc001_0000, 0),
                 (0xc001_0001, 0),
@@ -1765,7 +1775,6 @@ mod cpu_tests {
                 (0xc001_1022, 0),
                 (0xc001_102a, 0),
                 (0xc001_102e, 0),
-                (0x1d9, 0),
                 (0xc001_0010, (1 << 18) | (1 << 20)),
                 (0xc001_0015, 1 << 24),
                 (0xc001_0016, 0),

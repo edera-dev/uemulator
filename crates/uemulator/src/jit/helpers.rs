@@ -50,7 +50,9 @@ pub(crate) extern "C" fn helper_exec(cpu: &mut Cpu, insn: &Insn, rip: u64) -> u6
     }
     match cpu.exec(insn) {
         Ok(()) => {
-            if cpu.block_exit_requested {
+            // An instruction that set TF, RF, DR7 or DEBUGCTL hands the rest to `step_debug`:
+            // generated code never checks for breakpoints.
+            if cpu.block_exit_requested || cpu.debug_slow_path() {
                 STATUS_EXIT_REQUESTED
             } else {
                 STATUS_OK

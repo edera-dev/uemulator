@@ -731,7 +731,8 @@ impl Cpu {
             };
             self.rip = ip;
             self.set_stack_pointer(sp.wrapping_add(3 * step));
-            let mut loadable = self.loadable_eflags(self.cpl);
+            // A 32-bit iret loads RF, as iretq does (`debug.rs`).
+            let mut loadable = self.loadable_eflags(self.cpl) | RF;
             if size == 2 {
                 loadable &= WORD_MASK;
             }
@@ -780,7 +781,7 @@ impl Cpu {
             return Err(Exception::general_protection(0));
         }
         let loadable = {
-            let mut loadable = self.loadable_eflags(old_cpl);
+            let mut loadable = self.loadable_eflags(old_cpl) | RF;
             if size == 2 {
                 loadable &= WORD_MASK;
             }

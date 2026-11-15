@@ -518,7 +518,7 @@ impl Cpu {
     }
 
     /// Every vCPU's `Cpu` but this one. Only valid inside `with_exclusive`.
-    fn for_each_other_cpu(&mut self, mut f: impl FnMut(&mut Cpu)) {
+    pub(super) fn for_each_other_cpu(&mut self, mut f: impl FnMut(&mut Cpu)) {
         let links = self.links();
         for (index, link) in links.links.iter().enumerate() {
             if index == self.cpu_index as usize {

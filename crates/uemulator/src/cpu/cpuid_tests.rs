@@ -162,8 +162,8 @@ fn leaf_7_subleaf_0_features() {
         0, 3, 5, 7, 8, 9, 10, 16, 17, 18, 19, 20, 21, 23, 24, 28, 29, 30, 31,
     ]);
     // AVX512_VBMI UMIP AVX512_VBMI2 GFNI VAES VPCLMULQDQ AVX512_VNNI AVX512_BITALG
-    // AVX512_VPOPCNTDQ RDPID MOVDIRI MOVDIR64B; no PKU, LA57, CET_SS
-    let ecx = bits(&[1, 2, 6, 8, 9, 10, 11, 12, 14, 22, 27, 28]);
+    // AVX512_VPOPCNTDQ RDPID BUS_LOCK_DETECT MOVDIRI MOVDIR64B; no PKU, LA57, CET_SS
+    let ecx = bits(&[1, 2, 6, 8, 9, 10, 11, 12, 14, 22, 24, 27, 28]);
     // FSRM and AVX512_VP2INTERSECT; the speculation controls are in the AMD leaves
     let edx = bits(&[4, 8]);
     // EAX is the highest subleaf
@@ -260,12 +260,12 @@ fn extended_leaf_1_ecx_has_lahf_svm_abm_prefetchw_and_topoext() {
     let mut h = blank();
     let [_, ebx, ecx, _] = cpuid(&mut h, 0x8000_0001, 0);
     assert_eq!(ebx, 0);
-    // LAHF_LM SVM ABM 3DNOWPREFETCH TOPOEXT; no SSE4A, XOP, FMA4, IBS, LWP, PERFCTR_CORE
-    assert_eq!(ecx, bits(&[0, 2, 5, 8, 22]));
+    // LAHF_LM SVM ABM 3DNOWPREFETCH TOPOEXT BPEXT; no SSE4A, XOP, FMA4, IBS, LWP, PERFCTR_CORE
+    assert_eq!(ecx, bits(&[0, 2, 5, 8, 22, 26]));
     let mut h = with_topology(2, 2, 0);
     assert_eq!(
         cpuid(&mut h, 0x8000_0001, 0)[2],
-        bits(&[0, 1, 2, 5, 8, 22]),
+        bits(&[0, 1, 2, 5, 8, 22, 26]),
         "CMP_LEGACY"
     );
 }
@@ -347,13 +347,14 @@ fn address_size_leaf_reports_40_physical_and_48_virtual_bits_and_the_extensions(
     assert_eq!(eax & 0xff, 40);
     assert_eq!((eax >> 8) & 0xff, 48);
     assert_eq!(eax >> 16, 0);
-    // CLZERO XSAVEERPTR WBNOINVD IBPB IBRS STIBP STIBP_ALWAYS_ON IBRS_SAME_MODE EFER_LMSLE_MBZ
-    // SSBD PSFD BTC_NO IBPB_RET; no AMD_SSB_NO, VIRT_SSBD, PPIN, IBRS_ALWAYS_ON
+    // CLZERO INVLPGB XSAVEERPTR WBNOINVD IBPB IBRS STIBP STIBP_ALWAYS_ON IBRS_SAME_MODE
+    // EFER_LMSLE_MBZ SSBD PSFD BTC_NO IBPB_RET; no AMD_SSB_NO, VIRT_SSBD, PPIN, IBRS_ALWAYS_ON
     assert_eq!(
         ebx,
-        bits(&[0, 2, 9, 12, 14, 15, 17, 19, 20, 24, 28, 29, 30])
+        bits(&[0, 2, 3, 9, 12, 14, 15, 17, 19, 20, 24, 28, 29, 30])
     );
-    assert_eq!((ecx, edx), (0, 0));
+    // INVLPGB takes up to eight pages (EDX[15:0] = 7); no RDPRU
+    assert_eq!((ecx, edx), (0, 7));
     // NC is the processor count minus one, ApicIdSize the bits the ids need
     let mut h = with_topology(8, 2, 0);
     assert_eq!(cpuid(&mut h, 0x8000_0008, 0)[2], 7 | 3 << 12);
