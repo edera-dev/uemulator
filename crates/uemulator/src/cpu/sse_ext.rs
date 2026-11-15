@@ -132,7 +132,9 @@ impl Op {
     fn source(self) -> Source {
         match self {
             Op::Movddup => Source::Low(8),
-            Op::Lddqu => Source::Unaligned,
+            // SDM PCMPESTRI: "this instruction does not cause #GP if the memory operand is not
+            // aligned to 16 Byte boundary". Go's strings.Index relies on it for every haystack.
+            Op::Lddqu | Op::StringCompare { .. } => Source::Unaligned,
             Op::Widen {
                 from_bits, to_bits, ..
             } => Source::Low((from_bits * (VECTOR_BITS / to_bits) / 8) as u8),
@@ -3310,6 +3312,33 @@ mod tests {
             rig.exec_bytes(&bytes)
         }
 
+        // Go's strings.Index (internal/bytealg indexbody) runs `pcmpestri xmm1, [rdi], 0x0c` over
+        // a haystack at any byte offset; a #GP there killed every Go program on Fedora.
+        #[test]
+        fn string_compares_take_misaligned_memory_operands() {
+            let mut rig = Rig::new();
+            let haystack = b"xxxxxxxxxxxxxxxxxneedle..........";
+            rig.h.write(DATA, haystack);
+            rig.h.cpu.xmm[0] = u128::from_le_bytes(*b"needle\0\0\0\0\0\0\0\0\0\0");
+            for (asm, want) in [
+                ("pcmpestri xmm0, [rsi + 1], 0", Some(16)),
+                ("pcmpistri xmm0, [rsi + 1], 0", Some(16)),
+                ("pcmpestrm xmm0, [rsi + 1], 0", None),
+                ("pcmpistrm xmm0, [rsi + 1], 0", None),
+            ] {
+                let needle = rig.h.cpu.xmm[0];
+                rig.h.cpu.gpr[RAX] = 6;
+                rig.h.cpu.gpr[RDX] = 16;
+                rig.reset();
+                assert_eq!(exec_imm(&mut rig, asm, 0x0c), Stop::Halted, "{asm}");
+                if let Some(index) = want {
+                    // "needle" starts at haystack byte 17, past the 16 bytes compared.
+                    assert_eq!(rig.gpr(RCX), index, "{asm}");
+                }
+                rig.h.cpu.xmm[0] = needle;
+            }
+        }
+
         #[test]
         fn pcmpgtq_compares_signed_quadwords() {
             let mut rig = Rig::new();
@@ -3952,16 +3981,6 @@ mod tests {
                 rig.h.cpu.xmm[0],
                 lanes8([0xff, 0, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
             );
-        }
-
-        #[test]
-        fn string_compare_memory_operand_must_be_aligned() {
-            let mut rig = Rig::new();
-            for asm in ["pcmpistri xmm0, [rsi], 0", "pcmpestrm xmm0, [rsi], 0"] {
-                rig.reset();
-                rig.h.cpu.gpr[RSI] = DATA + 1;
-                assert_eq!(exec_imm(&mut rig, asm, 0), gp0(), "{asm}");
-            }
         }
 
         #[test]
@@ -5766,6 +5785,22 @@ mod tests {
         ),
         ("clwb [rsi]", &[0x66, 0x0f, 0xae, 0x36, 0xf4]),
         ("clflushopt [rsi]", &[0x66, 0x0f, 0xae, 0x3e, 0xf4]),
+        (
+            "pcmpestri xmm0, [rsi + 1], 0",
+            &[0x66, 0x0f, 0x3a, 0x61, 0x46, 0x01, 0x00, 0xf4],
+        ),
+        (
+            "pcmpistri xmm0, [rsi + 1], 0",
+            &[0x66, 0x0f, 0x3a, 0x63, 0x46, 0x01, 0x00, 0xf4],
+        ),
+        (
+            "pcmpestrm xmm0, [rsi + 1], 0",
+            &[0x66, 0x0f, 0x3a, 0x60, 0x46, 0x01, 0x00, 0xf4],
+        ),
+        (
+            "pcmpistrm xmm0, [rsi + 1], 0",
+            &[0x66, 0x0f, 0x3a, 0x62, 0x46, 0x01, 0x00, 0xf4],
+        ),
         // SNIPPETS-END
     ];
 }
