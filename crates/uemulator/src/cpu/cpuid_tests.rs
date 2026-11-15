@@ -289,8 +289,8 @@ fn extended_leaf_1_ecx_has_the_zen_5_features_that_are_implemented() {
     let [_, ebx, ecx, _] = cpuid(&mut h, 0x8000_0001, 0);
     assert_eq!(ebx, 0);
     // LAHF_LM SVM EXTAPIC CR8_LEGACY ABM SSE4A MISALIGNSSE 3DNOWPREFETCH OSVW TCE TOPOEXT
-    // PERFCTR_CORE PERFCTR_NB BPEXT PERFCTR_LLC MWAITX
-    let expected = bits(&[0, 2, 3, 4, 5, 6, 7, 8, 9, 17, 22, 23, 24, 26, 28, 29]);
+    // PERFCTR_CORE PERFCTR_NB BPEXT PERFCTR_LLC MWAITX ADDR_MASK_EXT
+    let expected = bits(&[0, 2, 3, 4, 5, 6, 7, 8, 9, 17, 22, 23, 24, 26, 28, 29, 30]);
     assert_eq!(ecx, expected, "{ecx:#034b}");
     for (bit, name) in [
         (10, "IBS"),
@@ -299,7 +299,6 @@ fn extended_leaf_1_ecx_has_the_zen_5_features_that_are_implemented() {
         (13, "WDT"),
         (15, "LWP"),
         (16, "FMA4"),
-        (30, "ADDR_MASK_EXT"),
     ] {
         assert_eq!(ecx & (1 << bit), 0, "{name} is not implemented");
     }

@@ -14474,8 +14474,8 @@ mod exec_tests {
         const EXTAPIC: u64 = 1 << 3;
         const PERFCTR_CORE_NB_LLC: u64 = (1 << 23) | (1 << 24) | (1 << 28);
         const AMD_EXTENSIONS: u64 = 1 << 4 | 1 << 6 | 1 << 7 | 1 << 9 | 1 << 17 | 1 << 29;
-        // the address masks are tested in debug_tests.rs
-        const BPEXT: u64 = 1 << 26;
+        // the address masks, and AdMskExtn's instruction breakpoints, are tested in debug_tests.rs
+        const BPEXT: u64 = 1 << 26 | 1 << 30;
         assert_eq!(
             ecx & !(LAHF_SAHF
                 | LZCNT_ABM

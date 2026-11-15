@@ -453,9 +453,11 @@ const EXT_FEATURE_PERFCTR_CORE: u32 = 1 << 23;
 /// and readable (by rdmsr and rdpmc 6-15) but never count.
 const EXT_FEATURE_PERFCTR_NB: u32 = 1 << 24;
 const EXT_FEATURE_PERFCTR_LLC: u32 = 1 << 28;
-/// BPEXT, the data breakpoint extension: the DR0-DR3 address mask MSRs (`debug.rs`). Bit 30,
-/// AdMskExtn (the masks extended to instruction breakpoints), stays clear.
+/// BPEXT, the data breakpoint extension: the DR0-DR3 address mask MSRs (`debug.rs`).
 const EXT_FEATURE_BPEXT: u32 = 1 << 26;
+/// AdMskExtn: the address masks are 32 bits wide and apply to instruction breakpoints too
+/// (`debug.rs`).
+const EXT_FEATURE_ADDRESS_MASK_EXTENSION: u32 = 1 << 30;
 /// monitorx and mwaitx (`protection.rs`), including the mwaitx timer.
 const EXT_FEATURE_MWAITX: u32 = 1 << 29;
 // Leaf 0x8000_0001 EDX, besides the aliases of leaf 1.
@@ -1002,7 +1004,8 @@ impl Cpu {
                     | EXT_FEATURE_PERFCTR_NB
                     | EXT_FEATURE_PERFCTR_LLC
                     | EXT_FEATURE_BPEXT
-                    | EXT_FEATURE_MWAITX,
+                    | EXT_FEATURE_MWAITX
+                    | EXT_FEATURE_ADDRESS_MASK_EXTENSION,
                 EXT_FEATURE_SYSCALL
                     | EXT_FEATURE_NX
                     | EXT_FEATURE_MMXEXT
