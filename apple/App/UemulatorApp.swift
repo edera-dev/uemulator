@@ -16,7 +16,7 @@ struct UemulatorApp: App {
     }
 }
 
-// The machine list and the selected machine (docs/plans/28-apple.md, M4).
+// The machine list and the selected machine (docs/plans/28-apple.md, "The UI as it is").
 //
 // Launch arguments, for scripted runs (UserDefaults' argument domain reads them):
 //   -machine NAME             select it
@@ -59,6 +59,7 @@ struct LibraryView: View {
             .toolbar {
                 ToolbarItem {
                     Button("New Machine", systemImage: "plus") { creating = true }
+                        .help("Make a machine")
                 }
             }
         } detail: {
@@ -72,6 +73,7 @@ struct LibraryView: View {
                     Text("Pick a machine, or make one from a CD image or the Alpine demo.")
                 } actions: {
                     Button("New Machine…") { creating = true }
+                        .buttonStyle(.borderedProminent)
                 }
             }
         }
@@ -160,8 +162,7 @@ struct MachineRow: View {
 
     // What the machine is, in a line: memory, processors, what it boots.
     static func summary(_ model: MachineModel) -> String {
-        let memory = model.definition.memoryMib
-        var parts = [memory >= 1024 && memory % 1024 == 0 ? "\(memory / 1024) GiB" : "\(memory) MiB"]
+        var parts = [MachineDefinition.memoryTitle(model.definition.memoryMib)]
         if model.definition.cpus > 1 { parts.append("\(model.definition.cpus) CPUs") }
         if let cd = model.cdromName { parts.append(cd) }
         if model.definition.bootsKernel { parts.append("kernel") }
@@ -200,32 +201,43 @@ struct NewMachineSheet: View {
 
     private static let memoryChoices = [256, 512, 1024, 2048, 3072, 4096]
     private static let diskChoices = [0, 1, 4, 8, 16, 32, 64]
+
     var body: some View {
         NavigationStack {
             Form {
-                TextField("Name", text: $name)
-                    #if os(iOS)
-                    .textInputAutocapitalization(.never)
-                    #endif
-                    .autocorrectionDisabled()
-                Picker("Boots", selection: $source) {
-                    ForEach(Source.allCases) { Text($0.title).tag($0) }
+                Section {
+                    TextField("Name", text: $name)
+                        #if os(iOS)
+                        .textInputAutocapitalization(.never)
+                        #endif
+                        .autocorrectionDisabled()
+                    Picker("Boots", selection: $source) {
+                        ForEach(Source.allCases) { Text($0.title).tag($0) }
+                    }
+                    if source == .cdrom {
+                        Button(cdrom?.lastPathComponent ?? "Choose CD Image…", systemImage: "opticaldisc") { choosingISO = true }
+                    }
                 }
-                if source == .cdrom {
-                    Button(cdrom?.lastPathComponent ?? "Choose CD Image…") { choosingISO = true }
+                Section {
+                    Picker("Memory", selection: $memoryMib) {
+                        ForEach(Self.memoryChoices, id: \.self) { Text(MachineDefinition.memoryTitle($0)).tag($0) }
+                    }
+                    Picker("Disk", selection: $diskGib) {
+                        ForEach(Self.diskChoices, id: \.self) { Text($0 == 0 ? "None" : "\($0) GiB").tag($0) }
+                    }
+                    Picker("Display", selection: $display) {
+                        ForEach(DisplayChoice.allCases) { Text($0.title).tag($0) }
+                    }
+                    Toggle("Network", isOn: $network)
+                } header: {
+                    Text("Hardware")
+                } footer: {
+                    Text("Everything here can be changed later in the machine's settings. The network reaches the internet through the app.")
                 }
-                Picker("Memory", selection: $memoryMib) {
-                    ForEach(Self.memoryChoices, id: \.self) { Text($0 >= 1024 ? "\($0 / 1024) GiB" : "\($0) MiB").tag($0) }
-                }
-                Picker("Disk", selection: $diskGib) {
-                    ForEach(Self.diskChoices, id: \.self) { Text($0 == 0 ? "None" : "\($0) GiB").tag($0) }
-                }
-                Picker("Display", selection: $display) {
-                    ForEach(DisplayChoice.allCases) { Text($0.title).tag($0) }
-                }
-                Toggle("Network (internet through the app)", isOn: $network)
                 if let problem {
-                    Text(problem).foregroundStyle(.red)
+                    Section {
+                        Label(problem, systemImage: "exclamationmark.triangle").foregroundStyle(.red)
+                    }
                 }
             }
             .formStyle(.grouped)

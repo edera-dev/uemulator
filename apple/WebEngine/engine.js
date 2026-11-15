@@ -4,7 +4,7 @@
 // control block, and passes the worker's console output, frames and events to the app over a
 // loopback WebSocket.
 //
-// The app serves this page at http://127.0.0.1:<port>/<token>/engine.html?socket=<port>&run=<n>.
+// The app serves this page at http://127.0.0.1:<port>/<token>/engine.html?socket=<port>&wisp=<port>&run=<n>.
 // The bridge, one WebSocket per run (WebKitEngine.swift reads and writes the same layout):
 //   page -> app, text first:  "<token> <run>" (the app drops a socket that does not say it)
 //   app -> page, text:        {"type": "boot", ...} once; then {"type": "resize", cols, rows},

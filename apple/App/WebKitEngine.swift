@@ -17,8 +17,8 @@ final class WebKitEngine: NSObject, MachineEngine {
     var onLog: ((String) -> Void)?
     var screen: ScreenSurface?
 
-    // Must sit in a window's view hierarchy (1x1, invisible): M0 ran it that way, and a web view in
-    // no window may be throttled.
+    // Must sit in a window's view hierarchy (1x1, invisible): the measurements were taken that way,
+    // and a web view in no window may be throttled.
     let webView: WKWebView
 
     private let files: LoopbackFiles
@@ -338,7 +338,6 @@ final class WebKitEngine: NSObject, MachineEngine {
         }
     }
 
-    // The guest ended by itself (or the page failed): same teardown as stop, its own reason.
     // The guest ended by itself, or the page failed: `uw_run` has returned (its disks are closed)
     // or never will, so there is nothing to wait for.
     private func finish(_ reason: String) {

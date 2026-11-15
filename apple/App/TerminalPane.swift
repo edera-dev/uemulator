@@ -11,14 +11,20 @@ final class TerminalSession: NSObject, TerminalViewDelegate {
     // The last size the view reported; SwiftTerm has no public getter for it. 80x25 until the
     // first layout, the guest console's own default.
     private(set) var size = (cols: 80, rows: 25)
+    // Points; a phone's narrower screen gets the smaller size so 80 columns fit across in landscape.
+    #if os(macOS)
+    private static let fontSize: CGFloat = 12
+    #else
+    private static let fontSize: CGFloat = 11
+    #endif
 
     override init() {
         super.init()
         view.terminalDelegate = self
         #if os(macOS)
-        view.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        view.font = NSFont.monospacedSystemFont(ofSize: Self.fontSize, weight: .regular)
         #else
-        view.font = UIFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        view.font = UIFont.monospacedSystemFont(ofSize: Self.fontSize, weight: .regular)
         #endif
     }
 

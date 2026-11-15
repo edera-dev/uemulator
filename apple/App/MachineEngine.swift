@@ -43,7 +43,8 @@ enum EngineKind: String, CaseIterable, Identifiable {
     }
 
     // iOS cannot JIT natively, and the web build's JIT in WebKit boots about 6.5 times faster
-    // than the native interpreter (M0); macOS JITs natively, several times faster than WebKit.
+    // than the native interpreter (docs/plans/28-apple.md, "M0 results"); macOS JITs natively,
+    // several times faster than WebKit.
     static var platformDefault: EngineKind {
         #if os(iOS)
         .webKit

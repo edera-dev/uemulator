@@ -3,7 +3,8 @@ import Network
 
 // The two loopback servers the WebKit engine needs (docs/plans/28-apple.md, "WebKitEngine").
 // Not a WKURLSchemeHandler: WebKit gives a custom scheme no SharedArrayBuffer even when the page
-// is cross-origin isolated, and worker.js cannot run without one (M0). http://127.0.0.1 is a
+// is cross-origin isolated, and worker.js cannot run without one (docs/plans/28-apple.md,
+// "M0 results"). http://127.0.0.1 is a
 // secure context and gets it.
 //
 // Both listen on 127.0.0.1 only. Other apps on the device can still connect to a loopback port,

@@ -1,6 +1,6 @@
 import SwiftUI
 
-// The guest's screen (docs/plans/28-apple.md, M3): the surface's image, aspect-fit, and the
+// The guest's screen (docs/plans/24-display-input.md): the surface's image, aspect-fit, and the
 // keyboard and pointer sent to the guest's virtio keyboard and tablet. Keys go as USB HID usages
 // (positions, not characters: the guest applies its own layout), the pointer as absolute screen
 // pixels, so the guest's pointer sits exactly under the host's and the guest's pointer image is

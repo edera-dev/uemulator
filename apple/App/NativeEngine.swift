@@ -191,7 +191,7 @@ final class NativeEngine: MachineEngine, @unchecked Sendable {
             RunLoop.main.add(timer, forMode: .common)
             screenTimer = timer
         }
-        // One word for a phone's toolbar, beside the engine menu.
+        // One word, to fit a phone's toolbar.
         onState?(.running(detail: jit ? "JIT" : "interp"))
     }
 

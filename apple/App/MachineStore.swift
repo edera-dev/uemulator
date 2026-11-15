@@ -1,13 +1,13 @@
 import Foundation
 import UemulatorCore
 
-// Named machines in the app's Documents/Machines (docs/plans/28-apple.md, M4), one folder each in
+// Named machines in the app's Documents/Machines (docs/plans/28-apple.md), one folder each in
 // the CLI's layout (`crates/uemulator-cli/src/machines.rs`):
 //   machine.toml   the CLI's file; the app reads and writes only the keys below (Rust keeps the
 //                  rest: ua_machine_load / ua_machine_save)
 //   disk-<n>.udisk the machine's disks, sparse udisk images
-//   nvram.kv       UEFI variables and TPM state (native engine; the WebKit engine keeps them in
-//                  memory until M4's follow-up)
+//   nvram.kv       UEFI variables and TPM state, for the native engine. The WebKit engine does
+//                  not hand the file to the web build: its variables last one run
 //   artifacts/     a kernel and initramfs to boot directly ("kernel", "initrd"), when it has one
 //   app.json       what only the app knows: the engine, the CD's bookmark. Not in machine.toml:
 //                  the CLI drops keys it does not know when it saves.
@@ -46,6 +46,12 @@ struct MachineDefinition {
     var engine: EngineKind?
     var bootsKernel = false
     var cdrom: CDROM?
+
+    // How the UI writes a memory size: "512 MiB", "2 GiB".
+    static func memoryTitle(_ mib: Int) -> String {
+        let mibPerGib = Int(MachineStore.mibPerGib)
+        return mib >= mibPerGib && mib % mibPerGib == 0 ? "\(mib / mibPerGib) GiB" : "\(mib) MiB"
+    }
 }
 
 enum MachineStoreError: LocalizedError {
@@ -76,10 +82,12 @@ final class MachineStore: ObservableObject {
     private static let maxNameLength = 64
     // What `uemulator quick create` writes for its NAT NIC.
     nonisolated static let userNetwork: [String: Any] = ["model": "virtio", "link": "user"]
+    nonisolated static let mibPerGib: UInt64 = 1024
+    // The app's Documents: Machines/ is in it, and `-debug-log` and `cdrom:` files are read from it.
+    nonisolated static let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
 
     init() {
-        root = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-            .appendingPathComponent("Machines")
+        root = Self.documents.appendingPathComponent("Machines")
         try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         reload()
     }
@@ -222,8 +230,6 @@ final class MachineStore: ObservableObject {
         reload()
     }
 
-    static let mibPerGib: UInt64 = 1024
-
     // The CLI's name for a machine's next disk: the first `disk-<n>.udisk` not taken.
     func createDisk(_ name: String, sizeMib: UInt64) throws -> DiskImage {
         let folder = directory(name)
@@ -259,7 +265,7 @@ final class MachineStore: ObservableObject {
     static func resolve(_ cdrom: CDROM) -> URL? {
         switch cdrom {
         case .documents(let file):
-            return FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!.appendingPathComponent(file)
+            return documents.appendingPathComponent(file)
         case .bookmark(let data):
             var stale = false
             #if os(macOS)

@@ -1,7 +1,7 @@
 import CoreGraphics
 import Foundation
 
-// The app's copy of the guest's screen (docs/plans/28-apple.md, M3). Both engines write the
+// The app's copy of the guest's screen (docs/plans/28-apple.md). Both engines write the
 // rectangles that changed into it and commit; the screen view shows the committed image. Pixels
 // are the library's format, blue, green, red, unused (XRGB8888 little-endian), which is
 // CoreGraphics' 32-bit little-endian "skip first" layout, so rows are copied as they come.

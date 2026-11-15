@@ -37,7 +37,7 @@ struct MachineSettingsView: View {
                 }
                 Section("Hardware") {
                     Picker("Memory", selection: $draft.memoryMib) {
-                        ForEach(memoryChoices, id: \.self) { Text(Self.memoryTitle($0)).tag($0) }
+                        ForEach(memoryChoices, id: \.self) { Text(MachineDefinition.memoryTitle($0)).tag($0) }
                     }
                     Stepper("Processors: \(draft.cpus)", value: $draft.cpus, in: 1...Self.maxCPUs)
                     Picker("Display", selection: $draft.display) {
@@ -170,10 +170,6 @@ struct MachineSettingsView: View {
             try? FileManager.default.removeItem(at: url)
         }
         createdDisks = []
-    }
-
-    private static func memoryTitle(_ mib: Int) -> String {
-        mib >= 1024 ? "\(mib / 1024) GiB" : "\(mib) MiB"
     }
 
     private static func fileSize(_ url: URL) -> String {

@@ -1,7 +1,7 @@
 import Foundation
 import Network
 
-// The app's Wisp v1 server (docs/plans/28-apple.md, M5): the guest's TCP and UDP streams, which
+// The app's Wisp v1 server (docs/plans/28-apple.md): the guest's TCP and UDP streams, which
 // the library's `WispClient` sends as Wisp packets, opened as Network.framework connections. Both
 // engines use it: the WebKit engine's page connects over a loopback WebSocket
 // (`WispSocketServer`), the native engine hands packets in directly (NativeEngine).

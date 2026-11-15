@@ -1,5 +1,4 @@
 import SwiftUI
-import UniformTypeIdentifiers
 import WebKit
 
 // One stored machine (MachineStore) and the engines that run it. The machine's devices are fixed
@@ -210,13 +209,11 @@ final class MachineModel: ObservableObject, ScreenInput {
     // seconds a line saying what the screen is getting. For finding out, without the window,
     // whether a guest is stuck or its frames are not showing.
     private var debugLog: FileHandle?
-    private var debugTimer: Timer?
     private static let debugInterval: TimeInterval = 5
 
     private func openDebugLog() {
         guard let file = UserDefaults.standard.string(forKey: "debug-log"), !file.isEmpty else { return }
-        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let url = documents.appendingPathComponent(file)
+        let url = MachineStore.documents.appendingPathComponent(file)
         FileManager.default.createFile(atPath: url.path, contents: nil)
         debugLog = try? FileHandle(forWritingTo: url)
         let timer = Timer(timeInterval: Self.debugInterval, repeats: true) { [weak self] _ in
@@ -226,8 +223,8 @@ final class MachineModel: ObservableObject, ScreenInput {
                 self.debugLog?.write(Data(line.utf8))
             }
         }
+        // The run loop keeps it; it lives as long as the app, as the model does.
         RunLoop.main.add(timer, forMode: .common)
-        debugTimer = timer
     }
 }
 
@@ -356,13 +353,15 @@ struct StoppedPlaceholder: View {
                 Label(reason, systemImage: "exclamationmark.triangle").foregroundStyle(.orange)
             }
             HStack {
-                Button("Settings…", action: onSettings)
+                Button("Settings…", systemImage: "slider.horizontal.3", action: onSettings)
+                    .buttonStyle(.bordered)
                 Button("Start", systemImage: "play.fill") { model.start() }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.defaultAction)
             }
             .controlSize(.large)
         }
+        .multilineTextAlignment(.center)
         .padding(32)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.background)
@@ -380,15 +379,25 @@ struct StateChip: View {
             Label("Starting", systemImage: "hourglass")
         case .running(let detail):
             TimelineView(.periodic(from: .now, by: 1)) { context in
-                let seconds = Int(context.date.timeIntervalSince(startedAt ?? context.date))
                 // The green dot says running; the text stays short enough for a phone's toolbar.
-                Label("\(seconds / 60):\(String(format: "%02d", seconds % 60)) · \(detail)", systemImage: "circle.fill")
+                Label("\(Self.uptime(since: startedAt, at: context.date)) · \(detail)", systemImage: "circle.fill")
                     .foregroundStyle(.green)
+                    .monospacedDigit()
             }
         case .stopped(let reason):
             Label(reason.isEmpty ? "Stopped" : reason, systemImage: "stop.circle")
                 .foregroundStyle(.secondary)
         }
+    }
+
+    // "4:05", or "1:04:05" past an hour.
+    private static func uptime(since start: Date?, at now: Date) -> String {
+        let secondsPerMinute = 60, minutesPerHour = 60
+        let seconds = max(0, Int(now.timeIntervalSince(start ?? now)))
+        let minutes = seconds / secondsPerMinute
+        let hours = minutes / minutesPerHour
+        let rest = String(format: "%02d", seconds % secondsPerMinute)
+        return hours > 0 ? "\(hours):\(String(format: "%02d", minutes % minutesPerHour)):\(rest)" : "\(minutes):\(rest)"
     }
 }
 
