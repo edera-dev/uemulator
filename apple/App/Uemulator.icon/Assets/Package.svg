@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <g>
+    <rect x="316" y="120" width="56" height="100" rx="20" fill="white"/>
+    <rect x="316" y="804" width="56" height="100" rx="20" fill="white"/>
+    <rect x="120" y="316" width="100" height="56" rx="20" fill="white"/>
+    <rect x="804" y="316" width="100" height="56" rx="20" fill="white"/>
+    <rect x="428" y="120" width="56" height="100" rx="20" fill="white"/>
+    <rect x="428" y="804" width="56" height="100" rx="20" fill="white"/>
+    <rect x="120" y="428" width="100" height="56" rx="20" fill="white"/>
+    <rect x="804" y="428" width="100" height="56" rx="20" fill="white"/>
+    <rect x="540" y="120" width="56" height="100" rx="20" fill="white"/>
+    <rect x="540" y="804" width="56" height="100" rx="20" fill="white"/>
+    <rect x="120" y="540" width="100" height="56" rx="20" fill="white"/>
+    <rect x="804" y="540" width="100" height="56" rx="20" fill="white"/>
+    <rect x="652" y="120" width="56" height="100" rx="20" fill="white"/>
+    <rect x="652" y="804" width="56" height="100" rx="20" fill="white"/>
+    <rect x="120" y="652" width="100" height="56" rx="20" fill="white"/>
+    <rect x="804" y="652" width="100" height="56" rx="20" fill="white"/>
+  </g>
+  <path fill="white" fill-rule="evenodd" d="M300 200H724A100 100 0 0 1 824 300V724A100 100 0 0 1 724 824H300A100 100 0 0 1 200 724V300A100 100 0 0 1 300 200ZM300 244A56 56 0 0 0 244 300V724A56 56 0 0 0 300 780H724A56 56 0 0 0 780 724V300A56 56 0 0 0 724 244Z"/>
+</svg>

@@ -20,6 +20,7 @@
 		B1000000000000000000B00B /* MachineView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000F00D /* MachineView.swift */; };
 		B1000000000000000000B00C /* Wisp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000F00E /* Wisp.swift */; };
 		B1000000000000000000B00D /* MachineSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000F00F /* MachineSettingsView.swift */; };
+		B1000000000000000000B00E /* Uemulator.icon in Resources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000F010 /* Uemulator.icon */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -38,6 +39,7 @@
 		B1000000000000000000F00D /* MachineView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MachineView.swift; sourceTree = "<group>"; };
 		B1000000000000000000F00E /* Wisp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Wisp.swift; sourceTree = "<group>"; };
 		B1000000000000000000F00F /* MachineSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MachineSettingsView.swift; sourceTree = "<group>"; };
+		B1000000000000000000F010 /* Uemulator.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; path = Uemulator.icon; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -50,6 +52,17 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXResourcesBuildPhase section */
+		B1000000000000000000P005 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B1000000000000000000B00E /* Uemulator.icon in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
 
 /* Begin PBXGroup section */
 		B1000000000000000000G001 = {
@@ -77,6 +90,7 @@
 				B1000000000000000000F008 /* MachineEngine.swift */,
 				B1000000000000000000F007 /* Loopback.swift */,
 				B1000000000000000000F004 /* Uemulator-macOS.entitlements */,
+				B1000000000000000000F010 /* Uemulator.icon */,
 			);
 			path = App;
 			sourceTree = "<group>";
@@ -107,6 +121,7 @@
 				B1000000000000000000P004 /* Build the Rust core */,
 				B1000000000000000000P001 /* Sources */,
 				B1000000000000000000P003 /* Frameworks */,
+				B1000000000000000000P005 /* Resources */,
 				B1000000000000000000P002 /* Bundle firmware and demo */,
 			);
 			buildRules = (
@@ -252,6 +267,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				"ENABLE_HARDENED_RUNTIME[sdk=macosx*]" = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				ASSETCATALOG_COMPILER_APPICON_NAME = Uemulator;
 				INFOPLIST_KEY_CFBundleDisplayName = uemulator;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphone*]" = YES;
@@ -281,6 +297,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				"ENABLE_HARDENED_RUNTIME[sdk=macosx*]" = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				ASSETCATALOG_COMPILER_APPICON_NAME = Uemulator;
 				INFOPLIST_KEY_CFBundleDisplayName = uemulator;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphone*]" = YES;
