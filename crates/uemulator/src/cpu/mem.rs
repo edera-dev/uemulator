@@ -725,6 +725,11 @@ impl Cpu {
     /// Reads `size` bytes (at most 8, all inside one page) at a physical address: RAM, else
     /// MMIO, else all ones for unmapped space.
     pub(super) fn phys_read(&mut self, pa: u64, size: u8) -> u64 {
+        let pa = if pa & super::svm::AVIC_MMIO_WINDOW != 0 {
+            self.avic_window_address(pa)
+        } else {
+            pa
+        };
         let len = size as usize;
         if let Some(src) = self.ram.slice(pa, len) {
             if self.ordered_memory {
@@ -750,6 +755,11 @@ impl Cpu {
 
     /// Counterpart of `phys_read`; writes to unmapped space are dropped.
     pub(super) fn phys_write(&mut self, pa: u64, size: u8, val: u64) {
+        let pa = if pa & super::svm::AVIC_MMIO_WINDOW != 0 {
+            self.avic_window_address(pa)
+        } else {
+            pa
+        };
         let start = pa as usize;
         let len = size as usize;
         if self.ram.contains(pa, len as u64) {
@@ -910,6 +920,9 @@ impl Cpu {
         let offset = (linear & PAGE_OFFSET_MASK) as usize;
         if offset + size as usize <= PAGE_SIZE as usize {
             let pa = self.translate(linear, AccessKind::Read, supervisor)?;
+            if pa & super::svm::AVIC_MMIO_WINDOW != 0 {
+                return self.avic_mmio_read(pa, size);
+            }
             return Ok(self.phys_read(pa, size));
         }
         let first_len = PAGE_SIZE as usize - offset;
@@ -950,6 +963,9 @@ impl Cpu {
         let offset = (linear & PAGE_OFFSET_MASK) as usize;
         if offset + size as usize <= PAGE_SIZE as usize {
             let pa = self.translate(linear, AccessKind::Write, supervisor)?;
+            if pa & super::svm::AVIC_MMIO_WINDOW != 0 {
+                return self.avic_mmio_write(pa, size, val);
+            }
             self.phys_write(pa, size, val);
             return Ok(());
         }

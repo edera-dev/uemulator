@@ -16,13 +16,21 @@
 use super::decode::Insn;
 use super::exception::Exception;
 use super::flags::*;
+use super::mem::AccessKind;
 use super::sys::{CR0_TS, EFER_AIBRSE, EFER_SCE, RAX, RCX, RDX};
 use super::*;
+
+#[path = "svm_avic.rs"]
+mod avic;
+pub(crate) use avic::AVIC_MMIO_WINDOW;
+use avic::{Avic, PendingTrap, V_INTR_MASKING};
 
 pub(crate) const MSR_VM_CR: u32 = 0xc001_0114;
 pub(crate) const MSR_VM_HSAVE_PA: u32 = 0xc001_0117;
 /// SVM-Lock key (APM 15.31): write-only, reads as zero.
 pub(crate) const MSR_SVM_KEY: u32 = 0xc001_0118;
+/// AVIC doorbell (APM 15.29.8): the host APIC id of a vCPU to look at its backing page.
+pub(crate) const MSR_AVIC_DOORBELL: u32 = 0xc001_011b;
 /// TSC_RATIO (APM 15.30.5): the guest's TSC is the host's times this 8.32 fixed-point ratio,
 /// plus the VMCB's TSC offset. Applies only while a guest runs.
 pub(crate) const MSR_TSC_RATIO: u32 = 0xc000_0104;
@@ -42,6 +50,11 @@ const LAST_BRANCH_MSRS: usize = 4;
 pub(crate) const EFER_SVME: u64 = 1 << 12;
 /// VM_CR bits software may write: DPD, R_INIT, DIS_A20M, LOCK, SVMDIS.
 pub(super) const VM_CR_WRITABLE: u64 = 0b1_1111;
+/// VM_CR.R_INIT: INIT becomes #SX with error code `SX_INIT_REDIRECTED` (APM 15.29).
+pub(super) const VM_CR_R_INIT: u64 = 1 << 1;
+/// #SX, and its error code for a redirected INIT.
+pub(super) const VECTOR_SECURITY_EXCEPTION: u8 = 30;
+pub(super) const SX_INIT_REDIRECTED: u32 = 1;
 pub(super) const VM_CR_LOCK: u64 = 1 << 3;
 pub(super) const VM_CR_SVMDIS: u64 = 1 << 4;
 
@@ -74,7 +87,15 @@ const VMCB_N_CR3: u64 = 0xb0;
 /// LBR virtualization (bit 0) and virtualized VMSAVE/VMLOAD (bit 1, not supported).
 const VMCB_VIRTUAL_EXTENSIONS: u64 = 0xb8;
 const LBR_VIRTUALIZATION_ENABLE: u64 = 1 << 0;
+/// Virtual VMLOAD/VMSAVE (APM 15.33.1): with nested paging, a guest `vmload`/`vmsave` the VMCB
+/// does not intercept takes rAX as a guest-physical address and goes through the nested tables.
+const VIRTUAL_VMLOAD_VMSAVE_ENABLE: u64 = 1 << 1;
 const VMCB_NEXT_RIP: u64 = 0xc8;
+/// Decode assists (APM 15.33.4): how many bytes of the guest's instruction a #PF intercept or a
+/// nested page fault fetched (0 to 15), and the bytes.
+const VMCB_INSTRUCTION_BYTES_FETCHED: u64 = 0xd0;
+const VMCB_INSTRUCTION_BYTES: u64 = 0xd1;
+const INSTRUCTION_BYTES_MAX: usize = 15;
 
 // State save area (starts at 0x400); each segment is selector u16, attrib u16, limit u32, base u64.
 const SAVE_ES: u64 = 0x400;
@@ -112,6 +133,9 @@ const SAVE_G_PAT: u64 = 0x668;
 /// under LBR virtualization.
 const SAVE_DEBUGCTL: u64 = 0x670;
 const SAVE_LAST_BRANCHES: [u64; LAST_BRANCH_MSRS] = [0x678, 0x680, 0x688, 0x690];
+/// The guest's SPEC_CTRL, which VMRUN loads and #VMEXIT saves (SpecCtrl virtualization: the
+/// hypervisor no longer swaps the MSR itself).
+const SAVE_SPEC_CTRL: u64 = 0x6e0;
 
 const SEGMENT_SELECTOR: u64 = 0;
 const SEGMENT_ATTRIB: u64 = 2;
@@ -223,6 +247,10 @@ pub(crate) const VMEXIT_INVALID: u64 = u64::MAX;
 const TASK_SWITCH_BY_IRET: u64 = 1 << 36;
 const TASK_SWITCH_BY_JUMP: u64 = 1 << 38;
 const TASK_SWITCH_ERROR_CODE_VALID: u64 = 1 << 44;
+/// Decode assists: EXITINFO1 of a CR access exit holds the GPR number in bits 3:0, valid only when
+/// this bit says it was a MOV (LMSW, CLTS and SMSW leave it clear). DR exits have the number alone.
+const CR_ACCESS_GPR_VALID: u64 = 1 << 63;
+const ACCESS_GPR_MASK: u64 = 0xf;
 
 // IOIO exit information (EXITINFO1).
 const IOIO_IN: u64 = 1 << 0;
@@ -253,9 +281,24 @@ pub(super) const EVENT_TYPE_SOFTWARE: u32 = 4;
 
 // V_INTR.
 const V_IRQ: u64 = 1 << 8;
+/// vGIF (APM 15.33.2): with V_GIF_ENABLE, a guest `stgi`/`clgi` the VMCB does not intercept
+/// sets/clears V_GIF instead of GIF, and virtual interrupts and NMIs wait for V_GIF.
+const V_GIF: u64 = 1 << 9;
+const V_GIF_ENABLE: u64 = 1 << 25;
+/// vNMI (APM 15.21.10): with V_NMI_ENABLE the hypervisor queues an NMI with V_NMI_PENDING and
+/// the processor delivers it when the guest's NMIs are unmasked; V_NMI_BLOCKING is the guest's
+/// NMI mask, set by the delivery (or by an NMI injected through EVENTINJ) and cleared by `iret`.
+const V_NMI_PENDING: u64 = 1 << 11;
+const V_NMI_BLOCKING: u64 = 1 << 12;
+const V_NMI_ENABLE: u64 = 1 << 26;
 const V_PRIORITY_SHIFT: u32 = 16;
 const V_PRIORITY_MASK: u64 = 0xf;
 const V_IGNORE_TPR: u64 = 1 << 20;
+/// V_TPR holds the guest's CR8 value (bits 3:0; 7:4 are reserved), which V_INTR_PRIO is compared
+/// with.
+const V_TPR_MASK: u8 = 0xf;
+/// CR8 is TPR bits 7:4.
+const CR8_TPR_SHIFT: u32 = 4;
 const V_VECTOR_SHIFT: u32 = 32;
 
 // TLB_CONTROL. Every value but `NOTHING` empties the guest's TLB here; `FLUSH_ALL` also empties
@@ -276,6 +319,14 @@ const CR0_CD_BIT: u64 = 1 << 30;
 const CR0_NW_BIT: u64 = 1 << 29;
 const CR0_PG_BIT: u64 = 1 << 31;
 const CR0_PE_BIT: u64 = 1;
+/// What `lmsw` loads (it can also set PE, never clear it).
+const LMSW_BITS: u64 = CR0_PE_BIT | 0b1110;
+/// CR intercept vector bits for CR0: reads in the low half, writes in the high half.
+const CR_INTERCEPT_CR0_READ: u32 = 1 << 0;
+const CR_INTERCEPT_CR0_WRITE: u32 = 1 << 16;
+/// Group 7 (0F 01) ModRM.reg of smsw and lmsw.
+const GROUP7_SMSW: u32 = 4;
+const GROUP7_LMSW: u32 = 6;
 /// EFER bits a VMCB may hold; any other is a consistency failure (VMEXIT_INVALID). AIBRSE is in
 /// the set because a KVM guest that sees automatic IBRS turns it on and KVM passes its EFER on.
 const EFER_KNOWN: u64 = EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE | EFER_SVME | EFER_AIBRSE;
@@ -293,8 +344,20 @@ const SVM_FEATURE_NEXT_RIP_SAVE: u32 = 1 << 3;
 const SVM_FEATURE_TSC_RATIO: u32 = 1 << 4;
 const SVM_FEATURE_VMCB_CLEAN_BITS: u32 = 1 << 5;
 const SVM_FEATURE_FLUSH_BY_ASID: u32 = 1 << 6;
+const SVM_FEATURE_DECODE_ASSISTS: u32 = 1 << 7;
 const SVM_FEATURE_PAUSE_FILTER: u32 = 1 << 10;
 const SVM_FEATURE_PAUSE_FILTER_THRESHOLD: u32 = 1 << 12;
+const SVM_FEATURE_AVIC: u32 = 1 << 13;
+const SVM_FEATURE_V_VMSAVE_VMLOAD: u32 = 1 << 15;
+const SVM_FEATURE_VGIF: u32 = 1 << 16;
+const SVM_FEATURE_X2AVIC: u32 = 1 << 18;
+const SVM_FEATURE_SPEC_CTRL: u32 = 1 << 20;
+const SVM_FEATURE_VNMI: u32 = 1 << 25;
+/// SVME_ADDR_CHK: a guest's VMRUN/VMLOAD/VMSAVE intercept is checked before rAX is (an address
+/// the processor refuses is #GP only when the instruction is not intercepted); without the bit
+/// KVM intercepts #GP to catch the old order. `svm_intercept` runs before the instruction does
+/// anything, which is the new order.
+const SVM_FEATURE_SVME_ADDR_CHK: u32 = 1 << 28;
 /// CPUID 0x8000000A EDX. VMCB clean bits: every VMRUN reloads the whole VMCB, which clean bits
 /// permit. Flush-by-ASID: any non-zero TLB_CONTROL empties the guest's whole TLB (`ParkedTlb`).
 pub(crate) const SVM_FEATURES: u32 = SVM_FEATURE_NESTED_PAGING
@@ -304,8 +367,16 @@ pub(crate) const SVM_FEATURES: u32 = SVM_FEATURE_NESTED_PAGING
     | SVM_FEATURE_TSC_RATIO
     | SVM_FEATURE_VMCB_CLEAN_BITS
     | SVM_FEATURE_FLUSH_BY_ASID
+    | SVM_FEATURE_DECODE_ASSISTS
     | SVM_FEATURE_PAUSE_FILTER
-    | SVM_FEATURE_PAUSE_FILTER_THRESHOLD;
+    | SVM_FEATURE_PAUSE_FILTER_THRESHOLD
+    | SVM_FEATURE_AVIC
+    | SVM_FEATURE_V_VMSAVE_VMLOAD
+    | SVM_FEATURE_VGIF
+    | SVM_FEATURE_X2AVIC
+    | SVM_FEATURE_SPEC_CTRL
+    | SVM_FEATURE_VNMI
+    | SVM_FEATURE_SVME_ADDR_CHK;
 
 /// What `vmrun` saved of the host, and restores at #VMEXIT. The other registers (including all
 /// GPRs but RAX/RSP) are deliberately *not* here: the hypervisor swaps those itself.
@@ -327,6 +398,10 @@ struct Host {
     /// DEBUGCTL and the branch records, put back at #VMEXIT under LBR virtualization.
     debugctl: u64,
     last_branches: [u64; LAST_BRANCH_MSRS],
+    /// The host's NMI mask. The guest has its own (`Cpu::nmi_blocked` while it runs): an NMI
+    /// injected into it must not mask the host's, nor the host's NMI handler the guest's.
+    nmi_blocked: bool,
+    spec_ctrl: u64,
 }
 
 /// The guest being run: the intercepts read from its VMCB at `vmrun` time (the hypervisor cannot
@@ -354,6 +429,17 @@ pub(crate) struct Guest {
     /// The VMCB's DEBUGCTL and branch records are the guest's own (swapped at VMRUN and #VMEXIT).
     lbr_virtualization: bool,
     pause_filter: PauseFilter,
+    /// Guest `vmload`/`vmsave` addresses are guest-physical (needs nested paging).
+    virtual_vmload_vmsave: bool,
+    /// V_GIF, when vGIF is enabled.
+    virtual_gif: Option<bool>,
+    /// V_NMI_PENDING, when vNMI is enabled (the mask is `Cpu::nmi_blocked`).
+    virtual_nmi_pending: Option<bool>,
+    /// V_INTR_MASKING: the guest's CR8 is `virtual_tpr` (with AVIC, the backing page's TPR).
+    interrupt_masking: bool,
+    avic: Option<Avic>,
+    /// An AVIC exit owed after the instruction that caused it.
+    avic_trap: Option<PendingTrap>,
 }
 
 /// The PAUSE intercept's filter (APM 15.14.4): a guest spinning on `pause` exits only after
@@ -392,6 +478,9 @@ pub(crate) struct Svm {
     /// Nested-table leaves the walker resolved for the running guest. `None` until the first
     /// nested walk.
     nested_leaves: Option<Box<NestedLeafCache>>,
+    /// Set while a #VMEXIT fetches the guest's instruction bytes (decode assists): a nested
+    /// fault then only ends the fetch, it must not exit (again).
+    fetching_instruction_bytes: bool,
 }
 
 impl Svm {
@@ -448,6 +537,7 @@ impl Svm {
             last_vmcb: 0,
             parked_tlb: None,
             nested_leaves: None,
+            fetching_instruction_bytes: false,
         }
     }
 }
@@ -750,7 +840,22 @@ impl Cpu {
     /// KernelGSbase, STAR, LSTAR, CSTAR, SFMASK and the SYSENTER MSRs.
     pub(super) fn vmload_vmsave(&mut self, save: bool, next: u64) -> ExecResult<()> {
         self.svm_instruction_checks()?;
-        let vmcb = self.vmcb_address()?;
+        let address = self.vmcb_address()?;
+        let vmcb = if self
+            .svm
+            .guest
+            .as_ref()
+            .is_some_and(|guest| guest.virtual_vmload_vmsave)
+        {
+            let access = if save {
+                AccessKind::Write
+            } else {
+                AccessKind::Read
+            };
+            self.nested_translate(address, access, false)?
+        } else {
+            address
+        };
         if save {
             for (offset, segment) in [
                 (SAVE_FS, self.seg[SEG_FS]),
@@ -793,10 +898,13 @@ impl Cpu {
         Ok(())
     }
 
-    /// 0F 01 DC / DD.
+    /// 0F 01 DC / DD. In a guest with vGIF they move V_GIF (the VMCB intercepts them otherwise).
     pub(super) fn stgi_clgi(&mut self, set: bool, next: u64) -> ExecResult<()> {
         self.svm_instruction_checks()?;
-        self.svm.gif = set;
+        match self.svm.guest.as_deref_mut() {
+            Some(guest) if guest.virtual_gif.is_some() => guest.virtual_gif = Some(set),
+            _ => self.svm.gif = set,
+        }
         self.rip = next;
         Ok(())
     }
@@ -924,11 +1032,13 @@ impl Cpu {
             pdpte: self.pdpte,
             debugctl: self.debugctl(),
             last_branches: self.svm.last_branches,
+            nmi_blocked: self.nmi_blocked,
+            spec_ctrl: self.spec_ctrl,
         };
         let v_intr = self.vmcb_read(vmcb, VMCB_V_INTR, 8);
         let nested = self.vmcb_read(vmcb, VMCB_NP_ENABLE, 8) & NP_ENABLE != 0;
-        let lbr_virtualization =
-            self.vmcb_read(vmcb, VMCB_VIRTUAL_EXTENSIONS, 8) & LBR_VIRTUALIZATION_ENABLE != 0;
+        let virtual_extensions = self.vmcb_read(vmcb, VMCB_VIRTUAL_EXTENSIONS, 8);
+        let lbr_virtualization = virtual_extensions & LBR_VIRTUALIZATION_ENABLE != 0;
         let pause_filter_count = self.vmcb_read(vmcb, VMCB_PAUSE_FILTER_COUNT, 2) as u16;
         let pause_filter = PauseFilter {
             count: pause_filter_count,
@@ -956,6 +1066,13 @@ impl Cpu {
             virtual_tpr: v_intr as u8,
             lbr_virtualization,
             pause_filter,
+            virtual_vmload_vmsave: nested && virtual_extensions & VIRTUAL_VMLOAD_VMSAVE_ENABLE != 0,
+            virtual_gif: (v_intr & V_GIF_ENABLE != 0).then_some(v_intr & V_GIF != 0),
+            virtual_nmi_pending: (v_intr & V_NMI_ENABLE != 0)
+                .then_some(v_intr & V_NMI_PENDING != 0),
+            interrupt_masking: v_intr & V_INTR_MASKING != 0,
+            avic: Avic::from_vmcb(self, vmcb, v_intr, nested),
+            avic_trap: None,
         };
         if self.trace.is_some() {
             let guest_rip = self.vmcb_read(vmcb, SAVE_RIP, 8);
@@ -1003,6 +1120,10 @@ impl Cpu {
                 self.svm.last_branches[k] = self.vmcb_read(vmcb, offset, 8);
             }
         }
+        self.spec_ctrl = self.vmcb_read(vmcb, SAVE_SPEC_CTRL, 8);
+        // Without vNMI nothing records the guest's NMI mask across exits: the hypervisor tracks
+        // it (KVM sets the IRET intercept after injecting an NMI).
+        self.nmi_blocked = v_intr & V_NMI_ENABLE != 0 && v_intr & V_NMI_BLOCKING != 0;
         self.interrupt_shadow =
             self.vmcb_read(vmcb, VMCB_INTERRUPT_SHADOW, 8) & INTERRUPT_SHADOW != 0;
         self.halted = false;
@@ -1035,7 +1156,7 @@ impl Cpu {
             let error_code = (event & EVENTINJ_ERROR_VALID != 0).then_some(error);
             let reason = match (event >> EVENTINJ_TYPE_SHIFT) & EVENTINJ_TYPE_MASK {
                 EVENT_TYPE_INTERRUPT => self.deliver_hardware_interrupt(vector),
-                EVENT_TYPE_NMI => self.deliver_event(NMI_VECTOR, None, false),
+                EVENT_TYPE_NMI => self.deliver_virtual_nmi(),
                 EVENT_TYPE_EXCEPTION => self.deliver_event(vector, error_code, false),
                 EVENT_TYPE_SOFTWARE => self.deliver_event(vector, None, true),
                 _ => None,
@@ -1052,6 +1173,9 @@ impl Cpu {
     /// been fully accounted for. `next_rip` is the address after the intercepted instruction (0
     /// when meaningless).
     pub(crate) fn vmexit(&mut self, code: u64, info1: u64, info2: u64, next_rip: u64) -> Exception {
+        let instruction_bytes = (code == VMEXIT_NPF
+            || code == VMEXIT_EXCEPTION + super::exception::VECTOR_PAGE_FAULT as u64)
+            .then(|| self.guest_instruction_bytes());
         let guest = self.svm.guest.take().expect("vmexit outside a guest");
         let vmcb = guest.vmcb;
         self.svm.last_vmcb = vmcb;
@@ -1111,6 +1235,7 @@ impl Cpu {
         if guest.nested_cr3.is_some() {
             self.vmcb_write(vmcb, SAVE_G_PAT, 8, self.pat);
         }
+        self.vmcb_write(vmcb, SAVE_SPEC_CTRL, 8, self.spec_ctrl);
         if guest.lbr_virtualization {
             self.vmcb_write(vmcb, SAVE_DEBUGCTL, 8, self.debugctl());
             for (k, offset) in SAVE_LAST_BRANCHES.into_iter().enumerate() {
@@ -1128,13 +1253,22 @@ impl Cpu {
             | (guest.virtual_irq as u64 * V_IRQ)
             | ((guest.virtual_priority as u64) << V_PRIORITY_SHIFT)
             | (guest.ignore_tpr as u64 * V_IGNORE_TPR)
-            | ((guest.virtual_vector as u64) << V_VECTOR_SHIFT);
-        let preserved = self.vmcb_read(vmcb, VMCB_V_INTR, 8)
-            & !(0xff
-                | V_IRQ
-                | (V_PRIORITY_MASK << V_PRIORITY_SHIFT)
-                | V_IGNORE_TPR
-                | (0xff << V_VECTOR_SHIFT));
+            | ((guest.virtual_vector as u64) << V_VECTOR_SHIFT)
+            | ((guest.virtual_gif == Some(true)) as u64 * V_GIF)
+            | ((guest.virtual_nmi_pending == Some(true)) as u64 * V_NMI_PENDING)
+            | ((guest.virtual_nmi_pending.is_some() && self.nmi_blocked) as u64 * V_NMI_BLOCKING);
+        let mut rebuilt = 0xff
+            | V_IRQ
+            | (V_PRIORITY_MASK << V_PRIORITY_SHIFT)
+            | V_IGNORE_TPR
+            | (0xff << V_VECTOR_SHIFT);
+        if guest.virtual_gif.is_some() {
+            rebuilt |= V_GIF;
+        }
+        if guest.virtual_nmi_pending.is_some() {
+            rebuilt |= V_NMI_PENDING | V_NMI_BLOCKING;
+        }
+        let preserved = self.vmcb_read(vmcb, VMCB_V_INTR, 8) & !rebuilt;
         self.vmcb_write(vmcb, VMCB_V_INTR, 8, preserved | v_intr);
         self.vmcb_write(vmcb, VMCB_EVENTINJ, 4, 0);
         self.vmcb_write(vmcb, VMCB_EXIT_INT_INFO, 4, 0);
@@ -1142,6 +1276,12 @@ impl Cpu {
         self.vmcb_write(vmcb, VMCB_EXITINFO1, 8, info1);
         self.vmcb_write(vmcb, VMCB_EXITINFO2, 8, info2);
         self.vmcb_write(vmcb, VMCB_NEXT_RIP, 8, next_rip);
+        if let Some((bytes, count)) = instruction_bytes {
+            self.vmcb_write(vmcb, VMCB_INSTRUCTION_BYTES_FETCHED, 1, count as u64);
+            for (k, &byte) in bytes[..count].iter().enumerate() {
+                self.vmcb_write(vmcb, VMCB_INSTRUCTION_BYTES + k as u64, 1, byte as u64);
+            }
+        }
         // restore the host
         let host = guest.host;
         self.seg[SEG_ES] = host.seg[0];
@@ -1162,6 +1302,8 @@ impl Cpu {
             self.set_debugctl(host.debugctl);
             self.svm.last_branches = host.last_branches;
         }
+        self.nmi_blocked = host.nmi_blocked;
+        self.spec_ctrl = host.spec_ctrl;
         self.eflags = (host.eflags & !(VM | RF)) | RESERVED_ONE;
         self.lazy_op = LazyFlagsOp::Eflags;
         self.rip = host.rip;
@@ -1173,6 +1315,38 @@ impl Cpu {
         self.leave_guest_tlb(space);
         self.flush_decode();
         Exception::Vmexit
+    }
+
+    /// Decode assists: up to 15 bytes of the guest instruction at CS:rIP, fetched as the guest
+    /// would (its paging, then the nested tables), for a #PF intercept or a nested page fault, so
+    /// the hypervisor can emulate an MMIO access without walking the guest's tables itself. The
+    /// fetch stops at the first byte it cannot translate (0 bytes when the fault was the fetch's
+    /// own). CR2 is the guest's fault address and must survive the fetch's own page faults.
+    fn guest_instruction_bytes(&mut self) -> ([u8; INSTRUCTION_BYTES_MAX], usize) {
+        let mut bytes = [0u8; INSTRUCTION_BYTES_MAX];
+        let mut count = 0;
+        let Ok(start) = self.fetch_linear() else {
+            return (bytes, 0);
+        };
+        let cr2 = self.cr2;
+        self.svm.fetching_instruction_bytes = true;
+        while count < INSTRUCTION_BYTES_MAX {
+            let Ok(physical) =
+                self.translate(start.wrapping_add(count as u64), AccessKind::Exec, false)
+            else {
+                break;
+            };
+            let in_page = (PAGE_SIZE - (physical & (PAGE_SIZE - 1))) as usize;
+            let length = in_page.min(INSTRUCTION_BYTES_MAX - count);
+            let Some(source) = self.ram.slice(physical, length) else {
+                break;
+            };
+            bytes[count..count + length].copy_from_slice(source);
+            count += length;
+        }
+        self.svm.fetching_instruction_bytes = false;
+        self.cr2 = cr2;
+        (bytes, count)
     }
 
     /// Records the event whose delivery a #VMEXIT just interrupted (a nested page fault while
@@ -1333,10 +1507,19 @@ impl Cpu {
     /// IDT (`before_step`), which is what hardware does, and which a hypervisor that always sets
     /// the intercept (KVM, Xen) never expects.
     pub(crate) fn svm_before_step(&mut self) -> bool {
+        let Some(guest) = self.svm.guest.as_deref_mut() else {
+            return false;
+        };
+        if let Some(trap) = guest.avic_trap.take() {
+            let next = self.rip;
+            self.vmexit(trap.code, trap.info1, trap.info2, next);
+            return true;
+        }
         let Some(guest) = &self.svm.guest else {
             return false;
         };
-        if guest.intercept3 & INTERCEPT_NMI != 0 && self.nmi_recognized() {
+        // The intercept is about the host's NMIs: the guest's own mask does not hold them back.
+        if guest.intercept3 & INTERCEPT_NMI != 0 && !guest.host.nmi_blocked && self.nmi_arrived() {
             let next = self.rip;
             self.vmexit(VMEXIT_NMI, 0, 0, next);
             return true;
@@ -1349,10 +1532,38 @@ impl Cpu {
             self.vmexit(VMEXIT_INTR, 0, 0, next);
             return true;
         }
-        if guest.virtual_irq
+        let virtual_gif = guest.virtual_gif.unwrap_or(true);
+        if virtual_gif
+            && guest.virtual_nmi_pending == Some(true)
+            && !self.nmi_blocked
+            && !self.interrupt_shadow
+        {
+            if let Some(guest) = &mut self.svm.guest {
+                guest.virtual_nmi_pending = Some(false);
+            }
+            self.halted = false;
+            // A failure to deliver is reported by the next step like any other fault.
+            let _ = self.deliver_virtual_nmi();
+            return false;
+        }
+        if virtual_gif
+            && guest.avic.is_some()
             && self.eflags & IF != 0
             && !self.interrupt_shadow
-            && (guest.ignore_tpr || guest.virtual_priority > guest.virtual_tpr >> 4)
+            && let Some(vector) = self.avic_accept_interrupt()
+        {
+            self.halted = false;
+            let _ = self.deliver_hardware_interrupt(vector);
+            return false;
+        }
+        let Some(guest) = &self.svm.guest else {
+            return false;
+        };
+        if virtual_gif
+            && guest.virtual_irq
+            && self.eflags & IF != 0
+            && !self.interrupt_shadow
+            && (guest.ignore_tpr || guest.virtual_priority > guest.virtual_tpr & V_TPR_MASK)
         {
             if guest.intercept3 & INTERCEPT_VINTR != 0 {
                 let next = self.rip;
@@ -1368,6 +1579,47 @@ impl Cpu {
             let _ = self.deliver_hardware_interrupt(vector);
         }
         false
+    }
+
+    /// MOV from CR8 in a guest with V_INTR_MASKING: its virtual TPR (`None` outside one, where
+    /// CR8 is the local APIC's TPR).
+    pub(crate) fn svm_guest_cr8(&mut self) -> Option<u64> {
+        let guest = self
+            .svm
+            .guest
+            .as_ref()
+            .filter(|guest| guest.interrupt_masking)?;
+        if guest.avic.is_some() {
+            return Some(self.avic_tpr() as u64 >> CR8_TPR_SHIFT);
+        }
+        Some((guest.virtual_tpr & V_TPR_MASK) as u64)
+    }
+
+    /// MOV to CR8 in a guest with V_INTR_MASKING; false outside one.
+    pub(crate) fn svm_set_guest_cr8(&mut self, cr8: u64) -> bool {
+        let Some(guest) = self
+            .svm
+            .guest
+            .as_deref_mut()
+            .filter(|guest| guest.interrupt_masking)
+        else {
+            return false;
+        };
+        guest.virtual_tpr = cr8 as u8;
+        if guest.avic.is_some() {
+            self.avic_set_tpr((cr8 as u8) << CR8_TPR_SHIFT);
+        }
+        true
+    }
+
+    /// Delivers an NMI the hypervisor gave the guest (EVENTINJ or vNMI) through the guest's IDT;
+    /// it masks the guest's NMIs until `iret` (APM 15.20), unless the delivery itself exited.
+    fn deliver_virtual_nmi(&mut self) -> Option<ExitReason> {
+        let reason = self.deliver_event(NMI_VECTOR, None, false);
+        if self.svm.guest.is_some() {
+            self.nmi_blocked = true;
+        }
+        reason
     }
 
     fn port_is_intercepted(&mut self, port: u16, size: u8) -> bool {
@@ -1414,7 +1666,8 @@ impl Cpu {
             0x9c => simple(VMEXIT_PUSHF, v3 & INTERCEPT_PUSHF != 0),
             0x9d => simple(VMEXIT_POPF, v3 & INTERCEPT_POPF != 0),
             0xcf => simple(VMEXIT_IRET, v3 & INTERCEPT_IRET != 0),
-            0xcd => simple(VMEXIT_INT, v3 & INTERCEPT_INT != 0),
+            // decode assists: the vector
+            0xcd => (v3 & INTERCEPT_INT != 0).then_some((VMEXIT_INT, i.imm as u8 as u64, 0)),
             0x108 => simple(VMEXIT_INVD, v3 & INTERCEPT_INVD != 0),
             0x109 => simple(VMEXIT_WBINVD, v4 & INTERCEPT_WBINVD != 0),
             // pause is `f3 90`
@@ -1469,35 +1722,59 @@ impl Cpu {
                     }
                 }
             }
-            // mov from/to control and debug registers
+            // mov from/to control and debug registers; decode assists name the GPR
             0x120 => (cr_bits >> (i.reg & 15) & 1 != 0).then_some((
                 VMEXIT_CR_READ + (i.reg & 15) as u64,
-                0,
+                CR_ACCESS_GPR_VALID | (i.rm as u64 & ACCESS_GPR_MASK),
                 0,
             )),
             0x122 => {
                 let number = (i.reg & 15) as u32;
+                let gpr = CR_ACCESS_GPR_VALID | (i.rm as u64 & ACCESS_GPR_MASK);
                 if cr_bits >> (16 + number) & 1 != 0 {
-                    Some((VMEXIT_CR_WRITE + number as u64, 0, 0))
+                    Some((VMEXIT_CR_WRITE + number as u64, gpr, 0))
                 } else if number == 0
                     && v3 & INTERCEPT_CR0_SELECTIVE_WRITE != 0
                     && (self.gpr[i.rm as usize] ^ self.cr0) & !CR0_SELECTIVE_IGNORED != 0
                 {
-                    Some((VMEXIT_CR0_SELECTIVE_WRITE, 0, 0))
+                    Some((VMEXIT_CR0_SELECTIVE_WRITE, gpr, 0))
                 } else {
                     None
                 }
             }
             0x121 => (dr_bits >> (i.reg & 15) & 1 != 0).then_some((
                 VMEXIT_DR_READ + (i.reg & 15) as u64,
-                0,
+                i.rm as u64 & ACCESS_GPR_MASK,
                 0,
             )),
             0x123 => (dr_bits >> (16 + (i.reg & 15) as u32) & 1 != 0).then_some((
                 VMEXIT_DR_WRITE + (i.reg & 15) as u64,
-                0,
+                i.rm as u64 & ACCESS_GPR_MASK,
                 0,
             )),
+            // clts writes CR0 (only TS, which the selective intercept ignores)
+            0x106 => simple(VMEXIT_CR_WRITE, cr_bits & CR_INTERCEPT_CR0_WRITE != 0),
+            // smsw reads CR0, lmsw writes it (MP, EM, TS, and PE only upwards); neither names a GPR
+            0x101 if reg == GROUP7_SMSW => {
+                simple(VMEXIT_CR_READ, cr_bits & CR_INTERCEPT_CR0_READ != 0)
+            }
+            0x101 if reg == GROUP7_LMSW => {
+                if cr_bits & CR_INTERCEPT_CR0_WRITE != 0 {
+                    Some((VMEXIT_CR_WRITE, 0, 0))
+                } else if v3 & INTERCEPT_CR0_SELECTIVE_WRITE != 0 {
+                    let location = self.modrm_location(i, next)?;
+                    let msw = self.load_operand(location, 2, i)?;
+                    let loaded =
+                        (self.cr0 & !LMSW_BITS) | (msw & LMSW_BITS) | (self.cr0 & CR0_PE_BIT);
+                    ((loaded ^ self.cr0) & !CR0_SELECTIVE_IGNORED != 0).then_some((
+                        VMEXIT_CR0_SELECTIVE_WRITE,
+                        0,
+                        0,
+                    ))
+                } else {
+                    None
+                }
+            }
             // group 6: sldt (/0), str (/1) read; lldt (/2), ltr (/3) write
             0x100 => match reg {
                 0 => simple(VMEXIT_LDTR_READ, v3 & INTERCEPT_LDTR_READ != 0),
@@ -1512,7 +1789,11 @@ impl Cpu {
                 1 => simple(VMEXIT_IDTR_READ, v3 & INTERCEPT_IDTR_READ != 0),
                 2 => simple(VMEXIT_GDTR_WRITE, v3 & INTERCEPT_GDTR_WRITE != 0),
                 3 => simple(VMEXIT_IDTR_WRITE, v3 & INTERCEPT_IDTR_WRITE != 0),
-                7 => simple(VMEXIT_INVLPG, v3 & INTERCEPT_INVLPG != 0),
+                // decode assists: the linear address
+                7 if v3 & INTERCEPT_INVLPG != 0 => match self.modrm_location(i, next)? {
+                    super::exec::Loc::Mem(linear) => Some((VMEXIT_INVLPG, linear, 0)),
+                    _ => None,
+                },
                 _ => None,
             },
             0x101 => match i.modrm {
@@ -1594,7 +1875,25 @@ impl Cpu {
     }
 
     /// `nested_translate` of the page a guest walk ends at, with what the nested leaf allows.
+    /// Under AVIC the APIC BAR page, once the nested tables allow the access, is the backing
+    /// page's window (`AVIC_MMIO_WINDOW`) instead.
     pub(crate) fn nested_translate_with_rights(
+        &mut self,
+        guest_physical: u64,
+        access: super::mem::AccessKind,
+        guest_table_walk: bool,
+    ) -> ExecResult<(u64, NestedRights)> {
+        let translated = self.nested_walk(guest_physical, access, guest_table_walk)?;
+        if !guest_table_walk && self.avic_mmio_page() == Some(guest_physical & !(PAGE_SIZE - 1)) {
+            return Ok((
+                AVIC_MMIO_WINDOW | (guest_physical & (PAGE_SIZE - 1)),
+                translated.1,
+            ));
+        }
+        Ok(translated)
+    }
+
+    fn nested_walk(
         &mut self,
         guest_physical: u64,
         access: super::mem::AccessKind,
@@ -1619,6 +1918,9 @@ impl Cpu {
             .as_ref()
             .is_some_and(|guest| guest.host.efer & EFER_NXE != 0);
         let fault = |cpu: &mut Cpu, present: bool, reserved: bool| {
+            if cpu.svm.fetching_instruction_bytes {
+                return Err(Exception::general_protection(0));
+            }
             let info = (if present { NPF_PRESENT } else { 0 })
                 | (if write { NPF_WRITE } else { 0 })
                 | NPF_USER
@@ -1668,11 +1970,7 @@ impl Cpu {
                     // Dirty for dirty logging, say): update it as hardware does, and walk again
                     // if it changed under us.
                     if !self.update_ram_u64(entry_address, entry, updated) {
-                        return self.nested_translate_with_rights(
-                            guest_physical,
-                            access,
-                            guest_table_walk,
-                        );
+                        return self.nested_walk(guest_physical, access, guest_table_walk);
                     }
                     entry = updated;
                 }
@@ -1698,7 +1996,7 @@ impl Cpu {
             if entry & NPT_ACCESSED == 0
                 && !self.update_ram_u64(entry_address, entry, entry | NPT_ACCESSED)
             {
-                return self.nested_translate_with_rights(guest_physical, access, guest_table_walk);
+                return self.nested_walk(guest_physical, access, guest_table_walk);
             }
             table = entry & NPT_ADDRESS_MASK;
         }
@@ -1715,7 +2013,7 @@ mod tests {
     use super::*;
     use crate::cpu::BeforeStep;
     use crate::cpu::mem::AccessKind;
-    use crate::cpu::sys::{MSR_DEBUGCTL, MSR_EFER};
+    use crate::cpu::sys::{CR0_EM, MSR_DEBUGCTL, MSR_EFER};
     use crate::cpu::test_support::{LegacyTables, PTE_P, PaeTables};
     use crate::testkit::RBX;
     use crate::testkit::{CODE_BASE, Harness, SCRATCH};
@@ -3510,6 +3808,717 @@ mod tests {
         );
     }
 
+    // ---- decode assists ----
+
+    /// Runs `code` with the CR intercept bits `cr` and DR bits `dr`; returns (exit code, info1).
+    fn cr_dr_exit(code: &[u8], cr: u32, dr: u32) -> (u64, u64) {
+        let mut h = rig(code);
+        put(&mut h, VMCB_INTERCEPT_CR, 4, cr as u64);
+        put(&mut h, VMCB_INTERCEPT_DR, 4, dr as u64);
+        run(&mut h);
+        (get(&h, VMCB_EXITCODE, 8), get(&h, VMCB_EXITINFO1, 8))
+    }
+
+    #[test]
+    fn decode_assists_name_the_gpr_of_a_cr_or_dr_move() {
+        // mov cr3, rbx / mov rax, cr0 / mov cr0, r9
+        let cases: &[(&[u8], u32, u64, u64)] = &[
+            (&[0x0f, 0x22, 0xdb], 1 << (16 + 3), VMEXIT_CR_WRITE + 3, 3),
+            (&[0x0f, 0x20, 0xc0], 1, VMEXIT_CR_READ, 0),
+            (&[0x41, 0x0f, 0x22, 0xc1], 1 << 16, VMEXIT_CR_WRITE, 9),
+        ];
+        for &(code, cr, exit, gpr) in cases {
+            assert_eq!(
+                cr_dr_exit(code, cr, 0),
+                (exit, CR_ACCESS_GPR_VALID | gpr),
+                "{code:02x?}"
+            );
+        }
+        // mov dr7, rcx / mov r10, dr6
+        assert_eq!(
+            cr_dr_exit(&[0x0f, 0x23, 0xf9], 0, 1 << (16 + 7)),
+            (VMEXIT_DR_WRITE + 7, 1)
+        );
+        assert_eq!(
+            cr_dr_exit(&[0x41, 0x0f, 0x21, 0xf2], 0, 1 << 6),
+            (VMEXIT_DR_READ + 6, 10)
+        );
+        // the CR0 selective write reports the GPR too: mov cr0, rbx
+        let mut h = rig(&[0x0f, 0x22, 0xc3, 0x0f, 0xa2]);
+        put(
+            &mut h,
+            VMCB_INTERCEPT3,
+            4,
+            (INTERCEPT_CPUID | INTERCEPT_CR0_SELECTIVE_WRITE) as u64,
+        );
+        h.cpu.gpr[3] = h.cpu.cr0 ^ CR0_CD_BIT;
+        run(&mut h);
+        assert_eq!(
+            (get(&h, VMCB_EXITCODE, 8), get(&h, VMCB_EXITINFO1, 8)),
+            (VMEXIT_CR0_SELECTIVE_WRITE, CR_ACCESS_GPR_VALID | 3)
+        );
+    }
+
+    #[test]
+    fn clts_lmsw_and_smsw_are_cr0_accesses_without_a_gpr() {
+        const CLTS: &[u8] = &[0x0f, 0x06];
+        const LMSW_AX: &[u8] = &[0x0f, 0x01, 0xf0];
+        const SMSW_EAX: &[u8] = &[0x0f, 0x01, 0xe0];
+        for code in [CLTS, LMSW_AX] {
+            assert_eq!(
+                cr_dr_exit(code, 1 << 16, 0),
+                (VMEXIT_CR_WRITE, 0),
+                "{code:02x?}"
+            );
+        }
+        assert_eq!(cr_dr_exit(SMSW_EAX, 1, 0), (VMEXIT_CR_READ, 0));
+        // the selective write intercept sees lmsw changing EM, and not clts or lmsw changing TS
+        let selective = |code: &[u8], ax: u64| {
+            let mut h = rig(&[code, ASM_CPUID].concat());
+            put(
+                &mut h,
+                VMCB_INTERCEPT3,
+                4,
+                (INTERCEPT_CPUID | INTERCEPT_CR0_SELECTIVE_WRITE) as u64,
+            );
+            put(&mut h, SAVE_RAX, 8, ax);
+            run(&mut h);
+            (get(&h, VMCB_EXITCODE, 8), get(&h, VMCB_EXITINFO1, 8))
+        };
+        let msw = Harness::new(HOST_CODE).cpu.cr0 & 0xf;
+        assert_eq!(
+            selective(LMSW_AX, msw ^ CR0_EM),
+            (VMEXIT_CR0_SELECTIVE_WRITE, 0)
+        );
+        assert_eq!(selective(LMSW_AX, msw ^ CR0_TS).0, VMEXIT_CPUID);
+        assert_eq!(selective(CLTS, 0).0, VMEXIT_CPUID);
+    }
+
+    #[test]
+    fn decode_assists_give_invlpg_its_linear_address_and_int_its_vector() {
+        // invlpg fs:[rbx + 0x10]
+        let mut h = rig(&[0x64, 0x0f, 0x01, 0x7b, 0x10]);
+        put(&mut h, VMCB_INTERCEPT3, 4, INTERCEPT_INVLPG as u64);
+        h.cpu.seg[SEG_FS].base = 0x1_0000;
+        h.cpu.gpr[3] = 0x5000;
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_INVLPG);
+        assert_eq!(get(&h, VMCB_EXITINFO1, 8), 0x1_5010);
+        let mut h = rig(&[0xcd, 0x80]);
+        put(&mut h, VMCB_INTERCEPT3, 4, INTERCEPT_INT as u64);
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_INT);
+        assert_eq!(get(&h, VMCB_EXITINFO1, 8), 0x80);
+    }
+
+    fn instruction_bytes(h: &Harness) -> Vec<u8> {
+        let count = get(h, VMCB_INSTRUCTION_BYTES_FETCHED, 1) as usize;
+        h.read(VMCB + VMCB_INSTRUCTION_BYTES, count)
+    }
+
+    #[test]
+    fn a_page_fault_intercept_carries_the_instruction_bytes() {
+        // mov rax, [UNMAPPED]; then filler, so a full 15 bytes are there to fetch
+        let code = [
+            0x48, 0xa1, 0, 0, 0, 0, 2, 0, 0, 0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+        ];
+        let mut h = rig(&code);
+        put(&mut h, VMCB_INTERCEPT_EXCEPTIONS, 4, 1 << 14);
+        put(&mut h, VMCB_INSTRUCTION_BYTES_FETCHED, 1, 0xee);
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_EXCEPTION + 14);
+        assert_eq!(instruction_bytes(&h), code[..INSTRUCTION_BYTES_MAX]);
+        assert_eq!(
+            get(&h, SAVE_CR2, 8),
+            UNMAPPED,
+            "fetching the bytes kept CR2"
+        );
+    }
+
+    #[test]
+    fn a_nested_page_fault_carries_the_instruction_bytes_unless_the_fetch_faulted() {
+        // the data access faults: mov rax, [0x800000]; cpuid
+        let code = [0x48, 0xa1, 0, 0, 0x80, 0, 0, 0, 0, 0, 0x0f, 0xa2];
+        let mut h = nested_rig(&code);
+        h.write(NPT + 0x3000, &0u64.to_le_bytes());
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_NPF);
+        let bytes = instruction_bytes(&h);
+        assert_eq!(bytes.len(), INSTRUCTION_BYTES_MAX);
+        assert_eq!(bytes[..code.len()], code);
+        // the fetch itself faults: mov eax, 0x800000; jmp rax
+        let mut h = nested_rig(&[0xb8, 0, 0, 0x80, 0, 0xff, 0xe0]);
+        h.write(NPT + 0x3000, &0u64.to_le_bytes());
+        put(&mut h, VMCB_INSTRUCTION_BYTES_FETCHED, 1, 0xee);
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_NPF);
+        assert_ne!(get(&h, VMCB_EXITINFO1, 8) & NPF_FETCH, 0);
+        assert_eq!(get(&h, VMCB_INSTRUCTION_BYTES_FETCHED, 1), 0);
+    }
+
+    #[test]
+    fn an_intercepted_svm_instruction_exits_before_its_address_is_checked() {
+        // SVME_ADDR_CHK: vmload with a misaligned rAX exits rather than raising #GP
+        let mut h = rig(&[0x0f, 0x01, 0xda]);
+        put(
+            &mut h,
+            VMCB_INTERCEPT4,
+            4,
+            (INTERCEPT_VMRUN | INTERCEPT_VMLOAD) as u64,
+        );
+        put(&mut h, SAVE_RAX, 8, 0x1234_5678);
+        put(&mut h, VMCB_INTERCEPT_EXCEPTIONS, 4, 1 << 13);
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_VMLOAD);
+    }
+
+    // ---- vGIF, vNMI, virtual VMLOAD/VMSAVE, SPEC_CTRL ----
+
+    /// A guest with an IDT whose gates `vectors` all lead to `handler` (code at GUEST_CODE + 0x100).
+    fn rig_with_handler(guest_code: &[u8], handler_code: &[u8], vectors: &[u8]) -> Harness {
+        let handler = GUEST_CODE + 0x100;
+        let mut h = rig(guest_code);
+        h.write(handler, handler_code);
+        let cs = h.cpu.seg[SEG_CS].sel;
+        for &vector in vectors {
+            install_idt_gate(&mut h, vector, handler, cs);
+        }
+        put(&mut h, SAVE_IDTR + SEGMENT_LIMIT, 4, 0xfff);
+        put(&mut h, SAVE_IDTR + SEGMENT_BASE, 8, IDT);
+        put(&mut h, SAVE_RFLAGS, 8, 2 | IF);
+        h.cpu.gpr[3] = 0;
+        h
+    }
+
+    /// inc ebx; stgi; jmp $+2; nop; hlt. The jmp ends a JIT block, so the boundary after `stgi`
+    /// exists in both modes.
+    const INC_THEN_STGI: &[u8] = &[0xff, 0xc3, 0x0f, 0x01, 0xdc, 0xeb, 0x00, 0x90, 0xf4];
+
+    #[test]
+    fn vgif_lets_the_guest_toggle_v_gif_without_an_exit() {
+        for (code, v_gif) in [
+            (
+                &[
+                    0x0f, 0x01, 0xdd, 0x0f, 0x01, 0xdc, 0x0f, 0x01, 0xdd, 0x0f, 0xa2,
+                ][..],
+                false,
+            ),
+            (&[0x0f, 0x01, 0xdd, 0x0f, 0x01, 0xdc, 0x0f, 0xa2][..], true),
+        ] {
+            let mut h = rig(code);
+            put(&mut h, VMCB_V_INTR, 8, V_GIF_ENABLE | V_GIF);
+            run(&mut h);
+            assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_CPUID, "{code:02x?}");
+            assert_eq!(get(&h, VMCB_V_INTR, 8) & V_GIF != 0, v_gif, "{code:02x?}");
+        }
+    }
+
+    #[test]
+    fn a_virtual_interrupt_and_a_virtual_nmi_wait_for_v_gif() {
+        for (v_intr, vector) in [
+            (V_IRQ | V_IGNORE_TPR | (0x40u64 << V_VECTOR_SHIFT), 0x40),
+            (V_NMI_ENABLE | V_NMI_PENDING, NMI_VECTOR),
+        ] {
+            let mut h = rig_with_handler(INC_THEN_STGI, ASM_CPUID, &[vector]);
+            put(&mut h, VMCB_V_INTR, 8, V_GIF_ENABLE | v_intr);
+            run(&mut h);
+            assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_CPUID, "{vector:#x}");
+            assert_eq!(get(&h, SAVE_RIP, 8), GUEST_CODE + 0x100, "{vector:#x}");
+            assert_eq!(h.cpu.gpr[3], 1, "{vector:#x}: delivered only after stgi");
+            assert!(get(&h, VMCB_V_INTR, 8) & V_GIF != 0);
+        }
+    }
+
+    /// Pushes an iret frame for the next label and runs `iretq` (unmasking NMIs), then:
+    /// nop; jmp $+2; cpuid.
+    const IRET_THEN_CPUID: &[u8] = &[
+        0x48, 0x89, 0xe0, // mov rax, rsp
+        0x8c, 0xd1, // mov ecx, ss
+        0x51, // push rcx
+        0x50, // push rax
+        0x9c, // pushfq
+        0x8c, 0xc9, // mov ecx, cs
+        0x51, // push rcx
+        0x48, 0x8d, 0x0d, 3, 0, 0, 0,    // lea rcx, [rip + 3]
+        0x51, // push rcx
+        0x48, 0xcf, // iretq
+        0x90, 0xeb, 0x00, 0x0f, 0xa2, // nop; jmp $+2; cpuid
+    ];
+    /// inc ebx; iretq
+    const INC_THEN_IRET: &[u8] = &[0xff, 0xc3, 0x48, 0xcf];
+
+    #[test]
+    fn a_virtual_nmi_is_delivered_when_the_guest_unmasks_nmis() {
+        let mut h = rig_with_handler(IRET_THEN_CPUID, INC_THEN_IRET, &[NMI_VECTOR]);
+        put(
+            &mut h,
+            VMCB_V_INTR,
+            8,
+            V_NMI_ENABLE | V_NMI_PENDING | V_NMI_BLOCKING,
+        );
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_CPUID);
+        assert_eq!(h.cpu.gpr[3], 1, "the NMI ran once, after the first iret");
+        let v_intr = get(&h, VMCB_V_INTR, 8);
+        assert_eq!(v_intr & (V_NMI_PENDING | V_NMI_BLOCKING), 0, "{v_intr:#x}");
+        // taken at once when unmasked; the handler's own state is in V_NMI_BLOCKING at the exit
+        let mut h = rig_with_handler(ASM_HLT, &[0xff, 0xc3, 0x0f, 0xa2], &[NMI_VECTOR]);
+        put(&mut h, VMCB_V_INTR, 8, V_NMI_ENABLE | V_NMI_PENDING);
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_CPUID);
+        assert_eq!(h.cpu.gpr[3], 1);
+        let v_intr = get(&h, VMCB_V_INTR, 8);
+        assert_eq!(v_intr & (V_NMI_PENDING | V_NMI_BLOCKING), V_NMI_BLOCKING);
+        // without V_NMI_ENABLE the bits mean nothing
+        let mut h = rig_with_handler(ASM_HLT, ASM_CPUID, &[NMI_VECTOR]);
+        put(&mut h, VMCB_V_INTR, 8, V_NMI_PENDING);
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_HLT);
+    }
+
+    #[test]
+    fn an_nmi_injected_through_eventinj_masks_the_guests_nmis() {
+        // handler: inc ebx; nop; jmp $+2; nop; cpuid. A physical NMI (not intercepted) waits
+        // behind the injected one instead of re-entering the handler.
+        let handler = &[0xff, 0xc3, 0x90, 0xeb, 0x00, 0x90, 0x0f, 0xa2];
+        let event = (EVENTINJ_VALID | (EVENT_TYPE_NMI << EVENTINJ_TYPE_SHIFT)) as u64;
+        let mut h = rig_with_handler(ASM_HLT, handler, &[NMI_VECTOR]);
+        put(&mut h, VMCB_EVENTINJ, 4, event);
+        enter_guest(&mut h);
+        raise_nmi(&mut h);
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_CPUID);
+        assert_eq!(h.cpu.gpr[3], 1, "the handler ran once");
+        assert!(!h.cpu.nmi_blocked, "the host's NMIs are its own");
+        assert!(h.cpu.dev.lock().nmi_pending());
+        // under vNMI the mask is reported in V_NMI_BLOCKING
+        let mut h = rig_with_handler(ASM_HLT, handler, &[NMI_VECTOR]);
+        put(&mut h, VMCB_EVENTINJ, 4, event);
+        put(&mut h, VMCB_V_INTR, 8, V_NMI_ENABLE);
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_CPUID);
+        assert_ne!(get(&h, VMCB_V_INTR, 8) & V_NMI_BLOCKING, 0);
+    }
+
+    /// mov eax, 0x800000; vmsave or vmload; cpuid, under the identity-plus-one-remap nested
+    /// tables, with `virtual_vmload_vmsave` set in the VMCB or not.
+    fn virtual_vmsave_rig(save: bool, virtual_vmload_vmsave: bool) -> Harness {
+        let instruction = if save { 0xdb } else { 0xda };
+        let mut h = nested_rig(&[0xb8, 0, 0, 0x80, 0, 0x0f, 0x01, instruction, 0x0f, 0xa2]);
+        if virtual_vmload_vmsave {
+            put(
+                &mut h,
+                VMCB_VIRTUAL_EXTENSIONS,
+                8,
+                VIRTUAL_VMLOAD_VMSAVE_ENABLE,
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn virtual_vmload_and_vmsave_take_a_guest_physical_address() {
+        const FS_BASE: u64 = 0x1234_0000;
+        let fs_base_at = |address: u64| address + SAVE_FS + SEGMENT_BASE;
+        let mut h = virtual_vmsave_rig(true, true);
+        h.cpu.seg[SEG_FS].base = FS_BASE;
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_CPUID);
+        assert_eq!(h.read_u64(fs_base_at(NESTED_REMAPPED_HPA)), FS_BASE);
+        assert_eq!(h.read_u64(fs_base_at(NESTED_REMAPPED_GPA)), 0);
+        // without the VMCB bit the address is the host's
+        let mut h = virtual_vmsave_rig(true, false);
+        h.cpu.seg[SEG_FS].base = FS_BASE;
+        run(&mut h);
+        assert_eq!(h.read_u64(fs_base_at(NESTED_REMAPPED_GPA)), FS_BASE);
+        // vmload reads through the nested tables too
+        let mut h = virtual_vmsave_rig(false, true);
+        h.write(fs_base_at(NESTED_REMAPPED_HPA), &FS_BASE.to_le_bytes());
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_CPUID);
+        assert_eq!(h.cpu.seg[SEG_FS].base, FS_BASE);
+        // and an unmapped guest-physical page is a nested page fault
+        let mut h = virtual_vmsave_rig(true, true);
+        h.write(NPT + 0x3000, &0u64.to_le_bytes());
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_NPF);
+        assert_eq!(get(&h, VMCB_EXITINFO2, 8), NESTED_REMAPPED_GPA);
+        assert_ne!(get(&h, VMCB_EXITINFO1, 8) & NPF_WRITE, 0);
+    }
+
+    #[test]
+    fn the_guests_spec_ctrl_comes_from_the_vmcb_and_goes_back_to_it() {
+        const SSBD: u64 = 1 << 2;
+        const IBRS: u64 = 1 << 0;
+        // mov ecx, 0x48; rdmsr; mov ebx, eax; mov eax, 5; xor edx, edx; wrmsr; cpuid
+        let mut h = rig(&[
+            0xb9, 0x48, 0, 0, 0, 0x0f, 0x32, 0x89, 0xc3, 0xb8, 5, 0, 0, 0, 0x31, 0xd2, 0x0f, 0x30,
+            0x0f, 0xa2,
+        ]);
+        h.cpu.spec_ctrl = IBRS;
+        put(&mut h, SAVE_SPEC_CTRL, 8, SSBD);
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_CPUID);
+        assert_eq!(h.cpu.gpr[3], SSBD, "the guest read its own");
+        assert_eq!(get(&h, SAVE_SPEC_CTRL, 8), SSBD | IBRS);
+        assert_eq!(h.cpu.spec_ctrl, IBRS, "the host's is back");
+    }
+
+    #[test]
+    fn with_r_init_an_init_is_a_security_exception_instead_of_a_reset() {
+        // the host: #SX through its IDT, error code 1, nothing reset
+        let handler = CODE_BASE + 0x800;
+        let mut h = rig(ASM_HLT);
+        let cs = h.cpu.seg[SEG_CS].sel;
+        install_idt_gate(&mut h, VECTOR_SECURITY_EXCEPTION, handler, cs);
+        h.cpu.idtr = DescriptorTable {
+            base: IDT,
+            limit: 0x4ff,
+        };
+        h.cpu.write_vm_cr(VM_CR_R_INIT).unwrap();
+        raise_init(&mut h);
+        assert!(h.cpu.apply_start_signals().is_none());
+        assert!(!h.cpu.wait_for_sipi, "not reset");
+        assert_eq!(h.cpu.rip, handler);
+        let rsp = h.cpu.gpr[GPR_RSP];
+        assert_eq!(h.read_u64(rsp), SX_INIT_REDIRECTED as u64, "the error code");
+        assert!(!h.cpu.dev.lock().lapic_of(0).start_signal_pending());
+        // a guest can intercept it like any exception
+        let mut h = rig(&[0x90, 0x0f, 0xa2]);
+        h.cpu.write_vm_cr(VM_CR_R_INIT).unwrap();
+        put(
+            &mut h,
+            VMCB_INTERCEPT_EXCEPTIONS,
+            4,
+            1 << VECTOR_SECURITY_EXCEPTION,
+        );
+        enter_guest(&mut h);
+        raise_init(&mut h);
+        assert!(h.cpu.apply_start_signals().is_none());
+        assert_eq!(
+            get(&h, VMCB_EXITCODE, 8),
+            VMEXIT_EXCEPTION + VECTOR_SECURITY_EXCEPTION as u64
+        );
+        assert_eq!(get(&h, VMCB_EXITINFO1, 8), SX_INIT_REDIRECTED as u64);
+        assert!(!h.cpu.wait_for_sipi);
+    }
+
+    // ---- AVIC, x2AVIC, V_INTR_MASKING ----
+
+    use super::avic::*;
+
+    const BACKING: u64 = 0x3a_0000;
+    const PHYSICAL_TABLE: u64 = 0x3b_0000;
+    const LOGICAL_TABLE: u64 = 0x3c_0000;
+    const TARGET_BACKING: u64 = 0x3d_0000;
+    /// Guest-physical (and, through the guest's identity paging, linear) APIC BAR: the second
+    /// 4 KiB page of the nested tables' split 2 MiB page, mapped to itself.
+    const APIC_BAR: u64 = NESTED_REMAPPED_GPA + 0x1000;
+    const TARGET_INDEX: u64 = 3;
+
+    /// `rig_with_handler` with nested paging and AVIC (x2AVIC with `x2apic`) on, IF clear.
+    fn avic_rig(code: &[u8], handler: &[u8], vectors: &[u8], x2apic: bool) -> Harness {
+        let mut h = rig_with_handler(code, handler, vectors);
+        build_nested_tables(&mut h);
+        put(&mut h, VMCB_NP_ENABLE, 8, NP_ENABLE);
+        put(&mut h, VMCB_N_CR3, 8, NPT);
+        put(&mut h, SAVE_G_PAT, 8, 0x0007_0406_0007_0406);
+        put(&mut h, SAVE_RFLAGS, 8, 2);
+        let x2avic = if x2apic { X2AVIC_ENABLE } else { 0 };
+        put(
+            &mut h,
+            VMCB_V_INTR,
+            8,
+            AVIC_ENABLE | V_INTR_MASKING | x2avic,
+        );
+        put(&mut h, VMCB_AVIC_APIC_BAR, 8, APIC_BAR);
+        put(&mut h, VMCB_AVIC_BACKING_PAGE, 8, BACKING);
+        put(&mut h, VMCB_AVIC_LOGICAL_TABLE, 8, LOGICAL_TABLE);
+        put(&mut h, VMCB_AVIC_PHYSICAL_TABLE, 8, PHYSICAL_TABLE | 7);
+        h
+    }
+
+    fn read_u32(h: &Harness, address: u64) -> u32 {
+        u32::from_le_bytes(h.read(address, 4).try_into().unwrap())
+    }
+
+    fn backing(h: &Harness, page: u64, offset: u64) -> u32 {
+        read_u32(h, page + offset)
+    }
+
+    fn set_backing(h: &mut Harness, page: u64, offset: u64, value: u32) {
+        h.write(page + offset, &value.to_le_bytes());
+    }
+
+    fn irr_has(h: &Harness, page: u64, vector: u8) -> bool {
+        backing(h, page, APIC_IRR + (vector as u64 / 32) * 0x10) >> (vector % 32) & 1 != 0
+    }
+
+    /// mov dword [APIC_BAR + offset], value
+    fn apic_store(offset: u64, value: u32) -> Vec<u8> {
+        let address = (APIC_BAR + offset) as u32;
+        [
+            &[0xc7, 0x04, 0x25][..],
+            &address.to_le_bytes(),
+            &value.to_le_bytes(),
+        ]
+        .concat()
+    }
+
+    /// mov <reg>, dword [APIC_BAR + offset], with `modrm` 0x04 (eax), 0x0c (ecx)...
+    fn apic_load(modrm: u8, offset: u64) -> Vec<u8> {
+        let address = (APIC_BAR + offset) as u32;
+        [&[0x8b, modrm, 0x25][..], &address.to_le_bytes()].concat()
+    }
+
+    fn exit(h: &Harness) -> (u64, u64, u64) {
+        (
+            get(h, VMCB_EXITCODE, 8),
+            get(h, VMCB_EXITINFO1, 8),
+            get(h, VMCB_EXITINFO2, 8),
+        )
+    }
+
+    #[test]
+    fn avic_reads_come_from_the_backing_page_and_the_current_count_faults() {
+        // mov eax, [ID]; mov ebx, eax; mov ecx, [current count]; cpuid
+        let code = [
+            apic_load(0x04, APIC_ID),
+            vec![0x89, 0xc3],
+            apic_load(0x0c, 0x390),
+            ASM_CPUID.to_vec(),
+        ]
+        .concat();
+        let mut h = avic_rig(&code, ASM_CPUID, &[], false);
+        set_backing(&mut h, BACKING, APIC_ID, 0x0500_0000);
+        run(&mut h);
+        assert_eq!(exit(&h), (VMEXIT_AVIC_NOACCEL, 0x390, 0));
+        assert_eq!(
+            h.cpu.gpr[3], 0x0500_0000,
+            "the ID came from the backing page"
+        );
+        assert_eq!(get(&h, SAVE_RIP, 8), GUEST_CODE + 9, "a fault: on the load");
+    }
+
+    #[test]
+    fn avic_trap_writes_land_then_exit_and_fault_writes_exit_first() {
+        // the SVR: written, then the exit with RIP past the store (not after the nop)
+        let code = [apic_store(APIC_SVR, 0x1ff), vec![0x90], ASM_CPUID.to_vec()].concat();
+        let mut h = avic_rig(&code, ASM_CPUID, &[], false);
+        run(&mut h);
+        assert_eq!(exit(&h), (VMEXIT_AVIC_NOACCEL, APIC_SVR | NOACCEL_WRITE, 0));
+        assert_eq!(get(&h, SAVE_RIP, 8), GUEST_CODE + 11);
+        assert_eq!(backing(&h, BACKING, APIC_SVR), 0x1ff);
+        assert_eq!(
+            read_u32(&h, APIC_BAR + APIC_SVR),
+            0,
+            "not the page the BAR maps"
+        );
+        // the PPR is read-only: the exit comes first and nothing is written
+        let code = [apic_store(APIC_PPR, 0xff), ASM_CPUID.to_vec()].concat();
+        let mut h = avic_rig(&code, ASM_CPUID, &[], false);
+        run(&mut h);
+        assert_eq!(exit(&h), (VMEXIT_AVIC_NOACCEL, APIC_PPR | NOACCEL_WRITE, 0));
+        assert_eq!(get(&h, SAVE_RIP, 8), GUEST_CODE);
+        assert_eq!(backing(&h, BACKING, APIC_PPR), 0);
+    }
+
+    /// inc ebx; EOI; iretq
+    fn counting_eoi_handler() -> Vec<u8> {
+        [vec![0xff, 0xc3], apic_store(APIC_EOI, 0), vec![0x48, 0xcf]].concat()
+    }
+
+    #[test]
+    fn avic_delivers_irr_vectors_above_the_ppr_and_an_edge_eoi_retires_them() {
+        // sti; nop; jmp $+2; cpuid
+        let code = [0xfb, 0x90, 0xeb, 0x00, 0x0f, 0xa2];
+        for (tpr, delivered) in [(0x50, 1), (0, 2)] {
+            let mut h = avic_rig(&code, &counting_eoi_handler(), &[0x41, 0x62], false);
+            set_backing(&mut h, BACKING, APIC_TPR, tpr);
+            set_backing(&mut h, BACKING, APIC_IRR + 0x20, 1 << 1); // 0x41
+            set_backing(&mut h, BACKING, APIC_IRR + 0x30, 1 << 2); // 0x62
+            run(&mut h);
+            assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_CPUID, "tpr {tpr:#x}");
+            assert_eq!(h.cpu.gpr[3], delivered, "tpr {tpr:#x}");
+            assert!(!irr_has(&h, BACKING, 0x62));
+            assert_eq!(irr_has(&h, BACKING, 0x41), tpr != 0, "tpr {tpr:#x}");
+            for word in 0..8 {
+                assert_eq!(
+                    backing(&h, BACKING, APIC_ISR + word * 0x10),
+                    0,
+                    "EOI retired it"
+                );
+            }
+            assert_eq!(backing(&h, BACKING, APIC_PPR), tpr);
+        }
+    }
+
+    #[test]
+    fn a_level_triggered_eoi_traps_and_leaves_the_isr_to_the_hypervisor() {
+        let code = [apic_store(APIC_EOI, 0), vec![0x90], ASM_CPUID.to_vec()].concat();
+        let mut h = avic_rig(&code, ASM_CPUID, &[], false);
+        set_backing(&mut h, BACKING, APIC_ISR + 0x30, 1 << 2); // 0x62
+        set_backing(&mut h, BACKING, APIC_TMR + 0x30, 1 << 2);
+        run(&mut h);
+        assert_eq!(
+            exit(&h),
+            (VMEXIT_AVIC_NOACCEL, APIC_EOI | NOACCEL_WRITE, 0x62)
+        );
+        assert_eq!(get(&h, SAVE_RIP, 8), GUEST_CODE + 11);
+        assert_eq!(backing(&h, BACKING, APIC_ISR + 0x30), 1 << 2);
+    }
+
+    /// The guest writes ICR high, then ICR low, then runs cpuid. Returns the harness after the
+    /// exit.
+    fn ipi(high: u32, low: u32, prepare: impl FnOnce(&mut Harness)) -> Harness {
+        let code = [
+            apic_store(APIC_ICR_HIGH, high),
+            apic_store(APIC_ICR_LOW, low),
+            ASM_CPUID.to_vec(),
+        ]
+        .concat();
+        let mut h = avic_rig(&code, ASM_CPUID, &[], false);
+        prepare(&mut h);
+        run(&mut h);
+        h
+    }
+
+    fn target_entry(h: &mut Harness, running: bool) {
+        let running = if running {
+            PHYSICAL_ENTRY_IS_RUNNING
+        } else {
+            0
+        };
+        let entry = TARGET_BACKING | PHYSICAL_ENTRY_VALID | running;
+        h.write(PHYSICAL_TABLE + TARGET_INDEX * 8, &entry.to_le_bytes());
+    }
+
+    #[test]
+    fn avic_virtualizes_fixed_ipis_and_exits_for_the_rest() {
+        const VECTOR: u32 = 0x46;
+        const SELF: u32 = 1 << 18;
+        const LOGICAL: u32 = 1 << 11;
+        const NMI: u32 = 4 << 8;
+        let physical = (TARGET_INDEX as u32) << 24;
+        // to itself
+        let h = ipi(0, SELF | VECTOR, |_| ());
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_CPUID);
+        assert!(irr_has(&h, BACKING, VECTOR as u8));
+        // to a running vCPU: no exit
+        let h = ipi(physical, VECTOR, |h| target_entry(h, true));
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_CPUID);
+        assert!(irr_has(&h, TARGET_BACKING, VECTOR as u8));
+        // to one that is not running: delivered, then the hypervisor is told to wake it
+        let h = ipi(physical, VECTOR, |h| target_entry(h, false));
+        assert_eq!(
+            exit(&h),
+            (
+                VMEXIT_AVIC_INCOMPLETE_IPI,
+                (physical as u64) << 32 | VECTOR as u64,
+                IPI_FAILURE_TARGET_NOT_RUNNING << 32 | TARGET_INDEX
+            )
+        );
+        assert_eq!(get(&h, SAVE_RIP, 8), GUEST_CODE + 22, "a trap");
+        assert!(irr_has(&h, TARGET_BACKING, VECTOR as u8));
+        // logical (flat): logical id bit 1 is guest APIC 3
+        let h = ipi(0x02 << 24, LOGICAL | VECTOR, |h| {
+            target_entry(h, true);
+            set_backing(h, BACKING, APIC_DFR, 0xffff_ffff);
+            let entry = (LOGICAL_ENTRY_VALID | TARGET_INDEX) as u32;
+            h.write(LOGICAL_TABLE + 4, &entry.to_le_bytes());
+        });
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_CPUID);
+        assert!(irr_has(&h, TARGET_BACKING, VECTOR as u8));
+        // nothing is delivered for an invalid target, an NMI or a reserved vector
+        for (low, prepare, cause) in [
+            (VECTOR, false, IPI_FAILURE_INVALID_TARGET),
+            (NMI | VECTOR, true, IPI_FAILURE_INVALID_INT_TYPE),
+            (5, true, IPI_FAILURE_INVALID_VECTOR),
+        ] {
+            let h = ipi(physical, low, |h| {
+                if prepare {
+                    target_entry(h, true)
+                }
+            });
+            assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_AVIC_INCOMPLETE_IPI);
+            assert_eq!(get(&h, VMCB_EXITINFO2, 8) >> 32, cause, "{low:#x}");
+            assert!(!irr_has(&h, TARGET_BACKING, low as u8), "{low:#x}");
+        }
+    }
+
+    #[test]
+    fn x2avic_serves_the_x2apic_msrs_from_the_backing_page() {
+        let code = [
+            &[0xb9, 0x02, 0x08, 0, 0][..],        // mov ecx, 0x802 (ID)
+            &[0x0f, 0x32],                        // rdmsr
+            &[0x89, 0xc3],                        // mov ebx, eax
+            &[0xb9, 0x30, 0x08, 0, 0],            // mov ecx, 0x830 (ICR)
+            &[0xb8, 0x46, 0, 0, 0],               // mov eax, 0x46
+            &[0xba, TARGET_INDEX as u8, 0, 0, 0], // mov edx, 3
+            &[0x0f, 0x30],                        // wrmsr
+            &[0xb9, 0x39, 0x08, 0, 0],            // mov ecx, 0x839 (current count)
+            &[0x0f, 0x32],                        // rdmsr
+            ASM_CPUID,
+        ]
+        .concat();
+        let mut h = avic_rig(&code, ASM_CPUID, &[], true);
+        set_backing(&mut h, BACKING, APIC_ID, 7);
+        target_entry(&mut h, true);
+        run(&mut h);
+        assert_eq!(h.cpu.gpr[3], 7);
+        assert!(irr_has(&h, TARGET_BACKING, 0x46));
+        assert_eq!(backing(&h, BACKING, APIC_ICR_HIGH), TARGET_INDEX as u32);
+        assert_eq!(exit(&h), (VMEXIT_AVIC_NOACCEL, 0x390, 0));
+        assert_eq!(get(&h, SAVE_RIP, 8), GUEST_CODE + 31);
+    }
+
+    #[test]
+    fn with_v_intr_masking_the_guests_cr8_is_its_virtual_tpr() {
+        // mov eax, 7; mov cr8, rax; mov rbx, cr8; cpuid
+        let code = [
+            0xb8, 7, 0, 0, 0, 0x44, 0x0f, 0x22, 0xc0, 0x44, 0x0f, 0x20, 0xc3, 0x0f, 0xa2,
+        ];
+        let mut h = rig(&code);
+        put(&mut h, VMCB_V_INTR, 8, V_INTR_MASKING);
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_CPUID);
+        assert_eq!(get(&h, VMCB_V_INTR, 8) & 0xff, 7);
+        assert_eq!(h.cpu.gpr[3], 7);
+        assert_eq!(
+            h.cpu.dev.lock().lapic().tpr(),
+            0,
+            "the host's TPR is untouched"
+        );
+        // under AVIC it is the backing page's TPR
+        let mut h = avic_rig(&code, ASM_CPUID, &[], false);
+        run(&mut h);
+        assert_eq!(get(&h, VMCB_EXITCODE, 8), VMEXIT_CPUID);
+        assert_eq!(backing(&h, BACKING, APIC_TPR), 0x70);
+        assert_eq!(h.cpu.gpr[3], 7);
+    }
+
+    #[test]
+    fn a_virtual_interrupt_waits_for_a_priority_above_v_tpr() {
+        for (priority, exit_code) in [(3u64, VMEXIT_HLT), (6, VMEXIT_CPUID)] {
+            let mut h = rig_with_handler(ASM_HLT, ASM_CPUID, &[0x40]);
+            put(
+                &mut h,
+                VMCB_V_INTR,
+                8,
+                5 | V_IRQ | (priority << V_PRIORITY_SHIFT) | (0x40u64 << V_VECTOR_SHIFT),
+            );
+            run(&mut h);
+            assert_eq!(get(&h, VMCB_EXITCODE, 8), exit_code, "priority {priority}");
+        }
+    }
+
+    #[test]
+    fn the_avic_doorbell_is_write_only() {
+        let mut h = rig(ASM_HLT);
+        assert!(h.cpu.wrmsr(MSR_AVIC_DOORBELL, 1).is_ok());
+        assert!(h.cpu.rdmsr(MSR_AVIC_DOORBELL).is_err());
+    }
+
     /// The same scenarios on the host JIT, one test each so a failure names its scenario.
     macro_rules! jit_scenarios {
         ($($name:ident),* $(,)?) => {
@@ -3550,5 +4559,23 @@ mod tests {
         lbr_virtualization_gives_the_guest_the_vmcbs_debugctl_and_branch_records,
         the_pause_filter_count_lets_pauses_through_until_it_runs_out,
         the_pause_filter_threshold_restarts_the_count_after_a_slow_pause,
+        decode_assists_name_the_gpr_of_a_cr_or_dr_move,
+        clts_lmsw_and_smsw_are_cr0_accesses_without_a_gpr,
+        decode_assists_give_invlpg_its_linear_address_and_int_its_vector,
+        a_page_fault_intercept_carries_the_instruction_bytes,
+        a_nested_page_fault_carries_the_instruction_bytes_unless_the_fetch_faulted,
+        vgif_lets_the_guest_toggle_v_gif_without_an_exit,
+        a_virtual_interrupt_and_a_virtual_nmi_wait_for_v_gif,
+        a_virtual_nmi_is_delivered_when_the_guest_unmasks_nmis,
+        an_nmi_injected_through_eventinj_masks_the_guests_nmis,
+        virtual_vmload_and_vmsave_take_a_guest_physical_address,
+        the_guests_spec_ctrl_comes_from_the_vmcb_and_goes_back_to_it,
+        avic_reads_come_from_the_backing_page_and_the_current_count_faults,
+        avic_trap_writes_land_then_exit_and_fault_writes_exit_first,
+        avic_delivers_irr_vectors_above_the_ppr_and_an_edge_eoi_retires_them,
+        a_level_triggered_eoi_traps_and_leaves_the_isr_to_the_hypervisor,
+        avic_virtualizes_fixed_ipis_and_exits_for_the_rest,
+        x2avic_serves_the_x2apic_msrs_from_the_backing_page,
+        with_v_intr_masking_the_guests_cr8_is_its_virtual_tpr,
     );
 }

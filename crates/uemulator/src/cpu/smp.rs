@@ -85,7 +85,9 @@ impl Smp {
 
     pub fn run(&mut self) -> ExitReason {
         loop {
-            self.cpus[self.active].apply_start_signals();
+            if let Some(reason) = self.cpus[self.active].apply_start_signals() {
+                return reason;
+            }
             let icount_before = self.cpus[self.active].icount;
             let slice = self.cpus[self.active].run_slice();
             let progressed = self.cpus[self.active].icount != icount_before;
