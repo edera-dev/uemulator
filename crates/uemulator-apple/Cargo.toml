@@ -1,0 +1,14 @@
+[package]
+name = "uemulator-apple"
+description = "uemulator as a static library with a C ABI, for the SwiftUI app on macOS and iOS (docs/plans/28-apple.md)"
+version.workspace = true
+edition.workspace = true
+
+# A staticlib on Apple targets, linked into the app by apple/Uemulator.xcodeproj through
+# hack/apple/build-core.sh. On other hosts it is an empty rlib, so `cargo test --workspace` and
+# clippy on Linux build it without producing an archive nobody links.
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+uemulator = { path = "../uemulator" }

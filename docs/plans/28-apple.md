@@ -1,6 +1,6 @@
 # Apple platforms: a SwiftUI app
 
-**Status:** proposal. M0, the spike that decides whether the WebKit engine is worth building, is done ("M0 results" below: it is, served from loopback HTTP rather than a scheme handler). Nothing of the app itself is built yet.
+**Status:** proposal. M0, the spike that decides whether the WebKit engine is worth building, is done ("M0 results" below: it is, served from loopback HTTP rather than a scheme handler). M1 is built: `apple/Uemulator.xcodeproj` boots the Alpine demo on the native engine on macOS (JIT) and iOS (interpreted).
 
 A native app for macOS, iOS and iPadOS (visionOS later, tvOS only interpreted) that does what the web page does (`13-web.md`): pick or create a machine, boot it, show the terminal or the screen, type into it, network it. The UI is SwiftUI throughout. No web page is ever shown.
 
@@ -89,12 +89,28 @@ It follows the web page's structure (`13-web.md`, "The page") so the two stay re
 ## Milestones
 
 - **M0 — WebKit spike (decides the plan). Done; results below.** A throwaway iOS app (`apple/M0Spike`, run by `hack/apple/m0.sh`): hidden `WKWebView`, scheme handler and loopback HTTP with COOP/COEP, the existing `uemulator_web.wasm` and `worker.js`, console bytes to a `Text` view. It answers, on a real iPhone and on the simulator: `crossOriginIsolated` on a custom scheme, whether the web view runs while hidden, tail calls and SIMD on JSC, sync XHR with a body from a worker to a scheme handler, the WebContent memory ceiling, and boot time to `Run /init` for the Alpine demo with the JIT, with `--no-jit` in the same web view, and on `NativeEngine` interpreted. Exit: those numbers written into this file. If `WebKitEngine` doesn't beat the native interpreter by a clear margin, it is dropped, and iOS ships interpreted.
-- **M1 — Core and project.** `crates/uemulator-apple`, `hack/apple/build-core.sh`, the xcframework, the Xcode project with a SwiftUI shell, and `NativeEngine` booting the Alpine demo to a shell on macOS (JIT) and iOS (interpreted) in a SwiftTerm view. Exit: ⌘R on both, and `xcodebuild` in CI.
+- **M1 — Core and project. Done** ("M1 as built" below). `crates/uemulator-apple`, `hack/apple/build-core.sh`, the xcframework, the Xcode project with a SwiftUI shell, and `NativeEngine` booting the Alpine demo to a shell on macOS (JIT) and iOS (interpreted) in a SwiftTerm view. Exit: ⌘R on both, and `xcodebuild` in CI.
 - **M2 — WebKitEngine.** The headless shim, the bridge (winning transport from M0), disk reads through the loopback server, console and keyboard. Exit: the same Alpine demo on iOS through `WebKitEngine`, with the JIT on.
 - **M3 — Screen and input.** Damaged-rect frames on both engines, virtio keyboard and tablet, cursor. Exit: a live ISO's desktop (the KDE ISO from `20-jit-perf.md`) is usable on an iPad with a keyboard and trackpad.
 - **M4 — Machines and persistence.** `MachineStore` on the CLI's format, `host_disk_write` (or flushed overlays), NVRAM and TPM state, presets and validation shared with the web page in Rust. Exit: install Alpine to a disk on iOS, quit the app, boot the installed disk.
 - **M5 — Network.** The Swift Wisp relay, the in-app segment between machines. Exit: `apk update` in the demo on iOS through `WebKitEngine` (the check `hack/wasm/wisp.mjs` does under Node).
 - **Later:** visionOS (WebKit engine, tier-3 Rust for native), tvOS (native interpreter only: tvOS has no WebKit), guest 3D (`25-gpu-3d.md`) through Metal instead of WebGL2, App Store review notes (the app downloads and runs operating systems the user picks: the same position as UTM SE, which ships interpreted only).
+
+## M1 as built (2026-11-14)
+
+- `crates/uemulator-apple`: a staticlib on Apple targets (an empty rlib elsewhere, so the workspace still builds on Linux), with the C ABI in `include/uemulator.h` and a module map that makes it the Swift module `UemulatorCore`. M1's surface is the console only: `ua_create` (kernel, initrd, optional UEFI firmware image, command-line tail, memory, vCPUs, the web build's `OPTION_*` bits), `ua_start`, `ua_input`, `ua_resize`, `ua_stop`, `ua_destroy`, and two callbacks, console output on the vCPU thread and the exit reason on a runner thread. `UA_OPTION_JIT` builds the machine with `JitMode::On` and, on `JitUnavailable`, again with `JitMode::Off`, so `ua_jit_active` tells the app which it got. No library change was needed: on iOS `mmap` of RWX memory fails and the probe falls back.
+- `apple/Uemulator.xcodeproj`: one multiplatform SwiftUI target (`SDKROOT = auto`, macOS 14 and iOS 17), committed as a hand-written `project.pbxproj` (no generator). Build phases: `hack/apple/build-core.sh --xcode` (cargo for each of Xcode's `ARCHS` on its `PLATFORM_NAME`, lipo'd into `BUILT_PRODUCTS_DIR`, plus the firmware), the Swift sources, and `hack/apple/bundle-app.sh` (the firmware image and the demo's kernel and initramfs from `WEB_DEMO=1 hack/web.sh`). Cargo runs with a scrubbed environment: Xcode's `SDKROOT` and friends break the host build scripts. `hack/apple/build-core.sh xcframework` makes `target/apple/UemulatorCore.xcframework` (macOS universal, iOS, iOS simulator) for embedding elsewhere; the project itself links the per-build archive.
+- SwiftTerm (1.99.3, pinned in `Package.resolved`) is the terminal. It runs a build-tool plugin: Xcode asks once to trust it, and command-line builds need `-skipPackagePluginValidation`.
+- macOS: hardened runtime and App Sandbox with `com.apple.security.cs.allow-jit`, signed to run locally. The demo boots through the UEFI firmware to its shell prompt in under two seconds on the JIT. iOS simulator: the same app, interpreted, reaches the shell (the simulator refuses RWX memory like a device does).
+- The chip says `JIT` or `interpreted`, from `ua_jit_active`. Not yet: `UemulatorKit` as its own package (the engine is in `apple/App` for now), a machine list, settings, disks, the screen.
+
+Build and run from the command line:
+
+    WEB_DEMO=1 hack/web.sh
+    xcodebuild -project apple/Uemulator.xcodeproj -scheme Uemulator -destination 'platform=macOS' -skipPackagePluginValidation build
+    xcodebuild -project apple/Uemulator.xcodeproj -scheme Uemulator -destination 'generic/platform=iOS Simulator' -skipPackagePluginValidation build
+
+`-autostart` boots the demo at launch.
 
 ## M0 results (2026-11-14)
 

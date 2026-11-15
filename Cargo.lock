@@ -564,6 +564,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "uemulator-apple"
+version = "0.1.0"
+dependencies = [
+ "uemulator",
+]
+
+[[package]]
 name = "uemulator-cli"
 version = "0.1.0"
 dependencies = [

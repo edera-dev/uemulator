@@ -1,0 +1,310 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		B1000000000000000000B001 /* UemulatorApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000F001 /* UemulatorApp.swift */; };
+		B1000000000000000000B002 /* NativeEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000F002 /* NativeEngine.swift */; };
+		B1000000000000000000B003 /* TerminalPane.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000F003 /* TerminalPane.swift */; };
+		B1000000000000000000B004 /* SwiftTerm in Frameworks */ = {isa = PBXBuildFile; productRef = B1000000000000000000S002 /* SwiftTerm */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		B1000000000000000000F001 /* UemulatorApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UemulatorApp.swift; sourceTree = "<group>"; };
+		B1000000000000000000F002 /* NativeEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeEngine.swift; sourceTree = "<group>"; };
+		B1000000000000000000F003 /* TerminalPane.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalPane.swift; sourceTree = "<group>"; };
+		B1000000000000000000F004 /* Uemulator-macOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "Uemulator-macOS.entitlements"; sourceTree = "<group>"; };
+		B1000000000000000000F005 /* Uemulator.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Uemulator.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		B1000000000000000000F006 /* uemulator.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = uemulator.h; path = "../crates/uemulator-apple/include/uemulator.h"; sourceTree = SOURCE_ROOT; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		B1000000000000000000P003 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B1000000000000000000B004 /* SwiftTerm in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		B1000000000000000000G001 = {
+			isa = PBXGroup;
+			children = (
+				B1000000000000000000G002 /* App */,
+				B1000000000000000000G004 /* Core */,
+				B1000000000000000000G003 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		B1000000000000000000G002 /* App */ = {
+			isa = PBXGroup;
+			children = (
+				B1000000000000000000F001 /* UemulatorApp.swift */,
+				B1000000000000000000F002 /* NativeEngine.swift */,
+				B1000000000000000000F003 /* TerminalPane.swift */,
+				B1000000000000000000F004 /* Uemulator-macOS.entitlements */,
+			);
+			path = App;
+			sourceTree = "<group>";
+		};
+		B1000000000000000000G003 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				B1000000000000000000F005 /* Uemulator.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		B1000000000000000000G004 /* Core */ = {
+			isa = PBXGroup;
+			children = (
+				B1000000000000000000F006 /* uemulator.h */,
+			);
+			name = Core;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		B1000000000000000000T001 /* Uemulator */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = B1000000000000000000L002 /* Build configuration list for PBXNativeTarget "Uemulator" */;
+			buildPhases = (
+				B1000000000000000000P004 /* Build the Rust core */,
+				B1000000000000000000P001 /* Sources */,
+				B1000000000000000000P003 /* Frameworks */,
+				B1000000000000000000P002 /* Bundle firmware and demo */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = Uemulator;
+			packageProductDependencies = (
+				B1000000000000000000S002 /* SwiftTerm */,
+			);
+			productName = Uemulator;
+			productReference = B1000000000000000000F005 /* Uemulator.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		B1000000000000000000R001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 2700;
+				LastUpgradeCheck = 2700;
+			};
+			buildConfigurationList = B1000000000000000000L001 /* Build configuration list for PBXProject "Uemulator" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = B1000000000000000000G001;
+			packageReferences = (
+				B1000000000000000000S001 /* XCRemoteSwiftPackageReference "SwiftTerm" */,
+			);
+			productRefGroup = B1000000000000000000G003 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				B1000000000000000000T001 /* Uemulator */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		B1000000000000000000P004 /* Build the Rust core */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+			);
+			name = "Build the Rust core";
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "exec \"$SRCROOT/../hack/apple/build-core.sh\" --xcode\n";
+		};
+		B1000000000000000000P002 /* Bundle firmware and demo */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+			);
+			name = "Bundle firmware and demo";
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "exec \"$SRCROOT/../hack/apple/bundle-app.sh\" \"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		B1000000000000000000P001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B1000000000000000000B001 /* UemulatorApp.swift in Sources */,
+				B1000000000000000000B002 /* NativeEngine.swift in Sources */,
+				B1000000000000000000B003 /* TerminalPane.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		B1000000000000000000C001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = auto;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_TREAT_WARNINGS_AS_ERRORS = YES;
+			};
+			name = Debug;
+		};
+		B1000000000000000000C002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				SDKROOT = auto;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_TREAT_WARNINGS_AS_ERRORS = YES;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		B1000000000000000000C003 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = "";
+				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = "App/Uemulator-macOS.entitlements";
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "-";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				"ENABLE_HARDENED_RUNTIME[sdk=macosx*]" = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = uemulator;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
+				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphone*]" = YES;
+				"INFOPLIST_KEY_UILaunchScreen_Generation[sdk=iphone*]" = YES;
+				"INFOPLIST_KEY_UISupportedInterfaceOrientations[sdk=iphone*]" = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				LIBRARY_SEARCH_PATHS = "$(BUILT_PRODUCTS_DIR)";
+				MARKETING_VERSION = 0.1;
+				OTHER_LDFLAGS = "-luemulator_apple";
+				PRODUCT_BUNDLE_IDENTIFIER = dev.edera.uemulator;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_INCLUDE_PATHS = "$(SRCROOT)/../crates/uemulator-apple/include";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		B1000000000000000000C004 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = "";
+				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = "App/Uemulator-macOS.entitlements";
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "-";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				"ENABLE_HARDENED_RUNTIME[sdk=macosx*]" = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = uemulator;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
+				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphone*]" = YES;
+				"INFOPLIST_KEY_UILaunchScreen_Generation[sdk=iphone*]" = YES;
+				"INFOPLIST_KEY_UISupportedInterfaceOrientations[sdk=iphone*]" = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				LIBRARY_SEARCH_PATHS = "$(BUILT_PRODUCTS_DIR)";
+				MARKETING_VERSION = 0.1;
+				OTHER_LDFLAGS = "-luemulator_apple";
+				PRODUCT_BUNDLE_IDENTIFIER = dev.edera.uemulator;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_INCLUDE_PATHS = "$(SRCROOT)/../crates/uemulator-apple/include";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		B1000000000000000000L001 /* Build configuration list for PBXProject "Uemulator" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B1000000000000000000C001 /* Debug */,
+				B1000000000000000000C002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		B1000000000000000000L002 /* Build configuration list for PBXNativeTarget "Uemulator" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B1000000000000000000C003 /* Debug */,
+				B1000000000000000000C004 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		B1000000000000000000S001 /* XCRemoteSwiftPackageReference "SwiftTerm" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/migueldeicaza/SwiftTerm";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.2.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		B1000000000000000000S002 /* SwiftTerm */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = B1000000000000000000S001 /* XCRemoteSwiftPackageReference "SwiftTerm" */;
+			productName = SwiftTerm;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = B1000000000000000000R001 /* Project object */;
+}
