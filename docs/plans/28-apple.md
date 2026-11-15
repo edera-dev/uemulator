@@ -1,6 +1,6 @@
 # Apple platforms: a SwiftUI app
 
-**Status:** proposal. M0, the spike that decides whether the WebKit engine is worth building, is done ("M0 results" below: it is, served from loopback HTTP rather than a scheme handler). M1 to M5 are built: `apple/Uemulator.xcodeproj` boots the Alpine demo on the native engine (JIT on macOS, interpreted on iOS) and on the WebKit engine (the web build's wasm JIT in a hidden web view, on both), with a screen, keyboard and pointer, from the demo or an ISO, as named machines whose disks keep what the guest wrote, with the internet through the app on both engines.
+**Status:** proposal. M0, the spike that decides whether the WebKit engine is worth building, is done ("M0 results" below: it is, served from loopback HTTP rather than a scheme handler). M1 to M5 are built: `apple/uemulator.xcodeproj` boots the Alpine demo on the native engine (JIT on macOS, interpreted on iOS) and on the WebKit engine (the web build's wasm JIT in a hidden web view, on both), with a screen, keyboard and pointer, from the demo or an ISO, as named machines whose disks keep what the guest wrote, with the internet through the app on both engines.
 
 A native app for macOS, iOS and iPadOS (visionOS later, tvOS only interpreted) that does what the web page does (`13-web.md`): pick or create a machine, boot it, show the terminal or the screen, type into it, network it. The UI is SwiftUI throughout. No web page is ever shown.
 
@@ -28,19 +28,22 @@ On iOS the user picks the engine per machine. The default is `WebKitEngine` when
 
 ```
 apple/
-  Uemulator.xcodeproj           committed; one multiplatform app target, plus UemulatorKitTests
-  App/                          SwiftUI: UemulatorApp, machine list, settings, run view
-  UemulatorKit/                 local Swift package, the engine layer (no UI)
-    Sources/UemulatorKit/       MachineEngine protocol, NativeEngine, WebKitEngine, MachineStore
-    Sources/UemulatorCore/      module map + header for the static library (binary target)
-  WebEngine/                    the headless shim: engine.html, engine.js (from worker.js), bridge.js
-  Entitlements/                 macOS (allow-jit, network client/server, user-selected files), iOS
-crates/uemulator-apple/         new crate: staticlib with a C ABI for NativeEngine
-hack/apple/build-core.sh        cargo builds -> UemulatorCore.xcframework; also runs hack/web.sh for the wasm
+  uemulator.xcodeproj           committed, hand-written; one multiplatform target and shared scheme, `uemulator`
+  App/                          SwiftUI and the engines: UemulatorApp, MachineStore, MachineView,
+                                MachineSettingsView, NativeEngine, WebKitEngine, Loopback, Wisp;
+                                uemulator.icon (the Icon Composer app icon) and the macOS entitlements
+  WebEngine/                    the WebKit engine's page: engine.html, engine.js (drives www/worker.js)
+  ci_scripts/ci_post_clone.sh   Xcode Cloud's setup: Rust, the web build, plugin trust ("Xcode Cloud")
+crates/uemulator-apple/         staticlib with a C ABI for NativeEngine
+hack/apple/build-core.sh        cargo for the build phase, or every slice into UemulatorCore.xcframework
+hack/apple/bundle-app.sh        copies the firmware, the web build and the Alpine demo into the app
+assets/uemulator-logo.svg       the logo the app icon is drawn from
 ```
 
+The layout planned before M1 had a separate `UemulatorKit` package and test target; the engines stayed in `App/` instead.
+
 - `crates/uemulator-apple` mirrors `uemulator-web`'s C ABI on purpose: `ua_create(config) -> handle`, `ua_add_disk`, `ua_set_firmware`, `ua_start`, `ua_stop`, plus callbacks that match the web host imports one for one (`output`, `input`, `frame_ready`/`frame`, `cursor`, `input_events`, `net_recv`/`net_send`, `wisp_*`, `log`). With both engines on the same event vocabulary, `MachineEngine` is one Swift protocol and the UI never knows which engine it has. The header is handwritten (no cbindgen, keeping the crate's dependencies to the library's), and it is the only thing outside `lib.rs` that sees the library: it uses the public `EmulatedMachine` API like the CLI does, and `lib.rs` stays the entire public API.
-- The xcframework has slices for `aarch64-apple-darwin` + `x86_64-apple-darwin` (lipo'd), `aarch64-apple-ios`, `aarch64-apple-ios-sim`, and later `aarch64-apple-visionos[-sim]` / `aarch64-apple-tvos` (tier 3: `-Zbuild-std`). An Xcode "Run Script" build phase calls `hack/apple/build-core.sh` with `$PLATFORM_NAME` and `$CONFIGURATION`, so a plain ⌘B builds the Rust. CI builds it all with `xcodebuild -scheme Uemulator -destination generic/platform=iOS`.
+- The xcframework has slices for `aarch64-apple-darwin` + `x86_64-apple-darwin` (lipo'd), `aarch64-apple-ios`, `aarch64-apple-ios-sim`, and later `aarch64-apple-visionos[-sim]` / `aarch64-apple-tvos` (tier 3: `-Zbuild-std`). An Xcode "Run Script" build phase calls `hack/apple/build-core.sh` with `$PLATFORM_NAME` and `$CONFIGURATION`, so a plain ⌘B builds the Rust. Xcode Cloud builds it all through the shared scheme `uemulator` ("Xcode Cloud" below).
 - Bundled resources: `uemulator_web.wasm` and the shim (iOS/visionOS), `uemulator-firmware.bin` (both engines; the CLI embeds it through `build.rs`, and the app loads it as a resource instead), and the Secure Boot keys the firmware needs.
 - Warnings: `cargo clippy --release --target aarch64-apple-ios -p uemulator-apple` must print zero, like the other targets, and the Swift side builds with warnings as errors.
 
@@ -88,7 +91,7 @@ It follows the web page's structure (`13-web.md`, "The page") so the two stay re
 
 ## Milestones
 
-- **M0 — WebKit spike (decides the plan). Done; results below.** A throwaway iOS app (`apple/M0Spike`, run by `hack/apple/m0.sh`): hidden `WKWebView`, scheme handler and loopback HTTP with COOP/COEP, the existing `uemulator_web.wasm` and `worker.js`, console bytes to a `Text` view. It answers, on a real iPhone and on the simulator: `crossOriginIsolated` on a custom scheme, whether the web view runs while hidden, tail calls and SIMD on JSC, sync XHR with a body from a worker to a scheme handler, the WebContent memory ceiling, and boot time to `Run /init` for the Alpine demo with the JIT, with `--no-jit` in the same web view, and on `NativeEngine` interpreted. Exit: those numbers written into this file. If `WebKitEngine` doesn't beat the native interpreter by a clear margin, it is dropped, and iOS ships interpreted.
+- **M0 — WebKit spike (decides the plan). Done; results below.** A throwaway iOS app (`apple/M0Spike`, run by `hack/apple/m0.sh`; both removed once M5 was built, and in git history up to 96267ae): hidden `WKWebView`, scheme handler and loopback HTTP with COOP/COEP, the existing `uemulator_web.wasm` and `worker.js`, console bytes to a `Text` view. It answers, on a real iPhone and on the simulator: `crossOriginIsolated` on a custom scheme, whether the web view runs while hidden, tail calls and SIMD on JSC, sync XHR with a body from a worker to a scheme handler, the WebContent memory ceiling, and boot time to `Run /init` for the Alpine demo with the JIT, with `--no-jit` in the same web view, and on `NativeEngine` interpreted. Exit: those numbers written into this file. If `WebKitEngine` doesn't beat the native interpreter by a clear margin, it is dropped, and iOS ships interpreted.
 - **M1 — Core and project. Done** ("M1 as built" below). `crates/uemulator-apple`, `hack/apple/build-core.sh`, the xcframework, the Xcode project with a SwiftUI shell, and `NativeEngine` booting the Alpine demo to a shell on macOS (JIT) and iOS (interpreted) in a SwiftTerm view. Exit: ⌘R on both, and `xcodebuild` in CI.
 - **M2 — WebKitEngine. Done** ("M2 as built" below). The headless shim, the bridge (winning transport from M0), disk reads through the loopback server, console and keyboard. Exit: the same Alpine demo on iOS through `WebKitEngine`, with the JIT on.
 - **M3 — Screen and input. Done** ("M3 as built" below): frames, keys and the pointer work on both engines, through firmware, GRUB and a GTK installer, and the Fedora KDE live ISO reaches its Plasma desktop in the Mac app (once the emulator's `pcmpestri` bug was fixed). The iPad keyboard-and-trackpad part of the exit is checked on the simulator only. Damaged-rect frames on both engines, virtio keyboard and tablet, cursor. Exit: a live ISO's desktop (the KDE ISO from `20-jit-perf.md`) is usable on an iPad with a keyboard and trackpad.
@@ -103,6 +106,10 @@ The machine menu of M3 and M4 is gone; what it held is in a settings sheet. Late
 - Library: a split view (a pushed list on a phone). Each row shows screen or terminal, a green dot while running, and memory, processors and what it boots; its context menu has Start/Stop and Delete. With nothing selected, the detail offers New Machine.
 - Machine: the toolbar has the state chip, the Terminal | Screen switch, Resize to Fit (screen only, while running), the iOS keyboard toggle, Settings and Start/Stop. Until a machine first starts after launch, the detail shows its summary with Settings and Start instead of a black terminal; why the last start failed shows there too.
 - Settings (`MachineSettingsView.swift`): an edited copy of the definition, saved on Done, applied at the next start. Memory (to 3 GiB on the WebKit engine), processors, display, network; the engine (fixed while running: the engine object is the running machine); the CD (insert, eject), "Boot From the Disks Instead" for a machine that boots the demo kernel, extra kernel command line; disks (Add Disk makes the next `disk-<n>.udisk`, Detach keeps the file); TPM and Secure Boot; Delete.
+
+## Xcode Cloud (2026-11-15)
+
+`apple/ci_scripts/ci_post_clone.sh` readies a fresh Xcode Cloud machine, which has Xcode and nothing else: rustup (stable, minimal) with every target `build-core.sh` can be asked for (both macOS architectures for an archive, iOS, both simulator architectures, the firmware's `x86_64-unknown-none`, the web build's `wasm32-unknown-unknown`), then `WEB_DEMO=1 hack/web.sh`, which downloads Alpine and Xen every build since nothing is cached between builds. It also sets the Xcode default that trusts package build plugins, since Xcode Cloud takes no `-skipPackagePluginValidation`. It touches that default only when `CI_PRIMARY_REPOSITORY_PATH` is set, so running it by hand changes nothing in the local Xcode. The workflow builds the shared scheme `uemulator`. Signing is Xcode Cloud's: the project has no `DEVELOPMENT_TEAM`, and macOS signs ad hoc (`CODE_SIGN_IDENTITY[sdk=macosx*] = "-"`) for local runs, which an archive for TestFlight or the App Store has to replace.
 
 ## Installing Alpine (2026-11-15)
 
@@ -160,7 +167,7 @@ M4's exit, on the iPhone simulator with the WebKit engine: `hack/apple/install-a
 ## M1 as built (2026-11-14)
 
 - `crates/uemulator-apple`: a staticlib on Apple targets (an empty rlib elsewhere, so the workspace still builds on Linux), with the C ABI in `include/uemulator.h` and a module map that makes it the Swift module `UemulatorCore`. M1's surface is the console only: `ua_create` (kernel, initrd, optional UEFI firmware image, command-line tail, memory, vCPUs, the web build's `OPTION_*` bits), `ua_start`, `ua_input`, `ua_resize`, `ua_stop`, `ua_destroy`, and two callbacks, console output on the vCPU thread and the exit reason on a runner thread. `UA_OPTION_JIT` builds the machine with `JitMode::On` and, on `JitUnavailable`, again with `JitMode::Off`, so `ua_jit_active` tells the app which it got. No library change was needed: on iOS `mmap` of RWX memory fails and the probe falls back.
-- `apple/Uemulator.xcodeproj`: one multiplatform SwiftUI target (`SDKROOT = auto`, macOS 14 and iOS 17), committed as a hand-written `project.pbxproj` (no generator). Build phases: `hack/apple/build-core.sh --xcode` (cargo for each of Xcode's `ARCHS` on its `PLATFORM_NAME`, lipo'd into `BUILT_PRODUCTS_DIR`, plus the firmware), the Swift sources, and `hack/apple/bundle-app.sh` (the firmware image and the demo's kernel and initramfs from `WEB_DEMO=1 hack/web.sh`). Cargo runs with a scrubbed environment: Xcode's `SDKROOT` and friends break the host build scripts. `hack/apple/build-core.sh xcframework` makes `target/apple/UemulatorCore.xcframework` (macOS universal, iOS, iOS simulator) for embedding elsewhere; the project itself links the per-build archive.
+- `apple/uemulator.xcodeproj` (`apple/Uemulator.xcodeproj` until 2026-11-15): one multiplatform SwiftUI target (`SDKROOT = auto`, macOS 14 and iOS 17), committed as a hand-written `project.pbxproj` (no generator). Build phases: `hack/apple/build-core.sh --xcode` (cargo for each of Xcode's `ARCHS` on its `PLATFORM_NAME`, lipo'd into `BUILT_PRODUCTS_DIR`, plus the firmware), the Swift sources, and `hack/apple/bundle-app.sh` (the firmware image and the demo's kernel and initramfs from `WEB_DEMO=1 hack/web.sh`). Cargo runs with a scrubbed environment: Xcode's `SDKROOT` and friends break the host build scripts. `hack/apple/build-core.sh xcframework` makes `target/apple/UemulatorCore.xcframework` (macOS universal, iOS, iOS simulator) for embedding elsewhere; the project itself links the per-build archive.
 - SwiftTerm (1.99.3, pinned in `Package.resolved`) is the terminal. It runs a build-tool plugin: Xcode asks once to trust it, and command-line builds need `-skipPackagePluginValidation`.
 - macOS: hardened runtime and App Sandbox with `com.apple.security.cs.allow-jit`, signed to run locally. The demo boots through the UEFI firmware to its shell prompt in under two seconds on the JIT. iOS simulator: the same app, interpreted, reaches the shell (the simulator refuses RWX memory like a device does).
 - The chip says `JIT` or `interpreted`, from `ua_jit_active`. Not yet: `UemulatorKit` as its own package (the engine is in `apple/App` for now), a machine list, settings, disks, the screen.
@@ -168,14 +175,14 @@ M4's exit, on the iPhone simulator with the WebKit engine: `hack/apple/install-a
 Build and run from the command line:
 
     WEB_DEMO=1 hack/web.sh
-    xcodebuild -project apple/Uemulator.xcodeproj -scheme Uemulator -destination 'platform=macOS' -skipPackagePluginValidation build
-    xcodebuild -project apple/Uemulator.xcodeproj -scheme Uemulator -destination 'generic/platform=iOS Simulator' -skipPackagePluginValidation build
+    xcodebuild -project apple/uemulator.xcodeproj -scheme uemulator -destination 'platform=macOS' -skipPackagePluginValidation build
+    xcodebuild -project apple/uemulator.xcodeproj -scheme uemulator -destination 'generic/platform=iOS Simulator' -skipPackagePluginValidation build
 
 `-autostart` boots the demo at launch.
 
 ## M0 results (2026-11-14)
 
-`WEB_DEMO=1 hack/web.sh`, then `hack/apple/m0.sh`: it builds `apple/M0Spike`, runs it on the booted simulator with `-autorun` and prints the probe and boot results. The boot is the Alpine demo (`hack/web/demo.py`), direct (`--firmware none`), 256 MiB, one vCPU, `earlycon=uart8250,io,0x3f8` appended, timed from the boot message to the worker until the console shows the text. The WKWebView rows are four runs of the JIT and two interpreted; a first JIT run at 17.3 s is left out: a stale launch of an earlier build was still booting in the same simulator. iPhone 17 Pro simulator (iOS 27.0 runtime; WebKit's user agent says 18_7), Xcode 27.2, an Apple Silicon Mac; every row ran on that same Mac, one at a time.
+`WEB_DEMO=1 hack/web.sh`, then `hack/apple/m0.sh` (removed since; see M0 above): it built `apple/M0Spike`, ran it on the booted simulator with `-autorun` and printed the probe and boot results. The boot is the Alpine demo (`hack/web/demo.py`), direct (`--firmware none`), 256 MiB, one vCPU, `earlycon=uart8250,io,0x3f8` appended, timed from the boot message to the worker until the console shows the text. The WKWebView rows are four runs of the JIT and two interpreted; a first JIT run at 17.3 s is left out: a stale launch of an earlier build was still booting in the same simulator. iPhone 17 Pro simulator (iOS 27.0 runtime; WebKit's user agent says 18_7), Xcode 27.2, an Apple Silicon Mac; every row ran on that same Mac, one at a time.
 
 | engine | `Run /init` | demo shell |
 |---|---|---|

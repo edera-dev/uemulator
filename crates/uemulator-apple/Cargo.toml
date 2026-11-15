@@ -4,7 +4,7 @@ description = "uemulator as a static library with a C ABI, for the SwiftUI app o
 version.workspace = true
 edition.workspace = true
 
-# A staticlib on Apple targets, linked into the app by apple/Uemulator.xcodeproj through
+# A staticlib on Apple targets, linked into the app by apple/uemulator.xcodeproj through
 # hack/apple/build-core.sh. On other hosts it is an empty rlib, so `cargo test --workspace` and
 # clippy on Linux build it without producing an archive nobody links.
 [lib]
