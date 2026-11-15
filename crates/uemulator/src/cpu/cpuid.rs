@@ -7,7 +7,7 @@
 //! raw leaves and refuses to run guests that depend on leaves it cannot make sense of. So the
 //! leaves a Zen 5 has are all present and consistent with one another (cache geometry and
 //! topology agree with each other and with the configured CPU count), and the ones it does not
-//! (Intel-only leaf 4, the hypervisor range, IBS, SEV) read as zero. There is one CPU model: the
+//! (Intel-only leaf 4, the hypervisor range, SEV) read as zero. There is one CPU model: the
 //! EPYC 9004 "Genoa" (family 19h model 11h) it replaced is described in
 //! `docs/plans/21-ryzen-7000-parity.md`.
 //!
@@ -442,6 +442,8 @@ const EXT_FEATURE_PREFETCHW: u32 = 1 << 8;
 const EXT_FEATURE_EXTAPIC: u32 = 1 << 3;
 /// OS visible workarounds: MSRs 0xC001_0140/0141, which describe no errata (`model_msr.rs`).
 const EXT_FEATURE_OSVW: u32 = 1 << 9;
+/// Instruction-based sampling, with leaf 0x8000_001B (`ibs.rs`).
+const EXT_FEATURE_IBS: u32 = 1 << 10;
 /// Translation cache extension: EFER.TCE (bit 15) is accepted. It lets `invlpg` keep upper-level
 /// paging-structure entries; the soft TLB caches none, so it flushes at least as much either way.
 const EXT_FEATURE_TCE: u32 = 1 << 17;
@@ -985,6 +987,7 @@ impl Cpu {
                 rdt::cpuid(leaf, subleaf)
             }
             LEAF_EXT_MAX => (MAX_EXTENDED_LEAF, VENDOR_EBX, VENDOR_ECX, VENDOR_EDX),
+            super::pmu::ibs::LEAF_IBS => (super::pmu::ibs::IBS_CAPABILITIES, 0, 0, 0),
             LEAF_EXT_FEATURES => (
                 SIGNATURE,
                 0,
@@ -998,6 +1001,7 @@ impl Cpu {
                     | EXT_FEATURE_PREFETCHW
                     | EXT_FEATURE_EXTAPIC
                     | EXT_FEATURE_OSVW
+                    | EXT_FEATURE_IBS
                     | EXT_FEATURE_TCE
                     | EXT_FEATURE_TOPOEXT
                     | EXT_FEATURE_PERFCTR_CORE

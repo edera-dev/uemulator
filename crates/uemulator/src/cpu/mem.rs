@@ -919,6 +919,24 @@ impl Cpu {
 
     /// Reads `size` bytes (at most 8, all inside one page) at a physical address: RAM, else
     /// MMIO, else all ones for unmapped space.
+    /// The RAM physical address the soft TLB holds for `linear` as an access of `kind` from the
+    /// current privilege level, without walking (so without side effects or faults): `None` when
+    /// it holds none, which includes every MMIO page. For instruction-based sampling, which asks
+    /// right after the access that filled the entry.
+    pub(super) fn cached_physical(&self, linear: u64, kind: AccessKind) -> Option<u64> {
+        let entry = &self.tlb[tlb_slot(linear, self.cpl == USER_CPL)];
+        let tag = match kind {
+            AccessKind::Read => entry.tag_r,
+            AccessKind::Write => entry.tag_w,
+            AccessKind::Exec => entry.tag_x,
+        };
+        (tag == linear & !PAGE_OFFSET_MASK).then(|| {
+            linear
+                .wrapping_add(entry.addend)
+                .wrapping_sub(self.ram_base)
+        })
+    }
+
     pub(super) fn phys_read(&mut self, pa: u64, size: u8) -> u64 {
         let pa = if pa & super::svm::AVIC_MMIO_WINDOW != 0 {
             self.avic_window_address(pa)

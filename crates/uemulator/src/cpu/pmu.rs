@@ -31,6 +31,9 @@ use super::decode::Insn;
 use super::exception::Exception;
 use super::*;
 
+#[path = "ibs.rs"]
+pub(crate) mod ibs;
+
 /// Core counters with PERFCTR_CORE (leaf 0x8000_0022 EBX reports the same number).
 pub(crate) const CORE_COUNTERS: usize = 6;
 /// The legacy counters at 0xC001_0000, which alias core counters 0-3.
@@ -264,6 +267,8 @@ pub(crate) struct Pmu {
     lbr: [(u64, u64); LBR_ENTRIES],
     northbridge: [(u64, u64); NORTHBRIDGE_COUNTERS],
     l3: [(u64, u64); L3_COUNTERS],
+    /// Instruction-based sampling (`ibs.rs`).
+    pub(crate) ibs: ibs::Ibs,
 }
 
 impl Pmu {
@@ -291,6 +296,7 @@ impl Pmu {
             lbr: [(0, 0); LBR_ENTRIES],
             northbridge: [(0, 0); NORTHBRIDGE_COUNTERS],
             l3: [(0, 0); L3_COUNTERS],
+            ibs: ibs::Ibs::new(),
         }
     }
 
@@ -306,7 +312,7 @@ impl Pmu {
                 | MSR_F15H_NB_PERF_CTL0..=MSR_NB_PERF_LAST
                 | MSR_F16H_L2I_PERF_CTL0..=MSR_L3_PERF_LAST
                 | MSR_IRPERF
-        )
+        ) || ibs::Ibs::owns(msr)
     }
 
     fn enabled(&self, index: usize) -> bool {
@@ -479,6 +485,10 @@ impl Cpu {
                 nearest_overflow = nearest_overflow.min(remaining.div_ceil(CYCLES_PER_ICOUNT));
             }
         }
+        // IBS: interpret around its next tag, and let the JIT run up to the stretch before it.
+        let (interpret, runway) = self.ibs_schedule(self.pmu.synced.instructions);
+        precise |= interpret;
+        nearest_overflow = nearest_overflow.min(runway);
         self.pmu.counting = counting;
         self.pmu.mode_sensitive = mode_sensitive;
         self.pmu.precise = precise;
@@ -531,6 +541,7 @@ impl Cpu {
 
     pub(crate) fn pmu_rdmsr(&mut self, msr: u32) -> ExecResult<u64> {
         Ok(match msr {
+            _ if ibs::Ibs::owns(msr) => return self.ibs_rdmsr(msr),
             MSR_K7_EVNTSEL0..MSR_K7_PERFCTR0 => {
                 self.pmu.event_select[(msr - MSR_K7_EVNTSEL0) as usize]
             }
@@ -580,6 +591,7 @@ impl Cpu {
     pub(crate) fn pmu_wrmsr(&mut self, msr: u32, value: u64) -> ExecResult<()> {
         let gp = || Err(Exception::general_protection(0));
         match msr {
+            _ if ibs::Ibs::owns(msr) => return self.ibs_wrmsr(msr, value),
             MSR_K7_EVNTSEL0..MSR_K7_PERFCTR0 => {
                 return self.pmu_write_select((msr - MSR_K7_EVNTSEL0) as usize, value);
             }
@@ -684,11 +696,28 @@ impl Cpu {
         }
     }
 
-    /// Runs `insn` in precise mode, counting it if it is a branch and recording it in the branch
-    /// stack if taken. A branch that always transfers is counted before it runs and taken back if
-    /// it faults, so one that changes CPL (syscall, iret) is counted in the mode it started in,
-    /// like the instruction itself.
+    /// Runs `insn` in precise mode: `exec_counting_branches`, and IBS's sample if this is the
+    /// instruction it tagged. A tagged op's memory accesses are watched (`watch_access`) for the
+    /// sample's data address.
     pub(crate) fn exec_observed(&mut self, insn: &Insn) -> ExecResult<()> {
+        let tagged = self.ibs_before();
+        if tagged == (false, false) {
+            return self.exec_counting_branches(insn);
+        }
+        let from = self.rip;
+        let watching = self.debug.watch_accesses;
+        self.debug.watch_accesses = true;
+        let result = self.exec_counting_branches(insn);
+        self.debug.watch_accesses = watching;
+        self.ibs_after(tagged, insn, from, &result);
+        result
+    }
+
+    /// Runs `insn`, counting it if it is a branch and recording it in the branch stack if
+    /// taken. A branch that always transfers is counted before it runs and taken back if it
+    /// faults, so one that changes CPL (syscall, iret) is counted in the mode it started in,
+    /// like the instruction itself.
+    fn exec_counting_branches(&mut self, insn: &Insn) -> ExecResult<()> {
         let from = self.rip;
         let source_cpl = self.cpl;
         let kind = BranchKind::of(insn);

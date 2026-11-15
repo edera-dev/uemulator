@@ -288,12 +288,13 @@ fn extended_leaf_1_ecx_has_the_zen_5_features_that_are_implemented() {
     let mut h = blank();
     let [_, ebx, ecx, _] = cpuid(&mut h, 0x8000_0001, 0);
     assert_eq!(ebx, 0);
-    // LAHF_LM SVM EXTAPIC CR8_LEGACY ABM SSE4A MISALIGNSSE 3DNOWPREFETCH OSVW TCE TOPOEXT
+    // LAHF_LM SVM EXTAPIC CR8_LEGACY ABM SSE4A MISALIGNSSE 3DNOWPREFETCH OSVW IBS TCE TOPOEXT
     // PERFCTR_CORE PERFCTR_NB BPEXT PERFCTR_LLC MWAITX ADDR_MASK_EXT
-    let expected = bits(&[0, 2, 3, 4, 5, 6, 7, 8, 9, 17, 22, 23, 24, 26, 28, 29, 30]);
+    let expected = bits(&[
+        0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 17, 22, 23, 24, 26, 28, 29, 30,
+    ]);
     assert_eq!(ecx, expected, "{ecx:#034b}");
     for (bit, name) in [
-        (10, "IBS"),
         (11, "XOP"),
         (12, "SKINIT"),
         (13, "WDT"),
@@ -610,7 +611,6 @@ fn leaves_past_the_last_extended_leaf_and_the_unused_ones_are_zero() {
     for leaf in [
         0x8000_0009,
         0x8000_000b,
-        0x8000_001b,
         0x8000_001c,
         0x8000_001f,
         0x8000_0023,

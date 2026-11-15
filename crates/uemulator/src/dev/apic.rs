@@ -57,8 +57,9 @@ const REG_SELF_IPI: u32 = 0x3f0;
 /// does not claim, and reads as zero.
 const REG_EXTENDED_FEATURE: u32 = 0x400;
 const REG_EXTENDED_CONTROL: u32 = 0x410;
-/// The four extended LVT entries, in both modes: stored, reset masked, never delivered (nothing
-/// raises them; the PMU overflow goes through the ordinary LVT performance entry). They must read
+/// The four extended LVT entries, in both modes: stored and reset masked. Only IBS raises one
+/// (`extended_interrupt`, at the offset IBS_CTL reports; the PMU overflow goes through the
+/// ordinary LVT performance entry, and nothing raises the MCA threshold ones). They must read
 /// masked: Linux's `setup_APIC_eilvt` takes an unmasked entry with another vector as firmware's
 /// and refuses it with a "[Firmware Bug]" line, and it programs offsets 1 and 2 for the
 /// machine-check threshold and deferred-error interrupts as soon as CPUID has SUCCOR.
@@ -521,6 +522,12 @@ impl Lapic {
     /// not set the entry's mask bit when it does (Linux's PerfMonV2 handler never unmasks it).
     pub fn performance_interrupt(&mut self) -> Delivered {
         self.lvt_deliver(self.lvt_performance)
+    }
+
+    /// Extended LVT entry `index` fires (IBS took a sample). Like the performance entry it stays
+    /// unmasked; Linux programs IBS's as an NMI.
+    pub fn extended_interrupt(&mut self, index: usize) -> Delivered {
+        self.lvt_deliver(self.extended_lvt[index])
     }
 
     fn timer_mode(&self) -> u32 {

@@ -191,6 +191,10 @@ impl Cpu {
     /// Called for every data access of `size` bytes at `linear` while `watch_accesses` is on.
     #[cold]
     pub(crate) fn watch_access(&mut self, linear: u64, size: u64, write: bool) {
+        // Instruction-based sampling watches the accesses of the instruction it tagged.
+        if let Some(capture) = self.pmu.ibs.capture.as_mut() {
+            capture.note(linear, size, write);
+        }
         if (linear % CACHE_LINE_BYTES) + size > CACHE_LINE_BYTES {
             self.debug.split_access = true;
         }
