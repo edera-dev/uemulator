@@ -96,13 +96,21 @@ It follows the web page's structure (`13-web.md`, "The page") so the two stay re
 - **M5 — Network. Done** ("M5 as built" below; the in-app segment between machines is not). The Swift Wisp relay, the in-app segment between machines. Exit: `apk update` in the demo on iOS through `WebKitEngine` (the check `hack/wasm/wisp.mjs` does under Node).
 - **Later:** visionOS (WebKit engine, tier-3 Rust for native), tvOS (native interpreter only: tvOS has no WebKit), guest 3D (`25-gpu-3d.md`) through Metal instead of WebGL2, App Store review notes (the app downloads and runs operating systems the user picks: the same position as UTM SE, which ships interpreted only).
 
+## The UI as it is (2026-11-15)
+
+The machine menu of M3 and M4 is gone; what it held is in a settings sheet. Later sections describe it as it was then.
+
+- Library: a split view (a pushed list on a phone). Each row shows screen or terminal, a green dot while running, and memory, processors and what it boots; its context menu has Start/Stop and Delete. With nothing selected, the detail offers New Machine.
+- Machine: the toolbar has the state chip, the Terminal | Screen switch, Resize to Fit (screen only, while running), the iOS keyboard toggle, Settings and Start/Stop. Until a machine first starts after launch, the detail shows its summary with Settings and Start instead of a black terminal; why the last start failed shows there too.
+- Settings (`MachineSettingsView.swift`): an edited copy of the definition, saved on Done, applied at the next start. Memory (to 3 GiB on the WebKit engine), processors, display, network; the engine (fixed while running: the engine object is the running machine); the CD (insert, eject), "Boot From the Disks Instead" for a machine that boots the demo kernel, extra kernel command line; disks (Add Disk makes the next `disk-<n>.udisk`, Detach keeps the file); TPM and Secure Boot; Delete.
+
 ## Installing Alpine (2026-11-15)
 
 M4's exit, on the iPhone simulator with the WebKit engine: `hack/apple/install-alpine.sh` (comments say why each step is the way it is), typed into the shell of a demo machine with a 1 GiB disk, 1 GiB of RAM and the network.
 
 - The demo kernel loads almost no modules, so the script mounts nothing: `sfdisk` makes a GPT with a 64 MiB EFI system partition; `apk --root /staging` installs `alpine-base`, `linux-virt` and `mkinitfs` in RAM; `mkinitfs -b` makes the installed kernel's initramfs; `mkfs.ext4 -d /staging` builds the root partition from the directory; `grub-mkstandalone` makes a GRUB with its `grub.cfg` inside, which `mtools` puts at `\EFI\BOOT\BOOTX64.EFI`, the path the firmware boots when NVRAM names nothing (so the WebKit engine's missing NVRAM does not matter).
 - 3 min 25 s for the whole install, packages over Wisp and about 87 MB of udisk written through the bridge.
-- Then `poweroff -f` (the worker exits and closes the disk), "Boot From Disk (Remove Kernel)" in the machine menu (new: a machine made from the demo boots its kernel first, since the firmware always tries a given kernel before the disks), the app terminated, and the machine started again: the firmware found GRUB, GRUB booted Linux 6.18.63 (the installed kernel, not the demo's 6.18.58) with root on `/dev/vda2`, OpenRC came up and `root` logged in on `ttyS0` 43 s after the start.
+- Then `poweroff -f` (the worker exits and closes the disk), "Boot From Disk (Remove Kernel)" in the machine menu (now "Boot From the Disks Instead" in Settings) (new: a machine made from the demo boots its kernel first, since the firmware always tries a given kernel before the disks), the app terminated, and the machine started again: the firmware found GRUB, GRUB booted Linux 6.18.63 (the installed kernel, not the demo's 6.18.58) with root on `/dev/vda2`, OpenRC came up and `root` logged in on `ttyS0` 43 s after the start.
 - The installed system is minimal: no OpenRC boot services were enabled (its hostname shows as `(none)`, though `/etc/hostname` was written), and nothing configures its network. `setup-alpine` from the installed system does the rest.
 
 ## M5 as built (2026-11-15)

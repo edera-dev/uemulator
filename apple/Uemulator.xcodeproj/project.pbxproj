@@ -19,6 +19,7 @@
 		B1000000000000000000B00A /* MachineStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000F00C /* MachineStore.swift */; };
 		B1000000000000000000B00B /* MachineView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000F00D /* MachineView.swift */; };
 		B1000000000000000000B00C /* Wisp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000F00E /* Wisp.swift */; };
+		B1000000000000000000B00D /* MachineSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000F00F /* MachineSettingsView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -36,6 +37,7 @@
 		B1000000000000000000F00C /* MachineStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MachineStore.swift; sourceTree = "<group>"; };
 		B1000000000000000000F00D /* MachineView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MachineView.swift; sourceTree = "<group>"; };
 		B1000000000000000000F00E /* Wisp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Wisp.swift; sourceTree = "<group>"; };
+		B1000000000000000000F00F /* MachineSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MachineSettingsView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -66,6 +68,7 @@
 				B1000000000000000000F002 /* NativeEngine.swift */,
 				B1000000000000000000F003 /* TerminalPane.swift */,
 				B1000000000000000000F00E /* Wisp.swift */,
+				B1000000000000000000F00F /* MachineSettingsView.swift */,
 				B1000000000000000000F00D /* MachineView.swift */,
 				B1000000000000000000F00C /* MachineStore.swift */,
 				B1000000000000000000F00B /* ScreenView.swift */,
@@ -190,6 +193,7 @@
 				B1000000000000000000B002 /* NativeEngine.swift in Sources */,
 				B1000000000000000000B003 /* TerminalPane.swift in Sources */,
 				B1000000000000000000B00C /* Wisp.swift in Sources */,
+				B1000000000000000000B00D /* MachineSettingsView.swift in Sources */,
 				B1000000000000000000B00B /* MachineView.swift in Sources */,
 				B1000000000000000000B00A /* MachineStore.swift in Sources */,
 				B1000000000000000000B009 /* ScreenView.swift in Sources */,

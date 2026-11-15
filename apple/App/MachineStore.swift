@@ -202,15 +202,7 @@ final class MachineStore: ObservableObject {
         do {
             var definition = MachineDefinition(memoryMib: memoryMib, display: display)
             definition.network = network
-            if diskMib > 0 {
-                // The CLI's name for a machine's first disk.
-                let disk = folder.appendingPathComponent("disk-0.udisk")
-                var error = [CChar](repeating: 0, count: Self.errorCapacity)
-                guard ua_disk_create(disk.path, diskMib, &error, error.count) == 0 else {
-                    throw MachineStoreError.failed(String(cString: error))
-                }
-                definition.disks = [DiskImage(url: disk, readOnly: false)]
-            }
+            if diskMib > 0 { definition.disks = [try createDisk(name, sizeMib: diskMib)] }
             switch source {
             case .demo:
                 let resources = Bundle.main.resourceURL!.appendingPathComponent("demo")
@@ -228,6 +220,21 @@ final class MachineStore: ObservableObject {
             throw error
         }
         reload()
+    }
+
+    static let mibPerGib: UInt64 = 1024
+
+    // The CLI's name for a machine's next disk: the first `disk-<n>.udisk` not taken.
+    func createDisk(_ name: String, sizeMib: UInt64) throws -> DiskImage {
+        let folder = directory(name)
+        var number = 0
+        while FileManager.default.fileExists(atPath: folder.appendingPathComponent("disk-\(number).udisk").path) { number += 1 }
+        let disk = folder.appendingPathComponent("disk-\(number).udisk")
+        var error = [CChar](repeating: 0, count: Self.errorCapacity)
+        guard ua_disk_create(disk.path, sizeMib, &error, error.count) == 0 else {
+            throw MachineStoreError.failed(String(cString: error))
+        }
+        return DiskImage(url: disk, readOnly: false)
     }
 
     func removeKernel(_ name: String) throws {

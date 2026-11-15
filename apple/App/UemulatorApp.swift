@@ -6,7 +6,13 @@ struct UemulatorApp: App {
     var body: some Scene {
         WindowGroup {
             LibraryView()
+                #if os(macOS)
+                .frame(minWidth: 720, minHeight: 480)
+                #endif
         }
+        #if os(macOS)
+        .defaultSize(width: 1200, height: 800)
+        #endif
     }
 }
 
@@ -25,6 +31,7 @@ struct LibraryView: View {
     @State private var selection: String?
     @State private var creating = false
     @State private var problem: String?
+    @State private var deleting: String?
     // The machine a first launch gets, so the app opens on something that boots.
     private static let firstMachine = "alpine-demo"
 
@@ -32,8 +39,23 @@ struct LibraryView: View {
         NavigationSplitView {
             List(store.names, id: \.self, selection: $selection) { name in
                 MachineRow(model: store.model(name))
+                    .contextMenu {
+                        let model = store.model(name)
+                        if model.isRunning {
+                            Button("Stop", systemImage: "stop.fill") { model.stop() }
+                        } else {
+                            Button("Start", systemImage: "play.fill") {
+                                selection = name
+                                model.start()
+                            }
+                        }
+                        Divider()
+                        Button("Delete…", systemImage: "trash", role: .destructive) { deleting = name }
+                            .disabled(model.isRunning)
+                    }
             }
             .navigationTitle("Machines")
+            .navigationSplitViewColumnWidth(min: 200, ideal: 240)
             .toolbar {
                 ToolbarItem {
                     Button("New Machine", systemImage: "plus") { creating = true }
@@ -44,7 +66,13 @@ struct LibraryView: View {
                 MachineView(model: store.model(selection)) { delete(selection) }
                     .id(selection)
             } else {
-                ContentUnavailableView("No Machine", systemImage: "cpu", description: Text("Pick a machine or make one."))
+                ContentUnavailableView {
+                    Label("No Machine", systemImage: "cpu")
+                } description: {
+                    Text("Pick a machine, or make one from a CD image or the Alpine demo.")
+                } actions: {
+                    Button("New Machine…") { creating = true }
+                }
             }
         }
         .sheet(isPresented: $creating) {
@@ -52,6 +80,14 @@ struct LibraryView: View {
                 creating = false
                 selection = name
             }
+        }
+        .confirmationDialog("Delete \(deleting ?? "")?", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
+                            titleVisibility: .visible) {
+            Button("Delete Machine and Its Disks", role: .destructive) {
+                if let deleting { delete(deleting) }
+            }
+        } message: {
+            Text("Its disks and NVRAM are deleted. A CD image it used stays where it is.")
         }
         .alert("Machines", isPresented: Binding(get: { problem != nil }, set: { if !$0 { problem = nil } })) {
             Button("OK", role: .cancel) {}
@@ -104,18 +140,29 @@ struct MachineRow: View {
 
     var body: some View {
         Label {
-            VStack(alignment: .leading) {
-                Text(model.name)
-                Text(summary).font(.caption).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(model.name).lineLimit(1)
+                Text(summary).font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
         } icon: {
-            Image(systemName: model.isRunning ? "play.circle.fill" : "cpu")
-                .foregroundStyle(model.isRunning ? .green : .secondary)
+            Image(systemName: model.definition.display.hasScreen ? "display" : "terminal")
+                .foregroundStyle(.secondary)
+                .overlay(alignment: .bottomTrailing) {
+                    if model.isRunning {
+                        Circle().fill(.green).frame(width: 7, height: 7).offset(x: 3, y: 3)
+                    }
+                }
         }
+        .padding(.vertical, 2)
     }
 
-    private var summary: String {
-        var parts = ["\(model.definition.memoryMib) MiB"]
+    private var summary: String { Self.summary(model) }
+
+    // What the machine is, in a line: memory, processors, what it boots.
+    static func summary(_ model: MachineModel) -> String {
+        let memory = model.definition.memoryMib
+        var parts = [memory >= 1024 && memory % 1024 == 0 ? "\(memory / 1024) GiB" : "\(memory) MiB"]
+        if model.definition.cpus > 1 { parts.append("\(model.definition.cpus) CPUs") }
         if let cd = model.cdromName { parts.append(cd) }
         if model.definition.bootsKernel { parts.append("kernel") }
         if !model.definition.disks.isEmpty { parts.append("\(model.definition.disks.count) disk\(model.definition.disks.count == 1 ? "" : "s")") }
@@ -153,8 +200,6 @@ struct NewMachineSheet: View {
 
     private static let memoryChoices = [256, 512, 1024, 2048, 3072, 4096]
     private static let diskChoices = [0, 1, 4, 8, 16, 32, 64]
-    private static let mibPerGib: UInt64 = 1024
-
     var body: some View {
         NavigationStack {
             Form {
@@ -170,7 +215,7 @@ struct NewMachineSheet: View {
                     Button(cdrom?.lastPathComponent ?? "Choose CD Image…") { choosingISO = true }
                 }
                 Picker("Memory", selection: $memoryMib) {
-                    ForEach(Self.memoryChoices, id: \.self) { Text("\($0) MiB").tag($0) }
+                    ForEach(Self.memoryChoices, id: \.self) { Text($0 >= 1024 ? "\($0 / 1024) GiB" : "\($0) MiB").tag($0) }
                 }
                 Picker("Disk", selection: $diskGib) {
                     ForEach(Self.diskChoices, id: \.self) { Text($0 == 0 ? "None" : "\($0) GiB").tag($0) }
@@ -218,7 +263,7 @@ struct NewMachineSheet: View {
                 defer { if scoped { cdrom.stopAccessingSecurityScopedResource() } }
                 machineSource = .cdrom(.bookmark(try MachineStore.bookmark(for: cdrom)))
             }
-            try store.create(name, source: machineSource, diskMib: UInt64(diskGib) * Self.mibPerGib,
+            try store.create(name, source: machineSource, diskMib: UInt64(diskGib) * MachineStore.mibPerGib,
                              memoryMib: memoryMib, display: display, network: network)
             onCreated(name)
         } catch {

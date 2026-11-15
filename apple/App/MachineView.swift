@@ -23,6 +23,9 @@ final class MachineModel: ObservableObject, ScreenInput {
         didSet { if view != oldValue { releaseAll() } }
     }
     @Published var problem: String?
+    // Whether this machine has run since the app started: until then the view shows how to start it
+    // rather than an empty terminal.
+    @Published private(set) var hasStarted = false
 
     let terminal = TerminalSession()
     let screen = ScreenSurface()
@@ -99,63 +102,40 @@ final class MachineModel: ObservableObject, ScreenInput {
         definition.cdrom.flatMap(MachineStore.resolve)?.lastPathComponent
     }
 
-    private func update(_ change: (inout MachineDefinition) -> Void) {
-        var changed = definition
-        change(&changed)
+    // The settings sheet's edits. The engine only changes while stopped: the engine object is the
+    // running machine.
+    func save(_ draft: MachineDefinition, engine newEngine: EngineKind) {
+        var changed = draft
+        if !isRunning { changed.engine = newEngine }
         do {
+            // A machine made from the demo boots its kernel first, since the firmware always tries
+            // a kernel it is given before the disks (docs/plans/19-uefi-firmware.md); booting the
+            // disks means dropping it.
+            if definition.bootsKernel && !changed.bootsKernel { try store.removeKernel(name) }
             try store.save(changed, as: name)
-            definition = changed
+            let displayChanged = changed.display != definition.display
+            definition = try store.load(name)
+            if displayChanged { view = definition.display == .screen ? .screen : .terminal }
         } catch {
             problem = error.localizedDescription
         }
     }
 
-    func select(_ newKind: EngineKind) {
-        guard newKind != kind else { return }
-        engine.stop()
-        update { $0.engine = newKind }
-        state = .stopped("")
+    // A new sparse disk in the machine's folder, for the settings sheet to attach.
+    func createDisk(sizeGib: Int) -> DiskImage? {
+        do {
+            return try store.createDisk(name, sizeMib: UInt64(sizeGib) * MachineStore.mibPerGib)
+        } catch {
+            problem = error.localizedDescription
+            return nil
+        }
     }
 
-    func setNetwork(_ on: Bool) {
-        guard on != definition.network else { return }
-        update { $0.network = on }
-    }
-
-    func select(_ newDisplay: DisplayChoice) {
-        guard newDisplay != definition.display else { return }
-        update { $0.display = newDisplay }
-        view = newDisplay == .screen ? .screen : .terminal
-    }
-
-    func insertCD(_ url: URL) {
+    // A picked CD image kept as a security-scoped bookmark, so the machine finds it next launch.
+    static func cdrom(for url: URL) -> CDROM? {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-        do {
-            let bookmark = try MachineStore.bookmark(for: url)
-            update {
-                $0.cdrom = .bookmark(bookmark)
-                if $0.memoryMib < Self.cdromMemoryMib { $0.memoryMib = Self.cdromMemoryMib }
-            }
-        } catch {
-            problem = error.localizedDescription
-        }
-    }
-
-    // After an install: the next start boots the disk.
-    func ejectCD() {
-        update { $0.cdrom = nil }
-    }
-
-    // After an install from a kernel-booted machine (the demo): the firmware boots the disk next,
-    // since a kernel given to the firmware is always tried first (docs/plans/19-uefi-firmware.md).
-    func removeKernel() {
-        do {
-            try store.removeKernel(name)
-            definition = try store.load(name)
-        } catch {
-            problem = error.localizedDescription
-        }
+        return (try? MachineStore.bookmark(for: url)).map(CDROM.bookmark)
     }
 
     // Asks the guest for a screen the size of the view, in pixels.
@@ -212,6 +192,7 @@ final class MachineModel: ObservableObject, ScreenInput {
             return
         }
         terminal.reset()
+        hasStarted = true
         engine.start(settings)
     }
 
@@ -262,9 +243,8 @@ struct MachineView: View {
     @ObservedObject var model: MachineModel
     let onDelete: () -> Void
     @State private var viewSize = CGSize.zero
-    @State private var choosingISO = false
     @State private var softwareKeyboard = false
-    @State private var confirmingDelete = false
+    @State private var editingSettings = false
     @Environment(\.displayScale) private var displayScale
 
     private var screenPane: ScreenPane {
@@ -287,6 +267,9 @@ struct MachineView: View {
                         .opacity(model.view == .screen ? 1 : 0)
                         .allowsHitTesting(model.view == .screen)
                 }
+                if !model.hasStarted && !model.isRunning {
+                    StoppedPlaceholder(model: model) { editingSettings = true }
+                }
             }
             .onAppear { viewSize = geometry.size }
             .onChange(of: geometry.size) { viewSize = geometry.size }
@@ -302,13 +285,8 @@ struct MachineView: View {
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
         #endif
-        .fileImporter(isPresented: $choosingISO, allowedContentTypes: [UTType(filenameExtension: "iso") ?? .data, .data]) { result in
-            if case .success(let url) = result { model.insertCD(url) }
-        }
-        .confirmationDialog("Delete \(model.name)?", isPresented: $confirmingDelete, titleVisibility: .visible) {
-            Button("Delete Machine and Its Disks", role: .destructive, action: onDelete)
-        } message: {
-            Text("Its disks and NVRAM are deleted. A CD image it used stays where it is.")
+        .sheet(isPresented: $editingSettings) {
+            MachineSettingsView(model: model, onDelete: onDelete)
         }
         .alert("Machine", isPresented: Binding(get: { model.problem != nil }, set: { if !$0 { model.problem = nil } })) {
             Button("OK", role: .cancel) {}
@@ -320,63 +298,74 @@ struct MachineView: View {
             ToolbarItem(placement: Self.statusPlacement) {
                 StateChip(state: model.state, startedAt: model.startedAt).labelStyle(.titleAndIcon)
             }
-            #if os(iOS)
-            if model.definition.display.hasScreen && model.view == .screen {
-                ToolbarItem(placement: Self.statusPlacement) {
-                    Toggle(isOn: $softwareKeyboard) { Image(systemName: "keyboard") }
-                        .toggleStyle(.button)
-                }
-            }
-            #endif
             if model.definition.display.hasScreen {
                 ToolbarItem(placement: Self.statusPlacement) {
                     Picker("View", selection: $model.view) {
-                        Image(systemName: "terminal").tag(MachineModel.View.terminal)
-                        Image(systemName: "display").tag(MachineModel.View.screen)
+                        Label("Terminal", systemImage: "terminal").tag(MachineModel.View.terminal)
+                        Label("Screen", systemImage: "display").tag(MachineModel.View.screen)
                     }
                     .pickerStyle(.segmented)
+                    .labelStyle(.iconOnly)
+                    .help("Terminal or screen")
                 }
-            }
-            ToolbarItem {
-                Menu {
-                    if let cd = model.cdromName {
-                        Button("Eject \(cd)", systemImage: "eject") { model.ejectCD() }
+                if model.view == .screen {
+                    #if os(iOS)
+                    ToolbarItem(placement: Self.statusPlacement) {
+                        Toggle(isOn: $softwareKeyboard) { Label("Keyboard", systemImage: "keyboard") }
+                            .toggleStyle(.button)
                     }
-                    if model.definition.bootsKernel && !model.definition.disks.isEmpty {
-                        Button("Boot From Disk (Remove Kernel)", systemImage: "internaldrive") { model.removeKernel() }
-                            .disabled(model.isRunning)
-                    }
-                    Button("Insert CD Image…", systemImage: "opticaldisc") { choosingISO = true }
-                    Divider()
-                    Picker("Engine", selection: Binding(get: { model.kind }, set: { model.select($0) })) {
-                        ForEach(EngineKind.allCases) { Text($0.title).tag($0) }
-                    }
-                    Picker("Display", selection: Binding(get: { model.definition.display }, set: { model.select($0) })) {
-                        ForEach(DisplayChoice.allCases) { Text($0.title).tag($0) }
-                    }
-                    Toggle("Network", systemImage: "network",
-                           isOn: Binding(get: { model.definition.network }, set: { model.setNetwork($0) }))
-                    if model.definition.display.hasScreen {
-                        Button("Resize Guest to Fit", systemImage: "arrow.up.left.and.arrow.down.right") {
+                    #endif
+                    ToolbarItem(placement: Self.statusPlacement) {
+                        Button("Resize to Fit", systemImage: "arrow.up.left.and.arrow.down.right") {
                             model.fitScreen(to: viewSize, scale: displayScale)
                         }
                         .disabled(!model.isRunning)
+                        .help("Ask the guest for a screen the size of the window")
                     }
-                    Divider()
-                    Button("Delete Machine…", systemImage: "trash", role: .destructive) { confirmingDelete = true }
-                        .disabled(model.isRunning)
-                } label: {
-                    Label("Machine", systemImage: "cpu")
                 }
+            }
+            ToolbarItem {
+                Button("Settings", systemImage: "slider.horizontal.3") { editingSettings = true }
+                    .help("Memory, disks, CD, engine")
             }
             ToolbarItem {
                 if model.isRunning {
                     Button("Stop", systemImage: "stop.fill") { model.stop() }
+                        .help("Stop the machine")
                 } else {
                     Button("Start", systemImage: "play.fill") { model.start() }
+                        .help("Start the machine")
                 }
             }
         }
+    }
+}
+
+// What a machine shows before its first start since the app opened: what it boots and how to start
+// it, instead of an empty black terminal.
+struct StoppedPlaceholder: View {
+    @ObservedObject var model: MachineModel
+    let onSettings: () -> Void
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "cpu").font(.system(size: 48)).foregroundStyle(.secondary)
+            Text(model.name).font(.title2.bold())
+            Text(MachineRow.summary(model)).foregroundStyle(.secondary)
+            if case .stopped(let reason) = model.state, !reason.isEmpty {
+                Label(reason, systemImage: "exclamationmark.triangle").foregroundStyle(.orange)
+            }
+            HStack {
+                Button("Settings…", action: onSettings)
+                Button("Start", systemImage: "play.fill") { model.start() }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+            }
+            .controlSize(.large)
+        }
+        .padding(32)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(.background)
     }
 }
 
