@@ -311,6 +311,9 @@ final class MachineStore: ObservableObject {
                 }
             case .install(let distro):
                 definition.install = distro
+                // The installer talks on the terminal (the console stays there), and the screen is
+                // there for what the installed system draws. The demos stay terminal only.
+                definition.display = .both
                 definition.memoryMib = distro.memoryMib
                 definition.disks = [try createDisk(name, sizeMib: UInt64(Distro.easyDiskGib) * Self.mibPerGib)]
             case .custom(let memoryMib, let diskGib, let display, let network):

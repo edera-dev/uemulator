@@ -158,17 +158,24 @@ struct ScreenPane: NSViewRepresentable {
 #else
 import UIKit
 
-// The bar above the software keyboard: SwiftTerm's terminal accessory (esc, a sticky ctrl, tab, a
-// few symbols, F-keys, arrows, hide) for the screen, sending keys instead of terminal bytes. A key
-// goes down on touch and up on release, so a held arrow repeats through the guest's own repeat.
-final class ScreenKeyAccessory: UIInputView {
+// The bar above the software keyboard, for the screen and the terminal alike: esc, a sticky ctrl,
+// tab, a few symbols, F-keys, arrows, hide. It reports keys as HID usages; the screen sends them as
+// keys and `TerminalSession` turns them into terminal bytes. A key goes down on touch and up on
+// release, so a held arrow repeats through the guest's own repeat on the screen. The terminal uses
+// this instead of SwiftTerm's own bar because that bar's keyboard key swaps the system keyboard
+// for SwiftTerm's key grid rather than hiding it.
+final class KeyAccessory: UIInputView {
     var onKey: ((UInt16, Bool) -> Void)?
     var onCharacter: ((Character) -> Void)?
     var onHide: (() -> Void)?
     // Applies to the next key, typed or from this bar, then lets go.
     var controlLatched = false {
-        didSet { controlButton.isSelected = controlLatched }
+        didSet {
+            controlButton.isSelected = controlLatched
+            if controlLatched != oldValue { onControlLatched?(controlLatched) }
+        }
     }
+    var onControlLatched: ((Bool) -> Void)?
     private var controlButton: UIButton!
     private static let barHeight: CGFloat = 44
     private static let initialWidth: CGFloat = 320
@@ -282,7 +289,7 @@ final class ScreenKeyAccessory: UIInputView {
     }
 }
 
-extension ScreenKeyAccessory: UIInputViewAudioFeedback {
+extension KeyAccessory: UIInputViewAudioFeedback {
     var enableInputClicksWhenVisible: Bool { true }
 }
 
@@ -317,7 +324,7 @@ final class ScreenUIView: UIView, UIKeyInput {
     }
     private let noKeyboard = UIView(frame: .zero)
     override var inputView: UIView? { showsSoftwareKeyboard ? nil : noKeyboard }
-    private let accessory = ScreenKeyAccessory()
+    private let accessory = KeyAccessory()
     override var inputAccessoryView: UIView? { showsSoftwareKeyboard ? accessory : nil }
     // The accessory's hide key: the SwiftUI side owns whether the keyboard shows.
     var onHideKeyboard: (() -> Void)?
