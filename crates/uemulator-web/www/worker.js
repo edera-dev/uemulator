@@ -20,7 +20,8 @@ const IDLE_WAIT_MS = 1;
 let wasm;
 let control;
 // Disk sources by the number `uw_add_disk` was given: { url } or { file }, and `readOnly` or
-// `writeThrough` (a URL that takes the guest's writes: the Apple app's page, apple/WebEngine).
+// `writeThrough` (a URL that takes the guest's writes: the Apple app's page, apple/WebEngine), and
+// `retryUnreachable` (the app's loopback server, which comes back: `sendSync`).
 const diskSources = [];
 let ring;
 let events;
@@ -254,22 +255,61 @@ function diskMode(source) {
   return source.writeThrough && source.url ? DISK_MODE.WRITE_THROUGH : DISK_MODE.OVERLAY;
 }
 
+// How long a disk request to a `retryUnreachable` source keeps trying while the server cannot be
+// reached at all (status 0, or a network error thrown by `send`). The Apple app's loopback server
+// goes away when iOS reclaims a suspended app's sockets and comes back on the same port when the
+// app returns (apple/App/Loopback.swift); failing the request instead would hand the guest an I/O
+// error, which is what corrupts an install. An answer with a status, even an error, is never
+// retried, and the web page's URL disks are not: a blocked or dead URL fails at once.
+const DISK_RETRY_TOTAL_MS = 20000;
+const DISK_RETRY_FIRST_MS = 50;
+const DISK_RETRY_MAX_MS = 1000;
+// A worker may block: this is a sleep.
+const sleepCell = new Int32Array(new SharedArrayBuffer(4));
+
+function sendSync(open, body, retry) {
+  let waitedMs = 0;
+  let delayMs = DISK_RETRY_FIRST_MS;
+  for (;;) {
+    const xhr = open();
+    let failure = null;
+    try {
+      xhr.send(body);
+    } catch (error) {
+      failure = error;
+    }
+    if (!failure && xhr.status !== 0) return xhr;
+    if (!retry || waitedMs >= DISK_RETRY_TOTAL_MS) {
+      if (failure) throw failure;
+      return xhr;
+    }
+    Atomics.wait(sleepCell, 0, 0, delayMs);
+    waitedMs += delayMs;
+    delayMs = Math.min(delayMs * 2, DISK_RETRY_MAX_MS);
+  }
+}
+
 // A synchronous POST to a write-through source: `?offset=N` with the bytes, or `?flush=1`.
+// Retrying a write is safe: the same bytes land at the same offset.
 function postToDisk(source, query, body) {
-  const xhr = new XMLHttpRequest();
-  xhr.open("POST", `${source.url}?${query}`, false);
-  xhr.send(body);
+  const xhr = sendSync(() => {
+    const request = new XMLHttpRequest();
+    request.open("POST", `${source.url}?${query}`, false);
+    return request;
+  }, body, source.retryUnreachable);
   if (xhr.status !== 200) throw new Error(`${source.url}: ${query} answered with ${xhr.status}`);
 }
 
 // One synchronous range request. A 200 instead of 206 means the server ignored the range and
 // sent the whole image, which would make every read a full download; that is refused.
-function rangeRequest(url, first, last) {
-  const xhr = new XMLHttpRequest();
-  xhr.open("GET", url, false);
-  xhr.responseType = "arraybuffer";
-  xhr.setRequestHeader("Range", `bytes=${first}-${last}`);
-  xhr.send();
+function rangeRequest(url, first, last, retry) {
+  const xhr = sendSync(() => {
+    const request = new XMLHttpRequest();
+    request.open("GET", url, false);
+    request.responseType = "arraybuffer";
+    request.setRequestHeader("Range", `bytes=${first}-${last}`);
+    return request;
+  }, null, retry);
   if (xhr.status !== 206) {
     throw new Error(`${url}: range request answered with ${xhr.status}; the server must support range requests`);
   }
@@ -280,12 +320,12 @@ function readDiskSource(source, offset, len) {
   if (source.file) {
     return new Uint8Array(new FileReaderSync().readAsArrayBuffer(source.file.slice(offset, offset + len)));
   }
-  return new Uint8Array(rangeRequest(source.url, offset, offset + len - 1).response);
+  return new Uint8Array(rangeRequest(source.url, offset, offset + len - 1, source.retryUnreachable).response);
 }
 
 function diskLength(source) {
   if (source.file) return source.file.size;
-  const total = rangeRequest(source.url, 0, 0).getResponseHeader("Content-Range")?.split("/")[1];
+  const total = rangeRequest(source.url, 0, 0, source.retryUnreachable).getResponseHeader("Content-Range")?.split("/")[1];
   if (!total || total === "*") throw new Error(`${source.url}: no length in Content-Range`);
   return Number(total);
 }

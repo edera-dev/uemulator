@@ -266,17 +266,21 @@ final class WispSocketServer: LoopbackListener, @unchecked Sendable {
     init(token: String) {
         self.token = token
         super.init(label: "loopback-wisp")
+    }
+
+    override func makeParameters() -> NWParameters {
         let parameters = NWParameters.tcp
         let websocket = NWProtocolWebSocket.Options()
         websocket.autoReplyPing = true
         websocket.maximumMessageSize = Self.maxMessage
+        let token = token
         websocket.setClientRequestHandler(queue) { subprotocols, _ in
             subprotocols.contains(token)
                 ? NWProtocolWebSocket.Response(status: .accept, subprotocol: token)
                 : NWProtocolWebSocket.Response(status: .reject, subprotocol: nil)
         }
         parameters.defaultProtocolStack.applicationProtocols.insert(websocket, at: 0)
-        start(parameters)
+        return parameters
     }
 
     override func accept(_ connection: NWConnection) {

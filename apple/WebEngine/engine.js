@@ -7,7 +7,8 @@
 // The app serves this page at http://127.0.0.1:<port>/<token>/engine.html?socket=<port>&wisp=<port>&run=<n>.
 // The bridge, one WebSocket per run (WebKitEngine.swift reads and writes the same layout):
 //   page -> app, text first:  "<token> <run>" (the app drops a socket that does not say it)
-//   app -> page, text:        {"type": "boot", ...} once; then {"type": "resize", cols, rows},
+//   app -> page, text:        {"type": "boot", ...} once, or {"type": "reattached"} to a page
+//                             that reconnected (below); then {"type": "resize", cols, rows},
 //                             {"type": "stop"} and {"type": "frame-ack"} (the app drew the last
 //                             frame: the worker may send the next, protocol.js FRAME_ACK)
 //   app -> page, binary:      a kind byte, then
@@ -20,6 +21,14 @@
 //                             CURSOR: kind, width, height, hot x, hot y (u32 LE), BGRA pixels
 //   page -> app, text:        {"type": "started"}, {"type": "exit", code, message},
 //                             {"type": "log", text}
+//
+// The socket can drop under a running machine: iOS reclaims a suspended app's sockets, listening
+// ones included, and the app reopens its servers on the same ports when it comes back
+// (apple/App/Loopback.swift). So a closed socket is not the end of the run: the page connects
+// again with the same token and run and the worker keeps going (its disk requests wait for the
+// server, worker.js `sendSync`). Only after RECONNECT_ATTEMPTS without a word from the app does
+// the page give up, and then it stops the worker and lets it close its disks before ending it:
+// terminating it at once would lose the udisk map updates the guest has not flushed.
 import {
   CONTROL_BYTES, CTRL, EVENT_OFFSET, EVENT_RECORDS, EVENT_WORDS, FRAME_READY, RING_BYTES, RING_OFFSET,
   WISP_OFFSET, WISP_RING_BYTES,
@@ -35,10 +44,27 @@ const TO_PAGE = { KEYS: 1, EVENTS: 2 };
 const TO_APP = { OUTPUT: 1, FRAME: 2, CURSOR: 3 };
 const U32 = 4;
 
+// Timers do not run while the app and so this page are suspended, so this counts attempts made
+// while awake: about a minute of the app being back and not answering.
+const RECONNECT_ATTEMPTS = 60;
+const RECONNECT_DELAY_MS = 1000;
+// How long a stopped worker gets to close its disks once the app is gone (WebKitEngine's
+// drainTimeout).
+const STOP_DRAIN_MS = 5000;
+
 const token = location.pathname.split("/")[1];
 const params = new URLSearchParams(location.search);
-const socket = new WebSocket(`ws://127.0.0.1:${params.get("socket")}/`);
-socket.binaryType = "arraybuffer";
+let socket = null;
+// Attempts since the app last said anything; reset by any message from it.
+let unanswered = 0;
+let booted = false;
+let gaveUp = false;
+// Console output made while the socket is down, sent when the app takes the page back, so the
+// terminal does not miss what an installer printed meanwhile. Frames are not kept: the reattach
+// asks for the whole screen anyway.
+const MAX_HELD_OUTPUT = 1 << 20;
+let heldOutput = [];
+let heldBytes = 0;
 
 let control = null;
 let ring = null;
@@ -69,6 +95,8 @@ function sendBinary(kind, words, payloads) {
   socket.send(bytes);
 }
 
+// The worker's own exit, once it has said it (worker.onmessage).
+let workerExited = false;
 // main.js's sendKeys: drop what does not fit rather than block.
 function sendKeys(bytes) {
   if (!control) return;
@@ -150,7 +178,12 @@ async function boot(settings) {
   worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
   worker.onmessage = ({ data }) => {
     if (data.type === "output") {
-      sendBinary(TO_APP.OUTPUT, [], [data.bytes]);
+      if (socket.readyState === WebSocket.OPEN) {
+        sendBinary(TO_APP.OUTPUT, [], [data.bytes]);
+      } else if (heldBytes + data.bytes.byteLength <= MAX_HELD_OUTPUT) {
+        heldOutput.push(data.bytes);
+        heldBytes += data.bytes.byteLength;
+      }
     } else if (data.type === "frame") {
       const rectCount = data.rects.length / 4;
       sendBinary(TO_APP.FRAME, [data.screenWidth, data.screenHeight, rectCount], [data.rects, data.pixels]);
@@ -159,6 +192,7 @@ async function boot(settings) {
     } else if (data.type === "started") {
       sendText({ type: "started" });
     } else if (data.type === "exit") {
+      workerExited = true;
       sendText({ type: "exit", code: data.code, message: data.message });
     } else if (data.type === "log") {
       sendText({ type: "log", text: data.text });
@@ -192,15 +226,16 @@ async function boot(settings) {
     wisp: network ? { resolver: WISP_RESOLVER, port: WISP_RESOLVER_PORT } : null,
     // worker.js reads them with synchronous range requests, which the app's loopback server
     // answers; a writable disk writes through to the app's file with synchronous POSTs to the
-    // same URL.
+    // same URL. Requests wait for a server iOS took away to come back (worker.js `sendSync`).
     disks: (settings.disks ?? []).map((disk) => ({
       url: new URL(disk.url, location.href).href, readOnly: disk.readOnly, writeThrough: !disk.readOnly,
+      retryUnreachable: true,
     })),
   }, [kernel, initrd, firmwareImage, hypervisor].filter(Boolean));
 }
 
-socket.onopen = () => socket.send(`${token} ${params.get("run")}`);
-socket.onmessage = ({ data }) => {
+function onMessage({ data }) {
+  unanswered = 0;
   if (typeof data !== "string") {
     const bytes = new Uint8Array(data);
     if (bytes[0] === TO_PAGE.KEYS) {
@@ -213,7 +248,17 @@ socket.onmessage = ({ data }) => {
   }
   const message = JSON.parse(data);
   if (message.type === "boot") {
+    // A page that reconnected before the app saw its first socket may be sent the boot twice.
+    if (booted) return;
+    booted = true;
     boot(message).catch((error) => sendText({ type: "exit", code: -2, message: String(error.message ?? error) }));
+  } else if (message.type === "reattached") {
+    // The frame in flight when the socket dropped was lost and so was its acknowledgement: without
+    // this the worker never sends another. RESEND: the whole screen, not what changed since.
+    if (control) Atomics.store(control, CTRL.FRAME_ACK, FRAME_READY.RESEND);
+    for (const bytes of heldOutput) sendBinary(TO_APP.OUTPUT, [], [bytes]);
+    heldOutput = [];
+    heldBytes = 0;
   } else if (message.type === "resize") {
     resize(message.cols, message.rows);
   } else if (message.type === "stop") {
@@ -221,10 +266,40 @@ socket.onmessage = ({ data }) => {
   } else if (message.type === "frame-ack" && control) {
     Atomics.store(control, CTRL.FRAME_ACK, FRAME_READY.YES);
   }
-};
-// The app went away (or closed this run): nothing may keep running unseen.
-socket.onclose = () => {
+}
+
+// The app is gone for good, or will not take this run back: nothing may keep running unseen.
+function giveUp() {
+  if (gaveUp) return;
+  gaveUp = true;
   stop();
   wisp?.close();
-  worker?.terminate();
-};
+  if (!worker) return;
+  const started = Date.now();
+  const end = () => {
+    if (workerExited || Date.now() - started >= STOP_DRAIN_MS) {
+      worker.terminate();
+    } else {
+      setTimeout(end, RECONNECT_DELAY_MS / 10);
+    }
+  };
+  end();
+}
+
+function connect() {
+  const current = new WebSocket(`ws://127.0.0.1:${params.get("socket")}/`);
+  socket = current;
+  current.binaryType = "arraybuffer";
+  current.onopen = () => current.send(`${token} ${params.get("run")}`);
+  current.onmessage = onMessage;
+  current.onclose = () => {
+    unanswered += 1;
+    if (unanswered > RECONNECT_ATTEMPTS) {
+      giveUp();
+    } else {
+      setTimeout(connect, RECONNECT_DELAY_MS);
+    }
+  };
+}
+
+connect();

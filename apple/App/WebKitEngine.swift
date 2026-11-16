@@ -1,5 +1,8 @@
 import Foundation
 import WebKit
+#if os(iOS)
+import UIKit
+#endif
 
 // The web build in a hidden WKWebView (docs/plans/28-apple.md, "WebKitEngine"). On iOS the only
 // process allowed to JIT is WebKit's WebContent process, and the web build's JIT emits
@@ -10,6 +13,13 @@ import WebKit
 // the boot settings. Only the current run's socket is listened to, so a page that is still going
 // away cannot write into the next run's terminal. Stopping drops the socket and blanks the page,
 // which ends the worker with it.
+//
+// Backgrounding (iOS): the app gets a background task's grace period, the machine keeps running
+// through it, and then the app, the WebContent process and the worker are suspended together.
+// The run survives that as long as iOS keeps the WebContent process: sockets iOS takes away are
+// reopened on the same ports (LoopbackListener), the page reconnects (engine.js) and its disk
+// requests wait (worker.js `sendSync`). If iOS ends the WebContent process (memory), the machine is
+// gone; the guest's disks hold what it last flushed, as after a power cut.
 @MainActor
 final class WebKitEngine: NSObject, MachineEngine {
     var onOutput: (([UInt8]) -> Void)?
@@ -38,6 +48,20 @@ final class WebKitEngine: NSObject, MachineEngine {
     // How long a stopping worker gets to close its disks before the page is blanked anyway.
     private static let drainTimeout: TimeInterval = 5
     private var jit = true
+    // The terminal size last asked for: sent again to a page that reconnects.
+    private var size: (cols: Int, rows: Int)?
+    // The current run's page lost its socket and has this long, counted while the app is in the
+    // foreground, to come back (engine.js retries every second).
+    private var reconnectTimer: Timer?
+    private static let reconnectGrace: TimeInterval = 20
+    private var inBackground = false
+    // When the app last came back from the background: a WebContent process that ended in the
+    // background is often only reported as the app returns.
+    private var foregroundedAt: Date?
+    private static let backgroundBlame: TimeInterval = 10
+    #if os(iOS)
+    private var backgroundTask = UIBackgroundTaskIdentifier.invalid
+    #endif
     // Whether the wasm JIT's blocks may tail-call each other (`return_call_indirect` through the
     // chain stubs). JavaScriptCore on an iPad Pro (M2, iPadOS 27.2.1) compiles the stubs and then
     // crashes the WebContent process the first time a block chains, before the firmware prints;
@@ -98,6 +122,59 @@ final class WebKitEngine: NSObject, MachineEngine {
         webView.isInspectable = true
         #endif
         sockets.onSocket = { [weak self] socket in self?.attach(socket) }
+        #if os(iOS)
+        let center = NotificationCenter.default
+        center.addObserver(self, selector: #selector(didEnterBackground),
+                           name: UIApplication.didEnterBackgroundNotification, object: nil)
+        center.addObserver(self, selector: #selector(willEnterForeground),
+                           name: UIApplication.willEnterForegroundNotification, object: nil)
+        #endif
+    }
+
+    #if os(iOS)
+    // The machine runs on through the grace period iOS gives a background task (about 30
+    // seconds). When it runs out, the guest's writes so far are made durable and the app lets
+    // itself be suspended; stopping the machine instead would end an install just as surely.
+    @objc private func didEnterBackground() {
+        inBackground = true
+        reconnectTimer?.invalidate()
+        reconnectTimer = nil
+        guard active || draining != nil, backgroundTask == .invalid else { return }
+        backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "uemulator machine") { [weak self] in
+            MainActor.assumeIsolated { self?.endBackgroundTask() }
+        }
+    }
+
+    @objc private func willEnterForeground() {
+        inBackground = false
+        foregroundedAt = Date()
+        endBackgroundTask()
+        for listener in [http, sockets, wisp] as [LoopbackListener] { listener.revive() }
+        if active, pendingBoot == nil, socket == nil { awaitReconnect() }
+    }
+
+    private func endBackgroundTask() {
+        files.synchronizeWritable()
+        guard backgroundTask != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(backgroundTask)
+        backgroundTask = .invalid
+    }
+    #endif
+
+    // The page's socket is gone (BridgeSocket.onClose) or was never back after a suspension:
+    // give it `reconnectGrace` in the foreground before calling the machine lost.
+    private func awaitReconnect() {
+        reconnectTimer?.invalidate()
+        reconnectTimer = nil
+        guard !inBackground else { return }
+        let timer = Timer(timeInterval: Self.reconnectGrace, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.active, self.socket == nil else { return }
+                self.finish("Lost the engine page after the app was in the background")
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        reconnectTimer = timer
     }
 
     func start(_ settings: MachineSettings) {
@@ -173,6 +250,8 @@ final class WebKitEngine: NSObject, MachineEngine {
         guard active else { return }
         active = false
         pendingBoot = nil
+        reconnectTimer?.invalidate()
+        reconnectTimer = nil
         if let socket {
             socket.send(text: Self.json(["type": "stop"]))
             draining = socket
@@ -189,6 +268,10 @@ final class WebKitEngine: NSObject, MachineEngine {
     }
 
     private func finishDrain() {
+        #if os(iOS)
+        // Nothing left to protect in the background; the disks were synchronized just below.
+        defer { if !active { endBackgroundTask() } }
+        #endif
         drainTimer?.invalidate()
         drainTimer = nil
         draining?.close()
@@ -301,16 +384,42 @@ final class WebKitEngine: NSObject, MachineEngine {
 
     func resize(cols: Int, rows: Int) {
         guard cols > 0, rows > 0 else { return }
+        size = (cols, rows)
         socket?.send(text: Self.json(["type": "resize", "cols": cols, "rows": rows]))
     }
 
+    // A page's socket: the run's first, which gets the boot message, or one from a page that
+    // reconnected (engine.js) to its running or draining run, which carries on where it was.
     private func attach(_ socket: BridgeSocket) {
-        guard active, socket.run == run, let boot = pendingBoot else {
+        guard socket.run == run else {
             socket.close()
             return
         }
-        pendingBoot = nil
-        self.socket = socket
+        if active, let boot = pendingBoot {
+            pendingBoot = nil
+            listen(to: socket)
+            socket.send(text: boot)
+        } else if active {
+            self.socket?.close()
+            reconnectTimer?.invalidate()
+            reconnectTimer = nil
+            listen(to: socket)
+            socket.send(text: Self.json(["type": "reattached"]))
+            if let size { socket.send(text: Self.json(["type": "resize", "cols": size.cols, "rows": size.rows])) }
+            onLog?("the engine page reconnected")
+        } else if draining != nil {
+            // Its stop may have been lost with the old socket.
+            draining?.close()
+            draining = socket
+            listen(to: socket)
+            socket.send(text: Self.json(["type": "stop"]))
+        } else {
+            socket.close()
+        }
+    }
+
+    private func listen(to socket: BridgeSocket) {
+        if active { self.socket = socket }
         socket.onBinary = { [weak self, weak socket] data in
             guard let self, let socket, socket === self.socket else { return }
             self.receive(data)
@@ -325,7 +434,12 @@ final class WebKitEngine: NSObject, MachineEngine {
             guard socket === self.socket else { return }
             self.handle(text)
         }
-        socket.send(text: boot)
+        socket.onClose = { [weak self, weak socket] in
+            guard let self, let socket, socket === self.socket else { return }
+            self.socket = nil
+            self.onLog?("the engine page's socket closed; waiting for it to reconnect")
+            self.awaitReconnect()
+        }
     }
 
     private func handle(_ text: String) {
@@ -336,6 +450,9 @@ final class WebKitEngine: NSObject, MachineEngine {
         case "started":
             // One word for a phone's toolbar: "wasm" is the WebKit engine's JIT.
             onState?(.running(detail: jit ? "wasm" : "wasm interp"))
+            #if DEBUG
+            scheduleDebugDrop()
+            #endif
         case "exit":
             let code = message["code"] as? Int ?? -1
             let detail = message["message"] as? String ?? ""
@@ -355,11 +472,30 @@ final class WebKitEngine: NSObject, MachineEngine {
         guard active else { return }
         active = false
         pendingBoot = nil
+        reconnectTimer?.invalidate()
+        reconnectTimer = nil
         socket?.close()
         socket = nil
         finishDrain()
         onState?(.stopped(reason))
     }
+
+    #if DEBUG
+    // `-debug-drop-sockets SECONDS`: that long after the machine starts, every loopback listener
+    // fails and the bridge drops, as when iOS reclaims a suspended app's sockets. The simulator
+    // never does that by itself. The machine should carry on.
+    private func scheduleDebugDrop() {
+        let delay = UserDefaults.standard.double(forKey: "debug-drop-sockets")
+        guard delay > 0 else { return }
+        let run = run
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, self.active, self.run == run else { return }
+            self.onLog?("debug: dropping the loopback sockets")
+            for listener in [self.http, self.sockets, self.wisp] as [LoopbackListener] { listener.debugFail() }
+            self.socket?.debugDrop()
+        }
+    }
+    #endif
 
     private static func json(_ object: [String: Any]) -> String {
         guard let data = try? JSONSerialization.data(withJSONObject: object) else { return "{}" }
@@ -369,7 +505,15 @@ final class WebKitEngine: NSObject, MachineEngine {
 
 extension WebKitEngine: WKNavigationDelegate {
     nonisolated func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        Task { @MainActor in self.finish("WebKit's process ended (memory?)") }
+        Task { @MainActor in
+            // iOS reclaims a suspended app's WebContent process for memory, and says so only once
+            // the app runs again.
+            let inBackground = self.inBackground
+                || self.foregroundedAt.map { Date().timeIntervalSince($0) < Self.backgroundBlame } ?? false
+            self.finish(inBackground
+                ? "iOS ended the machine while the app was in the background"
+                : "WebKit's process ended (memory?)")
+        }
     }
 
     nonisolated func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!,
