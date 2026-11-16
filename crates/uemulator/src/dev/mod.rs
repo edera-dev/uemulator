@@ -1,5 +1,6 @@
 #[cfg(freestanding)]
 use crate::prelude::*;
+use crate::snapshot::Snapshot;
 pub(crate) mod acpi_pm;
 pub(crate) mod apic;
 pub(crate) mod bootfb;
@@ -157,6 +158,8 @@ pub(crate) const IOAPIC_REQUESTER: u16 = 0x00a0;
 pub(crate) const HPET_REQUESTER: u16 = 0x00a1;
 
 /// A device interrupt on its way to the LAPIC.
+#[derive(Snapshot)]
+#[snapshot(new)]
 enum Source {
     /// An I/O APIC redirection entry's message and the pin that sent it.
     IoApic { pin: usize, interrupt: Interrupt },
@@ -221,6 +224,7 @@ pub(crate) const PCI_MMIO_BYTES: u64 = pci::MAX_VIRTIO_FUNCTIONS as u64 * pci::B
 /// The whole device bus: legacy port-I/O devices plus the virtio-pci host. Port I/O goes
 /// through `io_in`/`io_out`, physical accesses above RAM through `mmio_read`/`mmio_write`.
 /// Devices raise IRQs directly on `pic`; the CPU polls `pic.has_pending()`.
+#[derive(Snapshot)]
 pub(crate) struct Devices {
     pub pic: Pics,
     pit: Pit,
@@ -238,6 +242,7 @@ pub(crate) struct Devices {
     lapics: Vec<Lapic>,
     /// The vCPU that is executing; the CPU-facing APIC accesses (MMIO window, MSRs, CR8,
     /// interrupt acknowledge) go to its APIC. Set by the scheduler on every switch.
+    #[snapshot(skip)]
     current_cpu: usize,
     /// Where the previous lowest-priority interrupt went, so equal priorities take turns.
     lowest_priority_cursor: usize,
@@ -257,13 +262,16 @@ pub(crate) struct Devices {
     now_ns: u64,
     /// Position of the virtio console that shares the UART's console handle, if any: the UART
     /// stops taking host input once that console's driver is up.
+    #[snapshot(skip)]
     uart_peer_console: Option<usize>,
     /// Set by the reset ports (i8042, 0x92, 0xCF9); the CPU turns it into `ExitReason::Reset`.
     pub reset_requested: bool,
     /// The vCPU threads' shared state while the machine runs one thread per vCPU: what the device
     /// model tells them at every release of the device lock.
+    #[snapshot(skip)]
     links: Option<Arc<crate::cpu::vcpus::VcpuLinks>>,
     /// Scanned on every tick while the guest's GPU driver does not own the screen.
+    #[snapshot(skip)]
     boot_framebuffer: Option<BootFramebuffer>,
 }
 
@@ -396,6 +404,32 @@ impl Devices {
     /// PIC, PIT) is dropped on purpose: a reboot must not leak state from the previous run.
     pub fn into_disks(self) -> Vec<Disk> {
         self.pci.into_disks()
+    }
+
+    pub fn flush_storage(&mut self) -> Result<(), String> {
+        self.pci.flush_storage()
+    }
+
+    pub fn snapshot_blocker(&self) -> Option<&'static str> {
+        self.pci.snapshot_blocker()
+    }
+
+    pub fn restored(&mut self) {
+        self.pci.restored();
+    }
+
+    /// The devices a snapshot must have been taken with (`machine/suspend.rs` compares them):
+    /// restoring loads state into the devices a new machine built, so a different set would
+    /// misread everything.
+    pub fn snapshot_shape(&self) -> String {
+        format!(
+            "lapics={} {} kv={} tpm={} display={}",
+            self.lapics.len(),
+            self.pci.snapshot_shape(),
+            self.kv.is_some(),
+            self.tpm.is_some(),
+            self.boot_framebuffer.is_some(),
+        )
     }
 
     /// Whether host input is still on its way to the 16550, for the BIOS keyboard.

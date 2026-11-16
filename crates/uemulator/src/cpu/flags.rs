@@ -1,3 +1,4 @@
+use crate::snapshot::Snapshot;
 pub(crate) const CF: u64 = 1;
 pub(crate) const PF: u64 = 1 << 2;
 pub(crate) const AF: u64 = 1 << 4;
@@ -31,7 +32,7 @@ pub(crate) const ARITH: u64 = CF | PF | AF | ZF | SF | OF;
 /// The JIT writes the discriminant with a 16-bit store together with `Cpu::lazy_size`, so it
 /// must stay `repr(u8)`, and the variants it emits (Add, Sub, Logic, Inc, Dec, SzpCfOf) must not
 /// be renumbered without checking `jit/emit*.rs`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Snapshot)]
 #[repr(u8)]
 pub(crate) enum LazyFlagsOp {
     #[default]

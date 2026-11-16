@@ -15,6 +15,7 @@ use super::Cpu;
 use super::exception::VECTOR_MACHINE_CHECK;
 use super::sys::CR4_MCE;
 use crate::machine::ExitReason;
+use crate::snapshot::Snapshot;
 
 pub(crate) const MSR_MCG_CAP: u32 = 0x179;
 pub(crate) const MSR_MCG_STATUS: u32 = 0x17a;
@@ -192,7 +193,7 @@ pub(crate) struct WriteContext {
     pub status_writable: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Snapshot)]
 pub(crate) struct Mca {
     global_status: u64,
     global_control: u64,

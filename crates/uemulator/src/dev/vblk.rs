@@ -3,6 +3,7 @@ use super::virtio::{Chain, DEVICE_TYPE_BLOCK, Queue, VirtioDev};
 use crate::disk::Disk;
 #[cfg(freestanding)]
 use crate::prelude::*;
+use crate::snapshot::Snapshot;
 
 /// virtio-blk addresses the disk in 512-byte units regardless of `BLK_SIZE`.
 const SECTOR_SIZE: u64 = 512;
@@ -46,11 +47,14 @@ const SEG_MAX: u32 = 126;
 /// A larger request is answered with IOERR; QEMU likewise fails what it cannot map.
 const MAX_REQUEST_BYTES: usize = 16 << 20;
 
+#[derive(Snapshot)]
 pub(crate) struct VirtioBlk {
+    #[snapshot(skip)]
     disk: Disk,
     id: [u8; ID_BYTES],
     /// Data of the request being served, kept between requests: a fresh zeroed buffer per
     /// request cost as much host time as the read or write it carried.
+    #[snapshot(skip)]
     scratch: Vec<u8>,
 }
 
@@ -178,6 +182,13 @@ impl VirtioDev for VirtioBlk {
 
     fn into_disk(self: Box<Self>) -> Option<Disk> {
         Some(self.disk)
+    }
+
+    fn flush_storage(&mut self) -> Result<(), String> {
+        self.disk
+            .backend
+            .flush()
+            .map_err(|error| format!("flushing a disk: {error}"))
     }
 
     #[cfg(not(freestanding))]

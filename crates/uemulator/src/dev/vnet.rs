@@ -3,6 +3,7 @@ use super::virtio::{Chain, DEVICE_TYPE_NET, Queue, VirtioDev};
 use crate::netdev::{HostFrame, NetHandle};
 #[cfg(freestanding)]
 use crate::prelude::*;
+use crate::snapshot::Snapshot;
 
 /// Feature bits (virtio 1.x section 5.1.3). The offloads come in the pairs the spec ties
 /// together: each TSO bit requires its CSUM bit, and the guest's TSO is offered with merged
@@ -193,8 +194,10 @@ fn ones_complement_sum(sum: u16, data: &[u8]) -> u16 {
     acc as u16
 }
 
+#[derive(Snapshot)]
 pub(crate) struct VirtioNet {
     mac: [u8; 6],
+    #[snapshot(skip)]
     net: NetHandle,
     /// What the driver accepted; zero until FEATURES_OK and after a reset.
     negotiated: u64,

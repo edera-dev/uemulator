@@ -9,6 +9,7 @@
 //! Real hardware shares the allocation MSRs between the threads of one L3; here each vCPU has
 //! its own copy. Linux writes them on one CPU of each L3 domain and never reads them back, so the
 //! difference does not show.
+use crate::snapshot::Snapshot;
 
 const MSR_QM_EVTSEL: u32 = 0xc8d;
 const MSR_QM_CTR: u32 = 0xc8e;
@@ -88,7 +89,7 @@ pub(crate) fn cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Snapshot)]
 pub(crate) struct Rdt {
     association: u64,
     event_select: u64,

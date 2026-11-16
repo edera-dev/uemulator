@@ -10,6 +10,7 @@
 //! against `MAX_RESOURCE_BYTES` in total, rectangles against their resource, backing entries
 //! against RAM. A bad request gets an error response, never a panic.
 
+use crate::snapshot::Snapshot;
 use alloc::collections::BTreeMap;
 
 use super::guestmem::GuestMem;
@@ -139,11 +140,15 @@ fn channel_offsets(format: u32) -> Option<[usize; 3]> {
 }
 
 /// A guest page range a resource's pixels are copied from.
+#[derive(Snapshot)]
+#[snapshot(new)]
 struct BackingEntry {
     address: u64,
     length: u64,
 }
 
+#[derive(Snapshot)]
+#[snapshot(new)]
 struct Resource {
     format: u32,
     width: u32,
@@ -252,13 +257,16 @@ fn convert_row(source: &[u8], target: &mut [u8], channels: [usize; 3]) {
 }
 
 /// What scanout 0 shows: part of a resource, the size of the mode.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Snapshot)]
+#[snapshot(new)]
 struct Scanout {
     resource: u32,
     rect: Rect,
 }
 
+#[derive(Snapshot)]
 pub(crate) struct VirtioGpu {
+    #[snapshot(skip)]
     display: DisplayHandle,
     /// The mode `GET_DISPLAY_INFO` offers; a frontend may change it (`request_size`).
     preferred: (u32, u32),
@@ -269,6 +277,7 @@ pub(crate) struct VirtioGpu {
     /// A display event is waiting to be signalled as a configuration change.
     event_pending: bool,
     /// The 3D side, when the embedder gave the machine a renderer.
+    #[snapshot(skip)]
     accel: Option<Accel>,
 }
 
@@ -791,6 +800,19 @@ impl VirtioGpu {
 impl VirtioDev for VirtioGpu {
     fn device_type(&self) -> u16 {
         DEVICE_TYPE_GPU
+    }
+
+    fn restored(&mut self) {
+        if let Some(scanout) = self.scanout {
+            self.display.set_virtio_owns_screen(true);
+            self.present(scanout.rect);
+        }
+    }
+
+    fn snapshot_blocker(&self) -> Option<&'static str> {
+        self.accel
+            .is_some()
+            .then_some("3D acceleration keeps its state in the renderer")
     }
 
     /// `VIRGL` with a renderer, nothing otherwise: the driver then sticks to the 2D commands.

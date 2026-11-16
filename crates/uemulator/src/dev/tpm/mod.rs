@@ -9,6 +9,7 @@
 //! interface has none). Only locality 0 exists.
 #[cfg(freestanding)]
 use crate::prelude::*;
+use crate::snapshot::Snapshot;
 
 mod capability;
 mod context;
@@ -99,6 +100,7 @@ const INTERFACE_ID: u32 = INTF_TYPE_CRB_ACTIVE
 /// Nothing in Linux or the firmware reads them.
 const INTERFACE_ID_HIGH: u32 = 0x0001_1af4;
 
+#[derive(Snapshot)]
 pub(crate) struct TpmCrb {
     tpm: Tpm,
     locality_assigned: bool,

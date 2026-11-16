@@ -19,6 +19,7 @@ use super::flags::*;
 use super::mem::AccessKind;
 use super::sys::{CR0_TS, CR4_MCE, EFER_AIBRSE, EFER_SCE, RAX, RCX, RDX};
 use super::*;
+use crate::snapshot::Snapshot;
 
 #[path = "svm_avic.rs"]
 mod avic;
@@ -430,6 +431,8 @@ pub(crate) const SVM_FEATURES: u32 = SVM_FEATURE_NESTED_PAGING
 
 /// What `vmrun` saved of the host, and restores at #VMEXIT. The other registers (including all
 /// GPRs but RAX/RSP) are deliberately *not* here: the hypervisor swaps those itself.
+#[derive(Snapshot)]
+#[snapshot(new)]
 struct Host {
     rip: u64,
     rsp: u64,
@@ -458,6 +461,8 @@ struct Host {
 
 /// The guest being run: the intercepts read from its VMCB at `vmrun` time (the hypervisor cannot
 /// change them while the guest runs) and the host state to return to.
+#[derive(Snapshot)]
+#[snapshot(new)]
 pub(crate) struct Guest {
     vmcb: u64,
     pub(super) asid: u32,
@@ -504,6 +509,8 @@ pub(crate) struct Guest {
 /// (a pause after a longer gap restarts the count: the guest is not spinning). A count of 0 is no
 /// filter. KVM uses this to tell a vCPU waiting for a preempted lock holder from one that merely
 /// pauses now and then.
+#[derive(Snapshot)]
+#[snapshot(new)]
 struct PauseFilter {
     count: u16,
     threshold: u16,
@@ -514,6 +521,7 @@ struct PauseFilter {
 }
 
 /// SVM state of the CPU.
+#[derive(Snapshot)]
 pub(crate) struct Svm {
     pub(crate) hsave_pa: u64,
     pub(crate) vm_cr: u64,
@@ -531,12 +539,15 @@ pub(crate) struct Svm {
     last_vmcb: u64,
     /// The soft TLB of the side that is not running: the host's while a guest runs, the last
     /// guest's while the host runs. `None` until the first VMRUN.
+    #[snapshot(skip)]
     pub(crate) parked_tlb: Option<Box<ParkedTlb>>,
     /// Nested-table leaves the walker resolved for the running guest. `None` until the first
     /// nested walk.
+    #[snapshot(skip)]
     nested_leaves: Option<Box<NestedLeafCache>>,
     /// Set while a #VMEXIT fetches the guest's instruction bytes (decode assists): a nested
     /// fault then only ends the fetch, it must not exit (again).
+    #[snapshot(skip)]
     fetching_instruction_bytes: bool,
 }
 

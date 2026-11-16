@@ -10,6 +10,7 @@
 //! The hardware P-state registers, which amd_pstate also writes (`amd_perf_ctl_reset`, an
 //! unchecked wrmsr of PERF_CTL that warns on #GP, on every CPU it takes over), are
 //! `model_msr.rs`; the lowest nonlinear level here is its slowest P-state.
+use crate::snapshot::Snapshot;
 
 /// Read-only: lowest (7:0), lowest nonlinear (15:8), nominal (23:16) and highest (31:24)
 /// performance.
@@ -68,7 +69,7 @@ const REQUEST_RESET: u64 = (HIGHEST_PERFORMANCE << REQUEST_MAXIMUM_SHIFT
     as u64;
 
 /// The writable registers, per logical processor.
-#[derive(Clone)]
+#[derive(Clone, Snapshot)]
 pub(crate) struct Cppc {
     enable: u64,
     request: u64,

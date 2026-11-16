@@ -23,6 +23,7 @@
 //! function's.
 
 use super::data_fabric::{CONFIG_SPACE_SIZE, VENDOR_AMD};
+use crate::snapshot::Snapshot;
 
 pub(crate) const FCH_SLOT: u8 = 0x14;
 const DEVFN_SLOT_SHIFT: u32 = 3;
@@ -130,7 +131,7 @@ pub(crate) enum WatchdogAction {
     PowerOff,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Snapshot)]
 struct SmbusController {
     status: u8,
     control: u8,
@@ -182,6 +183,7 @@ impl SmbusController {
     }
 }
 
+#[derive(Snapshot)]
 pub(crate) struct Fch {
     pm: [u8; PM_REGISTERS],
     pm_index: u8,

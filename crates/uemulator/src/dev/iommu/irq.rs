@@ -10,6 +10,7 @@ use super::{
     CONTROL_GUEST_APIC_ENABLE, INTERRUPT_WINDOW_FIRST, INTERRUPT_WINDOW_LAST, Iommu, PhysRead,
     read_u64,
 };
+use crate::snapshot::Snapshot;
 
 /// MSI address (SDM vol. 3 10.11.1): destination ID in bits 19:12, redirection hint in bit 3,
 /// destination mode (1 = logical) in bit 2.
@@ -88,7 +89,8 @@ impl DeliveryMode {
 /// A device interrupt as it arrives at the IOMMU: the requester that sent it and the MSI
 /// address and data. An IOAPIC's redirection entry is turned into one by `ioapic_request`,
 /// with the requester id from the IVRS "special device" entry for that IOAPIC.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Snapshot)]
+#[snapshot(new)]
 pub(crate) struct InterruptRequest {
     pub requester: u16,
     pub address: u64,

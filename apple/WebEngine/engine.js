@@ -31,7 +31,7 @@
 // terminating it at once would lose the udisk map updates the guest has not flushed.
 import {
   CONTROL_BYTES, CTRL, EVENT_OFFSET, EVENT_RECORDS, EVENT_WORDS, FRAME_READY, RING_BYTES, RING_OFFSET,
-  WISP_OFFSET, WISP_RING_BYTES,
+  STOP, WISP_OFFSET, WISP_RING_BYTES,
 } from "./protocol.js";
 import { randomMac, randomTab } from "./segment.js";
 import { connectWisp } from "./wisp.js";
@@ -136,9 +136,11 @@ function resize(cols, rows) {
   Atomics.notify(control, CTRL.HEAD);
 }
 
-function stop() {
+// `request` is STOP.STOP, or STOP.SUSPEND to write the machine to the snapshot sink first
+// (the run then exits with code 5 once the app has the whole snapshot).
+function stop(request = STOP.STOP) {
   if (!control) return;
-  Atomics.store(control, CTRL.STOP, 1);
+  Atomics.store(control, CTRL.STOP, request);
   // The idle wait sleeps on HEAD (protocol.js).
   Atomics.notify(control, CTRL.HEAD);
 }
@@ -231,6 +233,16 @@ async function boot(settings) {
       url: new URL(disk.url, location.href).href, readOnly: disk.readOnly, writeThrough: !disk.readOnly,
       retryUnreachable: true,
     })),
+    // The machine's nvram.kv: read whole at the start, written back with synchronous POSTs.
+    nvram: settings.nvram ? { url: new URL(settings.nvram, location.href).href, retryUnreachable: true } : null,
+    // Written by offset into a temporary the app renames on `finish=1`, and read by range; the
+    // resume's is deleted on `consumed=1` (worker.js `host_snapshot_*`).
+    snapshot: {
+      suspend: settings.snapshot?.suspend
+        ? { url: new URL(settings.snapshot.suspend, location.href).href, retryUnreachable: true } : null,
+      resume: settings.snapshot?.resume
+        ? { url: new URL(settings.snapshot.resume, location.href).href, retryUnreachable: true } : null,
+    },
   }, [kernel, initrd, firmwareImage, hypervisor].filter(Boolean));
 }
 
@@ -263,6 +275,8 @@ function onMessage({ data }) {
     resize(message.cols, message.rows);
   } else if (message.type === "stop") {
     stop();
+  } else if (message.type === "suspend") {
+    stop(STOP.SUSPEND);
   } else if (message.type === "frame-ack" && control) {
     Atomics.store(control, CTRL.FRAME_ACK, FRAME_READY.YES);
   }

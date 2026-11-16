@@ -11,6 +11,7 @@
 //!
 //! Remapping only reads guest memory (`remap_interrupt` runs on paths that have nothing else),
 //! so a post is queued and `service` performs it with the writes it needs.
+use crate::snapshot::Snapshot;
 
 use super::{
     CONTROL_GUEST_APIC_ENABLE, CONTROL_INTCAPXT_ENABLE, Iommu, PhysWrite, RING_LENGTH_MASK,
@@ -63,7 +64,8 @@ const BACKING_IRR: u64 = 0x200;
 const BACKING_REGISTER_STRIDE: u64 = 0x10;
 
 /// An interrupt for a guest's virtual APIC, to be written by `service`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Snapshot)]
+#[snapshot(new)]
 pub(super) struct Post {
     backing_page: u64,
     vector: u8,

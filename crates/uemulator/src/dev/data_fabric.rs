@@ -16,6 +16,7 @@
 //!
 //! Kernels before 6.14 matched the root (0x153A) and function 3/4 ids from tables instead; both
 //! are the ones listed there for family 1Ah models 00h-0Fh.
+use crate::snapshot::Snapshot;
 pub(crate) const VENDOR_AMD: u16 = 0x1022;
 pub(crate) const DEVICE_ROOT_COMPLEX: u16 = 0x153a;
 /// Function `n` of the data fabric is this plus `n`.
@@ -92,7 +93,7 @@ fn host_bridge_header(device: u16) -> [u8; CONFIG_SPACE_SIZE] {
 }
 
 /// 00:00.0. Only the SMN index is writable; everything else is read-only.
-#[derive(Default)]
+#[derive(Default, Snapshot)]
 pub(crate) struct RootComplex {
     smn_index: u32,
 }

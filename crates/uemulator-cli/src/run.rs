@@ -2,8 +2,8 @@ use std::io::{IsTerminal, Read, Write};
 use std::time::Duration;
 
 use uemulator::{
-    ConsoleKind, Disk, DisplayMode, EmulatedMachine, ExitReason, JitMode, MachineConfig, NetHandle,
-    NetOffloads, SmpMode,
+    ConsoleKind, Disk, DisplayMode, EmulatedMachine, ExitReason, FileSnapshotSink,
+    FileSnapshotSource, JitMode, MachineConfig, NetHandle, NetOffloads, SmpMode, StopHandle,
 };
 
 use crate::args::{
@@ -139,6 +139,12 @@ fn build_config(
         .kernel(kernel)
         .debug(runtime.debug)
         .verify_jit(runtime.verify);
+    if let Some(path) = &runtime.suspend_to {
+        cfg = cfg.suspend_to(FileSnapshotSink::new(path));
+    }
+    if let Some(path) = &runtime.resume_from {
+        cfg = cfg.resume_from(FileSnapshotSource::open(path).map_err(|e| e.to_string())?);
+    }
     if runtime.debug {
         cfg = cfg.log(|line| eprintln!("{line}"));
     }
@@ -210,6 +216,9 @@ pub(crate) fn exit_message(reason: &ExitReason) -> String {
         ExitReason::Shutdown => "machine powered off".to_string(),
         ExitReason::Reset => "machine reset".to_string(),
         ExitReason::Stopped => "machine stopped".to_string(),
+        ExitReason::Suspended => "machine suspended".to_string(),
+        ExitReason::SuspendFailed(message) => format!("suspend failed: {message}"),
+        ExitReason::ResumeFailed(message) => format!("resume failed: {message}"),
         ExitReason::TripleFault => "machine failed: guest triple fault".to_string(),
         ExitReason::Internal(message) => format!("machine failed: {message}"),
     }
@@ -408,6 +417,15 @@ fn run_config(
     let saved_tty = if tty { enter_raw_mode(stty) } else { None };
     let input = console.clone();
     let stopper = machine.stop_handle();
+    // Ctrl-] and --timeout end the run; with --suspend-to they suspend it.
+    let suspending = runtime.suspend_to.is_some();
+    let end = move |handle: &StopHandle| {
+        if suspending {
+            handle.suspend();
+        } else {
+            handle.stop();
+        }
+    };
     std::thread::spawn(move || {
         let mut buf = [0u8; STDIN_CHUNK_LEN];
         while let Ok(n) = std::io::stdin().read(&mut buf) {
@@ -415,7 +433,7 @@ fn run_config(
                 break;
             }
             if contains_escape(&buf[..n]) {
-                stopper.stop();
+                end(&stopper);
                 break;
             }
             input.write(&buf[..n]);
@@ -425,7 +443,7 @@ fn run_config(
         let stop = machine.stop_handle();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_secs(secs));
-            stop.stop();
+            end(&stop);
         });
     }
 
@@ -436,9 +454,23 @@ fn run_config(
         stty(&[&saved]);
     }
     let reason = reason?;
-    // Clean exits (power-off, reset, stop) stay silent; only failures are reported.
-    if matches!(reason, ExitReason::TripleFault | ExitReason::Internal(_)) {
-        eprintln!("{}", exit_message(&reason));
+    // Clean exits (power-off, reset, stop) stay silent; failures are reported, and so is a
+    // suspend, which says where the machine went.
+    match &reason {
+        ExitReason::TripleFault
+        | ExitReason::Internal(_)
+        | ExitReason::SuspendFailed(_)
+        | ExitReason::ResumeFailed(_) => eprintln!("\r\n{}", exit_message(&reason)),
+        ExitReason::Suspended => eprintln!(
+            "\r\n{} to {}",
+            exit_message(&reason),
+            runtime
+                .suspend_to
+                .as_deref()
+                .unwrap_or(std::path::Path::new(""))
+                .display()
+        ),
+        _ => {}
     }
     Ok(reason)
 }

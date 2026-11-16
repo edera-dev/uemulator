@@ -11,6 +11,7 @@
 
 #[cfg(freestanding)]
 use crate::prelude::*;
+use crate::snapshot::Snapshot;
 use alloc::collections::VecDeque;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
@@ -72,7 +73,8 @@ const KEY_PRESSED: u32 = 1;
 const KEY_RELEASED: u32 = 0;
 
 /// A rectangle of the screen in pixels, origin top left.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Snapshot)]
+#[snapshot(new)]
 pub struct Rect {
     pub x: u32,
     pub y: u32,
@@ -666,7 +668,8 @@ pub(crate) struct InputEvent {
 pub(crate) type InputBatch = Vec<InputEvent>;
 
 /// Which virtio-input device a batch is for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Snapshot)]
+#[snapshot(new)]
 pub(crate) enum InputDevice {
     Keyboard,
     Tablet,

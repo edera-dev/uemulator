@@ -25,6 +25,7 @@ use crate::cpu::decode::Insn;
 use crate::cpu::exception::Exception;
 use crate::cpu::mem::AccessKind;
 use crate::cpu::{Cpu, ExecResult};
+use crate::snapshot::Snapshot;
 
 pub(crate) const MSR_IBS_FETCH_CONTROL: u32 = 0xc001_1030;
 const MSR_IBS_FETCH_LINEAR: u32 = 0xc001_1031;
@@ -136,7 +137,8 @@ const OP_DATA3_WIDTH_SHIFT: u32 = 22;
 const INTERPRET_WINDOW: u64 = 64;
 
 /// What the tagged instruction's accesses looked like (the first one's address and size).
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Snapshot)]
+#[snapshot(new)]
 pub(crate) struct Capture {
     first: Option<(u64, u64, bool)>,
     loaded: bool,
@@ -155,6 +157,7 @@ impl Capture {
 }
 
 /// The IBS registers and counting state. Lives in `Pmu`, one per vCPU.
+#[derive(Snapshot)]
 pub(crate) struct Ibs {
     fetch_control: u64,
     fetch_linear: u64,

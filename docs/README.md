@@ -50,6 +50,7 @@ The design plans in [`plans/`](plans/README.md) are the source of truth for how 
 - [13-web.md](plans/13-web.md): the WebAssembly port and the browser page.
 - [28-apple.md](plans/28-apple.md): the SwiftUI app for macOS and iOS (proposal): native engine, and the WebAssembly JIT run in a hidden WebKit view on iOS.
 - [12-uefi.md](plans/12-uefi.md): uemulator as a UEFI application, including the hardware-virtualization path.
+- [29-snapshots.md](plans/29-snapshots.md): suspending a machine to a snapshot and resuming it, on any host, keeping its disks consistent: how the app survives iOS ending it and moves a machine between engines.
 
 ## Performance
 

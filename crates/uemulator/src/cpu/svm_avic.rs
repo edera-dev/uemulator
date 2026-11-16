@@ -13,6 +13,7 @@
 //! accepted and does nothing more.
 
 use super::*;
+use crate::snapshot::Snapshot;
 
 pub(super) const VMCB_AVIC_APIC_BAR: u64 = 0x98;
 pub(super) const VMCB_AVIC_BACKING_PAGE: u64 = 0xe0;
@@ -107,6 +108,8 @@ pub(super) const ICR_SHORTHAND_SELF: u64 = 1;
 pub(super) const FIRST_LEGAL_VECTOR: u64 = 16;
 
 /// The VMCB's AVIC setup, read at VMRUN.
+#[derive(Snapshot)]
+#[snapshot(new)]
 pub(super) struct Avic {
     /// Guest-physical page of the xAPIC registers (unused in x2APIC mode).
     apic_bar: u64,
@@ -181,6 +184,8 @@ impl Avic {
 }
 
 /// A trap exit an AVIC access owes once its instruction has completed (`svm_before_step`).
+#[derive(Snapshot)]
+#[snapshot(new)]
 pub(super) struct PendingTrap {
     pub(super) code: u64,
     pub(super) info1: u64,

@@ -30,6 +30,14 @@ final class LoopbackFiles: @unchecked Sendable {
     // Writable ones (a machine's disks), with the handle their writes go through: one per file
     // for the run, not one per write.
     private var writableFiles: [String: FileHandle] = [:]
+    // A machine's nvram.kv, which the web build's NVRAM store reads whole and writes back
+    // (worker.js `loadNvram`, `host_nvram_*`). The file may not exist until the first write.
+    private var keyValueLogs: [String: URL] = [:]
+    // A run's snapshots (docs/plans/29-snapshots.md): a suspend's goes into `<file>.tmp` by offset
+    // and `finish=1` renames it into place, so a run that dies halfway leaves no torn snapshot; a
+    // resume's is read by range like a disk, and `consumed=1` deletes it.
+    private var snapshotSinks: [String: URL] = [:]
+    private var snapshotSources: Set<String> = []
 
     init(root: URL) {
         self.root = root
@@ -49,13 +57,114 @@ final class LoopbackFiles: @unchecked Sendable {
         lock.unlock()
     }
 
+    func registerSnapshotSink(_ path: String, file: URL) {
+        lock.lock()
+        snapshotSinks[path] = file
+        lock.unlock()
+    }
+
+    func registerSnapshotSource(_ path: String, file: URL) {
+        lock.lock()
+        registeredFiles[path] = file
+        snapshotSources.insert(path)
+        lock.unlock()
+    }
+
+    private func writeSnapshot(_ file: URL, query: [URLQueryItem], body: Data) throws -> LoopbackReply {
+        let temporary = file.appendingPathExtension("tmp")
+        if query.contains(where: { $0.name == "finish" }) {
+            let handle = try FileHandle(forUpdating: temporary)
+            try handle.synchronize()
+            try handle.close()
+            guard rename(temporary.path, file.path) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+        } else if let offset = query.first(where: { $0.name == "offset" })?.value.flatMap(UInt64.init) {
+            // The first write starts the file afresh: a temporary left by a run that died is junk.
+            if offset == 0 { FileManager.default.createFile(atPath: temporary.path, contents: nil) }
+            let handle = try FileHandle(forUpdating: temporary)
+            defer { try? handle.close() }
+            try handle.seek(toOffset: offset)
+            try handle.write(contentsOf: body)
+        } else {
+            return Self.make(400, Data(), "text/plain")
+        }
+        return Self.make(200, Data(), "text/plain")
+    }
+
+    func registerKeyValueLog(_ path: String, file: URL) {
+        lock.lock()
+        keyValueLogs[path] = file
+        lock.unlock()
+    }
+
+    // The library's store holds that each write is durable once acknowledged: a guest's
+    // SetVariable returned success. So every write is synchronized before the 200, and a
+    // replacement goes through a temporary file and a rename, as `FileKeyValueStore` does, so a
+    // crash leaves the old log or the new one. Each call opens the file afresh: a handle kept
+    // across a replacement would write into the unlinked old file.
+    private func writeKeyValueLog(_ file: URL, query: [URLQueryItem], body: Data) throws -> LoopbackReply {
+        if query.contains(where: { $0.name == "replace" }) {
+            let temporary = file.appendingPathExtension("tmp")
+            FileManager.default.createFile(atPath: temporary.path, contents: nil)
+            let handle = try FileHandle(forWritingTo: temporary)
+            try handle.write(contentsOf: body)
+            try handle.synchronize()
+            try handle.close()
+            guard rename(temporary.path, file.path) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+        } else if let offset = query.first(where: { $0.name == "offset" })?.value.flatMap(UInt64.init) {
+            if !FileManager.default.fileExists(atPath: file.path) {
+                FileManager.default.createFile(atPath: file.path, contents: nil)
+            }
+            let handle = try FileHandle(forUpdating: file)
+            defer { try? handle.close() }
+            try handle.seek(toOffset: offset)
+            try handle.write(contentsOf: body)
+            try handle.synchronize()
+        } else {
+            return Self.make(400, Data(), "text/plain")
+        }
+        return Self.make(200, Data(), "text/plain")
+    }
+
     // A POST from worker.js's write-through disks: `offset=N` writes the body there, `flush=1`
-    // makes what was written durable. 200, or 404 for anything not a writable registered file.
+    // makes what was written durable. From its NVRAM store: `offset=N`, or `replace=1` with the
+    // whole log. 200, or 404 for anything not a writable registered file or log.
     func write(path: String, query: [URLQueryItem], body: Data) -> LoopbackReply {
         let prefix = "/\(token)/"
         guard path.hasPrefix(prefix) else { return Self.make(404, Data(), "text/plain") }
+        let relative = String(path.dropFirst(prefix.count))
+        // Held across a key-value log's write: a replacement and a write must not interleave.
         lock.lock()
-        let handle = writableFiles[String(path.dropFirst(prefix.count))]
+        if let sink = snapshotSinks[relative] {
+            defer { lock.unlock() }
+            do {
+                return try writeSnapshot(sink, query: query, body: body)
+            } catch {
+                return Self.make(500, Data(error.localizedDescription.utf8), "text/plain")
+            }
+        }
+        if snapshotSources.contains(relative), query.contains(where: { $0.name == "consumed" }),
+           let source = registeredFiles[relative] {
+            defer { lock.unlock() }
+            do {
+                try FileManager.default.removeItem(at: source)
+                return Self.make(200, Data(), "text/plain")
+            } catch {
+                return Self.make(500, Data(error.localizedDescription.utf8), "text/plain")
+            }
+        }
+        if let log = keyValueLogs[relative] {
+            defer { lock.unlock() }
+            do {
+                return try writeKeyValueLog(log, query: query, body: body)
+            } catch {
+                return Self.make(500, Data(error.localizedDescription.utf8), "text/plain")
+            }
+        }
+        let handle = writableFiles[relative]
         lock.unlock()
         guard let handle else { return Self.make(404, Data(), "text/plain") }
         do {
@@ -84,6 +193,9 @@ final class LoopbackFiles: @unchecked Sendable {
         lock.lock()
         blobs = blobs.filter { !$0.key.hasPrefix(prefix) }
         registeredFiles = registeredFiles.filter { !$0.key.hasPrefix(prefix) }
+        keyValueLogs = keyValueLogs.filter { !$0.key.hasPrefix(prefix) }
+        snapshotSinks = snapshotSinks.filter { !$0.key.hasPrefix(prefix) }
+        snapshotSources = snapshotSources.filter { !$0.hasPrefix(prefix) }
         for (path, handle) in writableFiles where path.hasPrefix(prefix) {
             // What the guest wrote is on disk before the run's files are let go.
             try? handle.synchronize()
@@ -118,8 +230,14 @@ final class LoopbackFiles: @unchecked Sendable {
         lock.lock()
         let blob = blobs[relative]
         let registered = registeredFiles[relative]
+        let keyValueLog = keyValueLogs[relative]
         lock.unlock()
         if let registered { return reply(file: registered, range: range) }
+        // Whole: worker.js reads the log in one request. None yet is a 404.
+        if let keyValueLog {
+            guard let data = try? Data(contentsOf: keyValueLog) else { return Self.make(404, Data(), "text/plain") }
+            return Self.make(200, data, "application/octet-stream")
+        }
         let data: Data
         let type: String
         if let blob {

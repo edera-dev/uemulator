@@ -16,6 +16,10 @@ protocol MachineEngine: ScreenInput {
     func start(_ settings: MachineSettings)
     // Returns at once; the machine is gone from the UI's point of view.
     func stop()
+    // Stops the machine into `MachineSettings.suspendTo` (docs/plans/29-snapshots.md): the state
+    // goes to `.preparing("Suspending")`, then `.stopped(EngineState.suspendedReason)` once the
+    // snapshot is complete, or `.stopped` with why it failed.
+    func suspend()
     func send(_ bytes: [UInt8])
     func resize(cols: Int, rows: Int)
     // Asks the guest for this screen size, as a monitor hotplug would.
@@ -34,6 +38,9 @@ enum EngineState: Equatable {
     // (`MachineSettings.options`): the app starts the machine again instead, which decides what
     // boots afresh, so an installer that reboots comes back on the disk it installed to.
     static let resetReason = "Reset"
+    // What both engines report once a suspend's snapshot is complete.
+    static let suspendedReason = "Suspended"
+    static let suspending = EngineState.preparing("Suspending")
 }
 
 // What the machine starts in: the CLI's `--firmware`, and `ua_config.firmware_kind` /
@@ -123,6 +130,10 @@ struct MachineSettings {
     var disks: [DiskImage] = []
     // The machine's nvram.kv: UEFI variables and TPM state. Nil keeps them in memory.
     var nvram: URL?
+    // Where `suspend` writes the machine's snapshot, and one to resume from instead of booting
+    // (deleted by the engine once the machine runs again: its disks then move on).
+    var suspendTo: URL?
+    var resumeFrom: URL?
     var firmware = FirmwareKind.uefi
     // The UEFI firmware image, for `.uefi`.
     var firmwareImage: Data?

@@ -37,7 +37,8 @@ impl EmulatedMachine {
     pub fn stop_handle(&self) -> StopHandle;
 }
 
-pub enum ExitReason { Shutdown, Reset, TripleFault, Stopped, Internal(String) }
+pub enum ExitReason { Shutdown, Reset, TripleFault, Stopped, Suspended, SuspendFailed(String), ResumeFailed(String), Internal(String) }
+// Suspended and the two failures: MachineConfig::suspend_to / resume_from and StopHandle::suspend (29-snapshots.md)
 
 // Graphical console (docs/plans/24-display-input.md); screen and input are chosen apart
 MachineConfig::display(DisplayMode::Framebuffer)    // None (default) | Framebuffer: virtio-gpu (+ the UEFI GOP framebuffer)

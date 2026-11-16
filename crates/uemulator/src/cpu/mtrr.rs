@@ -6,6 +6,7 @@
 //! 11.12.2; AMD APM vol. 2 sec. 7.7 and 7.8).
 
 use super::sys::PHYSICAL_ADDRESS_BITS;
+use crate::snapshot::Snapshot;
 
 pub(crate) const MSR_MTRR_CAP: u32 = 0xfe;
 pub(crate) const MSR_MTRR_DEF_TYPE: u32 = 0x2ff;
@@ -71,7 +72,7 @@ pub(crate) fn pat_is_valid(value: u64) -> bool {
     all_bytes(value, valid_pat_type)
 }
 
-#[derive(Clone)]
+#[derive(Clone, Snapshot)]
 pub(crate) struct Mtrr {
     def_type: u64,
     fixed: [u64; FIXED_REGISTERS],

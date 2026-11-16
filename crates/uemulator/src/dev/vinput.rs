@@ -13,6 +13,7 @@ use crate::display::{
 };
 #[cfg(freestanding)]
 use crate::prelude::*;
+use crate::snapshot::Snapshot;
 
 const EVENT_QUEUE: usize = 0;
 /// LED states from the guest (caps lock and friends); taken and dropped.
@@ -58,8 +59,10 @@ const DEVICE_VERSION: u16 = 0x0001;
 const KEYBOARD_NAME: &str = "uemulator Virtio Keyboard";
 const TABLET_NAME: &str = "uemulator Virtio Tablet";
 
+#[derive(Snapshot)]
 pub(crate) struct VirtioInput {
     kind: InputDevice,
+    #[snapshot(skip)]
     input: InputHandle,
     select: u8,
     subsel: u8,

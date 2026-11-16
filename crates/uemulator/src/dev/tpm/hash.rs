@@ -1,6 +1,7 @@
 //! The TPM's hash algorithms by their `TPM_ALG_ID`, over `uemulator-crypto`.
 #[cfg(freestanding)]
 use crate::prelude::*;
+use crate::snapshot::Snapshot;
 use uemulator_crypto::sha::{HashAlgorithm, Hasher};
 
 pub(crate) const ALG_SHA1: u16 = 0x0004;
@@ -30,6 +31,8 @@ pub(crate) fn digest_len(id: u16) -> Option<usize> {
     algorithm(id).map(HashAlgorithm::digest_len)
 }
 
+#[derive(Snapshot)]
+#[snapshot(new)]
 pub(crate) struct Hash {
     pub id: u16,
     hasher: Hasher,
@@ -156,5 +159,40 @@ impl KdfStream {
             }
             *byte = self.pending.pop().unwrap_or(0);
         }
+    }
+}
+
+/// A hash sequence in progress (`TPM2_HashSequenceStart`) crosses a snapshot as the hasher's
+/// exported state; the crypto crate owns the layout.
+impl crate::snapshot::Snapshot for Hasher {
+    fn save(
+        &self,
+        w: &mut crate::snapshot::Writer<'_>,
+    ) -> Result<(), crate::snapshot::SnapshotError> {
+        let algorithm = HashAlgorithm::ALL
+            .iter()
+            .position(|&algorithm| algorithm == self.algorithm())
+            .unwrap_or_default() as u8;
+        w.u8(algorithm)?;
+        crate::snapshot::Snapshot::save(&self.export_state(), w)
+    }
+
+    fn load(
+        &mut self,
+        r: &mut crate::snapshot::Reader<'_>,
+    ) -> Result<(), crate::snapshot::SnapshotError> {
+        *self = <Self as crate::snapshot::Snapshot>::load_new(r)?;
+        Ok(())
+    }
+
+    fn load_new(
+        r: &mut crate::snapshot::Reader<'_>,
+    ) -> Result<Self, crate::snapshot::SnapshotError> {
+        let index = r.u8()?;
+        let state: Vec<u8> = crate::snapshot::Snapshot::load_new(r)?;
+        HashAlgorithm::ALL
+            .get(index as usize)
+            .and_then(|&algorithm| Hasher::import_state(algorithm, &state))
+            .ok_or_else(|| r.error("a TPM hash sequence's state does not fit its algorithm"))
     }
 }

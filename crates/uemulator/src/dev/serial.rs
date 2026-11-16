@@ -1,3 +1,4 @@
+use crate::snapshot::Snapshot;
 use alloc::collections::VecDeque;
 
 use crate::console::ConsoleHandle;
@@ -73,7 +74,9 @@ const MSR_DELTA_FROM_INPUT_MASK: u8 = MSR_DELTA_CTS | MSR_DELTA_DSR | MSR_DELTA_
 const FIFO_DEPTH: usize = 16;
 const NON_FIFO_DEPTH: usize = 1;
 
+#[derive(Snapshot)]
 pub(crate) struct Uart {
+    #[snapshot(skip)]
     console: ConsoleHandle,
     rx: VecDeque<u8>,
     /// Divisor latch bytes; stored for read-back only, the baud rate has no effect.

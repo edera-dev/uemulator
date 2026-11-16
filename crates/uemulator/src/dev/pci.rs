@@ -11,6 +11,7 @@ use super::virtio::{
 };
 #[cfg(freestanding)]
 use crate::prelude::*;
+use crate::snapshot::Snapshot;
 
 /// Start of the MMIO window, which is the PCI hole in the RAM layout: guest RAM is never mapped
 /// from here up to 4 GiB (`ram::flat_bytes`), and accesses there dispatch to the devices.
@@ -149,6 +150,7 @@ const ISR_LENGTH: u32 = 4;
 const DEVICE_CFG_LENGTH: u32 = 0x100;
 
 /// One virtio device on bus 0. Config space is synthesized on every read from this state.
+#[derive(Snapshot)]
 struct PciFunction {
     transport: Transport,
     devfn: u8,
@@ -158,6 +160,7 @@ struct PciFunction {
     int_line: u8,
 }
 
+#[derive(Snapshot)]
 pub(crate) struct PciHost {
     /// Value of the address dword at 0xCF8.
     config_address: u32,
@@ -349,6 +352,45 @@ impl PciHost {
             .iter_mut()
             .filter_map(|function| function.transport.dev.block_backend())
             .nth(index)
+    }
+
+    pub fn flush_storage(&mut self) -> Result<(), String> {
+        self.funcs
+            .iter_mut()
+            .try_for_each(|function| function.transport.dev.flush_storage())
+    }
+
+    pub fn restored(&mut self) {
+        for function in &mut self.funcs {
+            function.transport.dev.restored();
+        }
+    }
+
+    pub fn snapshot_blocker(&self) -> Option<&'static str> {
+        self.funcs
+            .iter()
+            .find_map(|function| function.transport.dev.snapshot_blocker())
+    }
+
+    /// What a snapshot's machine must look like to restore into this one: each function's slot
+    /// and virtio device type, and whether the IOMMU is there.
+    pub fn snapshot_shape(&self) -> String {
+        let functions: Vec<String> = self
+            .funcs
+            .iter()
+            .map(|function| {
+                format!(
+                    "{:02x}:{}",
+                    function.devfn,
+                    function.transport.dev.device_type()
+                )
+            })
+            .collect();
+        format!(
+            "pci=[{}] iommu={}",
+            functions.join(","),
+            self.iommu.is_some()
+        )
     }
 
     /// Tears the bus down and returns the disks behind its virtio-blk functions, in slot order.

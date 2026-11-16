@@ -31,6 +31,7 @@ mod platform;
 mod prelude;
 mod ram;
 mod segment;
+mod snapshot;
 mod sync;
 #[cfg(all(feature = "jit", not(target_arch = "wasm32")))]
 mod sys;
@@ -59,7 +60,7 @@ pub use gateway::{
 pub use gpu::{GpuBox, GpuCapset, GpuCommand, GpuLimits, GpuLink, GpuResource};
 #[cfg(not(freestanding))]
 pub use kv::FileKeyValueStore;
-pub use kv::{KeyValueError, KeyValueStore, MemoryKeyValueStore};
+pub use kv::{KeyValueError, KeyValueLog, KeyValueStore, LogKeyValueStore, MemoryKeyValueStore};
 pub use machine::{
     ClockMode, ConsoleKind, DEFAULT_HYPERVISOR_CMDLINE, DisplayMode, EmulatedMachine, Error,
     ExitReason, JitMode, MAX_MEMORY_MIB, MIN_MEMORY_MIB, MachineConfig, SmpMode, StopHandle,
@@ -67,6 +68,9 @@ pub use machine::{
 pub use netdev::{NetHandle, NetOffloads};
 pub use platform::{DEFAULT_CMDLINE, DEFAULT_SERIAL_CMDLINE, Platform, load_linux};
 pub use segment::{SegmentAgent, SegmentDestination, SegmentStatus};
+#[cfg(not(freestanding))]
+pub use snapshot::{FileSnapshotSink, FileSnapshotSource};
+pub use snapshot::{MemorySnapshot, SnapshotError, SnapshotSink, SnapshotSource};
 pub use wisp::{WispClient, WispState, WispStatus};
 
 #[cfg(test)]

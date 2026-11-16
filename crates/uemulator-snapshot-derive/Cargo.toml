@@ -1,0 +1,10 @@
+[package]
+name = "uemulator-snapshot-derive"
+version.workspace = true
+edition.workspace = true
+
+# `#[derive(Snapshot)]` for the library's machine state (`crates/uemulator/src/snapshot.rs`).
+# No dependencies: the library's `--no-default-features` build has no third-party code, so this
+# parses the item's tokens by hand instead of with syn.
+[lib]
+proc-macro = true

@@ -4,6 +4,7 @@
 //
 //   node hack/wasm/boot.mjs [--kernel K] [--initrd I] [--disk D]... [--cdrom ISO]... [--cmdline S] [--memory MiB]
 //                           [--firmware none|uefi|bios] [--cpus N] [--iommu] [--tpm] [--secure-boot] [--no-acpi] [--serial]
+//                           [--nvram FILE] [--suspend-to FILE] [--resume-from FILE]
 //                           [--hypervisor XEN [--hypervisor-cmdline S]]
 //                           [--gpu] [--no-jit] [--no-compile-worker] [--debug] [--wasm FILE] [--until TEXT]
 //                           [--seconds N] [--mark TEXT]... [--keys TEXT [--keys-after TEXT]]
@@ -23,6 +24,17 @@
 // boots Xen (xen.gz, xen or xen.efi) through the UEFI firmware with the kernel as its dom0, as the
 // page does; --cmdline is then dom0's and --hypervisor-cmdline Xen's (empty: the library's default).
 //
+// --nvram keeps the machine's key-value store (UEFI variables, Secure Boot keys, TPM state) in
+// FILE, the format of a named machine's nvram.kv, the way the Apple app's WebKit engine keeps one
+// (uw_set_nvram): read whole at the start, written back at an offset, and replaced through
+// FILE.tmp and a rename. Without it the store lasts one run.
+//
+// --suspend-to makes the end of the run (--until's text, or --seconds) a suspend to FILE instead
+// of a stop; --resume-from resumes the machine suspended to FILE instead of booting it, and
+// deletes FILE once it runs (`uw_set_snapshots`, docs/plans/29-snapshots.md). The file is the
+// format `uemulator advanced boot --suspend-to` writes, so a machine moves between the native
+// build and this one.
+//
 // --gpu gives the machine a screen and a 3D GPU (uw_set_gpu, with GLES 3.0's minimum limits)
 // whose commands go to www/gpu.js's renderer here, with a backend that draws nothing and logs
 // each clear, scanout and flush to stderr: a guest's virgl traffic and its fences without a
@@ -32,12 +44,15 @@
 // JIT host did to stderr. --mark prints the time since the start when its text first shows up, for
 // timing the stages of a boot. --keys types TEXT on the console (JSON string escapes: "\r" is Enter)
 // once --keys-after's text has shown up, or at once: a boot loader menu that waits for a key.
-import { closeSync, fstatSync, openSync, readFileSync, readSync } from "node:fs";
+import {
+  closeSync, existsSync, fstatSync, fsyncSync, openSync, readFileSync, readSync, renameSync, unlinkSync,
+  writeSync,
+} from "node:fs";
 import { execFileSync } from "node:child_process";
 import { Worker } from "node:worker_threads";
 import { parseArgs } from "node:util";
 import { createCompileQueue, createJitHost } from "../../crates/uemulator-web/www/jit_host.js";
-import { FIRMWARE, OPTION } from "../../crates/uemulator-web/www/protocol.js";
+import { EXIT_NAMES, FIRMWARE, OPTION, STOP } from "../../crates/uemulator-web/www/protocol.js";
 import {
   COMPLETION, LIMIT_PARAMETERS, MINIMUM_LIMITS, Renderer, encodeRecord, splitRecords,
 } from "../../crates/uemulator-web/www/gpu.js";
@@ -57,6 +72,9 @@ const { values } = parseArgs({
     "secure-boot": { type: "boolean", default: false },
     "no-acpi": { type: "boolean", default: false },
     serial: { type: "boolean", default: false },
+    nvram: { type: "string" },
+    "suspend-to": { type: "string" },
+    "resume-from": { type: "string" },
     hypervisor: { type: "string" },
     "hypervisor-cmdline": { type: "string", default: "" },
     wasm: { type: "string", default: new URL("../../target/web/uemulator_web.wasm", import.meta.url).pathname },
@@ -79,6 +97,9 @@ const deadline = start + Number(values.seconds) * 1000;
 let wasm;
 let seen = "";
 let found = false;
+// The snapshot files' descriptors, opened at the first write or read.
+let snapshotOut = null;
+let snapshotIn = null;
 let compileMs = 0;
 let compiled = 0;
 const decoder = new TextDecoder();
@@ -172,7 +193,31 @@ const host = {
   host_wisp_send() {},
   host_wisp_flush() {},
   host_wisp_status() {},
-  host_should_stop: () => (found || performance.now() > deadline ? 1 : 0),
+  host_should_stop: () => {
+    if (!found && performance.now() <= deadline) return 0;
+    return values["suspend-to"] ? STOP.SUSPEND : STOP.STOP;
+  },
+  host_snapshot_write(ptr, len) {
+    snapshotOut ??= openSync(`${values["suspend-to"]}.tmp`, "w");
+    writeSync(snapshotOut, bytes(ptr, len), 0, len);
+    return 0;
+  },
+  host_snapshot_finish() {
+    snapshotOut ??= openSync(`${values["suspend-to"]}.tmp`, "w");
+    fsyncSync(snapshotOut);
+    closeSync(snapshotOut);
+    renameSync(`${values["suspend-to"]}.tmp`, values["suspend-to"]);
+    return 0;
+  },
+  host_snapshot_read(ptr, capacity) {
+    snapshotIn ??= openSync(values["resume-from"], "r");
+    return readSync(snapshotIn, bytes(ptr, capacity), 0, capacity, null);
+  },
+  host_snapshot_consumed() {
+    closeSync(snapshotIn);
+    unlinkSync(values["resume-from"]);
+    return 0;
+  },
   host_idle: () => Atomics.wait(sleeper, 0, 0, 1),
   host_random(ptr, len) {
     crypto.getRandomValues(bytes(ptr, len));
@@ -182,6 +227,37 @@ const host = {
   // Never write-through here (boot.mjs attaches disks read-only or with an in-memory overlay).
   host_disk_write: () => 1,
   host_disk_flush: () => 1,
+  // Durable before they return, as the store requires (the app's loopback server does the same).
+  host_nvram_write(offset, ptr, len) {
+    const fd = openSync(values.nvram, existsSync(values.nvram) ? "r+" : "w+");
+    try {
+      writeSync(fd, bytes(ptr, len), 0, len, offset);
+      fsyncSync(fd);
+      return 0;
+    } catch (error) {
+      console.error("nvram:", error.message);
+      return 1;
+    } finally {
+      closeSync(fd);
+    }
+  },
+  host_nvram_replace(ptr, len) {
+    const temporary = `${values.nvram}.tmp`;
+    try {
+      const fd = openSync(temporary, "w");
+      try {
+        writeSync(fd, bytes(ptr, len), 0, len);
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      renameSync(temporary, values.nvram);
+      return 0;
+    } catch (error) {
+      console.error("nvram:", error.message);
+      return 1;
+    }
+  },
   host_disk_read(source, offset, ptr, len) {
     try {
       const data = diskSources[source].read(offset, len);
@@ -249,6 +325,13 @@ for (const [name, readOnly] of [...values.disk.map((d) => [d, 0]), ...values.cdr
     process.exit(2);
   }
 }
+if (values["suspend-to"] || values["resume-from"]) {
+  wasm.uw_set_snapshots(values["suspend-to"] ? 1 : 0, values["resume-from"] ? 1 : 0);
+}
+if (values.nvram) {
+  const log = existsSync(values.nvram) ? readFileSync(values.nvram) : new Uint8Array(0);
+  wasm.uw_set_nvram(upload(log), log.length);
+}
 const firmwareKind = FIRMWARE[values.firmware.toUpperCase()];
 if (firmwareKind === undefined) throw new Error(`--firmware ${values.firmware}: none, uefi or bios`);
 const firmwareImage = firmwareKind === FIRMWARE.UEFI
@@ -296,4 +379,6 @@ if (values.gpu) {
   console.error(`gpu: ${gpuFences} fences completed, ${gpuRenderer.clears} clears; ` +
     [...gpuRenderer.counts].map(([name, count]) => `${name} ${count}`).join(", "));
 }
-if (code === 4) console.error(decoder.decode(bytes(wasm.uw_error_ptr(), wasm.uw_error_len())));
+console.error(`exit: ${EXIT_NAMES[code] ?? code}`);
+// Internal error, failed suspend or resume: the library's message.
+if ([4, 6, 7].includes(code)) console.error(decoder.decode(bytes(wasm.uw_error_ptr(), wasm.uw_error_len())));

@@ -13,6 +13,7 @@ use super::hierarchy::{STORE_VERSION, nv_key};
 use super::object::trim_auth;
 use super::spec::*;
 use super::wire::{Reader, Truncated, Writer, marshal};
+use crate::snapshot::Snapshot;
 
 pub(super) const NV_PPWRITE: u32 = 1 << 0;
 pub(super) const NV_OWNERWRITE: u32 = 1 << 1;
@@ -44,6 +45,8 @@ pub(super) const MAX_NV_BUFFER_BYTES: usize = 1024;
 pub(super) const MAX_NV_INDICES: usize = 64;
 pub(super) const NV_MEMORY_BYTES: usize = 64 * 1024;
 
+#[derive(Snapshot)]
+#[snapshot(new)]
 pub(super) struct NvIndex {
     pub handle: u32,
     pub name_alg: u16,

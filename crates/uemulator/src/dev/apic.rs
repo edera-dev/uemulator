@@ -4,6 +4,7 @@
 //!
 //! SDM vol. 3 chapter 12 (Intel) and AMD APM vol. 2 chapter 16 describe the same register
 //! file; QEMU's `hw/intc/apic.c` is the behavioral reference for what guests actually rely on.
+use crate::snapshot::Snapshot;
 
 pub(crate) const APIC_DEFAULT_BASE: u64 = 0xfee0_0000;
 pub(crate) const APIC_MMIO_SIZE: u64 = 0x1000;
@@ -150,7 +151,8 @@ pub(crate) enum Delivered {
 }
 
 /// An interrupt arriving from the I/O APIC, an MSI, or an IPI.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Snapshot)]
+#[snapshot(new)]
 pub(crate) struct Interrupt {
     pub vector: u8,
     pub delivery_mode: u32,
@@ -167,6 +169,7 @@ pub(crate) struct Ipi {
     pub shorthand: u32,
 }
 
+#[derive(Snapshot)]
 pub(crate) struct Lapic {
     /// IA32_APIC_BASE.
     base: u64,

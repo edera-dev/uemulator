@@ -13,6 +13,7 @@
 use super::exception::Exception;
 use super::flags::{RF, TF};
 use super::*;
+use crate::snapshot::Snapshot;
 
 pub(crate) const VECTOR_DEBUG: u8 = 1;
 
@@ -76,7 +77,7 @@ const OP_SYSCALL: u16 = 0x105;
 const OP_SYSRET: u16 = 0x107;
 
 /// Debug state beyond the debug registers themselves (`Cpu::dr`).
-#[derive(Default)]
+#[derive(Default, Snapshot)]
 pub(crate) struct DebugState {
     pub debugctl: u64,
     /// DR0-DR3 address masks (BPEXT).

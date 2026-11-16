@@ -3,6 +3,7 @@ use super::virtio::{DEVICE_TYPE_RNG, Queue, VirtioDev};
 use crate::cpu::xsave::splitmix64;
 #[cfg(freestanding)]
 use crate::prelude::*;
+use crate::snapshot::Snapshot;
 use crate::sync::Arc;
 
 /// The only queue: the guest posts empty buffers, the device fills them.
@@ -64,7 +65,9 @@ pub(crate) fn host_entropy() -> Option<EntropyFn> {
     }
 }
 
+#[derive(Snapshot)]
 pub(crate) struct VirtioRng {
+    #[snapshot(skip)]
     source: RngSource,
     /// State of the `Seeded` stream; unused for `Host`.
     state: u64,

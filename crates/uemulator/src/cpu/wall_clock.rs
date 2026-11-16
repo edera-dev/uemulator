@@ -35,6 +35,11 @@ struct Timeline {
     last_host_ns: AtomicU64,
     skipped_ns: AtomicU64,
     writer: Mutex<()>,
+    /// Guest time at the origin: 0 for a machine that booted, the snapshot's guest time for one
+    /// that resumed (`resume_at`). Shared, so every vCPU's clone resumes together. Not the
+    /// origin moved back instead: a fresh page's host clock starts near 0, below any guest time
+    /// worth resuming at.
+    base_ns: AtomicU64,
 }
 
 impl WallClock {
@@ -48,8 +53,20 @@ impl WallClock {
                 last_host_ns: AtomicU64::new(origin_ns),
                 skipped_ns: AtomicU64::new(0),
                 writer: Mutex::new(()),
+                base_ns: AtomicU64::new(0),
             }),
         }
+    }
+
+    /// Makes guest time continue from `guest_ns` (a snapshot's), here and in every clone. Only
+    /// before the machine runs: a vCPU reading the clock meanwhile could see it jump.
+    pub(crate) fn resume_at(&self, guest_ns: u64) {
+        let timeline = &*self.timeline;
+        timeline.base_ns.store(0, Ordering::SeqCst);
+        let now = self.elapsed_ns();
+        timeline
+            .base_ns
+            .store(guest_ns.saturating_sub(now), Ordering::SeqCst);
     }
 
     pub(crate) fn elapsed_ns(&self) -> u64 {
@@ -70,7 +87,8 @@ impl WallClock {
                 continue;
             }
             if host.saturating_sub(last) <= REFRESH_NS {
-                return host.saturating_sub(self.origin_ns).saturating_sub(skipped);
+                let base = timeline.base_ns.load(Ordering::Relaxed);
+                return base + host.saturating_sub(self.origin_ns).saturating_sub(skipped);
             }
             timeline.advance(host);
         }
@@ -118,6 +136,16 @@ mod tests {
         let reader = now.clone();
         let clock = WallClock::new(Arc::new(move || reader.load(Ordering::SeqCst)));
         (now, clock)
+    }
+
+    #[test]
+    fn a_resumed_clock_continues_from_the_snapshot_and_its_clones_agree() {
+        let (host, clock) = manual_clock();
+        let clone = clock.clone();
+        clock.resume_at(3_600 * 1_000 * MS);
+        assert_eq!(clock.elapsed_ns(), 3_600 * 1_000 * MS);
+        host.fetch_add(5 * MS, Ordering::SeqCst);
+        assert_eq!(clone.elapsed_ns(), 3_600 * 1_000 * MS + 5 * MS);
     }
 
     #[test]

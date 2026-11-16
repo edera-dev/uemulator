@@ -53,6 +53,7 @@ mod vme;
 mod wall_clock;
 pub(crate) mod xsave;
 
+use crate::snapshot::Snapshot;
 use core::sync::atomic::{AtomicBool, Ordering, fence};
 
 use crate::sync::Arc;
@@ -210,7 +211,7 @@ const FCW_RESET: u16 = 0x37f;
 /// `SEG_DESCRIPTOR_FLAGS_MASK`, so the bit positions below match the in-memory descriptor.
 /// `limit` is already scaled by the granularity bit. The JIT reads `base` of FS and GS with
 /// `offset_of!(Seg, base)` and `size_of::<Seg>()`.
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Default, Debug, Snapshot)]
 pub(crate) struct Seg {
     pub sel: u16,
     pub base: u64,
@@ -270,7 +271,7 @@ impl Seg {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Snapshot)]
 pub(crate) struct DescriptorTable {
     pub base: u64,
     pub limit: u16,
@@ -408,6 +409,7 @@ const GPRS_PER_DUMP_LINE: usize = 4;
 /// touches (`gpr`, `rip`, `icount`, `block_exit_requested`, `prepaid_icount`, `lazy_dst`,
 /// `lazy_src`, `seg[].base`, `tlb_active_base`) is found with `offset_of!`.
 #[repr(C)]
+#[derive(Snapshot)]
 pub(crate) struct Cpu {
     pub gpr: [u64; 16],
     /// Address of the instruction being executed. The JIT stores it before anything that can
@@ -426,27 +428,32 @@ pub(crate) struct Cpu {
     /// The JIT latches it into a host register on block entry (`jit/arch_a64.rs`,
     /// `jit/arch_x64.rs`), so it must follow every CPL change (use `set_cpl`) and `tlb` must
     /// never be reallocated.
+    #[snapshot(skip)]
     pub tlb_active_base: u64,
     /// Current privilege level; change it only through `set_cpl`.
     pub cpl: u8,
     /// Set when a store hit a page holding translated code (`code_written`). Generated code
     /// polls it after stores and `helper_exec` reports it, so the running block stops before it
     /// can execute stale instructions; `step_block` clears it.
+    #[snapshot(skip)]
     pub block_exit_requested: bool,
     /// `shadow_stack_active()` as of entering the running chain of JIT blocks, which generated
     /// near calls and returns test to decide whether to touch the shadow stack. `step_block`
     /// sets it; within a chain it cannot go stale because everything that changes the answer
     /// (a CPL change, mov to CR0/CR4, wrmsr, VMRUN, #VMEXIT) ends the block through the run loop.
     /// A byte the generated code reads with one load, rather than CR4, CPL and U_CET/S_CET.
+    #[snapshot(skip)]
     pub shadow_stack_on: bool,
     /// Instructions the JIT already added to `icount` in the middle of a block, before
     /// rdtsc/port I/O, so those read an up-to-date clock. `step_block` subtracts it from the
     /// block's total.
+    #[snapshot(skip)]
     pub prepaid_icount: u64,
     /// One plus the block index of the instruction whose slow-path memory access is in progress
     /// (0: none). The access may reach a device, which reads the clock, and the instructions of
     /// the block before this one are not in `icount` yet (`now_ns` adds them). Written by the
     /// emitted slow path, cleared by the helper (`jit/helpers.rs`).
+    #[snapshot(skip)]
     pub slow_access_insn: u64,
     /// Indexed by `SEG_*`.
     pub seg: [Seg; 6],
@@ -477,6 +484,7 @@ pub(crate) struct Cpu {
     pub kgsbase: u64,
     pub tsc_aux: u64,
     /// What CPUID reports about the package and this processor in it.
+    #[snapshot(skip)]
     pub topology: cpuid::CpuTopology,
     /// IA32_SPEC_CTRL (stored, no speculation to control; see `SPEC_CTRL_WRITABLE` in sys.rs).
     pub spec_ctrl: u64,
@@ -508,7 +516,9 @@ pub(crate) struct Cpu {
     pub debug: debug::DebugState,
     /// INVLPGBs any time-shared vCPU has run (machine-wide, moved by `swap_shared`) and how many
     /// of them this vCPU has caught up with (`invlpgb.rs`).
+    #[snapshot(skip)]
     pub tlb_shootdown_epoch: u64,
+    #[snapshot(skip)]
     pub tlb_shootdown_seen: u64,
     /// MSRs that are only stored: a read returns the last write and writes are accepted.
     /// An MSR that is neither handled in `rdmsr`/`wrmsr` nor listed here raises #GP, which
@@ -530,10 +540,12 @@ pub(crate) struct Cpu {
     pub opmask: [u64; 8],
     /// True while a VEX instruction runs through the legacy SSE kernels (see `avx.rs`): they then
     /// skip the CR4.OSFXSR gate and the 16-byte alignment rule.
+    #[snapshot(skip)]
     pub vex_active: bool,
     /// Segment register and offset of the memory operand `linear_address` last formed outside 64-bit
     /// mode, so `load_operand`/`store_operand` can check its whole extent (see `modes.rs`). Reset at
     /// the start of every instruction there.
+    #[snapshot(skip)]
     pub pending_operand: core::cell::Cell<Option<(u8, u64)>>,
     pub mxcsr: u32,
     pub fcw: u16,
@@ -551,86 +563,118 @@ pub(crate) struct Cpu {
     pub interrupt_shadow: bool,
     /// Guest physical RAM starting at address 0. It must never be resized or moved after
     /// `Cpu::new`, because `ram_base` and the TLB addends point into it.
+    #[snapshot(skip)]
     pub ram: GuestRam,
     /// Host address of `ram[0]`.
+    #[snapshot(skip)]
     pub ram_base: u64,
     /// Two halves of `TLB_ENTRIES_PER_MODE` entries, supervisor then user. Fixed size, so its
     /// address is stable for `tlb_active_base`.
+    #[snapshot(skip)]
     pub tlb: Vec<TlbEntry>,
+    #[snapshot(skip)]
     pub decode_cache: Vec<DecodeCacheEntry>,
     /// Bumping it invalidates the whole decode cache at once. Starts at 1 so the zeroed
     /// entries (generation 0) never match. 64 bits wide so it cannot wrap back to a value
     /// that stale entries still carry (a u32 would after about 4e9 flushes).
+    #[snapshot(skip)]
     pub decode_cache_generation: u64,
     /// One byte per guest physical page: nonzero while a cached decode or a JIT block was
     /// built from that page. Stores to such pages take the slow path and call `code_written`.
     /// Devices see it through `GuestMem` for the same purpose.
+    #[snapshot(skip)]
     pub page_has_code: CodePages,
     /// Pages whose `page_has_code` byte is set, so `flush_decode` can clear them without
     /// scanning the whole array. May list pages already cleared by `code_written`.
+    #[snapshot(skip)]
     pub pages_with_code: Vec<u32>,
+    #[snapshot(skip)]
     pub dev: DevHandle,
     /// Present when the machine boots a disk's boot sector: the BIOS services run as host code
     /// (`bios.rs`).
     #[cfg(not(freestanding))]
+    #[snapshot(skip)]
     pub bios: Option<Box<bios::Bios>>,
     /// Instructions retired; guest time is derived from it. `run` adds one before an
     /// instruction executes, so an instruction that faults is counted too.
     pub icount: u64,
     /// Virtual time added while halted: the clock jumps to the next device deadline instead of
     /// executing instructions. Stays 0 with a `wall_clock`, which just waits.
+    #[snapshot(skip)]
     pub idle_skipped_ns: u64,
     /// With several vCPUs the clock is not the raw `icount` (see `smp.rs`): guest time is
     /// `time_base_ns` plus the instructions retired since `slice_base_icount` divided by
     /// `time_divisor`, the number of vCPUs that were running when the slice began. With one vCPU
     /// the divisor is 1 and the base 0, which is `icount * NS_PER_INSN`. `time_carry` is the
     /// instructions that did not make a whole nanosecond yet, kept while the divisor stays put.
+    #[snapshot(skip)]
     pub time_base_ns: u64,
+    #[snapshot(skip)]
     pub slice_base_icount: u64,
+    #[snapshot(skip)]
     pub time_divisor: u64,
+    #[snapshot(skip)]
     pub time_carry: u64,
     /// `icount` at which `service_events` runs next.
+    #[snapshot(skip)]
     pub next_event: u64,
     /// Host time before which `service_events` leaves the devices alone (`MIN_DEVICE_TICK_NS`).
     /// Per CPU even when time-sharing: each CPU ticking on its own turn only ticks more often.
+    #[snapshot(skip)]
     next_device_tick_ns: u64,
+    #[snapshot(skip)]
     pub stop: Arc<AtomicBool>,
+    #[snapshot(skip)]
     pub log: Option<LogFn>,
     /// Host callback run on every device tick; its argument is true when the guest is idle with
     /// nothing scheduled (only needed on UEFI, where the host has to be polled for input).
+    #[snapshot(skip)]
     pub poll: Option<PollFn>,
     /// Keys already reported by `log_once`.
+    #[snapshot(skip)]
     pub logged: alloc::collections::BTreeSet<u64>,
     /// Number of `flush_decode` calls, for `dump`.
+    #[snapshot(skip)]
     pub flushes: u64,
     /// Realtime mode: guest time is this host clock and halting really waits. `None` is the
     /// deterministic virtual clock.
+    #[snapshot(skip)]
     pub wall_clock: Option<WallClock>,
     /// Instructions the last JIT block retired before it exited; `run_verify` replays that many
     /// on the interpreter.
+    #[snapshot(skip)]
     pub last_block_insns: u64,
     /// Exception raised inside a JIT helper. Generated code only gets a status code back;
     /// `step_block` picks the exception up from here.
+    #[snapshot(skip)]
     pub pending: Option<Exception>,
+    #[snapshot(skip)]
     pub jit: Option<Box<crate::jit::Jit>>,
     /// Most recent instruction addresses, recorded only when debugging.
+    #[snapshot(skip)]
     pub trace: Option<alloc::collections::VecDeque<u64>>,
     /// How many times each kind of instruction went through `helper_exec` (see
     /// `jit::helpers::histogram_key`), counted only when debugging: what is left to lower.
+    #[snapshot(skip)]
     pub helper_histogram: Option<alloc::collections::BTreeMap<u64, u64>>,
     /// How many #VMEXITs of each exit code (with the port number for I/O exits, see
     /// `svm::exit_histogram_key`) the guest hypervisor took, counted only when debugging.
+    #[snapshot(skip)]
     pub svm_exit_histogram: Option<alloc::collections::BTreeMap<u64, u64>>,
     /// This vCPU's number, which is also the APIC id it starts with, and how many there are.
+    #[snapshot(skip)]
     pub cpu_index: u32,
+    #[snapshot(skip)]
     pub cpu_count: u32,
     /// More than one vCPU: the run loop hands control back to the scheduler (`smp.rs`) at every
     /// event tick, at `pause` and while halted.
+    #[snapshot(skip)]
     pub multi: bool,
     /// Halted since power-on or INIT until a start-up IPI arrives (the "wait-for-SIPI" state).
     pub wait_for_sipi: bool,
     /// While a `pause` has pulled `next_event` forward to force a yield, the deadline it
     /// displaced; 0 otherwise. `before_step` puts it back.
+    #[snapshot(skip)]
     pub pause_resume_event: u64,
     /// The cache line an MWAIT is waiting on (physical address) and its contents when the wait
     /// began; the scheduler wakes the vCPU when another vCPU or a device changes them.
@@ -638,26 +682,36 @@ pub(crate) struct Cpu {
     /// Counts pages that gained translated code. A vCPU that has not run since the count last
     /// moved may hold write tags for such a page in its private TLB; `Smp::switch_to` revokes
     /// them (machine-wide, so it moves with `dev`).
+    #[snapshot(skip)]
     pub code_mark_epoch: u64,
     /// The `code_mark_epoch` this vCPU's TLB is up to date with.
+    #[snapshot(skip)]
     pub code_mark_seen: u64,
     /// Guest memory accesses use x86 ordering and atomic page-table updates (`atomic.rs`): set
     /// when this vCPU runs on its own host thread beside others.
+    #[snapshot(skip)]
     pub ordered_memory: bool,
     /// How the instruction being executed treats its memory destination: see `Rmw`.
+    #[snapshot(skip)]
     pub rmw: Rmw,
     /// Set when this vCPU runs on its own host thread (`vcpus.rs`).
+    #[snapshot(skip)]
     pub threads: Option<vcpus::ThreadRuntime>,
     /// How much of the shared invalidation log this vCPU has applied.
+    #[snapshot(skip)]
     pub invalidation_seen: u64,
     /// `pause`s executed, so a spinning threaded vCPU yields its host core now and then.
+    #[snapshot(skip)]
     pub pause_count: u32,
     /// This vCPU is inside `with_exclusive`; a nested request runs in place.
+    #[snapshot(skip)]
     pub in_exclusive: bool,
     /// Large leaves behind the soft TLB (see `LargePage`), replaced round robin from
     /// `large_page_next`. Last in the struct: generated code never reads it, and the fields it
     /// does read must stay within their short load offsets.
+    #[snapshot(skip)]
     pub large_pages: [LargePage; LARGE_PAGE_CACHE_ENTRIES],
+    #[snapshot(skip)]
     pub large_page_next: usize,
 }
 

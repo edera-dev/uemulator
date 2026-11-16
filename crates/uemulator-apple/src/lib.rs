@@ -17,8 +17,9 @@ use std::thread::JoinHandle;
 
 use uemulator::{
     BlockBackend, ConsoleHandle, ConsoleKind, Cursor, Disk, DisplayHandle, DisplayMode,
-    EmulatedMachine, Error, ExitReason, FileKeyValueStore, ImageFile, InputHandle, JitMode,
-    MachineConfig, PointerButton, RawImage, ScreenMirror, SmpMode, StopHandle, Udisk,
+    EmulatedMachine, Error, ExitReason, FileKeyValueStore, FileSnapshotSink, FileSnapshotSource,
+    ImageFile, InputHandle, JitMode, MachineConfig, PointerButton, RawImage, ScreenMirror, SmpMode,
+    StopHandle, Udisk,
 };
 
 // `ua_config.options`: the web build's OPTION_* bits (crates/uemulator-web/src/lib.rs), so one set
@@ -85,6 +86,9 @@ const EXIT_RESET: i32 = 1;
 const EXIT_TRIPLE_FAULT: i32 = 2;
 const EXIT_STOPPED: i32 = 3;
 const EXIT_INTERNAL: i32 = 4;
+const EXIT_SUSPENDED: i32 = 5;
+const EXIT_SUSPEND_FAILED: i32 = 6;
+const EXIT_RESUME_FAILED: i32 = 7;
 
 #[repr(C)]
 pub struct Config {
@@ -113,6 +117,8 @@ pub struct Config {
     display_width: u32,
     display_height: u32,
     log: Option<LogFn>,
+    suspend_path: *const c_char,
+    resume_path: *const c_char,
 }
 
 // The header's layout on the 64-bit Apple targets: a field moved or resized here and not there
@@ -126,7 +132,9 @@ const _: () = {
     assert!(std::mem::offset_of!(Config, unix_time) == 128);
     assert!(std::mem::offset_of!(Config, display_height) == 140);
     assert!(std::mem::offset_of!(Config, log) == 144);
-    assert!(size_of::<Config>() == 152);
+    assert!(std::mem::offset_of!(Config, suspend_path) == 152);
+    assert!(std::mem::offset_of!(Config, resume_path) == 160);
+    assert!(size_of::<Config>() == 168);
 };
 
 /// `ua_log_fn`: the library's diagnostics, on whichever machine thread logs. `text` is UTF-8 and
@@ -199,6 +207,9 @@ struct Settings {
     disks: Vec<(String, bool)>,
     /// The machine's `nvram.kv`: UEFI variables and TPM state survive the app.
     nvram_path: Option<String>,
+    /// Where `ua_suspend` writes the machine's snapshot, and the snapshot to resume from.
+    suspend_path: Option<String>,
+    resume_path: Option<String>,
     memory_mib: usize,
     cpus: usize,
     options: u32,
@@ -251,16 +262,12 @@ impl Settings {
                 })
                 .collect()
         };
-        let nvram_path = (!config.nvram_path.is_null())
-            .then(|| {
-                unsafe { CStr::from_ptr(config.nvram_path) }
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .filter(|path| !path.is_empty());
+        let path = |text: *const c_char| Some(string(text)).filter(|path| !path.is_empty());
         Settings {
             disks,
-            nvram_path,
+            nvram_path: path(config.nvram_path),
+            suspend_path: path(config.suspend_path),
+            resume_path: path(config.resume_path),
             kernel: bytes(config.kernel, config.kernel_len),
             initrd: bytes(config.initrd, config.initrd_len),
             firmware: (!firmware.is_empty()).then_some(firmware),
@@ -350,6 +357,16 @@ impl Settings {
         }
         for (path, read_only) in &self.disks {
             config = config.disk(open_disk(path, *read_only)?);
+        }
+        if let Some(path) = &self.suspend_path {
+            config = config.suspend_to(FileSnapshotSink::new(path));
+        }
+        if let Some(path) = &self.resume_path {
+            // Opened per build like the store: the first build of `create`'s JIT fallback is
+            // dropped before it reads anything.
+            let source =
+                FileSnapshotSource::open(path).map_err(|e| Error::BadConfig(e.to_string()))?;
+            config = config.resume_from(source);
         }
         config = match (self.firmware_kind, &self.firmware) {
             (FIRMWARE_UEFI, Some(firmware)) => config.uefi_firmware(firmware.clone()),
@@ -527,6 +544,9 @@ pub unsafe extern "C" fn ua_start(machine: *mut Machine) -> i32 {
             ExitReason::Reset => (EXIT_RESET, String::new()),
             ExitReason::TripleFault => (EXIT_TRIPLE_FAULT, String::new()),
             ExitReason::Stopped => (EXIT_STOPPED, String::new()),
+            ExitReason::Suspended => (EXIT_SUSPENDED, String::new()),
+            ExitReason::SuspendFailed(text) => (EXIT_SUSPEND_FAILED, text),
+            ExitReason::ResumeFailed(text) => (EXIT_RESUME_FAILED, text),
             ExitReason::Internal(text) => (EXIT_INTERNAL, text),
         };
         let message = CString::new(text.replace('\0', " ")).unwrap_or_default();
@@ -559,6 +579,13 @@ pub unsafe extern "C" fn ua_resize(machine: *const Machine, cols: u16, rows: u16
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ua_stop(machine: *const Machine) {
     unsafe { &*machine }.stop.stop();
+}
+
+/// # Safety
+/// `machine` came from `ua_create` and was not destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ua_suspend(machine: *const Machine) {
+    unsafe { &*machine }.stop.suspend();
 }
 
 /// # Safety
@@ -882,6 +909,8 @@ mod tests {
             display_width: 0,
             display_height: 0,
             log: None,
+            suspend_path: std::ptr::null(),
+            resume_path: std::ptr::null(),
         }
     }
 
@@ -963,13 +992,24 @@ mod tests {
     /// is `hlt; jmp` back to it: what the library's `testkit::FakeKernel` builds, which is not
     /// visible from here. These tests never start it; they need a machine, not a guest.
     fn halting_kernel() -> Vec<u8> {
+        const HALT_LOOP: [u8; 3] = [0xf4, 0xeb, 0xfd];
+        kernel_with_entry(&HALT_LOOP)
+    }
+
+    /// `sti; hlt; jmp` back to the `hlt`: waiting for an interrupt that never comes, so the
+    /// machine runs until it is stopped (a `hlt` with interrupts off is a power-off).
+    fn waiting_kernel() -> Vec<u8> {
+        const WAIT_LOOP: [u8; 4] = [0xfb, 0xf4, 0xeb, 0xfd];
+        kernel_with_entry(&WAIT_LOOP)
+    }
+
+    fn kernel_with_entry(code: &[u8]) -> Vec<u8> {
         const SECTOR: usize = 512;
         const SETUP_SECTS: usize = 1;
         const ENTRY_OFFSET: usize = 0x200;
         const KERNEL_LOAD: u64 = 0x100_0000;
-        const HALT_LOOP: [u8; 3] = [0xf4, 0xeb, 0xfd];
         let protected = (SETUP_SECTS + 1) * SECTOR;
-        let payload = ENTRY_OFFSET + HALT_LOOP.len();
+        let payload = ENTRY_OFFSET + code.len();
         let mut image = vec![0u8; protected + payload];
         image[0x1f1] = SETUP_SECTS as u8;
         image[0x200] = 0xeb; // jmp short over the header
@@ -983,8 +1023,71 @@ mod tests {
         image[0x238..0x23c].copy_from_slice(&2048u32.to_le_bytes()); // cmdline_size
         image[0x258..0x260].copy_from_slice(&KERNEL_LOAD.to_le_bytes()); // pref_address
         image[0x260..0x264].copy_from_slice(&(payload as u32).to_le_bytes()); // init_size
-        image[protected + ENTRY_OFFSET..].copy_from_slice(&HALT_LOOP);
+        image[protected + ENTRY_OFFSET..].copy_from_slice(code);
         image
+    }
+
+    extern "C" fn record_exit(context: *mut c_void, reason: i32, _: *const c_char) {
+        let exits = unsafe { &*context.cast::<std::sync::Mutex<Vec<i32>>>() };
+        exits.lock().unwrap().push(reason);
+    }
+
+    /// Runs `config` until `end` is called on it and the machine reports its exit.
+    fn run_until(config: &Config, end: unsafe extern "C" fn(*const Machine)) -> i32 {
+        const EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+        let exits = std::sync::Mutex::new(Vec::new());
+        let mut error = [0 as c_char; 256];
+        let machine = unsafe {
+            ua_create(
+                config,
+                ignore_output,
+                record_exit,
+                (&raw const exits).cast_mut().cast(),
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        assert!(!machine.is_null());
+        let deadline = std::time::Instant::now() + EXIT_WAIT;
+        unsafe {
+            assert_eq!(ua_start(machine), 0);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            end(machine);
+        }
+        while exits.lock().unwrap().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "no exit");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        unsafe { ua_destroy(machine) };
+        exits.lock().unwrap()[0]
+    }
+
+    #[test]
+    fn a_machine_suspends_to_a_file_and_resumes_from_it_once() {
+        let dir = std::env::temp_dir().join(format!("ua-suspend-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let snapshot = dir.join("machine.snapshot");
+        let path = CString::new(snapshot.to_str().unwrap()).unwrap();
+        let kernel = waiting_kernel();
+
+        let mut suspending = config(&kernel);
+        suspending.suspend_path = path.as_ptr();
+        assert_eq!(run_until(&suspending, ua_suspend), EXIT_SUSPENDED);
+        assert!(snapshot.exists());
+
+        let mut resuming = config(&kernel);
+        resuming.resume_path = path.as_ptr();
+        assert_eq!(run_until(&resuming, ua_stop), EXIT_STOPPED);
+        assert!(!snapshot.exists(), "a resumed snapshot was kept");
+
+        // Gone, so a second resume fails at create and boots nothing.
+        assert!(
+            try_create(&resuming)
+                .unwrap_err()
+                .contains("machine.snapshot")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn create(kernel: &[u8], options: u32) -> *mut Machine {

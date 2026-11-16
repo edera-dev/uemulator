@@ -1,5 +1,6 @@
 #[cfg(freestanding)]
 use crate::prelude::*;
+use crate::snapshot::Snapshot;
 
 const MASTER_COMMAND_PORT: u16 = 0x20;
 const MASTER_DATA_PORT: u16 = 0x21;
@@ -71,7 +72,7 @@ const OCW2_IRQ_MASK: u8 = 7;
 const DEFAULT_MASTER_ICW3: u8 = 1 << CASCADE_IRQ;
 const DEFAULT_SLAVE_ICW3: u8 = CASCADE_IRQ;
 
-#[derive(Clone)]
+#[derive(Clone, Snapshot)]
 struct Pic {
     is_master: bool,
     /// Requested lines. Edge inputs latch here on `raise` and clear on acknowledge; level inputs
@@ -347,7 +348,7 @@ impl Pic {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Snapshot)]
 pub(crate) struct Pics {
     master: Pic,
     slave: Pic,

@@ -1,6 +1,7 @@
 use super::guestmem::GuestMem;
 #[cfg(freestanding)]
 use crate::prelude::*;
+use crate::snapshot::Snapshot;
 
 /// Largest queue size offered. Must be a power of two: `push_used` and `pop` index the
 /// rings with `index % size` while the 16-bit indices wrap at 65536.
@@ -133,7 +134,7 @@ const USED_ENTRY_LEN: u64 = 4;
 const RING_FIXED_BYTES: u64 = 6;
 
 /// Split-virtqueue state the driver programs through the common config registers.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Snapshot)]
 pub(crate) struct Queue {
     /// Starts at `QUEUE_MAX`; the driver may only shrink it to another power of two.
     pub size: u16,
@@ -393,7 +394,9 @@ impl Queue {
 
 /// A virtio device model behind a PCI `Transport`. The callbacks return true when buffers
 /// were completed (or config changed) and the guest should get an interrupt.
-pub(crate) trait VirtioDev: Send {
+/// `Snapshot` is a supertrait so a `Box<dyn VirtioDev>` saves the device behind it; each device
+/// derives it and skips its host side (its disk, its frame queues, its console handle).
+pub(crate) trait VirtioDev: Send + Snapshot {
     /// Virtio device type (1 net, 2 block, 3 console, 4 entropy, 16 GPU, 18 input). PCI device id
     /// is `0x1040 + id`.
     fn device_type(&self) -> u16;
@@ -428,10 +431,25 @@ pub(crate) trait VirtioDev: Send {
     fn block_backend(&mut self) -> Option<&mut dyn crate::disk::BlockBackend> {
         None
     }
+    /// Makes everything the guest wrote durable before a snapshot is taken, so the snapshot and
+    /// the disk agree (`docs/plans/29-snapshots.md`, "I/O consistency"). Only virtio-blk has
+    /// storage.
+    fn flush_storage(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+    /// Why the device's state cannot go into a snapshot, if it cannot: state that lives outside
+    /// the emulator (a 3D renderer's contexts).
+    fn snapshot_blocker(&self) -> Option<&'static str> {
+        None
+    }
+    /// The device's state was just restored from a snapshot: give the host side (the screen)
+    /// what the guest had shown, which the new machine's handles have never seen.
+    fn restored(&mut self) {}
 }
 
 /// virtio-pci modern transport for one device: decodes accesses to BAR0 and owns the common
 /// config state (feature negotiation, status, queue setup).
+#[derive(Snapshot)]
 pub(crate) struct Transport {
     pub dev: Box<dyn VirtioDev>,
     pub queues: Vec<Queue>,
@@ -456,7 +474,7 @@ pub(crate) struct Transport {
 }
 
 /// One MSI-X table entry. Masked at reset, as the PCI spec requires.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Snapshot)]
 struct MsixEntry {
     address: u64,
     data: u32,
@@ -1047,7 +1065,9 @@ mod tests {
         negotiated: Vec<u64>,
     }
 
-    struct ProbeDev(Arc<Mutex<Probe>>);
+    /// The probe is the test's view of the device, not guest state: nothing to save.
+    #[derive(crate::snapshot::Snapshot)]
+    struct ProbeDev(#[snapshot(skip)] Arc<Mutex<Probe>>);
 
     impl ProbeDev {
         fn drain(&self, queue: usize, queues: &mut [Queue], mem: &mut GuestMem) -> bool {
@@ -3011,5 +3031,21 @@ mod tests {
         let mut mem = GuestMem::new(&mut ram, &code);
         queue.push_used(&mut mem, 0, 1);
         assert_eq!(mem.code_pages_written, vec![(USED0 >> 12) as usize]);
+    }
+}
+
+impl Snapshot for Box<dyn VirtioDev> {
+    fn save(
+        &self,
+        w: &mut crate::snapshot::Writer<'_>,
+    ) -> Result<(), crate::snapshot::SnapshotError> {
+        (**self).save(w)
+    }
+
+    fn load(
+        &mut self,
+        r: &mut crate::snapshot::Reader<'_>,
+    ) -> Result<(), crate::snapshot::SnapshotError> {
+        (**self).load(r)
     }
 }

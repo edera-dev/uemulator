@@ -24,6 +24,7 @@ use super::exception::Exception;
 use super::flags::{CF, VM};
 use super::sys::is_canonical;
 use super::*;
+use crate::snapshot::Snapshot;
 
 pub(crate) const MSR_U_CET: u32 = 0x6a0;
 pub(crate) const MSR_S_CET: u32 = 0x6a2;
@@ -82,7 +83,7 @@ const ISST_ENTRY_BYTES: u64 = 8;
 const INCSSP_COUNT_MASK: u64 = 0xff;
 
 /// SSP and the CET MSRs of one vCPU.
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Snapshot)]
 pub(crate) struct Cet {
     pub ssp: u64,
     pub u_cet: u64,

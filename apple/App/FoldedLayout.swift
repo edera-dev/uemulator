@@ -167,7 +167,7 @@ struct FoldedControls: View {
                     if model.isRunning {
                         Button("Stop", systemImage: "stop.fill") { model.stop() }
                     } else {
-                        Button("Start", systemImage: "play.fill") { model.start() }
+                        Button(model.startTitle, systemImage: "play.fill") { model.start() }
                     }
                 }
             }

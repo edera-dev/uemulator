@@ -1,6 +1,7 @@
 use super::guestmem::GuestMem;
 use super::virtio::{DEVICE_TYPE_CONSOLE, Queue, VirtioDev};
 use crate::console::ConsoleHandle;
+use crate::snapshot::Snapshot;
 
 /// VIRTIO_CONSOLE_F_SIZE: config space carries cols/rows and changes raise a config interrupt.
 /// The multiport feature is not offered, so there are no control queues: just port 0's pair.
@@ -24,7 +25,9 @@ const MAX_NR_PORTS: u32 = 1;
 /// holding one more piece of a buffer the guest already proved is in RAM.
 const TX_CHUNK_BYTES: usize = 1 << 16;
 
+#[derive(Snapshot)]
 pub(crate) struct VirtioConsole {
+    #[snapshot(skip)]
     console: ConsoleHandle,
     cols: u16,
     rows: u16,

@@ -4,6 +4,7 @@
 
 #[cfg(freestanding)]
 use crate::prelude::*;
+use crate::snapshot::Snapshot;
 
 use super::apic::{DELIVERY_EXTINT, Interrupt};
 
@@ -47,6 +48,7 @@ const RTE_WRITABLE: u64 = RTE_VECTOR_MASK
     | RTE_MASKED
     | (0xff << RTE_DESTINATION_SHIFT);
 
+#[derive(Snapshot)]
 pub(crate) struct IoApic {
     id: u32,
     select: u32,

@@ -18,6 +18,7 @@ use super::nv::NvIndex;
 use super::object::{Object, Public, Sensitive, trim_auth};
 use super::spec::*;
 use super::wire::{Reader, Truncated, marshal};
+use crate::snapshot::Snapshot;
 
 /// Keys under this prefix belong to the TPM. `dev/kv.rs` hides them from the guest.
 pub(crate) const STORE_PREFIX: &[u8] = b"tpm/";
@@ -33,7 +34,8 @@ pub(super) const MAX_HIERARCHY_AUTH_BYTES: usize = 32;
 /// How many objects may be persistent at once (`TPM_PT_HR_PERSISTENT_MIN` promises as many).
 pub(super) const MAX_PERSISTENT_OBJECTS: usize = 16;
 
-#[derive(Clone)]
+#[derive(Clone, Snapshot)]
+#[snapshot(new)]
 pub(super) struct Hierarchy {
     pub seed: Vec<u8>,
     /// The HMAC key behind tickets this hierarchy's objects get.
@@ -51,7 +53,7 @@ impl Hierarchy {
 }
 
 /// What survives a TPM Reset.
-#[derive(Clone)]
+#[derive(Clone, Snapshot)]
 pub(super) struct PersistentState {
     pub platform: Hierarchy,
     pub endorsement: Hierarchy,

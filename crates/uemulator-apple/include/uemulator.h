@@ -63,6 +63,12 @@
 #define UA_EXIT_TRIPLE_FAULT 2
 #define UA_EXIT_STOPPED 3
 #define UA_EXIT_INTERNAL 4
+// ua_suspend wrote the snapshot to `suspend_path`, complete; the disks were flushed first.
+#define UA_EXIT_SUSPENDED 5
+// The suspend could not be taken or written (the machine is gone), or the snapshot at
+// `resume_path` could not be restored (nothing ran). The message says why.
+#define UA_EXIT_SUSPEND_FAILED 6
+#define UA_EXIT_RESUME_FAILED 7
 
 typedef struct ua_machine ua_machine;
 
@@ -70,7 +76,8 @@ typedef struct ua_machine ua_machine;
 // return, never call back into the machine.
 typedef void (*ua_output_fn)(void *context, const uint8_t *bytes, size_t len);
 // The guest exited (once per ua_start). Runs on the machine's own thread; `message` is UTF-8,
-// empty unless UA_EXIT_INTERNAL, and only valid during the call.
+// empty unless UA_EXIT_INTERNAL, UA_EXIT_SUSPEND_FAILED or UA_EXIT_RESUME_FAILED, and only valid
+// during the call.
 typedef void (*ua_exit_fn)(void *context, int32_t reason, const char *message);
 // The library's diagnostics, on whichever machine thread logs. `text` is UTF-8, not NUL-terminated,
 // and valid only during the call.
@@ -141,6 +148,12 @@ typedef struct {
     uint32_t display_height;
     // May be NULL.
     ua_log_fn log;
+    // Where ua_suspend writes the machine's snapshot (through `<path>.tmp`, renamed once complete);
+    // NULL: ua_suspend only stops. docs/plans/29-snapshots.md.
+    const char *suspend_path;
+    // A snapshot to resume instead of booting; the rest of the config must describe the machine it
+    // was taken from. Deleted once the machine resumes (its disks then move on). NULL to boot.
+    const char *resume_path;
 } ua_config;
 
 // Builds a machine; it does not run until ua_start. The buffers are copied. On failure returns
@@ -158,6 +171,9 @@ void ua_input(const ua_machine *machine, const uint8_t *bytes, size_t len);
 void ua_resize(const ua_machine *machine, uint16_t cols, uint16_t rows);
 // Asks the guest to stop; the exit callback follows with UA_EXIT_STOPPED. Any thread.
 void ua_stop(const ua_machine *machine);
+// Stops the machine and writes its snapshot to `suspend_path`; the exit callback follows with
+// UA_EXIT_SUSPENDED or UA_EXIT_SUSPEND_FAILED (UA_EXIT_STOPPED without a path). Any thread.
+void ua_suspend(const ua_machine *machine);
 // 1 if the machine has a screen (UA_OPTION_DISPLAY).
 int32_t ua_has_display(const ua_machine *machine);
 // Brings the app's copy of the screen up to date, calling `screen` when anything changed. Poll it

@@ -106,7 +106,10 @@ final class WebKitEngine: NSObject, MachineEngine {
     // worker.js's exit codes (protocol.js EXIT_NAMES), and the page's own for setup failures.
     private static let exitNames = [
         0: "Powered off", 1: EngineState.resetReason, 2: "Triple fault", 3: "Stopped", 4: "Emulator error",
+        5: EngineState.suspendedReason, 6: "Suspend failed", 7: "Resume failed",
     ]
+    // A suspend asked for while the page was away (reconnecting): sent when it is back.
+    private var suspendRequested = false
 
     override init() {
         files = LoopbackFiles(root: Bundle.main.resourceURL!.appendingPathComponent("web"))
@@ -208,6 +211,19 @@ final class WebKitEngine: NSObject, MachineEngine {
         let firmware = settings.firmware == .uefi ? settings.firmwareImage : nil
         if let firmware { files.register(prefix + "firmware", firmware) }
         if let hypervisor = settings.hypervisor { files.register(prefix + "hypervisor", hypervisor) }
+        suspendRequested = false
+        var snapshot: [String: Any] = [:]
+        if let url = settings.suspendTo {
+            files.registerSnapshotSink(prefix + "suspend", file: url)
+            snapshot["suspend"] = prefix + "suspend"
+        }
+        if let url = settings.resumeFrom {
+            files.registerSnapshotSource(prefix + "resume", file: url)
+            snapshot["resume"] = prefix + "resume"
+        }
+        // UEFI variables, Secure Boot keys and TPM state, in the same nvram.kv the native engine
+        // uses, so a machine keeps them when it moves between the engines.
+        if let nvram = settings.nvram { files.registerKeyValueLog(prefix + "nvram", file: nvram) }
         if settings.display.hasScreen { screen?.reset() }
         let boot: [String: Any] = [
             "type": "boot",
@@ -219,6 +235,8 @@ final class WebKitEngine: NSObject, MachineEngine {
             "firmwareKind": settings.firmware.code,
             "hypervisor": settings.hypervisor == nil ? NSNull() : prefix + "hypervisor",
             "hypervisorCmdline": settings.hypervisorCmdline,
+            "nvram": settings.nvram == nil ? NSNull() : prefix + "nvram",
+            "snapshot": snapshot,
             "cmdline": settings.cmdlineAppend,
             "memoryMib": settings.memoryMib,
             "cpus": settings.cpus,
@@ -284,6 +302,15 @@ final class WebKitEngine: NSObject, MachineEngine {
             startAfterDrain = nil
             begin(settings)
         }
+    }
+
+    // Like a stop, but the worker writes the machine through the loopback server before
+    // `uw_run` returns, and the run ends on its exit (5 once the snapshot is complete).
+    func suspend() {
+        guard active else { return }
+        onState?(EngineState.suspending)
+        suspendRequested = true
+        socket?.send(text: Self.json(["type": "suspend"]))
     }
 
     func send(_ bytes: [UInt8]) {
@@ -406,6 +433,7 @@ final class WebKitEngine: NSObject, MachineEngine {
             listen(to: socket)
             socket.send(text: Self.json(["type": "reattached"]))
             if let size { socket.send(text: Self.json(["type": "resize", "cols": size.cols, "rows": size.rows])) }
+            if suspendRequested { socket.send(text: Self.json(["type": "suspend"])) }
             onLog?("the engine page reconnected")
         } else if draining != nil {
             // Its stop may have been lost with the old socket.

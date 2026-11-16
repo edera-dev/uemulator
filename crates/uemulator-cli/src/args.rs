@@ -379,6 +379,15 @@ pub struct RuntimeArgs {
     /// Stop the machine after this many seconds
     #[arg(long, value_name = "SECS")]
     pub timeout: Option<u64>,
+    /// Ctrl-] and --timeout suspend the machine to FILE (its whole state; the disks are flushed)
+    /// instead of stopping it, for --resume-from
+    #[arg(long, value_name = "FILE")]
+    pub suspend_to: Option<std::path::PathBuf>,
+    /// Resume the machine suspended to FILE instead of booting. Give the options and disks it
+    /// was suspended with, untouched since; FILE is deleted once the machine resumes, since the
+    /// guest then writes its disks and the file no longer matches them
+    #[arg(long, value_name = "FILE")]
+    pub resume_from: Option<std::path::PathBuf>,
     /// Where the viewer of a machine with a screen or input listens, as HOST:PORT: an address or
     /// a host name (the viewer then answers to that name), port 0 picks a free one. Anyone who
     /// can reach it controls the machine's keyboard and mouse [default: 127.0.0.1:5800]

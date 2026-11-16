@@ -144,9 +144,13 @@ final class NativeEngine: MachineEngine, @unchecked Sendable {
         // C strings for the disks' paths, alive until ua_create has copied them.
         let paths = settings.disks.map { strdup($0.url.path) }
         let nvram = settings.nvram.map { strdup($0.path) } ?? nil
+        let suspendTo = settings.suspendTo.map { strdup($0.path) } ?? nil
+        let resumeFrom = settings.resumeFrom.map { strdup($0.path) } ?? nil
         defer {
             paths.forEach { free($0) }
             free(nvram)
+            free(suspendTo)
+            free(resumeFrom)
         }
         let disks = zip(settings.disks, paths).map { ua_disk(path: $1, read_only: $0.readOnly ? 1 : 0) }
         let created: OpaquePointer? = disks.withUnsafeBufferPointer { disks in settings.kernel.withUnsafeBytes { kernel in
@@ -170,7 +174,9 @@ final class NativeEngine: MachineEngine, @unchecked Sendable {
                                     hypervisor_cmdline: hypervisorCmdline,
                                     unix_time: settings.unixTime,
                                     display_width: 0, display_height: 0,
-                                    log: NativeEngine.logCallback)
+                                    log: NativeEngine.logCallback,
+                                    suspend_path: suspendTo,
+                                    resume_path: resumeFrom)
                                 return ua_create(&config, NativeEngine.outputCallback, NativeEngine.exitCallback, context,
                                                  &error, error.count)
                             }
@@ -224,6 +230,14 @@ final class NativeEngine: MachineEngine, @unchecked Sendable {
         network = nil
         DispatchQueue.global(qos: .userInitiated).async { teardown.run() }
         onState?(.stopped("Stopped"))
+    }
+
+    // The machine stays attached: its exit, with the snapshot complete, is what ends the run.
+    @MainActor
+    func suspend() {
+        guard let machine else { return }
+        onState?(EngineState.suspending)
+        ua_suspend(machine)
     }
 
     @MainActor
@@ -379,6 +393,9 @@ final class NativeEngine: MachineEngine, @unchecked Sendable {
         case Int32(UA_EXIT_RESET): text = EngineState.resetReason
         case Int32(UA_EXIT_TRIPLE_FAULT): text = "Triple fault"
         case Int32(UA_EXIT_STOPPED): text = "Stopped"
+        case Int32(UA_EXIT_SUSPENDED): text = EngineState.suspendedReason
+        case Int32(UA_EXIT_SUSPEND_FAILED): text = "Suspend failed: \(message)"
+        case Int32(UA_EXIT_RESUME_FAILED): text = "Resume failed: \(message)"
         default: text = "Emulator error: \(message)"
         }
         DispatchQueue.main.async { [weak self] in

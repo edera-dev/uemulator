@@ -21,15 +21,16 @@
 
 mod gpu;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use uemulator::{
     BYTES_PER_PIXEL, BlockBackend, ClockMode, ConsoleKind, Cursor, Disk, DisplayHandle,
     DisplayMode, EmulatedMachine, Endpoint, ExitReason, Gateway, GatewayConfig, GatewayPolicy,
-    GpuLink, ImageStorage, InputHandle, JitMode, MachineConfig, MemoryKeyValueStore, NetHandle,
-    PointerButton, RawImage, RemoteImage, ScreenMirror, SegmentAgent, SegmentDestination,
-    SegmentStatus, StopHandle, Udisk, UdiskOptions, WispClient, WispState, WispStatus, disk_io,
+    GpuLink, ImageStorage, InputHandle, JitMode, KeyValueError, KeyValueLog, LogKeyValueStore,
+    MachineConfig, MemoryKeyValueStore, NetHandle, PointerButton, RawImage, RemoteImage,
+    ScreenMirror, SegmentAgent, SegmentDestination, SegmentStatus, SnapshotError, SnapshotSink,
+    SnapshotSource, StopHandle, Udisk, UdiskOptions, WispClient, WispState, WispStatus, disk_io,
 };
 
 const NS_PER_MS: f64 = 1_000_000.0;
@@ -93,6 +94,11 @@ pub const EXIT_RESET: i32 = 1;
 pub const EXIT_TRIPLE_FAULT: i32 = 2;
 pub const EXIT_STOPPED: i32 = 3;
 pub const EXIT_INTERNAL: i32 = 4;
+/// The machine suspended to the host's snapshot sink (`uw_set_snapshots`), which was finished.
+pub const EXIT_SUSPENDED: i32 = 5;
+/// A suspend or a resume failed; the message is in `uw_error_*`.
+pub const EXIT_SUSPEND_FAILED: i32 = 6;
+pub const EXIT_RESUME_FAILED: i32 = 7;
 /// `uw_run` before a successful `uw_create`.
 pub const EXIT_NO_MACHINE: i32 = -1;
 
@@ -169,8 +175,21 @@ unsafe extern "C" {
     /// Writes the page's requested terminal size (`cols`, `rows` as two little-endian `u16`) to
     /// `ptr` and returns 1 if it changed since the last call.
     fn host_resize(ptr: *mut u16) -> i32;
-    /// Non-zero once the page asked to stop the machine.
+    /// Non-zero once the page asked to stop the machine: 1 to stop it, `SUSPEND_REQUESTED`
+    /// to suspend it to the snapshot sink.
     fn host_should_stop() -> i32;
+    /// The suspend's snapshot, in order (`uw_set_snapshots`): appends `ptr..ptr+len`, blocking
+    /// until the host has it. Returns 0, or non-zero on failure.
+    fn host_snapshot_write(ptr: *const u8, len: usize) -> i32;
+    /// The suspend's snapshot is complete: the host makes it durable and visible (a rename), only
+    /// now. Returns 0, or non-zero on failure.
+    fn host_snapshot_finish() -> i32;
+    /// The resume's snapshot, in order: fills up to `capacity` bytes at `ptr` and returns how
+    /// many, 0 at its end, negative on failure.
+    fn host_snapshot_read(ptr: *mut u8, capacity: usize) -> i32;
+    /// The resume read the whole snapshot and the guest is about to run: the host must not resume
+    /// from it again (the guest's disks will move on). Returns 0, or non-zero on failure.
+    fn host_snapshot_consumed() -> i32;
     /// The guest is halted with nothing scheduled: JavaScript may sleep for a moment.
     fn host_idle();
     /// Milliseconds on a monotonic clock (`performance.now()`), fractional.
@@ -190,6 +209,13 @@ unsafe extern "C" {
     /// Makes every completed write of `source` durable (the udisk writer orders its map updates
     /// on it). Returns 0, or non-zero on failure.
     fn host_disk_flush(source: i32) -> i32;
+    /// Writes `ptr..ptr+len` at `offset` of the NVRAM log `uw_set_nvram` loaded, durably, and
+    /// blocks until the host has it. Returns 0, or non-zero on failure. Only the Apple app's
+    /// page provides a real one.
+    fn host_nvram_write(offset: f64, ptr: *const u8, len: usize) -> i32;
+    /// Replaces the whole NVRAM log with `ptr..ptr+len`, atomically and durably. Returns 0, or
+    /// non-zero on failure.
+    fn host_nvram_replace(ptr: *const u8, len: usize) -> i32;
     /// Copies up to `capacity` input event records (`EVENT_WORDS` `i32` each) to `ptr` and
     /// returns how many; never blocks.
     fn host_input_events(ptr: *mut i32, capacity: usize) -> usize;
@@ -260,6 +286,10 @@ thread_local! {
     static PENDING_FIRMWARE: RefCell<(i32, Vec<u8>)> = const { RefCell::new((FIRMWARE_NONE, Vec::new())) };
     /// What `uw_set_hypervisor` gave the next `uw_create`: the image and its command line.
     static PENDING_HYPERVISOR: RefCell<Option<(Vec<u8>, String)>> = const { RefCell::new(None) };
+    /// What `uw_set_snapshots` asked of the next `uw_create`: (suspend to the host, resume from it).
+    static PENDING_SNAPSHOTS: Cell<(bool, bool)> = const { Cell::new((false, false)) };
+    /// The NVRAM log `uw_set_nvram` loaded, for the next `uw_create`'s store.
+    static PENDING_NVRAM: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
     /// The machine's screen and input handles, for the poll hook (like `STOP`).
     static SCREEN: RefCell<Option<ScreenLink>> = const { RefCell::new(None) };
     /// What `uw_set_network` (and `uw_set_wisp`) set up for the next `uw_create`.
@@ -500,6 +530,105 @@ pub unsafe extern "C" fn uw_set_hypervisor(
     PENDING_HYPERVISOR.with(|hypervisor| *hypervisor.borrow_mut() = Some((image, cmdline)));
 }
 
+/// Gives the next `uw_create` a persistent key-value store (UEFI variables, Secure Boot keys,
+/// TPM state) whose log the host keeps: `log` is the log as the host has it now (empty for a new
+/// one), and the machine's writes go back through `host_nvram_write` and `host_nvram_replace`.
+/// The Apple app's WebKit engine passes the machine's `nvram.kv`, so its variables last across
+/// runs and engines. Without it a UEFI machine's store lasts one run. `uw_create` opens the
+/// store, and fails on a log that is not in the store's format rather than replacing it.
+///
+/// # Safety
+/// `log` must come from `uw_alloc` with the matching length.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn uw_set_nvram(log: *mut u8, len: usize) {
+    let log = unsafe { take_buffer(log, len) };
+    PENDING_NVRAM.with(|nvram| *nvram.borrow_mut() = Some(log));
+}
+
+/// What `host_should_stop` returns for a suspend; any other non-zero value stops (`STOP` in
+/// `www/protocol.js`).
+const SUSPEND_REQUESTED: i32 = 2;
+
+/// Gives the next `uw_create` a snapshot sink (`suspend`: `host_should_stop` returning
+/// `SUSPEND_REQUESTED` suspends the machine through `host_snapshot_write` and
+/// `host_snapshot_finish`) and a snapshot to resume from (`resume`: read with
+/// `host_snapshot_read`) instead of booting (`docs/plans/29-snapshots.md`).
+#[unsafe(no_mangle)]
+pub extern "C" fn uw_set_snapshots(suspend: i32, resume: i32) {
+    PENDING_SNAPSHOTS.with(|pending| pending.set((suspend != 0, resume != 0)));
+}
+
+struct HostSnapshotSink;
+
+impl SnapshotSink for HostSnapshotSink {
+    fn write(&mut self, bytes: &[u8]) -> Result<(), SnapshotError> {
+        match unsafe { host_snapshot_write(bytes.as_ptr(), bytes.len()) } {
+            0 => Ok(()),
+            _ => Err(SnapshotError("the host could not take the snapshot".into())),
+        }
+    }
+
+    fn finish(&mut self) -> Result<(), SnapshotError> {
+        match unsafe { host_snapshot_finish() } {
+            0 => Ok(()),
+            _ => Err(SnapshotError("the host could not keep the snapshot".into())),
+        }
+    }
+}
+
+struct HostSnapshotSource;
+
+impl SnapshotSource for HostSnapshotSource {
+    fn read(&mut self, buffer: &mut [u8]) -> Result<usize, SnapshotError> {
+        let count = unsafe { host_snapshot_read(buffer.as_mut_ptr(), buffer.len()) };
+        usize::try_from(count)
+            .map_err(|_| SnapshotError("the host could not read the snapshot".into()))
+    }
+
+    fn finish(&mut self) -> Result<(), SnapshotError> {
+        match unsafe { host_snapshot_consumed() } {
+            0 => Ok(()),
+            _ => Err(SnapshotError(
+                "the host could not retire the snapshot".into(),
+            )),
+        }
+    }
+}
+
+/// The NVRAM log on the host (`uw_set_nvram`). Writes go to an offset, not "the end": a request
+/// the worker retries after the app's server came back (`sendSync`) must land where it did the
+/// first time, not be appended twice.
+struct HostNvram {
+    initial: Vec<u8>,
+    length: u64,
+}
+
+impl KeyValueLog for HostNvram {
+    fn read(&mut self) -> Result<Vec<u8>, KeyValueError> {
+        Ok(core::mem::take(&mut self.initial))
+    }
+
+    fn append(&mut self, record: &[u8]) -> Result<(), KeyValueError> {
+        match unsafe { host_nvram_write(self.length as f64, record.as_ptr(), record.len()) } {
+            0 => {
+                self.length += record.len() as u64;
+                Ok(())
+            }
+            _ => Err(KeyValueError("writing the NVRAM failed".into())),
+        }
+    }
+
+    fn replace(&mut self, contents: &[u8]) -> Result<(), KeyValueError> {
+        match unsafe { host_nvram_replace(contents.as_ptr(), contents.len()) } {
+            0 => {
+                self.length = contents.len() as u64;
+                Ok(())
+            }
+            _ => Err(KeyValueError("replacing the NVRAM failed".into())),
+        }
+    }
+}
+
 /// Gives the next `uw_create` a virtio-net NIC with address `mac` (6 bytes) on the segment the
 /// page's tabs share, as tab `tab` (`www/segment.js` picks both at random). Takes ownership of
 /// the buffer. Returns 0, or 1 with the message in `uw_error_*` for an address a tab may not use.
@@ -693,13 +822,36 @@ pub unsafe extern "C" fn uw_create(
             config = config.hypervisor_cmdline(cmdline);
         }
     }
+    let (suspend, resume) = PENDING_SNAPSHOTS.with(|pending| pending.replace((false, false)));
+    if suspend {
+        config = config.suspend_to(HostSnapshotSink);
+    }
+    if resume {
+        config = config.resume_from(HostSnapshotSource);
+    }
+    let nvram = PENDING_NVRAM.with(|nvram| nvram.take());
     let (firmware, image) = PENDING_FIRMWARE.with(|firmware| firmware.take());
-    config = match firmware {
+    if let Some(log) = nvram {
+        // Any firmware: the TPM keeps its state in the store too, as on the native engine.
+        let length = log.len() as u64;
+        match LogKeyValueStore::new(HostNvram {
+            initial: log,
+            length,
+        }) {
+            Ok(store) => config = config.key_value_store(store),
+            Err(error) => {
+                set_error(format!("NVRAM: {error}"));
+                return 1;
+            }
+        }
+    } else if firmware == FIRMWARE_UEFI {
         // The variables (`BootOrder`, what `efibootmgr` writes) then survive a guest reset,
         // though not the page: nothing here is kept across loads.
+        config = config.key_value_store(MemoryKeyValueStore::new());
+    }
+    config = match firmware {
         FIRMWARE_UEFI => config
             .uefi_firmware(image)
-            .key_value_store(MemoryKeyValueStore::new())
             .secure_boot(option(OPTION_SECURE_BOOT)),
         FIRMWARE_BIOS => config.boot_disk(true),
         FIRMWARE_REAL_MODE => config.firmware(image),
@@ -797,10 +949,15 @@ fn poll(console: &uemulator::ConsoleHandle, idle: bool) {
             pump.pump();
         }
     });
-    if unsafe { host_should_stop() } != 0 {
+    let request = unsafe { host_should_stop() };
+    if request != 0 {
         STOP.with(|stop| {
             if let Some(stop) = &*stop.borrow() {
-                stop.stop();
+                if request == SUSPEND_REQUESTED {
+                    stop.suspend();
+                } else {
+                    stop.stop();
+                }
             }
         });
     }
@@ -1077,6 +1234,15 @@ pub extern "C" fn uw_run() -> i32 {
         ExitReason::Reset => EXIT_RESET,
         ExitReason::TripleFault => EXIT_TRIPLE_FAULT,
         ExitReason::Stopped => EXIT_STOPPED,
+        ExitReason::Suspended => EXIT_SUSPENDED,
+        ExitReason::SuspendFailed(message) => {
+            set_error(message);
+            EXIT_SUSPEND_FAILED
+        }
+        ExitReason::ResumeFailed(message) => {
+            set_error(message);
+            EXIT_RESUME_FAILED
+        }
         ExitReason::Internal(message) => {
             set_error(message);
             EXIT_INTERNAL

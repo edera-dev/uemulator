@@ -630,8 +630,9 @@ pub(crate) fn run_threads_with(
     let make_jit = || jit_source.as_ref().map(|jit| Box::new(jit.sibling()));
     let mut cpus = crate::cpu::smp::secondary_cpus(cpu);
     prepare(&mut cpus);
-    let (exit, bsp, summary) =
+    let (exit, mut cpus, summary) =
         crate::cpu::vcpus::run_threaded(cpus, &crate::cpu::vcpus::std_thread_spawner(), &make_jit);
+    let bsp = cpus.swap_remove(0);
     finished.store(true, std::sync::atomic::Ordering::Relaxed);
     watchdog.join().unwrap();
     ThreadRun {

@@ -101,6 +101,98 @@ impl Hasher {
         }
     }
 
+    /// The hash in progress as bytes, for a machine snapshot that must carry a TPM hash
+    /// sequence across a restart: the state words, the bytes waiting for a full block and the
+    /// message length so far. `import_state` takes it back; the layout is this crate's own.
+    pub fn export_state(&self) -> Vec<u8> {
+        fn put<const BLOCK: usize>(out: &mut Vec<u8>, words: &[u8], buffer: &BlockBuffer<BLOCK>) {
+            out.extend_from_slice(words);
+            out.extend_from_slice(&buffer.total_len.to_le_bytes());
+            out.extend_from_slice(&buffer.pending[..buffer.pending_len]);
+        }
+        let mut out = Vec::new();
+        match self {
+            Self::Sha1(hasher) => {
+                let words: Vec<u8> = hasher.state.iter().flat_map(|w| w.to_le_bytes()).collect();
+                put(&mut out, &words, &hasher.buffer);
+            }
+            Self::Sha256(hasher) => {
+                let words: Vec<u8> = hasher.state.iter().flat_map(|w| w.to_le_bytes()).collect();
+                put(&mut out, &words, &hasher.buffer);
+            }
+            Self::Sha384(Sha384(core)) | Self::Sha512(Sha512(core)) => {
+                let words: Vec<u8> = core.state.iter().flat_map(|w| w.to_le_bytes()).collect();
+                put(&mut out, &words, &core.buffer);
+            }
+        }
+        out
+    }
+
+    /// A hasher in the state `export_state` gave for `algorithm`; `None` when the bytes do not
+    /// fit it.
+    pub fn import_state(algorithm: HashAlgorithm, bytes: &[u8]) -> Option<Self> {
+        fn take<const BLOCK: usize>(
+            bytes: &[u8],
+            word_bytes: usize,
+        ) -> Option<(&[u8], BlockBuffer<BLOCK>)> {
+            let words = bytes.get(..word_bytes)?;
+            let total_len =
+                u64::from_le_bytes(bytes.get(word_bytes..word_bytes + 8)?.try_into().ok()?);
+            let pending = &bytes[word_bytes + 8..];
+            // A full block is always compressed at once, so a valid state never holds one.
+            if pending.len() >= BLOCK || total_len % BLOCK as u64 != pending.len() as u64 {
+                return None;
+            }
+            let mut buffer = BlockBuffer::new();
+            buffer.pending[..pending.len()].copy_from_slice(pending);
+            buffer.pending_len = pending.len();
+            buffer.total_len = total_len;
+            Some((words, buffer))
+        }
+        fn words32<const N: usize>(bytes: &[u8]) -> [u32; N] {
+            let mut out = [0; N];
+            for (word, chunk) in out.iter_mut().zip(bytes.chunks_exact(4)) {
+                *word = u32::from_le_bytes(chunk.try_into().unwrap());
+            }
+            out
+        }
+        fn words64(bytes: &[u8]) -> [u64; 8] {
+            let mut out = [0; 8];
+            for (word, chunk) in out.iter_mut().zip(bytes.chunks_exact(8)) {
+                *word = u64::from_le_bytes(chunk.try_into().unwrap());
+            }
+            out
+        }
+        Some(match algorithm {
+            HashAlgorithm::Sha1 => {
+                let (words, buffer) = take::<SHA1_BLOCK_BYTES>(bytes, size_of::<[u32; 5]>())?;
+                Self::Sha1(Sha1 {
+                    state: words32(words),
+                    buffer,
+                })
+            }
+            HashAlgorithm::Sha256 => {
+                let (words, buffer) = take::<SHA256_BLOCK_BYTES>(bytes, size_of::<[u32; 8]>())?;
+                Self::Sha256(Sha256 {
+                    state: words32(words),
+                    buffer,
+                })
+            }
+            HashAlgorithm::Sha384 | HashAlgorithm::Sha512 => {
+                let (words, buffer) = take::<SHA512_BLOCK_BYTES>(bytes, size_of::<[u64; 8]>())?;
+                let core = Sha512Core {
+                    state: words64(words),
+                    buffer,
+                };
+                if algorithm == HashAlgorithm::Sha384 {
+                    Self::Sha384(Sha384(core))
+                } else {
+                    Self::Sha512(Sha512(core))
+                }
+            }
+        })
+    }
+
     pub fn finish(self) -> Vec<u8> {
         match self {
             Self::Sha1(hasher) => hasher.finish().to_vec(),
@@ -623,6 +715,26 @@ pub(crate) fn hex(bytes: &[u8]) -> alloc::string::String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hash_resumed_from_its_exported_state_gives_the_same_digest() {
+        let data: Vec<u8> = (0..1000u32).map(|i| (i * 31 + 7) as u8).collect();
+        for algorithm in HashAlgorithm::ALL {
+            for split in [0, 1, 63, 64, 65, 127, 128, 129, 500, 1000] {
+                let mut first = Hasher::new(algorithm);
+                first.update(&data[..split]);
+                let state = first.export_state();
+                let mut resumed = Hasher::import_state(algorithm, &state).unwrap();
+                resumed.update(&data[split..]);
+                assert_eq!(
+                    resumed.finish(),
+                    algorithm.digest(&data),
+                    "{algorithm:?} at {split}"
+                );
+            }
+            assert!(Hasher::import_state(algorithm, &[1, 2, 3]).is_none());
+        }
+    }
     use alloc::vec;
 
     const FIPS_448_BITS: &[u8] = b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";

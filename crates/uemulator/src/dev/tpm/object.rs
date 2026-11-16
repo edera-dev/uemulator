@@ -15,6 +15,7 @@ use super::engine::{Response, Tpm, end_of};
 use super::hash::{self, KdfStream};
 use super::spec::*;
 use super::wire::{Reader, Truncated, Writer, marshal};
+use crate::snapshot::Snapshot;
 use uemulator_crypto::aes;
 use uemulator_crypto::ecc::{self, EccPoint};
 use uemulator_crypto::rsa::RsaPrivateKey;
@@ -42,7 +43,8 @@ const LABEL_PRIMARY: &[u8] = b"Primary Object Creation";
 /// fails with probability about 2^-32, so this is never reached.
 const ECC_KEY_ATTEMPTS: usize = 64;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Snapshot)]
+#[snapshot(new)]
 pub(super) struct SymmetricDefinition {
     pub algorithm: u16,
     /// Bits of the key, or for `TPM_ALG_XOR` the hash.
@@ -98,7 +100,8 @@ impl SymmetricDefinition {
 }
 
 /// A `TPMT_*_SCHEME` or `TPMT_KDF_SCHEME`: the scheme and whatever details it carries.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Snapshot)]
+#[snapshot(new)]
 pub(super) struct Scheme {
     pub scheme: u16,
     pub hash: u16,
@@ -144,7 +147,8 @@ impl Scheme {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Snapshot)]
+#[snapshot(new)]
 pub(super) enum Parameters {
     KeyedHash {
         scheme: Scheme,
@@ -288,7 +292,8 @@ impl Parameters {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Snapshot)]
+#[snapshot(new)]
 pub(super) enum Unique {
     /// `KEYEDHASH` and `SYMCIPHER`: a digest binding the public area to the secret.
     Digest(Vec<u8>),
@@ -300,7 +305,8 @@ pub(super) enum Unique {
 }
 
 /// A `TPMT_PUBLIC`.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Snapshot)]
+#[snapshot(new)]
 pub(super) struct Public {
     pub object_type: u16,
     pub name_alg: u16,
@@ -490,7 +496,8 @@ pub(super) fn check_template(
 }
 
 /// The secret half of an object.
-#[derive(Clone)]
+#[derive(Clone, Snapshot)]
+#[snapshot(new)]
 pub(super) enum Secret {
     Rsa(Box<RsaPrivateKey>),
     Ecc([u8; P256_BYTES]),
@@ -498,7 +505,8 @@ pub(super) enum Secret {
 }
 
 /// A `TPMT_SENSITIVE`.
-#[derive(Clone)]
+#[derive(Clone, Snapshot)]
+#[snapshot(new)]
 pub(super) struct Sensitive {
     pub auth: Vec<u8>,
     /// A parent's protection seed, or a sealed object's obfuscation value.
@@ -572,7 +580,8 @@ impl Sensitive {
 }
 
 /// A loaded object, transient or persistent.
-#[derive(Clone)]
+#[derive(Clone, Snapshot)]
+#[snapshot(new)]
 pub(super) struct Object {
     pub handle: u32,
     /// `TPM_RH_OWNER`, `_ENDORSEMENT`, `_PLATFORM` or `_NULL`: whose seed it descends from.
@@ -1133,4 +1142,35 @@ fn read_ecc_point(parameters: &mut Reader, number: u32) -> Result<EccPoint, u32>
         return Err(parameter_error(RC_SIZE, number));
     }
     Ok(point)
+}
+
+/// A loaded RSA key crosses a snapshot as the TPM itself keeps one: the public part and the
+/// prime p (`TPM2B_PRIVATE_KEY_RSA`), from which `from_prime` rebuilds the rest.
+impl Snapshot for RsaPrivateKey {
+    fn save(
+        &self,
+        w: &mut crate::snapshot::Writer<'_>,
+    ) -> Result<(), crate::snapshot::SnapshotError> {
+        self.public.modulus.save(w)?;
+        self.public.exponent.save(w)?;
+        self.prime().save(w)
+    }
+
+    fn load(
+        &mut self,
+        r: &mut crate::snapshot::Reader<'_>,
+    ) -> Result<(), crate::snapshot::SnapshotError> {
+        *self = Self::load_new(r)?;
+        Ok(())
+    }
+
+    fn load_new(
+        r: &mut crate::snapshot::Reader<'_>,
+    ) -> Result<Self, crate::snapshot::SnapshotError> {
+        let modulus: Vec<u8> = Snapshot::load_new(r)?;
+        let exponent: Vec<u8> = Snapshot::load_new(r)?;
+        let prime: Vec<u8> = Snapshot::load_new(r)?;
+        RsaPrivateKey::from_prime(&modulus, &exponent, &prime)
+            .map_err(|_| r.error("a TPM RSA key in the snapshot is not a key"))
+    }
 }

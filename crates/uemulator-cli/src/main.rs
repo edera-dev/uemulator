@@ -35,9 +35,10 @@ const EXIT_MACHINE_FAILURE: i32 = 2;
 const EXIT_CODES_HELP: &str = "\
 Exit codes:
   0  the machine ended by itself (guest power-off, or reset with --no-reboot), or was stopped
-     with Ctrl-] or --timeout
+     (or suspended, with --suspend-to) with Ctrl-] or --timeout
   1  setup failed (bad arguments, unreadable file, download failure, rejected configuration)
-  2  the machine failed: guest triple fault or emulator-internal error (e.g. --verify divergence)";
+  2  the machine failed: guest triple fault or emulator-internal error (e.g. --verify
+     divergence), or a suspend or resume failed";
 
 /// Maps how the machine ended to the process exit status. A power-off is how a guest finishes
 /// cleanly; a reset only reaches here with `--no-reboot` and counts as success because Linux
@@ -46,8 +47,13 @@ Exit codes:
 /// callers that need to tell a timeout from a normal end can run without `--timeout`.
 fn exit_code(reason: &ExitReason) -> i32 {
     match reason {
-        ExitReason::Shutdown | ExitReason::Reset | ExitReason::Stopped => EXIT_SUCCESS,
-        ExitReason::TripleFault | ExitReason::Internal(_) => EXIT_MACHINE_FAILURE,
+        ExitReason::Shutdown | ExitReason::Reset | ExitReason::Stopped | ExitReason::Suspended => {
+            EXIT_SUCCESS
+        }
+        ExitReason::TripleFault
+        | ExitReason::Internal(_)
+        | ExitReason::SuspendFailed(_)
+        | ExitReason::ResumeFailed(_) => EXIT_MACHINE_FAILURE,
     }
 }
 

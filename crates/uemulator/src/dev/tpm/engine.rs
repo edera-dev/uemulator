@@ -24,6 +24,7 @@ use super::wire::{Reader, Truncated, Writer};
 use crate::cpu::xsave::splitmix64;
 use crate::dev::RngSource;
 use crate::dev::kv::SharedKeyValueStore;
+use crate::snapshot::Snapshot;
 
 pub(crate) use super::spec::RC_SUCCESS;
 
@@ -183,7 +184,9 @@ const CLOCK_SAFE: u8 = 1;
 const CONTEXT_SECRET_BYTES: usize = 32;
 
 /// The bytes `TPM2_GetRandom` hands out, and the TPM's own randomness: seeds, keys, nonces.
+#[derive(Snapshot)]
 pub(crate) struct Random {
+    #[snapshot(skip)]
     source: RngSource,
     state: u64,
 }
@@ -210,6 +213,8 @@ impl Random {
     }
 }
 
+#[derive(Snapshot)]
+#[snapshot(new)]
 pub(super) enum SequenceKind {
     Hash(Box<Hash>),
     /// `TPM2_HashSequenceStart` with `TPM_ALG_NULL`: one hash per implemented algorithm, for
@@ -226,6 +231,8 @@ impl SequenceKind {
     }
 }
 
+#[derive(Snapshot)]
+#[snapshot(new)]
 pub(super) struct Sequence {
     pub handle: u32,
     pub auth: Vec<u8>,
@@ -260,6 +267,7 @@ impl Response {
     }
 }
 
+#[derive(Snapshot)]
 pub(crate) struct Tpm {
     pub(super) started: bool,
     /// One row per entry of `PCR_BANKS`.
@@ -275,6 +283,7 @@ pub(crate) struct Tpm {
     pub(super) random: Random,
     /// Virtual time at `_TPM_Init`, for `TPM2_ReadClock`.
     init_ns: u64,
+    #[snapshot(skip)]
     pub(super) store: SharedKeyValueStore,
     pub(super) state: PersistentState,
     /// The null hierarchy's seed and proof, new at every TPM Reset.

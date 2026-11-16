@@ -70,6 +70,15 @@ export const EXIT_NAMES = {
   2: "triple fault",
   3: "stopped",
   4: "internal emulator error",
+  5: "suspended",
+  6: "suspend failed",
+  7: "resume failed",
+};
+// What the page stores in CTRL.STOP: SUSPEND writes the machine to the snapshot sink the boot
+// message named (`uw_set_snapshots`, SUSPEND_REQUESTED in src/lib.rs) instead of only stopping.
+export const STOP = {
+  STOP: 1,
+  SUSPEND: 2,
 };
 // `uw_set_firmware` kinds and `uw_create` option bits: the FIRMWARE_* and OPTION_* constants in
 // src/lib.rs.

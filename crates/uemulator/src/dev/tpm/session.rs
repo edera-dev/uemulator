@@ -24,6 +24,7 @@ use super::object::{
 };
 use super::spec::*;
 use super::wire::{Reader, Truncated, Writer, marshal};
+use crate::snapshot::Snapshot;
 use uemulator_crypto::{aes, ecc};
 
 const SE_HMAC: u8 = 0x00;
@@ -42,7 +43,8 @@ pub(super) const MAX_LOADED_SESSIONS: usize = 8;
 /// The low 24 bits of a session handle; both session types draw from one space.
 const SESSION_INDEX_MASK: u32 = 0x00ff_ffff;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Snapshot)]
+#[snapshot(new)]
 pub(super) enum SessionKind {
     Hmac,
     Policy,
@@ -50,6 +52,8 @@ pub(super) enum SessionKind {
     Trial,
 }
 
+#[derive(Snapshot)]
+#[snapshot(new)]
 pub(super) struct AuthSession {
     pub handle: u32,
     pub kind: SessionKind,

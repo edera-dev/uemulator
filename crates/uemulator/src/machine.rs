@@ -25,6 +25,7 @@ use crate::kv::{KeyValueStore, MemoryKeyValueStore};
 use crate::netdev::NetHandle;
 use crate::platform::{DEFAULT_CMDLINE, DEFAULT_SERIAL_CMDLINE};
 use crate::ram::GuestRam;
+use crate::snapshot::{SnapshotSink, SnapshotSource};
 use crate::sync::{Arc, Mutex};
 
 #[derive(Debug)]
@@ -110,6 +111,18 @@ pub enum ExitReason {
     TripleFault,
     /// `stop()` / `StopHandle::stop()`, or `wait()` with nothing running.
     Stopped,
+    /// `StopHandle::suspend()`: the machine stopped and its snapshot went to
+    /// `MachineConfig::suspend_to`, whose `finish` returned Ok. The disks were flushed first, so
+    /// the snapshot and the disks agree until something else writes them.
+    Suspended,
+    /// `StopHandle::suspend()`, and the snapshot could not be taken or written (a 3D GPU, a full
+    /// disk, a failed flush). The machine is stopped as by `stop()`: its state is gone, and the
+    /// sink may hold part of a snapshot, which must not be resumed from (its `finish` was not
+    /// called).
+    SuspendFailed(String),
+    /// `MachineConfig::resume_from` could not be restored: another machine's snapshot, another
+    /// build's, or a damaged one. Nothing ran.
+    ResumeFailed(String),
     /// An emulator-side failure, not a guest behavior.
     Internal(String),
 }
@@ -224,6 +237,8 @@ pub struct MachineConfig {
     unix_time: Option<u64>,
     random_seed: Option<u64>,
     reboot: bool,
+    suspend_to: Option<Box<dyn SnapshotSink>>,
+    resume_from: Option<Box<dyn SnapshotSource>>,
 }
 
 impl Default for MachineConfig {
@@ -268,6 +283,8 @@ impl Default for MachineConfig {
             unix_time: None,
             random_seed: None,
             reboot: true,
+            suspend_to: None,
+            resume_from: None,
         }
     }
 }
@@ -554,6 +571,22 @@ impl MachineConfig {
         self
     }
 
+    /// Where `StopHandle::suspend` writes the machine's snapshot (`docs/plans/29-snapshots.md`).
+    pub fn suspend_to(mut self, sink: impl SnapshotSink + 'static) -> Self {
+        self.suspend_to = Some(Box::new(sink));
+        self
+    }
+
+    /// Resume a suspended machine instead of booting: its snapshot is read into the machine this
+    /// configuration builds, which must be the same machine (memory, processors, devices, disks
+    /// in the same order; the kernel and firmware only matter for a later reboot). `wait()`
+    /// returns `ResumeFailed` when it cannot be. The disks must be as the suspend left them: the
+    /// guest's file systems are mid-flight in the snapshot.
+    pub fn resume_from(mut self, source: impl SnapshotSource + 'static) -> Self {
+        self.resume_from = Some(Box::new(source));
+        self
+    }
+
     /// Whether a guest reset request (keyboard controller, port 0x92, port 0xCF9) restarts the
     /// machine in place (the default) or ends the run with `ExitReason::Reset`.
     ///
@@ -641,11 +674,22 @@ impl MachineConfig {
 /// Cloneable, thread-safe way to end a running machine. The vCPU polls the flag at its event
 /// ticks and while idle, so `wait()` returns `Stopped` shortly after, not instantly.
 #[derive(Clone)]
-pub struct StopHandle(Arc<AtomicBool>);
+pub struct StopHandle {
+    stop: Arc<AtomicBool>,
+    suspend: Arc<AtomicBool>,
+}
 
 impl StopHandle {
     pub fn stop(&self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// Stops the machine and writes its snapshot to `MachineConfig::suspend_to`; `wait()` then
+    /// returns `Suspended` (or `SuspendFailed`). Without a sink it is `stop()`.
+    pub fn suspend(&self) {
+        // Before the stop: the run must see the request once it notices the stop.
+        self.suspend.store(true, Ordering::SeqCst);
+        self.stop.store(true, Ordering::SeqCst);
     }
 }
 
@@ -676,6 +720,11 @@ struct Vcpu {
     devcfg: DevConfig,
     /// What a restart needs; `None` when a reset should end the run.
     reboot: Option<RebootImage>,
+    /// Set by `StopHandle::suspend`: a stopped run is saved to `suspend_to`.
+    suspend_requested: Arc<AtomicBool>,
+    suspend_to: Option<Box<dyn SnapshotSink>>,
+    /// Taken by the first run: a reboot after resuming boots afresh.
+    resume_from: Option<Box<dyn SnapshotSource>>,
 }
 
 /// The display devices for one boot: the embedder's handle, and the boot framebuffer only
@@ -1211,32 +1260,75 @@ impl Vcpu {
                 twin.rng_state = cpu.rng_state;
                 cpu.run_verify(&mut twin)
             }
-            _ if cpu.cpu_count > 1 && self.runs_on_threads(&cpu) => {
-                let spawner = self
-                    .thread_spawner
-                    .clone()
-                    .expect("checked by runs_on_threads");
-                // Every vCPU runs the one code cache the bootstrap processor made, through a
-                // handle of its own (`Jit::sibling`); with the JIT off there is none.
-                let jit_source = cpu.jit.as_ref().map(|jit| jit.sibling());
-                let make_jit = || jit_source.as_ref().map(|jit| Box::new(jit.sibling()));
-                let (reason, bootstrap, summary) = crate::cpu::vcpus::run_threaded(
-                    crate::cpu::smp::secondary_cpus(cpu),
-                    &spawner,
-                    &make_jit,
-                );
-                vcpu_summary = summary;
-                cpu = bootstrap;
+            _ => {
+                let threaded = cpu.cpu_count > 1 && self.runs_on_threads(&cpu);
+                // Every vCPU exists before anything runs, so a resume can load each one.
+                let mut cpus = if cpu.cpu_count > 1 {
+                    crate::cpu::smp::secondary_cpus(cpu)
+                } else {
+                    vec![cpu]
+                };
+                let resumed = match self.resume_from.take() {
+                    Some(mut source) => suspend::restore(&mut cpus, threaded, &mut *source)
+                        .map_err(|error| ExitReason::ResumeFailed(error.to_string())),
+                    None => Ok(()),
+                };
+                let (reason, mut cpus, active) = match resumed {
+                    Err(reason) => (reason, cpus, 0),
+                    Ok(()) if threaded => {
+                        let spawner = self
+                            .thread_spawner
+                            .clone()
+                            .expect("checked by runs_on_threads");
+                        // Every vCPU runs the one code cache the bootstrap processor made,
+                        // through a handle of its own (`Jit::sibling`); with the JIT off there
+                        // is none.
+                        let jit_source = cpus[0].jit.as_ref().map(|jit| jit.sibling());
+                        let make_jit = || jit_source.as_ref().map(|jit| Box::new(jit.sibling()));
+                        let (reason, cpus, summary) =
+                            crate::cpu::vcpus::run_threaded(cpus, &spawner, &make_jit);
+                        vcpu_summary = summary;
+                        (reason, cpus, 0)
+                    }
+                    Ok(()) if cpus.len() > 1 => {
+                        let mut smp = Smp::with_cpus(cpus);
+                        let reason = smp.run();
+                        vcpu_summary = smp.summary();
+                        let (cpus, active) = smp.into_cpus();
+                        (reason, cpus, active)
+                    }
+                    Ok(()) => {
+                        let reason = cpus[0].run();
+                        (reason, cpus, 0)
+                    }
+                };
+                let reason = match (&reason, self.suspend_to.as_deref_mut()) {
+                    (ExitReason::Stopped, Some(sink))
+                        if self.suspend_requested.load(Ordering::SeqCst) =>
+                    {
+                        match suspend::save(&mut cpus, active, threaded, sink) {
+                            Ok(()) => ExitReason::Suspended,
+                            Err(error) => ExitReason::SuspendFailed(error.to_string()),
+                        }
+                    }
+                    _ => reason,
+                };
+                cpu = if cpus.is_empty() {
+                    // Every vCPU thread panicked before handing its `Cpu` back; there is nothing
+                    // left to inspect.
+                    Cpu::new(
+                        Vec::new(),
+                        Default::default(),
+                        Default::default(),
+                        Arc::new(AtomicBool::new(false)),
+                        None,
+                        Default::default(),
+                    )
+                } else {
+                    cpus.swap_remove(active)
+                };
                 reason
             }
-            _ if cpu.cpu_count > 1 => {
-                let mut smp = Smp::new(cpu);
-                let reason = smp.run();
-                vcpu_summary = smp.summary();
-                cpu = smp.into_active();
-                reason
-            }
-            _ => cpu.run(),
         };
         if let (Some(l), true) = (
             &self.log,
@@ -1284,6 +1376,7 @@ pub struct EmulatedMachine {
     /// With `MachineConfig::input` (by default together with the screen): keyboard and tablet.
     input: Option<InputHandle>,
     stop: Arc<AtomicBool>,
+    suspend: Arc<AtomicBool>,
 }
 
 impl EmulatedMachine {
@@ -1302,6 +1395,14 @@ impl EmulatedMachine {
             return Err(Error::BadConfig(format!(
                 "cpus must be between {MIN_CPUS} and {MAX_CPUS}"
             )));
+        }
+        let snapshots = cfg.suspend_to.is_some() || cfg.resume_from.is_some();
+        if snapshots && (cfg.verify || cfg.boot_disk) {
+            return Err(Error::BadConfig(
+                "suspend and resume cannot be combined with verify_jit (its twin is not saved) or \
+                 a BIOS disk boot (the BIOS services keep state on the host)"
+                    .into(),
+            ));
         }
         if cfg.cpus > 1 {
             if !cfg.acpi {
@@ -1626,6 +1727,7 @@ impl EmulatedMachine {
                 }
             });
         let stop = Arc::new(AtomicBool::new(false));
+        let suspend = Arc::new(AtomicBool::new(false));
         Ok(Self {
             vcpu: Some(Vcpu {
                 ram,
@@ -1647,6 +1749,9 @@ impl EmulatedMachine {
                 boot_ram,
                 devcfg,
                 reboot,
+                suspend_requested: suspend.clone(),
+                suspend_to: cfg.suspend_to,
+                resume_from: cfg.resume_from,
             }),
             #[cfg(not(freestanding))]
             thread: None,
@@ -1657,6 +1762,7 @@ impl EmulatedMachine {
             display,
             input,
             stop,
+            suspend,
         })
     }
 
@@ -1694,11 +1800,19 @@ impl EmulatedMachine {
     }
 
     pub fn stop_handle(&self) -> StopHandle {
-        StopHandle(self.stop.clone())
+        StopHandle {
+            stop: self.stop.clone(),
+            suspend: self.suspend.clone(),
+        }
     }
 
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// `StopHandle::suspend`.
+    pub fn suspend(&self) {
+        self.stop_handle().suspend();
     }
 
     /// Hosted: spawns the vCPU thread and returns. UEFI has no threads, so this only marks the
@@ -1741,5 +1855,6 @@ impl EmulatedMachine {
     }
 }
 
+mod suspend;
 #[cfg(test)]
 mod tests;

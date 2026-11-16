@@ -1,6 +1,7 @@
 //! Device table entries (spec 3.2.2.1, 256 bits as four little-endian qwords) and the host page
 //! table walk (spec 2.2.3 and 3.3.x "I/O page tables for host translations").
 use super::{PhysRead, read_u64};
+use crate::snapshot::Snapshot;
 
 const DTE_VALID: u64 = 1 << 0;
 const DTE_TRANSLATION_VALID: u64 = 1 << 1;
@@ -35,7 +36,8 @@ const DTE_NMI_PASS: u64 = 1 << 58;
 const DTE_LINT0_PASS: u64 = 1 << 62;
 const DTE_LINT1_PASS: u64 = 1 << 63;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Snapshot)]
+#[snapshot(new)]
 pub(super) struct DeviceTableEntry {
     quads: [u64; 4],
 }

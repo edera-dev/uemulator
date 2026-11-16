@@ -754,8 +754,8 @@ fn invalidate_for_device_write(
     links.publish_invalidation(None, page);
 }
 
-/// Runs the machine with one thread per vCPU and returns why it ended, with the bootstrap
-/// processor (for the exit dump) and a line per vCPU.
+/// Runs the machine with one thread per vCPU and returns why it ended, with every vCPU in index
+/// order (the bootstrap processor first; empty when every thread panicked) and a line per vCPU.
 ///
 /// The calling thread becomes the device thread: it ticks the devices until every vCPU thread has
 /// finished. `make_jit` builds a handle on the shared code cache for each secondary vCPU and for
@@ -764,7 +764,7 @@ pub(crate) fn run_threaded(
     mut cpus: Vec<Cpu>,
     spawner: &ThreadSpawner,
     make_jit: &dyn Fn() -> Option<Box<crate::jit::Jit>>,
-) -> (ExitReason, Cpu, String) {
+) -> (ExitReason, Vec<Cpu>, String) {
     let count = cpus.len();
     let links = VcpuLinks::new(count);
     let device_handle = cpus[0].dev.for_cpu(0);
@@ -859,7 +859,7 @@ pub(crate) fn run_threaded(
     let reason = links.exit_reason();
     device_handle.lock().detach_links();
     let mut results = results.lock().unwrap();
-    let mut finished: Vec<Cpu> = results.drain(..).flatten().map(|cpu| *cpu).collect();
+    let finished: Vec<Cpu> = results.drain(..).flatten().map(|cpu| *cpu).collect();
     let summary = finished
         .iter()
         .map(|cpu| {
@@ -874,23 +874,7 @@ pub(crate) fn run_threaded(
             )
         })
         .collect();
-    if finished.is_empty() {
-        // Every thread panicked before handing its `Cpu` back; there is nothing left to inspect.
-        return (
-            reason,
-            Cpu::new(
-                Vec::new(),
-                Default::default(),
-                Default::default(),
-                Arc::new(AtomicBool::new(false)),
-                None,
-                Default::default(),
-            ),
-            summary,
-        );
-    }
-    let bsp = finished.remove(0);
-    (reason, bsp, summary)
+    (reason, finished, summary)
 }
 
 #[cfg(test)]

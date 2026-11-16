@@ -11,6 +11,8 @@ jit = ["dep:libc", "dep:windows-sys"]
 [dependencies]
 # First-party, `no_std` and dependency-free: the TPM's hashes.
 uemulator-crypto = { path = "../uemulator-crypto" }
+# First-party and dependency-free: `#[derive(Snapshot)]` (`src/snapshot.rs`).
+uemulator-snapshot-derive = { path = "../uemulator-snapshot-derive" }
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", optional = true }

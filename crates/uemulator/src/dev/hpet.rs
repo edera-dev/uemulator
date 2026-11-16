@@ -5,6 +5,7 @@
 //! reference.
 #[cfg(freestanding)]
 use crate::prelude::*;
+use crate::snapshot::Snapshot;
 
 pub(crate) const HPET_BASE: u64 = 0xfed0_0000;
 pub(crate) const HPET_MMIO_SIZE: u64 = 0x400;
@@ -73,7 +74,7 @@ const MASK_32BIT: u64 = 0xffff_ffff;
 const COMPARATOR_PASSED: u64 = 1 << 63;
 
 /// What a firing timer asks the platform to do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Snapshot)]
 pub(crate) enum HpetOutput {
     /// An edge-triggered timer pulsed this I/O APIC pin.
     Pulse { pin: u8 },
@@ -83,7 +84,7 @@ pub(crate) enum HpetOutput {
     Message { address: u64, data: u32 },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Snapshot)]
 struct Timer {
     config: u64,
     comparator: u64,
@@ -93,6 +94,7 @@ struct Timer {
     deadline_ns: Option<u64>,
 }
 
+#[derive(Snapshot)]
 pub(crate) struct Hpet {
     config: u64,
     /// Bit n: timer n's level-triggered interrupt is asserted.

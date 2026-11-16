@@ -1,5 +1,8 @@
 import SwiftUI
 import WebKit
+#if os(iOS)
+import UIKit
+#endif
 
 // One stored machine (MachineStore) and the engines that run it. The machine's devices are fixed
 // when it starts: a change to its settings applies to the next start.
@@ -25,6 +28,18 @@ final class MachineModel: ObservableObject, ScreenInput {
     // Whether this machine has run since the app started: until then the view shows how to start it
     // rather than an empty terminal.
     @Published private(set) var hasStarted = false
+    // A snapshot waits in the machine's folder: the next start resumes it (docs/plans/29-snapshots.md).
+    // Only meaningful while stopped; a run resuming from it deletes it once the guest runs.
+    @Published private(set) var suspended = false
+    // The disks the current run started with, recorded beside its snapshot once a suspend is complete.
+    private var runningDisks: [URL] = []
+    // Suspended because the app went to the background (iOS): the foreground resumes it.
+    private var resumeOnForeground = false
+    #if os(iOS)
+    // Keeps the app running while a suspend writes the snapshot.
+    private var suspendTask = UIBackgroundTaskIdentifier.invalid
+    private var lifecycleObservers: [NSObjectProtocol] = []
+    #endif
 
     let terminal = TerminalSession()
     let screen = ScreenSurface()
@@ -52,10 +67,85 @@ final class MachineModel: ObservableObject, ScreenInput {
         self.store = store
         definition = (try? store.load(name)) ?? MachineDefinition()
         view = definition.display == .screen ? .screen : .terminal
+        suspended = store.hasSnapshot(name)
         wire(native)
         terminal.onInput = { [weak self] bytes in self?.engine.send(bytes) }
         terminal.onResize = { [weak self] cols, rows in self?.engine.resize(cols: cols, rows: rows) }
         openDebugLog()
+        #if os(iOS)
+        let center = NotificationCenter.default
+        lifecycleObservers = [
+            center.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.didEnterBackground() }
+            },
+            center.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.willEnterForeground() }
+            },
+        ]
+        #endif
+    }
+
+    #if os(iOS)
+    // iOS suspends the app soon and may end it (or only the WebKit engine's process) while it is
+    // suspended: either way the machine would be gone. So it is suspended to its folder at once,
+    // within the background grace, and resumed when the app is back; if iOS ended the app
+    // meanwhile, the next start resumes it instead. At once rather than at the end of the
+    // grace: writing a large guest's RAM can take a good part of it.
+    private func didEnterBackground() {
+        guard case .running = state else { return }
+        resumeOnForeground = true
+        suspend()
+    }
+
+    private func willEnterForeground() {
+        guard resumeOnForeground else { return }
+        resumeOnForeground = false
+        // Only a finished suspend: one that failed says why and waits for the user.
+        if case .stopped(EngineState.suspendedReason) = state { start() }
+    }
+
+    private func endSuspendTask() {
+        guard suspendTask != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(suspendTask)
+        suspendTask = .invalid
+    }
+    #endif
+
+    // `-debug-suspend-after SECONDS`: suspends each run that long after it starts, so a scripted
+    // launch (`-autostart`) exercises suspend and, launched again, resume.
+    private func scheduleDebugSuspend() {
+        let delay = UserDefaults.standard.double(forKey: "debug-suspend-after")
+        guard delay > 0 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, case .running = self.state else { return }
+            self.suspend()
+        }
+    }
+
+    var isSuspending: Bool { state == EngineState.suspending }
+
+    // What starting does: resume the suspended state, or boot.
+    var startTitle: String { suspended ? "Resume" : "Start" }
+
+    // Writes the machine's whole state to its folder and stops it; the next start resumes it.
+    func suspend() {
+        guard case .running = state else { return }
+        #if os(iOS)
+        if suspendTask == .invalid {
+            suspendTask = UIApplication.shared.beginBackgroundTask(withName: "uemulator suspend") { [weak self] in
+                MainActor.assumeIsolated { self?.endSuspendTask() }
+            }
+        }
+        #endif
+        engine.suspend()
+    }
+
+    // Forgets the suspended state: the next start boots afresh, as after a power cut.
+    func discardSuspended() {
+        guard !isRunning else { return }
+        store.discardSnapshot(name)
+        suspended = false
+        if case .stopped(EngineState.suspendedReason) = state { state = .stopped("") }
     }
 
     // `-engine native|webkit` on the command line (UserDefaults' argument domain) wins over the
@@ -94,9 +184,22 @@ final class MachineModel: ObservableObject, ScreenInput {
         engine.onState = { [weak self, weak engine] state in
             guard let self, let engine, engine === self.engine else { return }
             self.state = state
-            if case .running = state { self.startedAt = Date() }
+            if case .running = state {
+                self.startedAt = Date()
+                self.scheduleDebugSuspend()
+            }
             if case .stopped(let reason) = state {
                 self.releaseScope()
+                if reason == EngineState.suspendedReason {
+                    self.store.recordSnapshot(self.name, disks: self.runningDisks)
+                } else if reason.hasPrefix("Resume failed") {
+                    // Kept: settings changed since the suspend can be put back. Settings can discard it.
+                    self.problem = "\(reason). Put the machine's settings back as they were, or discard the suspended state in Settings."
+                }
+                self.suspended = self.store.hasSnapshot(self.name)
+                #if os(iOS)
+                self.endSuspendTask()
+                #endif
                 // Booted afresh, so an installer that rebooted comes up on its disk.
                 if reason == EngineState.resetReason && self.definition.reboot {
                     self.restartingAfterReset = true
@@ -305,7 +408,22 @@ final class MachineModel: ObservableObject, ScreenInput {
             state = .stopped("Nothing to boot")
             return
         }
-        if !restartingAfterReset { terminal.reset() }
+        settings.suspendTo = store.snapshot(name)
+        let disks = settings.disks.map(\.url)
+        let resuming = store.hasSnapshot(name)
+        if resuming && store.snapshotMatches(name, disks: disks) {
+            settings.resumeFrom = store.snapshot(name)
+        } else {
+            if resuming {
+                problem = "The suspended state was set aside: the disks changed after it was taken, and " +
+                    "resuming over them would corrupt them. The machine boots afresh."
+            }
+            store.discardSnapshot(name)
+            suspended = false
+        }
+        runningDisks = disks
+        // A resumed guest carries on where its console left off in this session.
+        if !restartingAfterReset && settings.resumeFrom == nil { terminal.reset() }
         restartingAfterReset = false
         hasStarted = true
         engine.start(settings)
@@ -586,15 +704,23 @@ struct MachineView: View {
                     .keyboardShortcut("i", modifiers: .command)
                     .help("Settings")
             }
+            if model.isRunning {
+                ToolbarItem {
+                    Button("Suspend", systemImage: "pause.fill") { model.suspend() }
+                        .keyboardShortcut("s", modifiers: [.command, .shift])
+                        .help("Suspend: save the machine's state and stop; Start resumes it")
+                        .disabled(model.isSuspending)
+                }
+            }
             ToolbarItem {
                 if model.isRunning {
                     Button("Stop", systemImage: "stop.fill") { model.stop() }
                         .keyboardShortcut(".", modifiers: .command)
                         .help("Stop")
                 } else {
-                    Button("Start", systemImage: "play.fill") { model.start() }
+                    Button(model.startTitle, systemImage: "play.fill") { model.start() }
                         .keyboardShortcut("r", modifiers: .command)
-                        .help("Start")
+                        .help(model.startTitle)
                 }
             }
         }
@@ -618,7 +744,7 @@ struct StoppedPlaceholder: View {
             HStack {
                 Button("Settings…", systemImage: "slider.horizontal.3", action: onSettings)
                     .buttonStyle(.bordered)
-                Button("Start", systemImage: "play.fill") { model.start() }
+                Button(model.startTitle, systemImage: "play.fill") { model.start() }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.defaultAction)
             }
@@ -639,7 +765,7 @@ struct MachineInfoButton: View {
     @State private var showing = false
     // Ends that are not failures: the user's Stop, the guest's poweroff or reboot, and never
     // started. Any other reason is an error the icon flags until the popover is read.
-    private static let normalStops: Set<String> = ["", "Stopped", "Powered off", "Reset"]
+    private static let normalStops: Set<String> = ["", "Stopped", "Powered off", "Reset", EngineState.suspendedReason]
 
     var body: some View {
         Button { showing = true } label: {

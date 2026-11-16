@@ -23,6 +23,13 @@ let control;
 // `writeThrough` (a URL that takes the guest's writes: the Apple app's page, apple/WebEngine), and
 // `retryUnreachable` (the app's loopback server, which comes back: `sendSync`).
 const diskSources = [];
+// The NVRAM log's source (`uw_set_nvram`): { url, retryUnreachable }, from the Apple app's page
+// only. The web page keeps no NVRAM across loads.
+let nvramSource = null;
+// Where a suspend writes the snapshot and where a resume reads it (`uw_set_snapshots`), each
+// { url, retryUnreachable } with the position reached; the Apple app's page only.
+let snapshotSink = null;
+let snapshotSource = null;
 let ring;
 let events;
 let netRing;
@@ -233,6 +240,71 @@ const host = {
       return 1;
     }
   },
+  // The NVRAM store's writes (src/lib.rs `HostNvram`). The app makes each one durable before it
+  // answers, as the store's contract requires.
+  host_nvram_write(offset, ptr, len) {
+    try {
+      postToDisk(nvramSource, `offset=${offset}`, memoryBytes(ptr, len).slice());
+      return 0;
+    } catch (error) {
+      postMessage({ type: "log", text: `NVRAM write at ${offset} failed: ${error}` });
+      return 1;
+    }
+  },
+  host_nvram_replace(ptr, len) {
+    try {
+      postToDisk(nvramSource, "replace=1", memoryBytes(ptr, len).slice());
+      return 0;
+    } catch (error) {
+      postMessage({ type: "log", text: `NVRAM replace failed: ${error}` });
+      return 1;
+    }
+  },
+  // Snapshot writes go to an offset, like the disks', so a retried POST lands where it did
+  // the first time; the app writes them to a temporary file that `finish=1` renames.
+  host_snapshot_write(ptr, len) {
+    try {
+      postToDisk(snapshotSink, `offset=${snapshotSink.offset}`, memoryBytes(ptr, len).slice());
+      snapshotSink.offset += len;
+      return 0;
+    } catch (error) {
+      postMessage({ type: "log", text: `snapshot write failed: ${error}` });
+      return 1;
+    }
+  },
+  host_snapshot_finish() {
+    try {
+      postToDisk(snapshotSink, "finish=1", null);
+      return 0;
+    } catch (error) {
+      postMessage({ type: "log", text: `snapshot finish failed: ${error}` });
+      return 1;
+    }
+  },
+  host_snapshot_read(ptr, capacity) {
+    try {
+      const source = snapshotSource;
+      source.length ??= diskLength(source);
+      const count = Math.min(capacity, source.length - source.offset);
+      if (count <= 0) return 0;
+      const bytes = readDiskSource(source, source.offset, count);
+      memoryBytes(ptr, bytes.byteLength).set(bytes);
+      source.offset += bytes.byteLength;
+      return bytes.byteLength;
+    } catch (error) {
+      postMessage({ type: "log", text: `snapshot read failed: ${error}` });
+      return -1;
+    }
+  },
+  host_snapshot_consumed() {
+    try {
+      postToDisk(snapshotSource, "consumed=1", null);
+      return 0;
+    } catch (error) {
+      postMessage({ type: "log", text: `snapshot retire failed: ${error}` });
+      return 1;
+    }
+  },
   host_disk_read(source, offset, ptr, len) {
     try {
       const bytes = readDiskSource(diskSources[source], offset, len);
@@ -330,6 +402,20 @@ function diskLength(source) {
   return Number(total);
 }
 
+// The whole NVRAM log: small (variables and TPM state, compacted at every start). 404 is a
+// machine that has none yet.
+function loadNvram(source) {
+  const xhr = sendSync(() => {
+    const request = new XMLHttpRequest();
+    request.open("GET", source.url, false);
+    request.responseType = "arraybuffer";
+    return request;
+  }, null, source.retryUnreachable);
+  if (xhr.status === 404) return new Uint8Array(0);
+  if (xhr.status !== 200) throw new Error(`${source.url}: answered with ${xhr.status}`);
+  return new Uint8Array(xhr.response);
+}
+
 function lastError() {
   const text = decoder.decode(memoryBytes(wasm.uw_error_ptr(), wasm.uw_error_len()));
   return text;
@@ -397,6 +483,16 @@ async function boot(message) {
       postMessage({ type: "exit", code: -2, message: `gpu: ${lastError()}` });
       return;
     }
+  }
+  if (message.snapshot?.suspend || message.snapshot?.resume) {
+    snapshotSink = message.snapshot.suspend ? { ...message.snapshot.suspend, offset: 0 } : null;
+    snapshotSource = message.snapshot.resume ? { ...message.snapshot.resume, offset: 0 } : null;
+    wasm.uw_set_snapshots(snapshotSink ? 1 : 0, snapshotSource ? 1 : 0);
+  }
+  if (message.nvram) {
+    nvramSource = message.nvram;
+    const log = loadNvram(nvramSource);
+    wasm.uw_set_nvram(upload(log), log.length);
   }
   const kernelPtr = upload(kernel);
   const initrdPtr = upload(initrd);

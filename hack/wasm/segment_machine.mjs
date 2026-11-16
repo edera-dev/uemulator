@@ -109,6 +109,13 @@ const host = {
   host_disk_read: () => 1,
   host_disk_write: () => 1,
   host_disk_flush: () => 1,
+  // No --nvram here: `uw_set_nvram` is never called, so these are never reached.
+  host_nvram_write: () => 1,
+  host_nvram_replace: () => 1,
+  host_snapshot_write: () => 1,
+  host_snapshot_finish: () => 1,
+  host_snapshot_read: () => -1,
+  host_snapshot_consumed: () => 1,
 };
 
 const { instance } = await WebAssembly.instantiate(readFileSync(wasmPath), { host });

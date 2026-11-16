@@ -6,6 +6,7 @@ use crate::dev::tpm::STORE_PREFIX as TPM_STORE_PREFIX;
 use crate::kv::{KeyValueStore, MAX_KEY_BYTES, MAX_VALUE_BYTES};
 #[cfg(freestanding)]
 use crate::prelude::*;
+use crate::snapshot::Snapshot;
 use crate::sync::{Arc, Mutex};
 
 /// What a machine keeps across guest resets: the guest sees the same store on every boot.
@@ -34,13 +35,15 @@ pub(crate) const STATUS_TOO_LARGE: u32 = 2;
 pub(crate) const STATUS_IO_ERROR: u32 = 3;
 pub(crate) const STATUS_BAD_COMMAND: u32 = 4;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Snapshot)]
 enum Input {
     Key,
     Aux,
 }
 
+#[derive(Snapshot)]
 pub(crate) struct KvDevice {
+    #[snapshot(skip)]
     store: SharedKeyValueStore,
     key: Vec<u8>,
     aux: Vec<u8>,

@@ -2238,6 +2238,9 @@ mod exits {
             ExitReason::Reset => "reset",
             ExitReason::TripleFault => "triple fault",
             ExitReason::Stopped => "stopped",
+            ExitReason::Suspended => "suspended",
+            ExitReason::SuspendFailed(_) => "suspend failed",
+            ExitReason::ResumeFailed(_) => "resume failed",
             ExitReason::Internal(_) => "internal",
         }
     }

@@ -2,6 +2,7 @@
 //! section 4.8). Only what a guest without SMM needs: SCI_EN is hardwired (the FADT has no
 //! SMI_CMD, so ACPI starts enabled), SLP_EN with the `\_S5` sleep type powers the machine off,
 //! and the PM timer runs on virtual time.
+use crate::snapshot::Snapshot;
 
 /// PM1a_EVT_BLK: status at +0, enable at +2.
 pub(crate) const PM1_EVENT_BASE: u16 = 0x600;
@@ -57,6 +58,7 @@ const CONTROL_STORED: u16 = (CONTROL_SLEEP_TYPE_MASK << CONTROL_SLEEP_TYPE_SHIFT
     | CONTROL_BUS_MASTER_RELOAD
     | CONTROL_GLOBAL_RELEASE;
 
+#[derive(Snapshot)]
 pub(crate) struct AcpiPm {
     status: u16,
     enable: u16,

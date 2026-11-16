@@ -78,6 +78,17 @@ struct MachineSettingsView: View {
                     Toggle("Secure Boot", isOn: $draft.secureBoot)
                 }
                 advancedSection
+                if model.suspended && !model.isRunning {
+                    Section {
+                        Button("Discard Suspended State", role: .destructive) { model.discardSuspended() }
+                    } footer: {
+                        // docs/plans/29-snapshots.md: the snapshot is the machine's devices' state,
+                        // so a hardware change makes it unusable; either engine resumes it.
+                        Text("Start resumes the machine where it was suspended, on either engine. " +
+                             "Changing its memory, processors, display, network, disks or security " +
+                             "makes the suspended state unusable until they are put back.")
+                    }
+                }
                 Section {
                     Button("Delete Machine…", role: .destructive) { confirmingDelete = true }
                         .disabled(model.isRunning)

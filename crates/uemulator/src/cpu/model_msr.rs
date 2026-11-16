@@ -10,6 +10,7 @@
 
 use super::exception::Exception;
 use super::{Cpu, ExecResult};
+use crate::snapshot::Snapshot;
 
 /// Maximum and actual performance clocks (AMD names them MPERF and APERF, Linux "aperfmperf"),
 /// advertised by leaf 6 ECX bit 0. Writable: Linux zeroes neither, but the hardware allows it.
@@ -118,7 +119,7 @@ pub(super) enum CpuidMask {
 }
 
 /// Per-vCPU state behind the MSRs above.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Snapshot)]
 pub(crate) struct ModelMsrs {
     /// Added to guest time to make the TSC: a write of IA32_TIME_STAMP_COUNTER (0x10) sets it.
     pub tsc_adjust: u64,

@@ -23,6 +23,7 @@
 
 #[cfg(freestanding)]
 use crate::prelude::*;
+use crate::snapshot::Snapshot;
 use alloc::collections::BTreeMap;
 
 mod commands;
@@ -322,7 +323,8 @@ pub(crate) struct MsiMessage {
     pub data: u32,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Snapshot)]
+#[snapshot(new)]
 struct IotlbEntry {
     requester: u16,
     /// Device address >> `PAGE_SHIFT`; `NO_IOTLB_PAGE` for an empty slot.
@@ -348,6 +350,7 @@ fn iotlb_slot(requester: u16, page: u64) -> usize {
     (page ^ (requester as u64) << IOTLB_REQUESTER_SHIFT) as usize & (IOTLB_ENTRIES - 1)
 }
 
+#[derive(Snapshot)]
 pub(crate) struct Iommu {
     config: [u8; PCI_CONFIG_BYTES],
     config_writable: [u8; PCI_CONFIG_BYTES],

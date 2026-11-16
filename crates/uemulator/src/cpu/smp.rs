@@ -50,9 +50,19 @@ impl Smp {
         }
     }
 
-    /// The vCPU that owns the machine-wide state: what the machine inspects after the run.
-    pub fn into_active(mut self) -> Cpu {
-        self.cpus.swap_remove(self.active)
+    /// Already built vCPUs (`secondary_cpus`, then a snapshot restored into them), the first
+    /// owning the machine-wide state.
+    pub fn with_cpus(cpus: Vec<Cpu>) -> Self {
+        Smp {
+            cpus,
+            active: 0,
+            stalled_slices: 0,
+        }
+    }
+
+    /// Every vCPU, and which one owns the machine-wide state.
+    pub fn into_cpus(self) -> (Vec<Cpu>, usize) {
+        (self.cpus, self.active)
     }
 
     #[cfg(test)]

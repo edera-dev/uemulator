@@ -6,13 +6,16 @@ import UemulatorCore
 //   machine.toml   the CLI's file; the app reads and writes only the keys below (Rust keeps the
 //                  rest: ua_machine_load / ua_machine_save)
 //   disk-<n>.udisk the machine's disks, sparse udisk images; imported ISOs and images beside them
-//   nvram.kv       UEFI variables and TPM state, for the native engine. The WebKit engine does
-//                  not hand the file to the web build: its variables last one run
+//   nvram.kv       UEFI variables, Secure Boot keys and TPM state, on both engines (the WebKit
+//                  engine's store writes it back through the loopback server)
 //   artifacts/     an installer's kernel and initramfs under the CLI's names (`Distro`), or a
 //                  kernel and initramfs to boot directly ("kernel", "initrd")
 //   hypervisor     the image `hypervisor` names, as the CLI keeps it
 //   app.json       what only the app knows: the engine, the demo. Not in machine.toml: the CLI
 //                  drops keys it does not know when it saves.
+//   suspended.snapshot  a suspended machine's whole state (docs/plans/29-snapshots.md), either
+//                  engine's; deleted once the machine resumes from it
+//   suspended.json what the disks looked like when it was taken (`SnapshotRecord`)
 //
 // The CLI writes absolute disk paths; an iOS app's container moves when the app is reinstalled,
 // so a disk path that does not exist is looked for by name in the machine's own folder.
@@ -111,6 +114,8 @@ final class MachineStore: ObservableObject {
     private static let nvramFile = "nvram.kv"
     private static let artifacts = "artifacts"
     private static let hypervisorFile = "hypervisor"
+    private static let snapshotFile = "suspended.snapshot"
+    private static let snapshotRecordFile = "suspended.json"
     private static let errorCapacity = 1024
     // The CLI's `--display` values for the app's choices.
     private static let displayNames: [DisplayChoice: String] = [.terminal: "serial", .screen: "framebuffer", .both: "both"]
@@ -139,6 +144,68 @@ final class MachineStore: ObservableObject {
     func directory(_ name: String) -> URL { root.appendingPathComponent(name) }
     func nvram(_ name: String) -> URL { directory(name).appendingPathComponent(Self.nvramFile) }
     func hypervisor(_ name: String) -> URL { directory(name).appendingPathComponent(Self.hypervisorFile) }
+    func snapshot(_ name: String) -> URL { directory(name).appendingPathComponent(Self.snapshotFile) }
+    private func snapshotRecord(_ name: String) -> URL { directory(name).appendingPathComponent(Self.snapshotRecordFile) }
+
+    // A snapshot holds the guest mid-flight: its page cache, its file systems' journals, all of
+    // which describe the disks as they were when it was taken. Resumed over disks that changed
+    // since (booted from the CLI, say, or from the app with the snapshot set aside), the guest
+    // would write through stale metadata and corrupt them. So the disks' sizes and modification
+    // times are recorded once the suspend is complete (the library flushed them first, and a
+    // flushed udisk writes nothing more when it closes) and must still be so to resume. Not
+    // nvram.kv: every machine built from it compacts it (a resume that then fails included), so
+    // its time says nothing, and only the CLI could change what is in it meanwhile.
+    private struct SnapshotRecord: Codable, Equatable {
+        struct File: Codable, Equatable {
+            var path: String
+            var size: UInt64
+            var modified: Double
+        }
+        var disks: [File]
+    }
+
+    private static func describe(_ url: URL) -> SnapshotRecord.File? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = (attributes[.size] as? NSNumber)?.uint64Value,
+              let modified = attributes[.modificationDate] as? Date
+        else { return nil }
+        return .init(path: url.lastPathComponent, size: size, modified: modified.timeIntervalSince1970)
+    }
+
+    private static func record(disks: [URL]) -> SnapshotRecord {
+        SnapshotRecord(disks: disks.compactMap(describe))
+    }
+
+    func hasSnapshot(_ name: String) -> Bool {
+        FileManager.default.fileExists(atPath: snapshot(name).path)
+    }
+
+    // Called once a suspend is complete, with the disks the machine ran with.
+    func recordSnapshot(_ name: String, disks: [URL]) {
+        let record = Self.record(disks: disks)
+        if let data = try? JSONEncoder().encode(record) {
+            try? data.write(to: snapshotRecord(name), options: .atomic)
+        }
+    }
+
+    // Whether the snapshot may be resumed with these disks: a snapshot without its record (the
+    // app died between the two) cannot be trusted either.
+    func snapshotMatches(_ name: String, disks: [URL]) -> Bool {
+        guard let data = try? Data(contentsOf: snapshotRecord(name)),
+              let saved = try? JSONDecoder().decode(SnapshotRecord.self, from: data)
+        else { return false }
+        return saved == Self.record(disks: disks)
+    }
+
+    // The record goes with the snapshot: the engine deletes the snapshot itself once it resumes.
+    func discardSnapshot(_ name: String) {
+        try? FileManager.default.removeItem(at: snapshot(name))
+        try? FileManager.default.removeItem(at: snapshotRecord(name))
+    }
+
+    func forgetSnapshotRecord(_ name: String) {
+        try? FileManager.default.removeItem(at: snapshotRecord(name))
+    }
     private func artifacts(_ name: String) -> URL { directory(name).appendingPathComponent(Self.artifacts) }
 
     // An installer's under the CLI's names, else the directly booted "kernel" and "initrd".

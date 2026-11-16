@@ -579,6 +579,7 @@ dependencies = [
  "libc",
  "libm",
  "uemulator-crypto",
+ "uemulator-snapshot-derive",
  "windows-sys 0.61.2",
 ]
 
@@ -614,6 +615,10 @@ version = "0.1.0"
 dependencies = [
  "uemulator-crypto",
 ]
+
+[[package]]
+name = "uemulator-snapshot-derive"
+version = "0.1.0"
 
 [[package]]
 name = "uemulator-uefi"

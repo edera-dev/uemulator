@@ -268,7 +268,7 @@ struct MachineRow: View {
             if model.isRunning {
                 Button("Stop", systemImage: "stop.fill") { model.stop() }
             } else {
-                Button("Start", systemImage: "play.fill") {
+                Button(model.startTitle, systemImage: "play.fill") {
                     onStart()
                     model.start()
                 }

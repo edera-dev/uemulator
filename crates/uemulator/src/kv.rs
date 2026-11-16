@@ -45,7 +45,6 @@ impl MemoryKeyValueStore {
         Self::default()
     }
 
-    #[cfg(not(freestanding))]
     fn live_bytes(&self) -> usize {
         self.entries.iter().map(|(k, v)| k.len() + v.len()).sum()
     }
@@ -92,6 +91,182 @@ pub(crate) fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
+const MAGIC: &[u8; 8] = b"UEMUKV01";
+const OP_SET: u8 = 1;
+const OP_DELETE: u8 = 2;
+/// length u32, crc32 u32; then the payload the length counts.
+const RECORD_HEADER_BYTES: usize = 8;
+/// op u8, key length u16; then the key and (for a set) the value.
+const PAYLOAD_HEADER_BYTES: usize = 3;
+/// Rewrite the log once it holds this many bytes beyond what the live entries need, so a
+/// guest that rewrites one variable forever does not grow the file without bound.
+const WASTE_COMPACTION_BYTES: u64 = 1 << 20;
+
+fn encode_record(op: u8, key: &[u8], value: &[u8]) -> Vec<u8> {
+    let payload_len = PAYLOAD_HEADER_BYTES + key.len() + value.len();
+    let mut record = Vec::with_capacity(RECORD_HEADER_BYTES + payload_len);
+    record.extend_from_slice(&(payload_len as u32).to_le_bytes());
+    record.extend_from_slice(&[0; 4]);
+    record.push(op);
+    record.extend_from_slice(&(key.len() as u16).to_le_bytes());
+    record.extend_from_slice(key);
+    record.extend_from_slice(value);
+    let crc = crc32(&record[RECORD_HEADER_BYTES..]);
+    record[4..8].copy_from_slice(&crc.to_le_bytes());
+    record
+}
+
+/// Applies the records of `log` to `entries` and returns how many bytes were good. The log
+/// ends at the first record that is short or fails its checksum: that is a write the host
+/// died in the middle of, and nothing after it can be trusted.
+fn replay(log: &[u8], entries: &mut BTreeMap<Vec<u8>, Vec<u8>>) -> usize {
+    let mut at = 0;
+    while let Some(header) = log.get(at..at + RECORD_HEADER_BYTES) {
+        let payload_len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+        let crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        let start = at + RECORD_HEADER_BYTES;
+        let Some(payload) = log.get(start..start.saturating_add(payload_len)) else {
+            break;
+        };
+        if payload_len < PAYLOAD_HEADER_BYTES || crc32(payload) != crc {
+            break;
+        }
+        let key_len = u16::from_le_bytes([payload[1], payload[2]]) as usize;
+        let Some(key) = payload.get(PAYLOAD_HEADER_BYTES..PAYLOAD_HEADER_BYTES + key_len) else {
+            break;
+        };
+        match payload[0] {
+            OP_SET => {
+                entries.insert(
+                    key.to_vec(),
+                    payload[PAYLOAD_HEADER_BYTES + key_len..].to_vec(),
+                );
+            }
+            OP_DELETE => {
+                entries.remove(key);
+            }
+            _ => break,
+        }
+        at = start + payload_len;
+    }
+    at
+}
+
+fn check_sizes(key: &[u8], value: &[u8]) -> Result<(), KeyValueError> {
+    if key.len() > MAX_KEY_BYTES || value.len() > MAX_VALUE_BYTES {
+        return Err(KeyValueError("key or value too long".into()));
+    }
+    Ok(())
+}
+
+/// Where a `LogKeyValueStore` keeps its log: a file (`FileKeyValueStore`), or a host the
+/// embedder reaches some other way (the Apple app's WebKit engine posts to the app, which
+/// writes the machine's `nvram.kv`). Both writes must be durable before they return Ok.
+pub trait KeyValueLog: Send {
+    /// The whole log as it is now; empty when there is none yet.
+    fn read(&mut self) -> Result<Vec<u8>, KeyValueError>;
+    /// Adds `record` at the end of the log.
+    fn append(&mut self, record: &[u8]) -> Result<(), KeyValueError>;
+    /// Replaces the whole log with `contents`, atomically: after a host crash the log is either
+    /// the old one or `contents`, never a mix.
+    fn replace(&mut self, contents: &[u8]) -> Result<(), KeyValueError>;
+}
+
+/// A `MemoryKeyValueStore` backed by an append-only log of checksummed records. Every `set`
+/// and `delete` appends one record. Opening replays the log and replaces it compacted (one
+/// record per live key), which also drops a torn last record. Single writer: two stores on one
+/// log will lose updates.
+pub struct LogKeyValueStore<L: KeyValueLog> {
+    log: L,
+    memory: MemoryKeyValueStore,
+    log_bytes: u64,
+    needs_recovery: bool,
+}
+
+impl<L: KeyValueLog> LogKeyValueStore<L> {
+    /// A log that does not start with the format's magic is refused rather than replaced.
+    pub fn new(mut log: L) -> Result<Self, KeyValueError> {
+        let mut memory = MemoryKeyValueStore::new();
+        let bytes = log.read()?;
+        if !bytes.is_empty() {
+            if !bytes.starts_with(MAGIC) {
+                return Err(KeyValueError("not a uemulator key-value file".into()));
+            }
+            replay(&bytes[MAGIC.len()..], &mut memory.entries);
+        }
+        let mut store = Self {
+            log,
+            memory,
+            log_bytes: 0,
+            needs_recovery: false,
+        };
+        store.compact()?;
+        Ok(store)
+    }
+
+    fn compact(&mut self) -> Result<(), KeyValueError> {
+        let mut contents = MAGIC.to_vec();
+        for (key, value) in &self.memory.entries {
+            contents.extend_from_slice(&encode_record(OP_SET, key, value));
+        }
+        self.log.replace(&contents)?;
+        self.log_bytes = contents.len() as u64;
+        Ok(())
+    }
+
+    fn recover(&mut self) -> Result<(), KeyValueError> {
+        if self.needs_recovery {
+            // A failed write may have left a partial record, while a failed sync may have left
+            // a complete one. Rewrite the last acknowledged state either way.
+            self.compact()?;
+            self.needs_recovery = false;
+        }
+        Ok(())
+    }
+
+    fn append(&mut self, record: &[u8]) -> Result<(), KeyValueError> {
+        self.recover()?;
+        // Compact the old state before appending: `memory` does not include this operation
+        // until append succeeds, so compacting afterwards would lose it.
+        let live = (MAGIC.len() + self.memory.live_bytes()) as u64;
+        if self.log_bytes + record.len() as u64 > live + WASTE_COMPACTION_BYTES {
+            self.compact()?;
+        }
+        if let Err(error) = self.log.append(record) {
+            self.needs_recovery = true;
+            return Err(error);
+        }
+        self.log_bytes += record.len() as u64;
+        Ok(())
+    }
+}
+
+impl<L: KeyValueLog> KeyValueStore for LogKeyValueStore<L> {
+    fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
+        self.memory.get(key)
+    }
+
+    fn set(&mut self, key: &[u8], value: &[u8]) -> Result<(), KeyValueError> {
+        check_sizes(key, value)?;
+        // Durable before visible: a failed append leaves the in-memory copy unchanged.
+        self.append(&encode_record(OP_SET, key, value))?;
+        self.memory.set(key, value)
+    }
+
+    fn delete(&mut self, key: &[u8]) -> Result<(), KeyValueError> {
+        self.recover()?;
+        if self.memory.get(key).is_none() {
+            return Ok(());
+        }
+        self.append(&encode_record(OP_DELETE, key, &[]))?;
+        self.memory.delete(key)
+    }
+
+    fn list(&mut self, prefix: &[u8]) -> Vec<Vec<u8>> {
+        self.memory.list(prefix)
+    }
+}
+
 #[cfg(not(freestanding))]
 mod file {
     use super::*;
@@ -110,78 +285,13 @@ mod file {
         }
     }
 
-    const MAGIC: &[u8; 8] = b"UEMUKV01";
-    const OP_SET: u8 = 1;
-    const OP_DELETE: u8 = 2;
-    /// length u32, crc32 u32; then the payload the length counts.
-    const RECORD_HEADER_BYTES: usize = 8;
-    /// op u8, key length u16; then the key and (for a set) the value.
-    const PAYLOAD_HEADER_BYTES: usize = 3;
-    /// Rewrite the log once it holds this many bytes beyond what the live entries need, so a
-    /// guest that rewrites one variable forever does not grow the file without bound.
-    const WASTE_COMPACTION_BYTES: u64 = 1 << 20;
-
-    fn encode_record(op: u8, key: &[u8], value: &[u8]) -> Vec<u8> {
-        let payload_len = PAYLOAD_HEADER_BYTES + key.len() + value.len();
-        let mut record = Vec::with_capacity(RECORD_HEADER_BYTES + payload_len);
-        record.extend_from_slice(&(payload_len as u32).to_le_bytes());
-        record.extend_from_slice(&[0; 4]);
-        record.push(op);
-        record.extend_from_slice(&(key.len() as u16).to_le_bytes());
-        record.extend_from_slice(key);
-        record.extend_from_slice(value);
-        let crc = crc32(&record[RECORD_HEADER_BYTES..]);
-        record[4..8].copy_from_slice(&crc.to_le_bytes());
-        record
-    }
-
-    /// Applies the records of `log` to `entries` and returns how many bytes were good. The log
-    /// ends at the first record that is short or fails its checksum: that is a write the host
-    /// died in the middle of, and nothing after it can be trusted.
-    fn replay(log: &[u8], entries: &mut BTreeMap<Vec<u8>, Vec<u8>>) -> usize {
-        let mut at = 0;
-        while let Some(header) = log.get(at..at + RECORD_HEADER_BYTES) {
-            let payload_len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
-            let crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
-            let start = at + RECORD_HEADER_BYTES;
-            let Some(payload) = log.get(start..start.saturating_add(payload_len)) else {
-                break;
-            };
-            if payload_len < PAYLOAD_HEADER_BYTES || crc32(payload) != crc {
-                break;
-            }
-            let key_len = u16::from_le_bytes([payload[1], payload[2]]) as usize;
-            let Some(key) = payload.get(PAYLOAD_HEADER_BYTES..PAYLOAD_HEADER_BYTES + key_len)
-            else {
-                break;
-            };
-            match payload[0] {
-                OP_SET => {
-                    entries.insert(
-                        key.to_vec(),
-                        payload[PAYLOAD_HEADER_BYTES + key_len..].to_vec(),
-                    );
-                }
-                OP_DELETE => {
-                    entries.remove(key);
-                }
-                _ => break,
-            }
-            at = start + payload_len;
-        }
-        at
-    }
-
-    /// A `MemoryKeyValueStore` backed by an append-only log. Every `set` and `delete` appends
-    /// one checksummed record and syncs it. Opening replays the log and rewrites it compacted
-    /// (one record per live key) through a temporary file and an atomic rename, which also
-    /// drops a torn last record. Single writer: two processes on one file will lose updates.
-    pub struct FileKeyValueStore {
+    /// The log as a file: appends are synced, and a replacement goes through `path.tmp` and an
+    /// atomic rename.
+    pub struct FileLog {
         path: PathBuf,
-        memory: MemoryKeyValueStore,
-        log: File,
-        log_bytes: u64,
-        needs_recovery: bool,
+        /// Positioned at EOF; `None` until the first `replace`, which the store always makes
+        /// on opening.
+        log: Option<File>,
     }
 
     fn io_error(what: &str, path: &Path, error: std::io::Error) -> KeyValueError {
@@ -217,57 +327,42 @@ mod file {
             .open(path)
     }
 
-    impl FileKeyValueStore {
-        /// Opens `path`, creating it when missing. A file that does not start with the format's
-        /// magic is refused rather than overwritten.
-        pub fn open(path: impl Into<PathBuf>) -> Result<Self, KeyValueError> {
-            let path = path.into();
-            let mut memory = MemoryKeyValueStore::new();
-            match File::open(&path) {
+    impl KeyValueLog for FileLog {
+        fn read(&mut self) -> Result<Vec<u8>, KeyValueError> {
+            let mut bytes = Vec::new();
+            match File::open(&self.path) {
                 Ok(mut file) => {
-                    let mut bytes = Vec::new();
                     file.read_to_end(&mut bytes)
-                        .map_err(|e| io_error("reading", &path, e))?;
-                    if !bytes.is_empty() {
-                        if !bytes.starts_with(MAGIC) {
-                            return Err(KeyValueError(format!(
-                                "{} is not a uemulator key-value file",
-                                path.display()
-                            )));
-                        }
-                        replay(&bytes[MAGIC.len()..], &mut memory.entries);
-                    }
+                        .map_err(|e| io_error("reading", &self.path, e))?;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(io_error("opening", &path, e)),
+                Err(e) => return Err(io_error("opening", &self.path, e)),
             }
-            let (log, log_bytes) = Self::write_compacted(&path, &memory)?;
-            Ok(Self {
-                path,
-                memory,
-                log,
-                log_bytes,
-                needs_recovery: false,
-            })
+            Ok(bytes)
         }
 
-        /// Writes `memory` to `path.tmp`, syncs it and renames it over `path`. Keep the
-        /// writable descriptor at EOF across the rename: reopening after replacement could
-        /// fail while the old descriptor already points to an unlinked file.
-        fn write_compacted(
-            path: &Path,
-            memory: &MemoryKeyValueStore,
-        ) -> Result<(File, u64), KeyValueError> {
+        fn append(&mut self, record: &[u8]) -> Result<(), KeyValueError> {
+            let Some(log) = &mut self.log else {
+                return Err(KeyValueError(format!(
+                    "{} is not open",
+                    self.path.display()
+                )));
+            };
+            write_record(log, record)
+                .and_then(|()| sync_record(log))
+                .map_err(|e| io_error("appending to", &self.path, e))
+        }
+
+        /// Keeps the writable descriptor at EOF across the rename: reopening after replacement
+        /// could fail while the old descriptor already points to an unlinked file.
+        fn replace(&mut self, contents: &[u8]) -> Result<(), KeyValueError> {
+            let path = &self.path;
             let mut temporary = path.as_os_str().to_owned();
             temporary.push(".tmp");
             let temporary = PathBuf::from(temporary);
-            let mut contents = MAGIC.to_vec();
-            for (key, value) in &memory.entries {
-                contents.extend_from_slice(&encode_record(OP_SET, key, value));
-            }
             let mut file =
                 open_temporary(&temporary).map_err(|e| io_error("creating", &temporary, e))?;
-            file.write_all(&contents)
+            file.write_all(contents)
                 .and_then(|()| file.sync_all())
                 .map_err(|e| io_error("writing", &temporary, e))?;
             fs::rename(&temporary, path).map_err(|e| io_error("renaming to", path, e))?;
@@ -282,72 +377,44 @@ mod file {
                     let _ = directory.sync_all();
                 }
             }
-            Ok((file, contents.len() as u64))
-        }
-
-        fn recover(&mut self) -> Result<(), KeyValueError> {
-            if self.needs_recovery {
-                // A failed write may have left a partial record, while a failed sync may
-                // have left a complete one. Rewrite the last acknowledged state either way.
-                let (log, log_bytes) = Self::write_compacted(&self.path, &self.memory)?;
-                self.log = log;
-                self.log_bytes = log_bytes;
-                self.needs_recovery = false;
-            }
-            Ok(())
-        }
-
-        fn append(&mut self, record: &[u8]) -> Result<(), KeyValueError> {
-            self.recover()?;
-            // Compact the old state before appending: `memory` does not include this
-            // operation until append succeeds, so compacting afterwards would lose it.
-            let live = (MAGIC.len() + self.memory.live_bytes()) as u64;
-            if self.log_bytes + record.len() as u64 > live + WASTE_COMPACTION_BYTES {
-                let (log, log_bytes) = Self::write_compacted(&self.path, &self.memory)?;
-                self.log = log;
-                self.log_bytes = log_bytes;
-            }
-            if let Err(error) =
-                write_record(&mut self.log, record).and_then(|()| sync_record(&self.log))
-            {
-                self.needs_recovery = true;
-                return Err(io_error("appending to", &self.path, error));
-            }
-            self.log_bytes += record.len() as u64;
+            self.log = Some(file);
             Ok(())
         }
     }
 
-    fn check_sizes(key: &[u8], value: &[u8]) -> Result<(), KeyValueError> {
-        if key.len() > MAX_KEY_BYTES || value.len() > MAX_VALUE_BYTES {
-            return Err(KeyValueError("key or value too long".into()));
+    /// A `LogKeyValueStore` on a file.
+    pub struct FileKeyValueStore(LogKeyValueStore<FileLog>);
+
+    impl FileKeyValueStore {
+        /// Opens `path`, creating it when missing. A file that does not start with the format's
+        /// magic is refused rather than overwritten.
+        pub fn open(path: impl Into<PathBuf>) -> Result<Self, KeyValueError> {
+            let path = path.into();
+            let log = FileLog {
+                path: path.clone(),
+                log: None,
+            };
+            LogKeyValueStore::new(log)
+                .map(Self)
+                .map_err(|error| KeyValueError(format!("{}: {}", path.display(), error.0)))
         }
-        Ok(())
     }
 
     impl KeyValueStore for FileKeyValueStore {
         fn get(&mut self, key: &[u8]) -> Option<Vec<u8>> {
-            self.memory.get(key)
+            self.0.get(key)
         }
 
         fn set(&mut self, key: &[u8], value: &[u8]) -> Result<(), KeyValueError> {
-            check_sizes(key, value)?;
-            // Durable before visible: a failed append leaves the in-memory copy unchanged.
-            self.append(&encode_record(OP_SET, key, value))?;
-            self.memory.set(key, value)
+            self.0.set(key, value)
         }
 
         fn delete(&mut self, key: &[u8]) -> Result<(), KeyValueError> {
-            self.recover()?;
-            if self.memory.get(key).is_none() {
-                return Ok(());
-            }
-            self.append(&encode_record(OP_DELETE, key, &[]))?;
-            self.memory.delete(key)
+            self.0.delete(key)
         }
 
         fn list(&mut self, prefix: &[u8]) -> Vec<Vec<u8>> {
-            self.memory.list(prefix)
+            self.0.list(prefix)
         }
     }
 
@@ -573,6 +640,83 @@ mod tests {
         assert_eq!(keys, ["var/", "var/a", "var/b"]);
         assert_eq!(store.list(b"").len(), 5);
         assert!(store.list(b"zzz").is_empty());
+    }
+
+    /// A log that lives in a `Vec`, as the WebKit engine's lives in the app: the shape
+    /// `uemulator-web`'s `HostNvram` gives the store, without the host.
+    #[derive(Default)]
+    struct VecLog {
+        bytes: Vec<u8>,
+        replaces: usize,
+        fail_next_append: bool,
+    }
+
+    impl KeyValueLog for VecLog {
+        fn read(&mut self) -> Result<Vec<u8>, KeyValueError> {
+            Ok(self.bytes.clone())
+        }
+
+        fn append(&mut self, record: &[u8]) -> Result<(), KeyValueError> {
+            if core::mem::take(&mut self.fail_next_append) {
+                // Half the record arrived, as when the host died mid-write.
+                self.bytes.extend_from_slice(&record[..record.len() / 2]);
+                return Err(KeyValueError("injected".into()));
+            }
+            self.bytes.extend_from_slice(record);
+            Ok(())
+        }
+
+        fn replace(&mut self, contents: &[u8]) -> Result<(), KeyValueError> {
+            self.bytes = contents.to_vec();
+            self.replaces += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_log_store_survives_reopening_from_its_log() {
+        let mut store = LogKeyValueStore::new(VecLog::default()).unwrap();
+        store.set(b"Boot0000", b"entry").unwrap();
+        store.set(b"tpm/state", b"seeds").unwrap();
+        store.delete(b"Boot0000").unwrap();
+        let bytes = store.log.bytes.clone();
+        let mut reopened = LogKeyValueStore::new(VecLog {
+            bytes,
+            ..VecLog::default()
+        })
+        .unwrap();
+        assert_eq!(reopened.list(b""), vec![b"tpm/state".to_vec()]);
+        assert_eq!(reopened.get(b"tpm/state"), Some(b"seeds".to_vec()));
+    }
+
+    #[test]
+    fn a_log_store_rewrites_its_log_after_a_failed_append() {
+        let mut store = LogKeyValueStore::new(VecLog::default()).unwrap();
+        store.set(b"keep", b"1").unwrap();
+        store.log.fail_next_append = true;
+        assert!(store.set(b"lost", b"2").is_err());
+        let replaces = store.log.replaces;
+        store.set(b"later", b"3").unwrap();
+        assert_eq!(store.log.replaces, replaces + 1);
+        let bytes = store.log.bytes.clone();
+        let mut reopened = LogKeyValueStore::new(VecLog {
+            bytes,
+            ..VecLog::default()
+        })
+        .unwrap();
+        assert_eq!(
+            reopened.list(b""),
+            vec![b"keep".to_vec(), b"later".to_vec()]
+        );
+    }
+
+    #[test]
+    fn a_log_store_refuses_a_foreign_log() {
+        let log = VecLog {
+            bytes: b"not ours".to_vec(),
+            ..VecLog::default()
+        };
+        assert!(LogKeyValueStore::new(log).is_err());
     }
 
     #[test]

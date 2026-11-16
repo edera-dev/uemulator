@@ -1,5 +1,6 @@
 #[cfg(freestanding)]
 use crate::prelude::*;
+use crate::snapshot::Snapshot;
 
 /// Input clock of the 8254 (14.31818 MHz / 12, rounded). The guest calibrates the TSC against
 /// this, so it must be derived from the same emulated nanosecond clock as the TSC.
@@ -62,7 +63,7 @@ const BCD_DIGIT_MASK: u32 = 0xf;
 const BCD_DIGITS: u32 = 4;
 const DECIMAL_BASE: u32 = 10;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Snapshot)]
 struct Channel {
     mode: u8,
     access: u8,
@@ -124,6 +125,7 @@ impl Default for Channel {
     }
 }
 
+#[derive(Snapshot)]
 pub(crate) struct Pit {
     channels: [Channel; CHANNEL_COUNT],
     /// Emulated time of the next IRQ 0, if channel 0 is armed. Consumed by `tick`.

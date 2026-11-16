@@ -30,6 +30,7 @@
 use super::decode::Insn;
 use super::exception::Exception;
 use super::*;
+use crate::snapshot::Snapshot;
 
 #[path = "ibs.rs"]
 pub(crate) mod ibs;
@@ -165,7 +166,7 @@ impl Source {
 
 /// Running totals of what the counters count. They only grow (wrapping), and a counter adds the
 /// difference between two readings, so nothing has to be reset when counters change.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Snapshot)]
 struct Totals {
     cycles: u64,
     instructions: u64,
@@ -232,6 +233,7 @@ impl BranchKind {
 }
 
 /// Per-vCPU counter state. Not machine-wide: each vCPU has its own PMU.
+#[derive(Snapshot)]
 pub(crate) struct Pmu {
     event_select: [u64; CORE_COUNTERS],
     /// Each counter's value as of the last sync.
