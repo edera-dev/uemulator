@@ -22,6 +22,7 @@
 		B1000000000000000000B00D /* MachineSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000F00F /* MachineSettingsView.swift */; };
 		B1000000000000000000B00E /* uemulator.icon in Resources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000F010 /* uemulator.icon */; };
 		B1000000000000000000B00F /* Presets.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000F011 /* Presets.swift */; };
+		B10000000000000000F01DB0 /* FoldedLayout.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000F01DF0 /* FoldedLayout.swift */; };
 		B1000000000000000000B010 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000F012 /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
@@ -43,6 +44,7 @@
 		B1000000000000000000F00F /* MachineSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MachineSettingsView.swift; sourceTree = "<group>"; };
 		B1000000000000000000F010 /* uemulator.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; path = uemulator.icon; sourceTree = "<group>"; };
 		B1000000000000000000F011 /* Presets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Presets.swift; sourceTree = "<group>"; };
+		B10000000000000000F01DF0 /* FoldedLayout.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FoldedLayout.swift; sourceTree = "<group>"; };
 		B1000000000000000000F012 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -85,6 +87,7 @@
 				B1000000000000000000F004 /* uemulator-macOS.entitlements */,
 				B1000000000000000000F010 /* uemulator.icon */,
 				B1000000000000000000F011 /* Presets.swift */,
+				B10000000000000000F01DF0 /* FoldedLayout.swift */,
 				B1000000000000000000F012 /* Assets.xcassets */,
 			);
 			path = App;
@@ -218,6 +221,7 @@
 				B1000000000000000000B00C /* Wisp.swift in Sources */,
 				B1000000000000000000B00D /* MachineSettingsView.swift in Sources */,
 				B1000000000000000000B00F /* Presets.swift in Sources */,
+				B10000000000000000F01DB0 /* FoldedLayout.swift in Sources */,
 				B1000000000000000000B00B /* MachineView.swift in Sources */,
 				B1000000000000000000B00A /* MachineStore.swift in Sources */,
 				B1000000000000000000B009 /* ScreenView.swift in Sources */,

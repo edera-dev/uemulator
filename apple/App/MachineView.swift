@@ -369,11 +369,13 @@ struct MachineView: View {
     @AppStorage("keyboardBelowScreen") private var keyboardBelowScreen = false
     @State private var softwareKeyboard = false
     @State private var editingSettings = false
+    // Partially open in portrait (FoldedLayout.swift): the guest above the fold, the controls below.
+    @State private var fold: FoldPosture?
     @Environment(\.displayScale) private var displayScale
 
     private var screenPane: ScreenPane {
         #if os(iOS)
-        ScreenPane(surface: model.screen, input: model, showsSoftwareKeyboard: $softwareKeyboard, keepsAboveKeyboard: splitKeyboard)
+        ScreenPane(surface: model.screen, input: model, showsSoftwareKeyboard: $softwareKeyboard, keepsAboveKeyboard: splitKeyboard || fold != nil)
         #else
         ScreenPane(surface: model.screen, input: model)
         #endif
@@ -395,32 +397,50 @@ struct MachineView: View {
 
     private var splitKeyboard: Bool { keyboardBelowScreen && unfoldedPortrait && model.view == .screen }
 
+    // The guest's part of the view: above the fold when folded, else all of it.
+    private var guestSize: CGSize {
+        fold.map { CGSize(width: viewSize.width, height: $0.foldY) } ?? viewSize
+    }
+
     var body: some View {
         GeometryReader { geometry in
-            ZStack {
-                // Both stay alive so the terminal keeps its scrollback and the screen its image.
-                TerminalPane(session: model.terminal)
-                    .opacity(model.view == .terminal ? 1 : 0)
-                    .allowsHitTesting(model.view == .terminal)
-                if model.definition.display.hasScreen {
-                    // Under the keyboard by default; above it when split (ScreenUIView's
-                    // `keepsAboveKeyboard`).
-                    screenPane
-                        .opacity(model.view == .screen ? 1 : 0)
-                        .allowsHitTesting(model.view == .screen)
-                }
-                if !model.hasStarted && !model.isRunning {
-                    StoppedPlaceholder(model: model) { editingSettings = true }
-                }
-                if case .preparing(let what) = model.state {
-                    VStack(spacing: 12) {
-                        ProgressView()
-                        Text(what).monospacedDigit().foregroundStyle(.secondary)
+            VStack(spacing: 0) {
+                ZStack {
+                    // Both stay alive so the terminal keeps its scrollback and the screen its image.
+                    TerminalPane(session: model.terminal)
+                        .opacity(model.view == .terminal ? 1 : 0)
+                        .allowsHitTesting(model.view == .terminal)
+                    if model.definition.display.hasScreen {
+                        // Under the keyboard by default; above it when split (ScreenUIView's
+                        // `keepsAboveKeyboard`).
+                        screenPane
+                            .opacity(model.view == .screen ? 1 : 0)
+                            .allowsHitTesting(model.view == .screen)
                     }
-                    .padding(24)
-                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+                    if !model.hasStarted && !model.isRunning {
+                        StoppedPlaceholder(model: model) { editingSettings = true }
+                    }
+                    if case .preparing(let what) = model.state {
+                        VStack(spacing: 12) {
+                            ProgressView()
+                            Text(what).monospacedDigit().foregroundStyle(.secondary)
+                        }
+                        .padding(24)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+                    }
                 }
+                // The ZStack stays the first child either way, so folding keeps the panes' views.
+                .frame(height: fold?.foldY)
+                #if os(iOS)
+                if fold != nil {
+                    FoldedControls(model: model, fullscreen: $fullscreen, softwareKeyboard: $softwareKeyboard,
+                                   screenSize: guestSize) { editingSettings = true }
+                }
+                #endif
             }
+            #if os(iOS)
+            .background { HingeReader(posture: $fold) }
+            #endif
             .onAppear { viewSize = geometry.size }
             .onChange(of: geometry.size) { viewSize = geometry.size }
         }
@@ -438,7 +458,9 @@ struct MachineView: View {
         .subtitle(model.subject)
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
-        .toolbar(fullscreen ? .hidden : .automatic, for: .navigationBar, .bottomBar)
+        .toolbar(fullscreen ? .hidden : .automatic, for: .navigationBar)
+        // Folded, the bottom bar's buttons are in FoldedControls.
+        .toolbar(fullscreen || fold != nil ? .hidden : .automatic, for: .bottomBar)
         .statusBarHidden(fullscreen)
         .persistentSystemOverlays(fullscreen ? .hidden : .automatic)
         #else
@@ -447,7 +469,7 @@ struct MachineView: View {
         .ignoresSafeArea(edges: fullscreen ? .all : [])
         // After the line above: the screen goes edge to edge, the way out stays in the safe area.
         .overlay(alignment: .topTrailing) {
-            if fullscreen {
+            if fullscreen && fold == nil {
                 Button("Exit Full Screen", systemImage: "arrow.down.right.and.arrow.up.left") { fullscreen = false }
                     .labelStyle(.iconOnly)
                     .padding(10)
@@ -510,7 +532,7 @@ struct MachineView: View {
                     #endif
                     ToolbarItem(placement: Self.statusPlacement) {
                         Button("Resize to Fit", systemImage: "aspectratio") {
-                            model.fitScreen(to: viewSize, scale: displayScale)
+                            model.fitScreen(to: guestSize, scale: displayScale)
                         }
                         .disabled(!model.isRunning)
                         .help("Ask the guest for a screen the size of the window")
