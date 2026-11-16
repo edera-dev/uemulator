@@ -2,7 +2,7 @@
 # Copies the app's resources into its bundle (docs/plans/28-apple.md): the UEFI firmware
 # (build-core.sh builds it); the WebKit engine's web/ folder (the web build's module, worker and JIT
 # host, unchanged, and apple/WebEngine's page in place of main.js); and the Alpine demo machine's
-# kernel and initramfs, which
+# kernel and initramfs, Edera Xen and demo.json (the Xen demo's arguments), which
 # `WEB_DEMO=1 hack/web.sh` downloads (hack/web/demo.py: Alpine's virt kernel and a minirootfs
 # with an /init that starts a shell).
 set -e
@@ -11,7 +11,7 @@ out="$1"
 firmware=target/firmware/x86_64-unknown-none/release/uemulator-firmware
 demo=target/web/demo
 web=target/web
-for need in "$firmware" "$demo/vmlinuz-virt" "$demo/initramfs.gz" "$web/uemulator_web.wasm"; do
+for need in "$firmware" "$demo/vmlinuz-virt" "$demo/initramfs.gz" "$demo/xen.gz" "$demo/demo.json" "$web/uemulator_web.wasm"; do
     if [ ! -e "$need" ]; then
         echo "error: $need is missing; run WEB_DEMO=1 hack/web.sh first" >&2
         exit 1
@@ -19,7 +19,7 @@ for need in "$firmware" "$demo/vmlinuz-virt" "$demo/initramfs.gz" "$web/uemulato
 done
 mkdir -p "$out/demo"
 cp -L "$firmware" "$out/uemulator-firmware.bin"
-cp -L "$demo/vmlinuz-virt" "$demo/initramfs.gz" "$out/demo/"
+cp -L "$demo/vmlinuz-virt" "$demo/initramfs.gz" "$demo/xen.gz" "$demo/demo.json" "$out/demo/"
 rm -rf "$out/web"
 mkdir -p "$out/web"
 # The worker's imports: protocol.js, gpu.js, jit_host.js, segment.js, wisp.js (main.js and the

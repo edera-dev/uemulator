@@ -93,16 +93,25 @@ for module in {" ".join(m.rsplit("/", 1)[1].removesuffix(".ko") for m in DEMO_MO
     insmod /{MODULE_DIR}/$module.ko 2>/dev/null
 done
 ip link set lo up
+# The Apple app boots this with uemulator.host=app: one machine, its internet through the app.
+where="in your browser"
+peers="on the network this browser's other tabs share: 'ping' or 'nc' their machines."
+case " $(cat /proc/cmdline) " in
+*" uemulator.host=app "*)
+    where="in the uemulator app"
+    peers="with the internet through the app."
+    ;;
+esac
 network="No network."
 if ip link set eth0 up 2>/dev/null; then
     if udhcpc -i eth0 -q -n -t 5 -T 2 >/dev/null 2>&1; then
         address=$(ip -4 -o addr show eth0 | awk '{{print $4}}')
-        network="eth0 is $address on the network this browser's other tabs share: 'ping' or 'nc' their machines."
+        network="eth0 is $address $peers"
     else
         network="eth0 got no address from DHCP; 'udhcpc -i eth0' tries again."
     fi
 fi
-echo "Alpine Linux {ALPINE_VERSION} on uemulator, running from RAM in your browser."
+echo "Alpine Linux {ALPINE_VERSION} on uemulator, running from RAM $where."
 if [ "$(cat /sys/hypervisor/type 2>/dev/null)" = xen ]; then
     v=/sys/hypervisor/version
     echo "It is the $(cat /sys/hypervisor/guest_type) dom0 of Xen $(cat $v/major).$(cat $v/minor)$(cat $v/extra); see 'dmesg' and /sys/hypervisor."
