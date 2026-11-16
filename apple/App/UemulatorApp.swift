@@ -28,6 +28,7 @@ struct UemulatorApp: App {
 //                             default), demo:xen, install:alpine|debian|fedora, iso:FILE (in
 //                             Documents, imported) or empty
 //   -engine native|webkit, -debug-log FILE   see MachineModel
+//   -debug-drop-sockets SECONDS (Debug)      see WebKitEngine
 struct LibraryView: View {
     @StateObject private var store = MachineStore()
     @State private var selection: String?

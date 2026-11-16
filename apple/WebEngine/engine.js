@@ -226,9 +226,10 @@ async function boot(settings) {
     wisp: network ? { resolver: WISP_RESOLVER, port: WISP_RESOLVER_PORT } : null,
     // worker.js reads them with synchronous range requests, which the app's loopback server
     // answers; a writable disk writes through to the app's file with synchronous POSTs to the
-    // same URL.
+    // same URL. Requests wait for a server iOS took away to come back (worker.js `sendSync`).
     disks: (settings.disks ?? []).map((disk) => ({
       url: new URL(disk.url, location.href).href, readOnly: disk.readOnly, writeThrough: !disk.readOnly,
+      retryUnreachable: true,
     })),
   }, [kernel, initrd, firmwareImage, hypervisor].filter(Boolean));
 }
@@ -286,11 +287,12 @@ function giveUp() {
 }
 
 function connect() {
-  socket = new WebSocket(`ws://127.0.0.1:${params.get("socket")}/`);
-  socket.binaryType = "arraybuffer";
-  socket.onopen = () => socket.send(`${token} ${params.get("run")}`);
-  socket.onmessage = onMessage;
-  socket.onclose = () => {
+  const current = new WebSocket(`ws://127.0.0.1:${params.get("socket")}/`);
+  socket = current;
+  current.binaryType = "arraybuffer";
+  current.onopen = () => current.send(`${token} ${params.get("run")}`);
+  current.onmessage = onMessage;
+  current.onclose = () => {
     unanswered += 1;
     if (unanswered > RECONNECT_ATTEMPTS) {
       giveUp();
