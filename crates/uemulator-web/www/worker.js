@@ -305,6 +305,9 @@ function upload(bytes) {
 
 async function boot(message) {
   jit.useCompileQueue(message.compileQueue);
+  // Absent means allowed. The web page (main.js, `chainingWorks`) and the Apple app's page
+  // (apple/WebEngine/engine.js) say no on iOS and iPadOS.
+  jit.allowChaining(message.jitChaining ?? true);
   control = new Int32Array(message.control, 0, RING_OFFSET / 4);
   ring = new Uint8Array(message.control, RING_OFFSET, RING_BYTES);
   events = new Int32Array(message.control, EVENT_OFFSET, EVENT_RECORDS * EVENT_WORDS);

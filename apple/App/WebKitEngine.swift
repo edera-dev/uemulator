@@ -38,6 +38,17 @@ final class WebKitEngine: NSObject, MachineEngine {
     // How long a stopping worker gets to close its disks before the page is blanked anyway.
     private static let drainTimeout: TimeInterval = 5
     private var jit = true
+    // Whether the wasm JIT's blocks may tail-call each other (`return_call_indirect` through the
+    // chain stubs). JavaScriptCore on an iPad Pro (M2, iPadOS 27.2.1) compiles the stubs and then
+    // crashes the WebContent process the first time a block chains, before the firmware prints;
+    // no probe survives that, so devices go unchained (docs/plans/28-apple.md, "WebKitEngine on
+    // devices"). The simulator and macOS ran the chained JIT; turn it back on per OS once a
+    // device runs it.
+    #if os(macOS) || targetEnvironment(simulator)
+    private static let jitChaining = true
+    #else
+    private static let jitChaining = false
+    #endif
 
     // `www/protocol.js`'s FIRMWARE and OPTION values, which `uw_create` takes.
     private enum Firmware {
@@ -136,6 +147,7 @@ final class WebKitEngine: NSObject, MachineEngine {
             "memoryMib": settings.memoryMib,
             "cpus": settings.cpus,
             "options": settings.options,
+            "jitChaining": Self.jitChaining,
             "network": settings.network,
             "cols": settings.cols,
             "rows": settings.rows,

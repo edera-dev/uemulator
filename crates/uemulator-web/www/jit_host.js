@@ -59,6 +59,17 @@ export function compileWorkerHelps() {
   return Boolean(globalThis.process?.versions?.v8) || /\bChrom(e|ium)\//.test(globalThis.navigator?.userAgent ?? "");
 }
 
+// Whether blocks may chain through the tail-calling stubs (`allowChaining`). Not in Safari
+// outside macOS: JavaScriptCore on an iPad compiles the stubs and then crashes the tab the first
+// time a block chains (docs/plans/28-apple.md, "WebKitEngine on devices"). Every iOS and iPadOS
+// browser is Safari's WebKit underneath, and iPadOS Safari says it is a Mac, so a "Macintosh" with
+// a touch screen is an iPad. The simulator matches too and runs unchained, which costs only speed.
+export function chainingWorks() {
+  const agent = globalThis.navigator?.userAgent ?? "";
+  if (/\b(iPhone|iPad|iPod)\b/.test(agent)) return false;
+  return !(/\bMacintosh\b/.test(agent) && (globalThis.navigator?.maxTouchPoints ?? 0) > 1);
+}
+
 export function createJitHost() {
   let exports = null;
   // Slots handed out so far, and the ones given back. The first slots of the table are the
@@ -66,6 +77,7 @@ export function createJitHost() {
   let nextSlot = 0;
   const freeSlots = [];
   let queue = null;
+  let chaining = true;
 
   function allocateSlot(table) {
     if (nextSlot === 0) nextSlot = table.length;
@@ -110,6 +122,10 @@ export function createJitHost() {
       exports.__indirect_function_table.set(slot, null);
       freeSlots.push(slot);
     },
+    // Whether blocks may tail-call each other through the chain stubs (`Jit::new`).
+    host_jit_chaining() {
+      return chaining ? 1 : 0;
+    },
     // Copies the module into the compile queue. Returns its ticket, or -1 when there is no
     // worker (yet) or no room: the library then compiles it at once.
     host_jit_submit(ptr, len) {
@@ -153,6 +169,12 @@ export function createJitHost() {
     // Call with the emulator's instance exports before anything runs.
     attach(instanceExports) {
       exports = instanceExports;
+    },
+    // `false` keeps blocks from chaining: every block returns to the run loop. For an engine
+    // that compiles tail calls and then crashes running them, which no probe survives
+    // (`chainingWorks`).
+    allowChaining(allowed) {
+      chaining = allowed;
     },
     // Hand modules to the compile worker reading `buffer` (`createCompileQueue`) from now on.
     useCompileQueue(buffer) {

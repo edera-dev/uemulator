@@ -184,6 +184,7 @@ async function boot(settings) {
     cols: settings.cols,
     rows: settings.rows,
     options: settings.options,
+    jitChaining: settings.jitChaining,
     network,
     wisp: network ? { resolver: WISP_RESOLVER, port: WISP_RESOLVER_PORT } : null,
     // worker.js reads them with synchronous range requests, which the app's loopback server

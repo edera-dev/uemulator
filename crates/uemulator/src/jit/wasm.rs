@@ -60,6 +60,11 @@ unsafe extern "C" {
     fn host_jit_compile(ptr: *const u8, len: usize, slots: *mut u32, count: usize) -> i32;
     /// Gives a slot back; the host empties it so the engine can free the instance.
     fn host_jit_release(slot: i32);
+    /// Nonzero if blocks may chain through the tail-calling stubs. An engine that cannot compile
+    /// tail calls refuses the stubs, which `Jit::new` handles, but one that compiles them and then
+    /// dies running them cannot be probed for: the page has to know (JavaScriptCore on an iPad,
+    /// docs/plans/28-apple.md, "WebKitEngine on devices").
+    fn host_jit_chaining() -> i32;
     /// Hands a copy of the module to the host's compile worker and returns a ticket, or -1 when
     /// there is no compile worker or it has no room: the module is then compiled at once.
     fn host_jit_submit(ptr: *const u8, len: usize) -> i32;
@@ -877,7 +882,8 @@ impl Jit {
         }
         let valid: Box<[AtomicU8]> = (0..=MAX_BLOCKS).map(|_| AtomicU8::new(0)).collect();
         let jump_cache = JumpCache::new();
-        let (chain_slot, chain_link_slot) = if chaining {
+        // SAFETY: takes and returns plain integers.
+        let (chain_slot, chain_link_slot) = if chaining && unsafe { host_jit_chaining() } != 0 {
             let tables = ChainTables {
                 jump_cache: jump_cache.base(),
                 valid: valid.as_ptr() as usize as u32,

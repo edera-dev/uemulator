@@ -212,7 +212,12 @@ final class MachineModel: ObservableObject, ScreenInput {
     private static let debugInterval: TimeInterval = 5
 
     private func openDebugLog() {
-        guard let file = UserDefaults.standard.string(forKey: "debug-log"), !file.isEmpty else { return }
+        let defaults = UserDefaults.standard
+        guard let file = defaults.string(forKey: "debug-log"), !file.isEmpty else { return }
+        // Only the machine the launch named: every model is built at launch, and `createFile`
+        // replaces the file, so a second model would leave the first writing to an unlinked one.
+        let named = defaults.string(forKey: "machine") ?? defaults.string(forKey: "new-machine")
+        if let named, named != name { return }
         let url = MachineStore.documents.appendingPathComponent(file)
         FileManager.default.createFile(atPath: url.path, contents: nil)
         debugLog = try? FileHandle(forWritingTo: url)

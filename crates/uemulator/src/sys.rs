@@ -111,8 +111,20 @@ mod imp {
     #[cfg(not(target_os = "macos"))]
     const PLATFORM_MMAP_FLAGS: i32 = 0;
 
+    /// iOS, iPadOS, tvOS and visionOS give an App Store app no executable memory, and asking
+    /// cannot be relied on to fail: on an iPad Pro (M2, iPadOS 27.2.1) a debug build installed by
+    /// Xcode gets the RWX `mmap`, but the pages are not executable, and `jit_probe`'s call into
+    /// them is a SIGBUS (KERN_PROTECTION_FAILURE) that kills the app instead of `false`. Refuse
+    /// before mapping so `JitMode::On` reports `JitUnavailable` and the app falls back to the
+    /// interpreter (`docs/plans/28-apple.md`).
+    const PLATFORM_ALLOWS_EXECUTABLE_MEMORY: bool =
+        !cfg!(all(target_vendor = "apple", not(target_os = "macos")));
+
     impl ExecMem {
         pub fn new(len: usize) -> Option<ExecMem> {
+            if !PLATFORM_ALLOWS_EXECUTABLE_MEMORY {
+                return None;
+            }
             let mapping = unsafe {
                 libc::mmap(
                     std::ptr::null_mut(),
@@ -302,10 +314,20 @@ mod tests {
         advise_huge_pages(&mut ram[1..3]);
     }
 
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[cfg(all(
+        any(target_arch = "aarch64", target_arch = "x86_64"),
+        not(all(target_vendor = "apple", not(target_os = "macos")))
+    ))]
     #[test]
     fn probe_succeeds_on_a_host_with_a_jit_backend() {
         assert!(jit_probe());
+    }
+
+    #[cfg(all(target_vendor = "apple", not(target_os = "macos")))]
+    #[test]
+    fn probe_fails_without_mapping_on_apple_mobile_systems() {
+        assert!(ExecMem::new(PROBE_MAPPING_SIZE).is_none());
+        assert!(!jit_probe());
     }
 
     #[test]

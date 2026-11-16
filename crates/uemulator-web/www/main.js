@@ -6,7 +6,7 @@ import {
 import { COMMAND_RING_BYTES, COMPLETION_RING_BYTES, createRing } from "./gpu.js";
 import { formatMac, joinSegment, randomMac, randomTab } from "./segment.js";
 import { connectWisp } from "./wisp.js";
-import { compileWorkerHelps, createCompileQueue } from "./jit_host.js";
+import { chainingWorks, compileWorkerHelps, createCompileQueue } from "./jit_host.js";
 
 const $ = (id) => document.getElementById(id);
 const term = window.term = new Terminal({ convertEol: false, cursorBlink: true, fontSize: 14, scrollback: 5000 });
@@ -1379,6 +1379,7 @@ async function launch() {
       wisp: wispSettings,
       gpu,
       compileQueue,
+      jitChaining: chainingWorks(),
     };
     setStatus("Starting…", "busy");
     worker.postMessage(message, [kernel, initrd, hypervisor, firmware.image].filter(Boolean));
