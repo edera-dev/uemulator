@@ -1,5 +1,8 @@
 import SwiftUI
 import UniformTypeIdentifiers
+#if os(macOS)
+import AppKit
+#endif
 
 @main
 struct UemulatorApp: App {
@@ -31,6 +34,9 @@ struct LibraryView: View {
     @State private var creating = false
     @State private var problem: String?
     @State private var deleting: String?
+    // Only the screen or terminal: no sidebar, no bars (MachineView).
+    @State private var fullscreen = false
+    @State private var columns = NavigationSplitViewVisibility.automatic
     #if os(iOS)
     // A phone opens on the list, so an empty library offers the presets there; wider layouts show
     // them in the detail.
@@ -41,32 +47,12 @@ struct LibraryView: View {
     #endif
 
     var body: some View {
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: $columns) {
             List(store.names, id: \.self, selection: $selection) { name in
-                MachineRow(model: store.model(name))
-                    .contextMenu {
-                        let model = store.model(name)
-                        if model.isRunning {
-                            Button("Stop", systemImage: "stop.fill") { model.stop() }
-                        } else {
-                            Button("Start", systemImage: "play.fill") {
-                                selection = name
-                                model.start()
-                            }
-                        }
-                        Divider()
-                        Button("Delete…", systemImage: "trash", role: .destructive) { deleting = name }
-                            .disabled(model.isRunning)
-                    }
+                MachineRow(model: store.model(name), onStart: { selection = name }, onDelete: { deleting = name })
             }
             .overlay {
-                if compact && store.names.isEmpty {
-                    ContentUnavailableView {
-                        Label("No Machines", systemImage: "cpu")
-                    } actions: {
-                        PresetButtons(onDemo: add, onInstall: add) { creating = true }
-                    }
-                }
+                if compact && store.names.isEmpty { EmptyLibrary(onDemo: add) }
             }
             .navigationTitle("uemulator")
             #if os(iOS)
@@ -86,18 +72,22 @@ struct LibraryView: View {
             }
         } detail: {
             if let selection, store.names.contains(selection) {
-                MachineView(model: store.model(selection)) { delete(selection) }
+                MachineView(model: store.model(selection), fullscreen: $fullscreen) { delete(selection) }
                     .id(selection)
+            } else if store.names.isEmpty {
+                EmptyLibrary(onDemo: add)
             } else {
-                ContentUnavailableView {
-                    Label(store.names.isEmpty ? "No Machines" : "No Machine Selected", systemImage: "cpu")
-                } actions: {
-                    if store.names.isEmpty {
-                        PresetButtons(onDemo: add, onInstall: add) { creating = true }
-                    }
-                }
+                ContentUnavailableView("No Machine Selected", systemImage: "cpu")
             }
         }
+        .onChange(of: fullscreen) {
+            columns = fullscreen ? .detailOnly : .automatic
+            #if os(macOS)
+            // The window too, unless it already is (the user's green button).
+            if let window = NSApp.keyWindow, window.styleMask.contains(.fullScreen) != fullscreen { window.toggleFullScreen(nil) }
+            #endif
+        }
+        .onChange(of: selection) { fullscreen = false }
         .sheet(isPresented: $creating) {
             NewMachineSheet(store: store) { name in
                 creating = false
@@ -194,6 +184,7 @@ struct LibraryView: View {
     }
 }
 
+// The logo; a Mac's sidebar has room for the name beside it, a phone's bar does not.
 struct BrandMark: View {
     var body: some View {
         HStack(spacing: 8) {
@@ -201,59 +192,55 @@ struct BrandMark: View {
                 .resizable()
                 .interpolation(.high)
                 .frame(width: 24, height: 24)
+            #if os(macOS)
             Text("uemulator").font(.headline)
+            #endif
         }
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .ignore)
         .accessibilityLabel("uemulator")
     }
 }
 
-// The Add menu: the demos, the easy installs, and a machine set up by hand.
+// The Add menu: the easy installs, a machine set up by hand, and the demos.
 struct NewMachineMenu: View {
     let onDemo: (Demo) -> Void
     let onInstall: (Distro) -> Void
     let onCustom: () -> Void
 
     var body: some View {
-        Section("Demo") {
-            ForEach(Demo.allCases) { demo in Button(demo.title) { onDemo(demo) } }
-        }
         Section("Install") {
             ForEach(Distro.allCases) { distro in Button(distro.title) { onInstall(distro) } }
         }
         Button("Custom…", systemImage: "slider.horizontal.3", action: onCustom)
+        Menu("Demo", systemImage: "play.circle") {
+            ForEach(Demo.allCases) { demo in Button(demo.title) { onDemo(demo) } }
+        }
     }
 }
 
-// The same choices as buttons, for an empty library.
-struct PresetButtons: View {
+// An empty library: the + button makes machines; a demo is one small menu away.
+struct EmptyLibrary: View {
     let onDemo: (Demo) -> Void
-    let onInstall: (Distro) -> Void
-    let onCustom: () -> Void
 
     var body: some View {
-        VStack(spacing: 12) {
-            HStack {
-                ForEach(Demo.allCases) { demo in
-                    Button(demo.title, systemImage: "play.fill") { onDemo(demo) }
-                        .buttonStyle(.borderedProminent)
-                }
+        ContentUnavailableView {
+            Label("No Machines", systemImage: "cpu")
+        } actions: {
+            Menu("Try a Demo", systemImage: "play.circle") {
+                ForEach(Demo.allCases) { demo in Button(demo.title) { onDemo(demo) } }
             }
-            HStack {
-                Menu("Install", systemImage: "arrow.down.circle") {
-                    ForEach(Distro.allCases) { distro in Button(distro.title) { onInstall(distro) } }
-                }
-                .fixedSize()
-                Button("Custom…", systemImage: "slider.horizontal.3", action: onCustom)
-            }
+            .fixedSize()
             .buttonStyle(.bordered)
+            .controlSize(.small)
         }
-        .controlSize(.large)
     }
 }
 
 struct MachineRow: View {
+    // Observed here, not in the list: the context menu must see the machine's current state.
     @ObservedObject var model: MachineModel
+    let onStart: () -> Void
+    let onDelete: () -> Void
 
     var body: some View {
         Label {
@@ -271,6 +258,19 @@ struct MachineRow: View {
                 }
         }
         .padding(.vertical, 2)
+        .contextMenu {
+            if model.isRunning {
+                Button("Stop", systemImage: "stop.fill") { model.stop() }
+            } else {
+                Button("Start", systemImage: "play.fill") {
+                    onStart()
+                    model.start()
+                }
+            }
+            Divider()
+            Button("Delete…", systemImage: "trash", role: .destructive, action: onDelete)
+                .disabled(model.isRunning)
+        }
     }
 
     // What the machine is, in a line: what it runs, then memory and processors.

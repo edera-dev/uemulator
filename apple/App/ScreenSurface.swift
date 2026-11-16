@@ -140,9 +140,17 @@ enum HIDUsage {
     static let digit1: UInt16 = 0x1E
     static let digit0: UInt16 = 0x27
     static let enter: UInt16 = 0x28
+    static let escape: UInt16 = 0x29
     static let backspace: UInt16 = 0x2A
     static let tab: UInt16 = 0x2B
     static let space: UInt16 = 0x2C
+    // F1 to F12 are consecutive from here.
+    static let f1: UInt16 = 0x3A
+    static let right: UInt16 = 0x4F
+    static let left: UInt16 = 0x50
+    static let down: UInt16 = 0x51
+    static let up: UInt16 = 0x52
+    static let leftControl: UInt16 = 0xE0
     static let leftShift: UInt16 = 0xE1
 
     // A character the iOS software keyboard typed, as the key and whether it needs shift on a US

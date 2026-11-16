@@ -158,13 +158,150 @@ struct ScreenPane: NSViewRepresentable {
 #else
 import UIKit
 
+// The bar above the software keyboard: SwiftTerm's terminal accessory (esc, a sticky ctrl, tab, a
+// few symbols, F-keys, arrows, hide) for the screen, sending keys instead of terminal bytes. A key
+// goes down on touch and up on release, so a held arrow repeats through the guest's own repeat.
+final class ScreenKeyAccessory: UIInputView {
+    var onKey: ((UInt16, Bool) -> Void)?
+    var onCharacter: ((Character) -> Void)?
+    var onHide: (() -> Void)?
+    // Applies to the next key, typed or from this bar, then lets go.
+    var controlLatched = false {
+        didSet { controlButton.isSelected = controlLatched }
+    }
+    private var controlButton: UIButton!
+    private static let barHeight: CGFloat = 44
+    private static let initialWidth: CGFloat = 320
+    private static let spacing: CGFloat = 4
+    // Esc, ctrl, tab and the arrows at this width leave the symbols and F-keys room to scroll even
+    // on a phone held upright.
+    private static let fixedKeyWidth: CGFloat = 36
+    private static let symbols: [Character] = ["~", "|", "/", "-"]
+    private static let functionKeys = 12
+
+    init() {
+        // UIKit sets the width to the keyboard's; without the mask the bar keeps its initial one.
+        super.init(frame: CGRect(x: 0, y: 0, width: Self.initialWidth, height: Self.barHeight), inputViewStyle: .keyboard)
+        autoresizingMask = .flexibleWidth
+        let leading = UIStackView(arrangedSubviews: [
+            keyButton(symbol: "escape", usage: HIDUsage.escape),
+            controlToggle(),
+            keyButton(symbol: "arrow.right.to.line.compact", usage: HIDUsage.tab),
+        ])
+        let middle = UIStackView(arrangedSubviews: Self.symbols.map(characterButton)
+            + (0..<Self.functionKeys).map { keyButton(title: "F\($0 + 1)", usage: HIDUsage.f1 + UInt16($0)) })
+        let trailing = UIStackView(arrangedSubviews: [
+            keyButton(symbol: "arrow.left", usage: HIDUsage.left),
+            keyButton(symbol: "arrow.down", usage: HIDUsage.down),
+            keyButton(symbol: "arrow.up", usage: HIDUsage.up),
+            keyButton(symbol: "arrow.right", usage: HIDUsage.right),
+            hideButton(),
+        ])
+        for stack in [leading, middle, trailing] { stack.spacing = Self.spacing }
+        // The symbols and F-keys scroll; esc, ctrl, tab and the arrows stay put.
+        let scroll = UIScrollView()
+        scroll.showsHorizontalScrollIndicator = false
+        scroll.addSubview(middle)
+        middle.translatesAutoresizingMaskIntoConstraints = false
+        let row = UIStackView(arrangedSubviews: [leading, scroll, trailing])
+        row.spacing = Self.spacing
+        row.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(row)
+        // esc, ctrl, tab and the arrows keep their size; the scrolling strip takes what is left.
+        for button in leading.arrangedSubviews + trailing.arrangedSubviews {
+            button.widthAnchor.constraint(equalToConstant: Self.fixedKeyWidth).isActive = true
+        }
+        for stack in [leading, trailing] {
+            stack.setContentHuggingPriority(.required, for: .horizontal)
+            stack.setContentCompressionResistancePriority(.required, for: .horizontal)
+        }
+        scroll.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        scroll.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        NSLayoutConstraint.activate([
+            row.leadingAnchor.constraint(equalTo: safeAreaLayoutGuide.leadingAnchor, constant: Self.spacing),
+            row.trailingAnchor.constraint(equalTo: safeAreaLayoutGuide.trailingAnchor, constant: -Self.spacing),
+            row.topAnchor.constraint(equalTo: topAnchor, constant: Self.spacing),
+            row.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -Self.spacing),
+            middle.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor),
+            middle.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor),
+            middle.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor),
+            middle.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor),
+            middle.heightAnchor.constraint(equalTo: scroll.frameLayoutGuide.heightAnchor),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+
+    private func styled(title: String?, symbol: String?) -> UIButton {
+        var configuration = UIButton.Configuration.gray()
+        configuration.title = title
+        configuration.image = symbol.flatMap { UIImage(systemName: $0) }
+        configuration.cornerStyle = .medium
+        configuration.contentInsets = NSDirectionalEdgeInsets(top: 4, leading: 8, bottom: 4, trailing: 8)
+        let button = UIButton(configuration: configuration)
+        button.configurationUpdateHandler = { button in
+            button.configuration?.baseBackgroundColor = button.isSelected ? .tintColor : nil
+            button.configuration?.baseForegroundColor = button.isSelected ? .white : .label
+        }
+        return button
+    }
+
+    private func keyButton(title: String? = nil, symbol: String? = nil, usage: UInt16) -> UIButton {
+        let button = styled(title: title, symbol: symbol)
+        button.addAction(UIAction { [weak self] _ in
+            UIDevice.current.playInputClick()
+            self?.onKey?(usage, true)
+        }, for: .touchDown)
+        for event: UIControl.Event in [.touchUpInside, .touchUpOutside, .touchCancel] {
+            button.addAction(UIAction { [weak self] _ in self?.onKey?(usage, false) }, for: event)
+        }
+        return button
+    }
+
+    private func characterButton(_ character: Character) -> UIButton {
+        let button = styled(title: String(character), symbol: nil)
+        button.addAction(UIAction { [weak self] _ in
+            UIDevice.current.playInputClick()
+            self?.onCharacter?(character)
+        }, for: .touchUpInside)
+        return button
+    }
+
+    private func controlToggle() -> UIButton {
+        let button = styled(title: nil, symbol: "control")
+        button.addAction(UIAction { [weak self] _ in self?.controlLatched.toggle() }, for: .touchUpInside)
+        controlButton = button
+        return button
+    }
+
+    private func hideButton() -> UIButton {
+        let button = styled(title: nil, symbol: "keyboard.chevron.compact.down")
+        button.addAction(UIAction { [weak self] _ in self?.onHide?() }, for: .touchUpInside)
+        return button
+    }
+}
+
+extension ScreenKeyAccessory: UIInputViewAudioFeedback {
+    var enableInputClicksWhenVisible: Bool { true }
+}
+
 final class ScreenUIView: UIView, UIKeyInput {
     weak var input: (any ScreenInput)?
     var surface: ScreenSurface? {
         didSet { attach() }
     }
+    // The guest's image, in `contentRect`.
+    private let imageLayer = CALayer()
     // The guest's pointer image, drawn where the pointer is: a touch has no host pointer to swap.
     private let pointerLayer = CALayer()
+    // The image above the software keyboard rather than under it (MachineView's Keyboard Below
+    // Screen). Follows the keyboard through `keyboardLayoutGuide`, accessory bar included.
+    var keepsAboveKeyboard = false {
+        didSet { if keepsAboveKeyboard != oldValue { setNeedsLayout() } }
+    }
+    // Pinned to the keyboard's top, so a keyboard that moves lays this view out again.
+    private let keyboardTop = UIView()
     private var pointerPixel = CGPoint.zero
     private var scrollRemainder: CGFloat = 0
     // The view is first responder whenever it has been touched, so hardware keys reach the guest;
@@ -175,10 +312,15 @@ final class ScreenUIView: UIView, UIKeyInput {
             guard showsSoftwareKeyboard != oldValue else { return }
             if showsSoftwareKeyboard && !isFirstResponder { becomeFirstResponder() }
             reloadInputViews()
+            setNeedsLayout()
         }
     }
     private let noKeyboard = UIView(frame: .zero)
     override var inputView: UIView? { showsSoftwareKeyboard ? nil : noKeyboard }
+    private let accessory = ScreenKeyAccessory()
+    override var inputAccessoryView: UIView? { showsSoftwareKeyboard ? accessory : nil }
+    // The accessory's hide key: the SwiftUI side owns whether the keyboard shows.
+    var onHideKeyboard: (() -> Void)?
     // A two-finger pan of this many points is one wheel notch.
     private static let pointsPerNotch: CGFloat = 12
 
@@ -186,9 +328,20 @@ final class ScreenUIView: UIView, UIKeyInput {
         super.init(frame: frame)
         backgroundColor = .black
         isMultipleTouchEnabled = true
-        layer.contentsGravity = .resizeAspect
-        layer.magnificationFilter = .nearest
-        layer.minificationFilter = .linear
+        imageLayer.contentsGravity = .resizeAspect
+        imageLayer.magnificationFilter = .nearest
+        imageLayer.minificationFilter = .linear
+        layer.addSublayer(imageLayer)
+        keyboardTop.isUserInteractionEnabled = false
+        keyboardTop.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(keyboardTop)
+        keyboardLayoutGuide.followsUndockedKeyboard = true
+        NSLayoutConstraint.activate([
+            keyboardTop.leadingAnchor.constraint(equalTo: leadingAnchor),
+            keyboardTop.widthAnchor.constraint(equalToConstant: 0),
+            keyboardTop.heightAnchor.constraint(equalToConstant: 0),
+            keyboardTop.bottomAnchor.constraint(equalTo: keyboardLayoutGuide.topAnchor),
+        ])
         pointerLayer.isHidden = true
         pointerLayer.zPosition = 1
         layer.addSublayer(pointerLayer)
@@ -197,22 +350,49 @@ final class ScreenUIView: UIView, UIKeyInput {
         pan.minimumNumberOfTouches = 2
         pan.allowedScrollTypesMask = .all
         addGestureRecognizer(pan)
+        accessory.onKey = { [weak self] usage, pressed in self?.accessoryKey(usage, pressed: pressed) }
+        accessory.onCharacter = { [weak self] character in self?.insertText(String(character)) }
+        accessory.onHide = { [weak self] in self?.onHideKeyboard?() }
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
 
+    // A latched ctrl is held around the key and then let go.
+    private func accessoryKey(_ usage: UInt16, pressed: Bool) {
+        if pressed {
+            if accessory.controlLatched { input?.key(usage: HIDUsage.leftControl, pressed: true) }
+            input?.key(usage: usage, pressed: true)
+        } else {
+            input?.key(usage: usage, pressed: false)
+            if accessory.controlLatched {
+                input?.key(usage: HIDUsage.leftControl, pressed: false)
+                accessory.controlLatched = false
+            }
+        }
+    }
+
     private func attach() {
         surface?.onImage = { [weak self] in
-            self?.layer.contents = self?.surface?.image
+            self?.imageLayer.contents = self?.surface?.image
             self?.placePointer()
         }
         surface?.onPointer = { [weak self] in self?.placePointer() }
-        layer.contents = surface?.image
+        imageLayer.contents = surface?.image
     }
 
     override func layoutSubviews() {
         super.layoutSubviews()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        imageLayer.frame = contentRect
+        CATransaction.commit()
         placePointer()
+    }
+
+    // Where the image goes: all of the view, or the part above a shown keyboard.
+    private var contentRect: CGRect {
+        guard keepsAboveKeyboard, showsSoftwareKeyboard, keyboardTop.frame.maxY < bounds.maxY else { return bounds }
+        return CGRect(x: bounds.minX, y: bounds.minY, width: bounds.width, height: max(0, keyboardTop.frame.maxY - bounds.minY))
     }
 
     private var imageSize: CGSize {
@@ -224,7 +404,7 @@ final class ScreenUIView: UIView, UIKeyInput {
             pointerLayer.isHidden = true
             return
         }
-        let frame = AspectFit.frame(imageSize: imageSize, in: bounds)
+        let frame = AspectFit.frame(imageSize: imageSize, in: contentRect)
         let scale = frame.width / imageSize.width
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -237,7 +417,7 @@ final class ScreenUIView: UIView, UIKeyInput {
     }
 
     private func move(to point: CGPoint) {
-        guard let pixel = AspectFit.pixel(at: point, imageSize: imageSize, in: bounds) else { return }
+        guard let pixel = AspectFit.pixel(at: point, imageSize: imageSize, in: contentRect) else { return }
         pointerPixel = CGPoint(x: pixel.x, y: pixel.y)
         input?.pointerMove(x: pixel.x, y: pixel.y)
         placePointer()
@@ -276,12 +456,18 @@ final class ScreenUIView: UIView, UIKeyInput {
     var hasText: Bool { true }
 
     func insertText(_ text: String) {
+        let control = accessory.controlLatched
+        if control { input?.key(usage: HIDUsage.leftControl, pressed: true) }
         for character in text {
             guard let (usage, shift) = HIDUsage.forCharacter(character) else { continue }
             if shift { input?.key(usage: HIDUsage.leftShift, pressed: true) }
             input?.key(usage: usage, pressed: true)
             input?.key(usage: usage, pressed: false)
             if shift { input?.key(usage: HIDUsage.leftShift, pressed: false) }
+        }
+        if control {
+            input?.key(usage: HIDUsage.leftControl, pressed: false)
+            accessory.controlLatched = false
         }
     }
 
@@ -334,7 +520,8 @@ final class ScreenUIView: UIView, UIKeyInput {
 struct ScreenPane: UIViewRepresentable {
     let surface: ScreenSurface
     let input: any ScreenInput
-    var showsSoftwareKeyboard = false
+    @Binding var showsSoftwareKeyboard: Bool
+    var keepsAboveKeyboard = false
 
     func makeUIView(context: Context) -> ScreenUIView {
         let view = ScreenUIView(frame: .zero)
@@ -346,6 +533,8 @@ struct ScreenPane: UIViewRepresentable {
     func updateUIView(_ view: ScreenUIView, context: Context) {
         view.input = input
         view.showsSoftwareKeyboard = showsSoftwareKeyboard
+        view.keepsAboveKeyboard = keepsAboveKeyboard
+        view.onHideKeyboard = { showsSoftwareKeyboard = false }
     }
 }
 #endif

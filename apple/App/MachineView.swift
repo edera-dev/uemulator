@@ -362,19 +362,38 @@ struct MachineView: View {
     #endif
 
     @ObservedObject var model: MachineModel
+    @Binding var fullscreen: Bool
     let onDelete: () -> Void
     @State private var viewSize = CGSize.zero
+    // Duo unfolded in portrait: the screen above the software keyboard instead of under it.
+    @AppStorage("keyboardBelowScreen") private var keyboardBelowScreen = false
     @State private var softwareKeyboard = false
     @State private var editingSettings = false
     @Environment(\.displayScale) private var displayScale
 
     private var screenPane: ScreenPane {
         #if os(iOS)
-        ScreenPane(surface: model.screen, input: model, showsSoftwareKeyboard: softwareKeyboard)
+        ScreenPane(surface: model.screen, input: model, showsSoftwareKeyboard: $softwareKeyboard, keepsAboveKeyboard: splitKeyboard)
         #else
         ScreenPane(surface: model.screen, input: model)
         #endif
     }
+
+    // A phone held upright whose screen is nearly square: a foldable unfolded. Measured without
+    // the keyboard, which would otherwise make it look landscape once shown.
+    private var unfoldedPortrait: Bool {
+        #if os(iOS)
+        UIDevice.current.userInterfaceIdiom == .phone && viewSize.height > viewSize.width
+            && viewSize.width / viewSize.height >= Self.unfoldedAspect
+        #else
+        false
+        #endif
+    }
+
+    // Width over height above any slab phone's (about 0.46) and below a foldable's inner screen.
+    private static let unfoldedAspect: CGFloat = 0.6
+
+    private var splitKeyboard: Bool { keyboardBelowScreen && unfoldedPortrait && model.view == .screen }
 
     var body: some View {
         GeometryReader { geometry in
@@ -384,6 +403,8 @@ struct MachineView: View {
                     .opacity(model.view == .terminal ? 1 : 0)
                     .allowsHitTesting(model.view == .terminal)
                 if model.definition.display.hasScreen {
+                    // Under the keyboard by default; above it when split (ScreenUIView's
+                    // `keepsAboveKeyboard`).
                     screenPane
                         .opacity(model.view == .screen ? 1 : 0)
                         .allowsHitTesting(model.view == .screen)
@@ -403,6 +424,9 @@ struct MachineView: View {
             .onAppear { viewSize = geometry.size }
             .onChange(of: geometry.size) { viewSize = geometry.size }
         }
+        .ignoresSafeArea(.keyboard)
+        // Turning the split on brings the keyboard up; a layout change (full screen, rotating) does not.
+        .onChange(of: keyboardBelowScreen) { if keyboardBelowScreen { softwareKeyboard = true } }
         .background(Color.black)
         // The WebKit engine's web view: in the hierarchy but invisible, never the UI.
         .background {
@@ -414,7 +438,24 @@ struct MachineView: View {
         .subtitle(model.subject)
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar(fullscreen ? .hidden : .automatic, for: .navigationBar, .bottomBar)
+        .statusBarHidden(fullscreen)
+        .persistentSystemOverlays(fullscreen ? .hidden : .automatic)
+        #else
+        .toolbar(fullscreen ? .hidden : .automatic, for: .windowToolbar)
         #endif
+        .ignoresSafeArea(edges: fullscreen ? .all : [])
+        // After the line above: the screen goes edge to edge, the way out stays in the safe area.
+        .overlay(alignment: .topTrailing) {
+            if fullscreen {
+                Button("Exit Full Screen", systemImage: "arrow.down.right.and.arrow.up.left") { fullscreen = false }
+                    .labelStyle(.iconOnly)
+                    .padding(10)
+                    .background(.ultraThinMaterial, in: Circle())
+                    .padding(12)
+                    .keyboardShortcut("f", modifiers: [.command, .control])
+            }
+        }
         .sheet(isPresented: $editingSettings) {
             MachineSettingsView(model: model, onDelete: onDelete)
         }
@@ -460,15 +501,26 @@ struct MachineView: View {
                         Toggle(isOn: $softwareKeyboard) { Label("Keyboard", systemImage: "keyboard") }
                             .toggleStyle(.button)
                     }
+                    if unfoldedPortrait {
+                        ToolbarItem(placement: Self.statusPlacement) {
+                            Toggle(isOn: $keyboardBelowScreen) { Label("Keyboard Below Screen", systemImage: "rectangle.split.1x2") }
+                                .toggleStyle(.button)
+                        }
+                    }
                     #endif
                     ToolbarItem(placement: Self.statusPlacement) {
-                        Button("Resize to Fit", systemImage: "arrow.up.left.and.arrow.down.right") {
+                        Button("Resize to Fit", systemImage: "aspectratio") {
                             model.fitScreen(to: viewSize, scale: displayScale)
                         }
                         .disabled(!model.isRunning)
                         .help("Ask the guest for a screen the size of the window")
                     }
                 }
+            }
+            ToolbarItem(placement: Self.statusPlacement) {
+                Button("Full Screen", systemImage: "arrow.up.left.and.arrow.down.right") { fullscreen = true }
+                    .keyboardShortcut("f", modifiers: [.command, .control])
+                    .help("Full screen")
             }
             ToolbarItem {
                 Button("Settings", systemImage: "slider.horizontal.3") { editingSettings = true }
