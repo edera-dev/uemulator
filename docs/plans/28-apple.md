@@ -124,6 +124,26 @@ The first runs on a real device (an iPad Pro 12.9" 6th generation, M2, iPadOS 27
 
 Not checked: whether an iPhone (A-series) or another iPadOS version does the same, which instruction pattern in the stubs JSC trips on, and how much slower the unchained boot is on the device. Mobile Safari uses the same JSC, so the web page turns chaining off in Safari outside macOS (`jit_host.js`'s `chainingWorks`, by user agent and touch points, since iPadOS Safari calls itself a Mac); that cannot tell a device from the simulator, so the simulator's Safari runs unchained too. Not checked on a device's Safari.
 
+## Backgrounding (2026-11-15)
+
+An install on an iPad with the WebKit engine died when the app went to the background; on return the machine was gone. What the code did then, any of which ends a run:
+
+- `engine.js` ended the worker the moment its bridge WebSocket closed (`stop()` then `worker.terminate()` in the same turn), so `uw_run` never returned and the udisk map updates the guest had not flushed were lost. iOS may take a suspended app's sockets away, listening ones included (TN2277), and the bridge is one.
+- The loopback listeners never noticed failing: `port()` handed out the old port, nothing listened there, and the worker's synchronous disk requests failed, which the guest sees as I/O errors.
+- The app never noticed the bridge closing (`BridgeSocket.receiveLoop` returned quietly), so the chip said running over a dead machine.
+- A WebContent process that iOS ends for memory was already reported (`webViewWebContentProcessDidTerminate`), without saying the background was why.
+
+Now:
+
+- `LoopbackListener` restarts a failed listener on the port it had (a running page has its ports baked in: the disk URLs, the bridge's and Wisp's addresses), and `revive()` replaces one that is not ready when the app returns to the foreground.
+- `worker.js`'s synchronous disk requests (`sendSync`) retry for up to 20 s while the server cannot be reached (status 0 or a thrown network error; an answered error is never retried), so the guest's request waits instead of failing. Harmless on the web page.
+- `engine.js` reconnects a closed bridge with the same token and run, gives up only after 60 attempts with no word from the app, and then stops the worker and waits up to 5 s for its exit before terminating it. Console output made while disconnected is held (up to 1 MiB) and sent on reconnecting. The app answers a reconnect with `reattached` (the page asks for a whole frame, since the ack in flight was lost) and the terminal size; a reconnecting page of a stopping run gets `stop` again.
+- `WebKitEngine` gives a page whose socket closed 20 s in the foreground to come back, then stops the run saying so; it starts a background task when the app goes to the background, so the machine keeps running through the grace iOS gives (about 30 s), and at its end synchronizes the writable disks and lets the app be suspended. Stopping the machine instead would end an install just as surely. A WebContent process that ends in the background, or within 10 s of returning, is reported as "iOS ended the machine while the app was in the background".
+
+What iOS does not allow: running on after the grace period. Only audio, VoIP, location and similar background modes keep an app running, and claiming one to run an emulator would not pass App Store review. So a suspended machine is frozen (guest time jumps when it resumes, as after a host sleep), and if iOS ends the WebContent process while the app is suspended (it does under memory pressure, and a machine with 2 GiB of RAM is a big target) the machine is gone and its disks hold what the guest last flushed, as after a power cut: Linux's journal commits flush every few seconds, so the filesystem survives but an install in progress has to start over. Guest TCP connections through Wisp are lost too (`wisp.js` reconnects; an installer may have to retry a download). The native engine runs in the app's own process with direct file I/O and no loopback sockets, so it freezes and resumes with the app and is only lost when the whole app is; it is the robust choice for a long install, at the interpreter's speed.
+
+Checked on the iPhone simulator with `-debug-drop-sockets 8` (Debug builds: 8 s after the machine starts, every loopback listener fails and the bridge drops, as a reclaim would): the Alpine demo's page reconnected within a second and the guest booted on to its shell, keys typed afterwards reached it, and `apk update` ran through the restarted Wisp listener. The demo has no writable disk, so the disk retry ran no request across the drop there. Not checked on a device: whether iOS actually takes the loopback sockets during a short suspension, and whether the restarted listener gets its port back every time. The simulator does not reclaim sockets by itself.
+
 ## Installing Alpine (2026-11-15)
 
 M4's exit, on the iPhone simulator with the WebKit engine: `hack/apple/install-alpine.sh` (comments say why each step is the way it is), typed into the shell of a demo machine with a 1 GiB disk, 1 GiB of RAM and the network.

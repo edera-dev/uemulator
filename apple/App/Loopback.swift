@@ -73,6 +73,13 @@ final class LoopbackFiles: @unchecked Sendable {
         }
     }
 
+    // What the guest has written so far goes to storage, for when iOS may end the app next.
+    func synchronizeWritable() {
+        lock.lock()
+        for handle in writableFiles.values { try? handle.synchronize() }
+        lock.unlock()
+    }
+
     func removeAll(prefix: String) {
         lock.lock()
         blobs = blobs.filter { !$0.key.hasPrefix(prefix) }
@@ -168,38 +175,112 @@ final class LoopbackFiles: @unchecked Sendable {
 }
 
 // A listener on 127.0.0.1 with an OS-picked port, which `port()` waits for.
+//
+// iOS may take a listening socket away from a suspended app (TN2277, "Networking and
+// Multitasking"): the listener fails, then or when the app runs again. A running engine page has
+// the ports baked in (worker.js's disk URLs, the page's bridge and Wisp addresses), so the
+// listener comes back on the port it had; a fresh port would strand the run. Everything runs on
+// `queue`.
 class LoopbackListener: @unchecked Sendable {
     let queue: DispatchQueue
     private var listener: NWListener?
     private var waiting: [CheckedContinuation<UInt16, Never>] = []
     private var boundPort: UInt16?
+    private var ready = false
+    // Same-port attempts since the listener last failed; a port another process took meanwhile
+    // will not come back, and then any port does (new runs work, the running one is lost).
+    private var restartAttempts = 0
+    private static let restartDelay: TimeInterval = 0.5
+    private static let maxSamePortAttempts = 10
 
     init(label: String) {
         queue = DispatchQueue(label: label)
+        queue.async { self.listen() }
     }
 
-    func start(_ parameters: NWParameters) {
-        parameters.requiredLocalEndpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: .any)
-        guard let listener = try? NWListener(using: parameters) else { return }
+    // Called on `queue` for each listener made: one NWParameters is not reused after a failure.
+    func makeParameters() -> NWParameters { .tcp }
+
+    private func listen() {
+        let parameters = makeParameters()
+        let port = boundPort.flatMap(NWEndpoint.Port.init(rawValue:)) ?? .any
+        let samePort = boundPort != nil && restartAttempts < Self.maxSamePortAttempts
+        parameters.requiredLocalEndpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: samePort ? port : .any)
+        parameters.allowLocalEndpointReuse = true
+        guard let listener = try? NWListener(using: parameters) else {
+            scheduleRestart()
+            return
+        }
         self.listener = listener
         listener.newConnectionHandler = { [weak self] connection in
             guard let self else { return }
             connection.start(queue: self.queue)
             self.accept(connection)
         }
-        listener.stateUpdateHandler = { [weak self] state in
-            guard let self, case .ready = state, let port = listener.port?.rawValue else { return }
-            self.boundPort = port
-            for waiter in self.waiting { waiter.resume(returning: port) }
-            self.waiting = []
+        listener.stateUpdateHandler = { [weak self, weak listener] state in
+            guard let self, let listener, listener === self.listener else { return }
+            switch state {
+            case .ready:
+                guard let port = listener.port?.rawValue else { return }
+                self.ready = true
+                self.restartAttempts = 0
+                self.boundPort = port
+                for waiter in self.waiting { waiter.resume(returning: port) }
+                self.waiting = []
+            case .failed, .waiting:
+                self.ready = false
+                listener.cancel()
+                self.listener = nil
+                self.scheduleRestart()
+            default:
+                break
+            }
         }
         listener.start(queue: queue)
     }
 
+    private func scheduleRestart() {
+        restartAttempts += 1
+        queue.asyncAfter(deadline: .now() + Self.restartDelay) { [weak self] in
+            guard let self, self.listener == nil else { return }
+            self.listen()
+        }
+    }
+
+    // When the app comes back to the foreground: a listener that iOS took away without telling it
+    // (no state change yet) is replaced.
+    func revive() {
+        queue.async {
+            guard let listener = self.listener else { return }
+            if case .ready = listener.state { return }
+            self.ready = false
+            listener.cancel()
+            self.listener = nil
+            self.listen()
+        }
+    }
+
+    #if DEBUG
+    // What iOS does to a suspended app's listener (`-debug-drop-sockets`, WebKitEngine).
+    func debugFail() {
+        queue.async {
+            guard let listener = self.listener else { return }
+            self.ready = false
+            listener.cancel()
+            self.listener = nil
+            self.scheduleRestart()
+        }
+    }
+    #endif
+
     func port() async -> UInt16 {
         await withCheckedContinuation { continuation in
             queue.async {
-                if let port = self.boundPort { continuation.resume(returning: port) } else { self.waiting.append(continuation) }
+                if self.ready, let port = self.boundPort {
+                    continuation.resume(returning: port)
+                } else {
+                    self.waiting.append(continuation)
+                }
             }
         }
     }
@@ -221,7 +302,6 @@ final class LoopbackHTTPServer: LoopbackListener, @unchecked Sendable {
     init(files: LoopbackFiles) {
         self.files = files
         super.init(label: "loopback-http")
-        start(.tcp)
     }
 
     override func accept(_ connection: NWConnection) {
@@ -277,18 +357,45 @@ final class BridgeSocket: @unchecked Sendable {
     private let connection: NWConnection
     var onBinary: ((Data) -> Void)?
     var onText: ((String) -> Void)?
+    // The connection ended: the page went, or iOS took the socket away while the app was
+    // suspended. Once, on the main queue; not for `close()`.
+    var onClose: (() -> Void)?
+    private var closed = false
 
     init(run: Int, connection: NWConnection) {
         self.run = run
         self.connection = connection
+        connection.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .failed, .cancelled: self?.ended()
+            default: break
+            }
+        }
+    }
+
+    // On the connection's queue or the main queue; reports once, on the main queue.
+    private func ended() {
+        DispatchQueue.main.async {
+            guard !self.closed else { return }
+            self.closed = true
+            self.onClose?()
+        }
     }
 
     func send(binary: Data) { send(binary, opcode: .binary) }
     func send(text: String) { send(Data(text.utf8), opcode: .text) }
 
     func close() {
+        DispatchQueue.main.async { self.closed = true }
         connection.cancel()
     }
+
+    #if DEBUG
+    // A socket iOS took away: closed, and reported as such.
+    func debugDrop() {
+        connection.cancel()
+    }
+    #endif
 
     private func send(_ data: Data, opcode: NWProtocolWebSocket.Opcode) {
         let context = NWConnection.ContentContext(identifier: "bridge",
@@ -298,7 +405,11 @@ final class BridgeSocket: @unchecked Sendable {
 
     fileprivate func receiveLoop() {
         connection.receiveMessage { [weak self] data, context, _, error in
-            guard let self, error == nil, let data else { return }
+            guard let self else { return }
+            guard error == nil, let data else {
+                self.ended()
+                return
+            }
             let metadata = context?.protocolMetadata(definition: NWProtocolWebSocket.definition) as? NWProtocolWebSocket.Metadata
             let isText = metadata?.opcode == .text
             DispatchQueue.main.async {
@@ -320,12 +431,15 @@ final class LoopbackSocketServer: LoopbackListener, @unchecked Sendable {
     init(token: String) {
         self.token = token
         super.init(label: "loopback-socket")
+    }
+
+    override func makeParameters() -> NWParameters {
         let parameters = NWParameters.tcp
         let websocket = NWProtocolWebSocket.Options()
         websocket.autoReplyPing = true
         websocket.maximumMessageSize = Self.maxMessage
         parameters.defaultProtocolStack.applicationProtocols.insert(websocket, at: 0)
-        start(parameters)
+        return parameters
     }
 
     override func accept(_ connection: NWConnection) {
