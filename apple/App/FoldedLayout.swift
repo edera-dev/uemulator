@@ -4,6 +4,9 @@ import SwiftUI
 // the screen or terminal above the fold and FoldedControls below it.
 struct FoldPosture: Equatable {
     var foldY: CGFloat
+
+    // Kept clear on each side of the fold: the crease distorts the picture and is awkward to touch.
+    static let clearance: CGFloat = 12
 }
 
 #if os(iOS)
@@ -96,8 +99,6 @@ struct FoldedControls: View {
     @State private var panelBottom: CGFloat = 0
     @State private var keyboardFrame = CGRect.null
 
-    // Keeps the buttons off the crease, where a touch is awkward.
-    private static let foldClearance: CGFloat = 16
     private static let spacing: CGFloat = 12
     // Shorter than any software keyboard, taller than a hardware keyboard's shortcut bar: a
     // keyboard frame at least this tall is the software keyboard showing.
@@ -113,7 +114,21 @@ struct FoldedControls: View {
         return max(0, panelBottom - keyboardFrame.minY.rounded())
     }
 
+    // The keys first, just below the fold and outside the panel the keyboard clips, so they show
+    // whatever the keyboard's height. They are the screen's or the terminal's own (the one that
+    // receives typing), taken off the keyboard while folded.
     var body: some View {
+        VStack(spacing: 0) {
+            FoldedKeyBar(bar: model.view == .screen ? model.screenFoldedKeyBar : model.terminal.foldedKeyBar)
+                .frame(height: KeyAccessory.barHeight)
+            controls
+        }
+        // The guest stops `clearance` above the fold (MachineView); this starts as far below it.
+        .padding(.top, 2 * FoldPosture.clearance)
+        .background(Color.black)
+    }
+
+    private var controls: some View {
         VStack(spacing: Self.spacing) {
             HStack(spacing: Self.spacing) {
                 if model.definition.display.hasScreen {
@@ -170,7 +185,7 @@ struct FoldedControls: View {
         }
         .buttonStyle(.bordered)
         .controlSize(.large)
-        .padding(.top, Self.foldClearance)
+        .padding(.top, Self.spacing)
         .padding(.horizontal)
         .padding(.bottom, keyboardOverlap)
         // minHeight 0: the half's height whatever the content asks for. Without it a tall keyboard's
@@ -204,6 +219,26 @@ struct FoldedControls: View {
                 _ = model.terminal.view.resignFirstResponder()
             }
         }
+    }
+}
+
+// Hosts one of the freestanding key bars in a container SwiftUI owns, so swapping between the
+// screen's and the terminal's moves only the bar, never a view SwiftUI is laying out.
+struct FoldedKeyBar: UIViewRepresentable {
+    let bar: KeyAccessory
+
+    func makeUIView(context: Context) -> UIView {
+        let container = UIView()
+        container.backgroundColor = .black
+        return container
+    }
+
+    func updateUIView(_ container: UIView, context: Context) {
+        guard bar.superview !== container else { return }
+        container.subviews.forEach { $0.removeFromSuperview() }
+        bar.frame = container.bounds
+        bar.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        container.addSubview(bar)
     }
 }
 #endif

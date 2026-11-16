@@ -89,6 +89,11 @@ struct LibraryView: View {
             #endif
         }
         .onChange(of: selection) { fullscreen = false }
+        #if os(iOS)
+        // Here at the root: iOS ignores these set inside the split view's detail (MachineView).
+        .statusBarHidden(fullscreen)
+        .persistentSystemOverlays(fullscreen ? .hidden : .automatic)
+        #endif
         .sheet(isPresented: $creating) {
             NewMachineSheet(store: store) { name in
                 creating = false

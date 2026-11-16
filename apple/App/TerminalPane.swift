@@ -27,11 +27,13 @@ final class TerminalSession: NSObject, TerminalViewDelegate {
         view.font = UIFont.monospacedSystemFont(ofSize: Self.fontSize, weight: .regular)
         // After TerminalView's own setup, which installs SwiftTerm's bar once, in init.
         view.inputAccessoryView = accessory
-        accessory.onKey = { [weak self] usage, pressed in self?.accessoryKey(usage, pressed: pressed) }
-        accessory.onCharacter = { [weak self] character in self?.view.insertText(String(character)) }
-        // TerminalView applies its own `controlModifier` to the next character typed and clears it.
-        accessory.onControlLatched = { [weak self] latched in self?.view.controlModifier = latched }
-        accessory.onHide = { [weak self] in _ = self?.view.resignFirstResponder() }
+        for bar in [accessory, foldedKeyBar] {
+            bar.onKey = { [weak self] usage, pressed in self?.accessoryKey(usage, pressed: pressed) }
+            bar.onCharacter = { [weak self] character in self?.view.insertText(String(character)) }
+            // TerminalView applies its own `controlModifier` to the next character typed and clears it.
+            bar.onControlLatched = { [weak self] latched in self?.view.controlModifier = latched }
+            bar.onHide = { [weak self] in _ = self?.view.resignFirstResponder() }
+        }
         #endif
     }
 
@@ -51,8 +53,8 @@ final class TerminalSession: NSObject, TerminalViewDelegate {
             // A character from the system keyboard used up the latched ctrl; unlight the bar's key.
             // TerminalView clears its flag after this call returns, hence the next turn.
             DispatchQueue.main.async { [weak self] in
-                guard let self, self.accessory.controlLatched, !self.view.controlModifier else { return }
-                self.accessory.controlLatched = false
+                guard let self, self.keyBar.controlLatched, !self.view.controlModifier else { return }
+                self.keyBar.controlLatched = false
             }
             #endif
         }
@@ -67,6 +69,17 @@ final class TerminalSession: NSObject, TerminalViewDelegate {
 
     #if os(iOS)
     private let accessory = KeyAccessory()
+    // Folded, the keys below the fold in FoldedControls instead of on the keyboard, where they would
+    // cross it (ScreenUIView.folded says why).
+    let foldedKeyBar = KeyAccessory(freestanding: true)
+    var folded = false {
+        didSet {
+            guard folded != oldValue else { return }
+            view.inputAccessoryView = folded ? nil : accessory
+            if view.isFirstResponder { view.reloadInputViews() }
+        }
+    }
+    private var keyBar: KeyAccessory { folded ? foldedKeyBar : accessory }
     // A held arrow on the bar: terminal bytes have no key up, so the repeat is ours.
     private var repeatTimer: Timer?
     private static let repeatDelay: TimeInterval = 0.5

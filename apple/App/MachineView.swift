@@ -28,6 +28,10 @@ final class MachineModel: ObservableObject, ScreenInput {
 
     let terminal = TerminalSession()
     let screen = ScreenSurface()
+    #if os(iOS)
+    // The screen's keys below a foldable's fold: ScreenUIView sends them, FoldedControls shows them.
+    let screenFoldedKeyBar = KeyAccessory(freestanding: true)
+    #endif
     private let native = NativeEngine()
     private var webKitEngine: WebKitEngine?
     // A picked CD is readable only inside its security scope, held while the machine runs.
@@ -371,11 +375,14 @@ struct MachineView: View {
     @State private var editingSettings = false
     // Partially open in portrait (FoldedLayout.swift): the guest above the fold, the controls below.
     @State private var fold: FoldPosture?
+    // Full screen came from folding, so leaving the fold ends it; one the user asked for stays.
+    @State private var fullscreenFromFold = false
     @Environment(\.displayScale) private var displayScale
 
     private var screenPane: ScreenPane {
         #if os(iOS)
-        ScreenPane(surface: model.screen, input: model, showsSoftwareKeyboard: $softwareKeyboard, keepsAboveKeyboard: splitKeyboard || fold != nil)
+        ScreenPane(surface: model.screen, input: model, showsSoftwareKeyboard: $softwareKeyboard,
+                   keepsAboveKeyboard: splitKeyboard || fold != nil, folded: fold != nil, foldedBar: model.screenFoldedKeyBar)
         #else
         ScreenPane(surface: model.screen, input: model)
         #endif
@@ -397,9 +404,11 @@ struct MachineView: View {
 
     private var splitKeyboard: Bool { keyboardBelowScreen && unfoldedPortrait && model.view == .screen }
 
-    // The guest's part of the view: above the fold when folded, else all of it.
+    // The guest's part of the view: above the fold, short of it by the clearance, when folded; else
+    // all of it.
+    private var guestHeight: CGFloat? { fold.map { $0.foldY - FoldPosture.clearance } }
     private var guestSize: CGSize {
-        fold.map { CGSize(width: viewSize.width, height: $0.foldY) } ?? viewSize
+        guestHeight.map { CGSize(width: viewSize.width, height: $0) } ?? viewSize
     }
 
     var body: some View {
@@ -430,7 +439,7 @@ struct MachineView: View {
                     }
                 }
                 // The ZStack stays the first child either way, so folding keeps the panes' views.
-                .frame(height: fold?.foldY)
+                .frame(height: guestHeight)
                 #if os(iOS)
                 if fold != nil {
                     FoldedControls(model: model, fullscreen: $fullscreen, softwareKeyboard: $softwareKeyboard,
@@ -447,6 +456,26 @@ struct MachineView: View {
         .ignoresSafeArea(.keyboard)
         // Turning the split on brings the keyboard up; a layout change (full screen, rotating) does not.
         .onChange(of: keyboardBelowScreen) { if keyboardBelowScreen { softwareKeyboard = true } }
+        #if os(iOS)
+        // Folded upright is full screen; folding flat (or turning sideways) ends it. Set on a change,
+        // not derived from the fold, so the Full Screen button and leaving the machine still work;
+        // `initial` makes a machine opened while folded start full screen.
+        .onChange(of: fold != nil, initial: true) {
+            let folded = fold != nil
+            model.terminal.folded = folded
+            if folded {
+                if !fullscreen { fullscreenFromFold = true }
+                fullscreen = true
+            } else if fullscreenFromFold {
+                fullscreenFromFold = false
+                fullscreen = false
+            }
+        }
+        .onChange(of: fullscreen) { if !fullscreen { fullscreenFromFold = false } }
+        // The screen's keyboard would go on typing into the hidden screen, and folded the bar on
+        // show is the terminal's, whose hide key cannot put it away.
+        .onChange(of: model.view) { if model.view != .screen { softwareKeyboard = false } }
+        #endif
         .background(Color.black)
         // The WebKit engine's web view: in the hierarchy but invisible, never the UI.
         .background {
@@ -461,21 +490,29 @@ struct MachineView: View {
         .toolbar(fullscreen ? .hidden : .automatic, for: .navigationBar)
         // Folded, the bottom bar's buttons are in FoldedControls.
         .toolbar(fullscreen || fold != nil ? .hidden : .automatic, for: .bottomBar)
-        .statusBarHidden(fullscreen)
-        .persistentSystemOverlays(fullscreen ? .hidden : .automatic)
+        // The status bar is hidden by LibraryView: set here, in a split view's detail, iOS ignores it.
         #else
         .toolbar(fullscreen ? .hidden : .automatic, for: .windowToolbar)
         #endif
         .ignoresSafeArea(edges: fullscreen ? .all : [])
-        // After the line above: the screen goes edge to edge, the way out stays in the safe area.
-        .overlay(alignment: .topTrailing) {
+        // After the line above: the screen goes edge to edge, the buttons stay in the safe area, at
+        // the bottom with the keyboard. Folded, FoldedControls has them.
+        .overlay(alignment: .bottomTrailing) {
             if fullscreen && fold == nil {
-                Button("Exit Full Screen", systemImage: "arrow.down.right.and.arrow.up.left") { fullscreen = false }
-                    .labelStyle(.iconOnly)
-                    .padding(10)
-                    .background(.ultraThinMaterial, in: Circle())
-                    .padding(12)
-                    .keyboardShortcut("f", modifiers: [.command, .control])
+                HStack(spacing: 12) {
+                    #if os(iOS)
+                    if model.view == .screen {
+                        Toggle(isOn: $softwareKeyboard) { Label("Keyboard", systemImage: "keyboard") }
+                            .toggleStyle(.button)
+                    }
+                    #endif
+                    Button("Exit Full Screen", systemImage: "arrow.down.right.and.arrow.up.left") { fullscreen = false }
+                        .keyboardShortcut("f", modifiers: [.command, .control])
+                }
+                .labelStyle(.iconOnly)
+                .padding(10)
+                .background(.ultraThinMaterial, in: Capsule())
+                .padding(12)
             }
         }
         .sheet(isPresented: $editingSettings) {

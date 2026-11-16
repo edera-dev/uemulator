@@ -177,7 +177,7 @@ final class KeyAccessory: UIInputView {
     }
     var onControlLatched: ((Bool) -> Void)?
     private var controlButton: UIButton!
-    private static let barHeight: CGFloat = 44
+    static let barHeight: CGFloat = 44
     private static let initialWidth: CGFloat = 320
     private static let spacing: CGFloat = 4
     // Esc, ctrl, tab and the arrows at this width leave the symbols and F-keys room to scroll even
@@ -186,10 +186,14 @@ final class KeyAccessory: UIInputView {
     private static let symbols: [Character] = ["~", "|", "/", "-"]
     private static let functionKeys = 12
 
-    init() {
+    // `freestanding`: not on the keyboard but below a foldable's fold (FoldedControls). Without the
+    // keyboard's backdrop it draws dark, for the black around it, and it takes the full width: the
+    // safe area's side inset is for the status bar beside the camera, above the fold.
+    init(freestanding: Bool = false) {
         // UIKit sets the width to the keyboard's; without the mask the bar keeps its initial one.
         super.init(frame: CGRect(x: 0, y: 0, width: Self.initialWidth, height: Self.barHeight), inputViewStyle: .keyboard)
         autoresizingMask = .flexibleWidth
+        if freestanding { overrideUserInterfaceStyle = .dark }
         let leading = UIStackView(arrangedSubviews: [
             keyButton(symbol: "escape", usage: HIDUsage.escape),
             controlToggle(),
@@ -224,9 +228,11 @@ final class KeyAccessory: UIInputView {
         }
         scroll.setContentHuggingPriority(.defaultLow, for: .horizontal)
         scroll.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let horizontalBounds: (leading: NSLayoutXAxisAnchor, trailing: NSLayoutXAxisAnchor) = freestanding
+            ? (leadingAnchor, trailingAnchor) : (safeAreaLayoutGuide.leadingAnchor, safeAreaLayoutGuide.trailingAnchor)
         NSLayoutConstraint.activate([
-            row.leadingAnchor.constraint(equalTo: safeAreaLayoutGuide.leadingAnchor, constant: Self.spacing),
-            row.trailingAnchor.constraint(equalTo: safeAreaLayoutGuide.trailingAnchor, constant: -Self.spacing),
+            row.leadingAnchor.constraint(equalTo: horizontalBounds.leading, constant: Self.spacing),
+            row.trailingAnchor.constraint(equalTo: horizontalBounds.trailing, constant: -Self.spacing),
             row.topAnchor.constraint(equalTo: topAnchor, constant: Self.spacing),
             row.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -Self.spacing),
             middle.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor),
@@ -325,7 +331,20 @@ final class ScreenUIView: UIView, UIKeyInput {
     private let noKeyboard = UIView(frame: .zero)
     override var inputView: UIView? { showsSoftwareKeyboard ? nil : noKeyboard }
     private let accessory = KeyAccessory()
-    override var inputAccessoryView: UIView? { showsSoftwareKeyboard ? accessory : nil }
+    // Folded, the keyboard and an accessory on it are taller than the half below the fold, so the
+    // accessory would cross it: the keys are `foldedBar` instead, which FoldedControls shows just
+    // below the fold (MachineModel owns it so the panel can reach it).
+    var folded = false {
+        didSet { if folded != oldValue { reloadInputViews() } }
+    }
+    var foldedBar: KeyAccessory? {
+        didSet {
+            guard let foldedBar, foldedBar !== oldValue else { return }
+            wire(foldedBar)
+        }
+    }
+    private var keyBar: KeyAccessory { folded ? foldedBar ?? accessory : accessory }
+    override var inputAccessoryView: UIView? { showsSoftwareKeyboard && !folded ? accessory : nil }
     // The accessory's hide key: the SwiftUI side owns whether the keyboard shows.
     var onHideKeyboard: (() -> Void)?
     // A two-finger pan of this many points is one wheel notch.
@@ -357,23 +376,27 @@ final class ScreenUIView: UIView, UIKeyInput {
         pan.minimumNumberOfTouches = 2
         pan.allowedScrollTypesMask = .all
         addGestureRecognizer(pan)
-        accessory.onKey = { [weak self] usage, pressed in self?.accessoryKey(usage, pressed: pressed) }
-        accessory.onCharacter = { [weak self] character in self?.insertText(String(character)) }
-        accessory.onHide = { [weak self] in self?.onHideKeyboard?() }
+        wire(accessory)
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
 
+    private func wire(_ bar: KeyAccessory) {
+        bar.onKey = { [weak self] usage, pressed in self?.accessoryKey(usage, pressed: pressed) }
+        bar.onCharacter = { [weak self] character in self?.insertText(String(character)) }
+        bar.onHide = { [weak self] in self?.onHideKeyboard?() }
+    }
+
     // A latched ctrl is held around the key and then let go.
     private func accessoryKey(_ usage: UInt16, pressed: Bool) {
         if pressed {
-            if accessory.controlLatched { input?.key(usage: HIDUsage.leftControl, pressed: true) }
+            if keyBar.controlLatched { input?.key(usage: HIDUsage.leftControl, pressed: true) }
             input?.key(usage: usage, pressed: true)
         } else {
             input?.key(usage: usage, pressed: false)
-            if accessory.controlLatched {
+            if keyBar.controlLatched {
                 input?.key(usage: HIDUsage.leftControl, pressed: false)
-                accessory.controlLatched = false
+                keyBar.controlLatched = false
             }
         }
     }
@@ -463,7 +486,7 @@ final class ScreenUIView: UIView, UIKeyInput {
     var hasText: Bool { true }
 
     func insertText(_ text: String) {
-        let control = accessory.controlLatched
+        let control = keyBar.controlLatched
         if control { input?.key(usage: HIDUsage.leftControl, pressed: true) }
         for character in text {
             guard let (usage, shift) = HIDUsage.forCharacter(character) else { continue }
@@ -474,7 +497,7 @@ final class ScreenUIView: UIView, UIKeyInput {
         }
         if control {
             input?.key(usage: HIDUsage.leftControl, pressed: false)
-            accessory.controlLatched = false
+            keyBar.controlLatched = false
         }
     }
 
@@ -529,6 +552,8 @@ struct ScreenPane: UIViewRepresentable {
     let input: any ScreenInput
     @Binding var showsSoftwareKeyboard: Bool
     var keepsAboveKeyboard = false
+    var folded = false
+    var foldedBar: KeyAccessory?
 
     func makeUIView(context: Context) -> ScreenUIView {
         let view = ScreenUIView(frame: .zero)
@@ -541,6 +566,8 @@ struct ScreenPane: UIViewRepresentable {
         view.input = input
         view.showsSoftwareKeyboard = showsSoftwareKeyboard
         view.keepsAboveKeyboard = keepsAboveKeyboard
+        view.foldedBar = foldedBar
+        view.folded = folded
         view.onHideKeyboard = { showsSoftwareKeyboard = false }
     }
 }
