@@ -5,34 +5,61 @@ import UemulatorCore
 // the CLI's layout (`crates/uemulator-cli/src/machines.rs`):
 //   machine.toml   the CLI's file; the app reads and writes only the keys below (Rust keeps the
 //                  rest: ua_machine_load / ua_machine_save)
-//   disk-<n>.udisk the machine's disks, sparse udisk images
+//   disk-<n>.udisk the machine's disks, sparse udisk images; imported ISOs and images beside them
 //   nvram.kv       UEFI variables and TPM state, for the native engine. The WebKit engine does
 //                  not hand the file to the web build: its variables last one run
-//   artifacts/     a kernel and initramfs to boot directly ("kernel", "initrd"), when it has one
-//   app.json       what only the app knows: the engine, the CD's bookmark. Not in machine.toml:
-//                  the CLI drops keys it does not know when it saves.
+//   artifacts/     an installer's kernel and initramfs under the CLI's names (`Distro`), or a
+//                  kernel and initramfs to boot directly ("kernel", "initrd")
+//   hypervisor     the image `hypervisor` names, as the CLI keeps it
+//   app.json       what only the app knows: the engine, the demo. Not in machine.toml: the CLI
+//                  drops keys it does not know when it saves.
 //
 // The CLI writes absolute disk paths; an iOS app's container moves when the app is reinstalled,
 // so a disk path that does not exist is looked for by name in the machine's own folder.
 
-// The CD a machine boots from: a file the user picked (a security-scoped bookmark: the file
-// stays where it is) or one in the app's Documents (by name, for `-new-machine` and tests).
+// A CD a machine made before imports existed still boots from: a file the user picked (a
+// security-scoped bookmark) or one in the app's Documents. New machines import the file instead.
 enum CDROM: Equatable {
     case bookmark(Data)
     case documents(String)
 }
 
+// The CLI's `boot_from`.
+enum BootFrom: String, CaseIterable, Identifiable {
+    // The disk once something is installed on it, else the installer.
+    case auto
+    case installer
+    case disk
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .auto: "Automatic"
+        case .installer: "Installer"
+        case .disk: "Disk"
+        }
+    }
+}
+
 struct MachineDefinition {
     var memoryMib = 2048
     var cpus = 1
-    // "uefi" boots through the bundled firmware; "none" enters the kernel directly. The CLI's
-    // "bios" is booted as "uefi" here.
-    var firmware = "uefi"
+    var firmware = FirmwareKind.uefi
     var display = DisplayChoice.terminal
     var serialConsole = true
     var tpm = false
     var secureBoot = false
-    var cmdlineAppend = ""
+    var iommu = false
+    var smt = true
+    var timeshare = false
+    var rng = true
+    var jit = true
+    // A guest reset boots the machine again; off, it stops.
+    var reboot = true
+    var cmdline = ""
+    // `cmdline` replaces the default command line instead of adding to it.
+    var replaceCmdline = false
     var disks: [DiskImage] = []
     // A NIC: the CLI's `[[networks]]`, kept as they were (the app only knows on or off).
     var networks: [[String: Any]] = []
@@ -42,10 +69,18 @@ struct MachineDefinition {
             if !newValue { networks = [] } else if networks.isEmpty { networks = [MachineStore.userNetwork] }
         }
     }
+    // An installer machine: what it installs and whether it boots that or its disk.
+    var install: Distro?
+    var bootFrom = BootFrom.auto
+    // The name of the file the hypervisor image came from (xen.gz, xen.efi); nil for none.
+    var hypervisor: String?
+    var hypervisorCmdline = ""
     // app.json
     var engine: EngineKind?
-    var bootsKernel = false
+    var demo: Demo?
     var cdrom: CDROM?
+    // artifacts/kernel is there: a directly booted kernel (not an installer's).
+    var bootsKernel = false
 
     // How the UI writes a memory size: "512 MiB", "2 GiB".
     static func memoryTitle(_ mib: Int) -> String {
@@ -75,6 +110,7 @@ final class MachineStore: ObservableObject {
     private static let sidecarFile = "app.json"
     private static let nvramFile = "nvram.kv"
     private static let artifacts = "artifacts"
+    private static let hypervisorFile = "hypervisor"
     private static let errorCapacity = 1024
     // The CLI's `--display` values for the app's choices.
     private static let displayNames: [DisplayChoice: String] = [.terminal: "serial", .screen: "framebuffer", .both: "both"]
@@ -102,8 +138,17 @@ final class MachineStore: ObservableObject {
 
     func directory(_ name: String) -> URL { root.appendingPathComponent(name) }
     func nvram(_ name: String) -> URL { directory(name).appendingPathComponent(Self.nvramFile) }
-    func kernel(_ name: String) -> URL { directory(name).appendingPathComponent(Self.artifacts).appendingPathComponent("kernel") }
-    func initrd(_ name: String) -> URL { directory(name).appendingPathComponent(Self.artifacts).appendingPathComponent("initrd") }
+    func hypervisor(_ name: String) -> URL { directory(name).appendingPathComponent(Self.hypervisorFile) }
+    private func artifacts(_ name: String) -> URL { directory(name).appendingPathComponent(Self.artifacts) }
+
+    // An installer's under the CLI's names, else the directly booted "kernel" and "initrd".
+    func kernel(_ name: String, install: Distro? = nil) -> URL {
+        artifacts(name).appendingPathComponent(install?.kernel.file ?? "kernel")
+    }
+
+    func initrd(_ name: String, install: Distro? = nil) -> URL {
+        artifacts(name).appendingPathComponent(install?.initrd.file ?? "initrd")
+    }
 
     func model(_ name: String) -> MachineModel {
         if let model = models[name] { return model }
@@ -116,8 +161,19 @@ final class MachineStore: ObservableObject {
         let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
         guard let first = name.unicodeScalars.first, CharacterSet.alphanumerics.contains(first),
               name.count <= maxNameLength, name.unicodeScalars.allSatisfy(allowed.contains), name.allSatisfy(\.isASCII)
-        else { return "Use up to \(maxNameLength) letters, digits, '.', '_' or '-', starting with a letter or digit" }
+        else { return "Use letters, digits, '.', '_' or '-'" }
         return nil
+    }
+
+    // `base`, or `base-2`, `base-3`, ... whichever is free.
+    func freeName(_ base: String) -> String {
+        var name = base
+        var number = 2
+        while FileManager.default.fileExists(atPath: directory(name).path) {
+            name = "\(base)-\(number)"
+            number += 1
+        }
+        return name
     }
 
     func load(_ name: String) throws -> MachineDefinition {
@@ -131,7 +187,7 @@ final class MachineStore: ObservableObject {
         var definition = MachineDefinition()
         if let memory = table["memory"] as? Int { definition.memoryMib = memory }
         if let cpus = table["cpus"] as? Int { definition.cpus = cpus }
-        if let firmware = table["firmware"] as? String { definition.firmware = firmware }
+        if let firmware = (table["firmware"] as? String).flatMap(FirmwareKind.init(rawValue:)) { definition.firmware = firmware }
         if let display = table["display"] as? String,
            let choice = Self.displayNames.first(where: { $0.value == display })?.key {
             definition.display = choice
@@ -140,7 +196,22 @@ final class MachineStore: ObservableObject {
         if let consoles = table["consoles"] as? [String] { definition.serialConsole = consoles.first == "serial" }
         definition.tpm = table["tpm"] as? Bool ?? false
         definition.secureBoot = table["secure_boot"] as? Bool ?? false
-        definition.cmdlineAppend = table["append"] as? String ?? ""
+        definition.iommu = table["iommu"] as? Bool ?? false
+        definition.smt = table["smt"] as? Bool ?? true
+        definition.timeshare = table["smp"] as? String == "timeshare"
+        definition.rng = !(table["disable_rng"] as? Bool ?? false)
+        definition.jit = !(table["disable_jit"] as? Bool ?? false)
+        definition.reboot = !(table["no_reboot"] as? Bool ?? false)
+        if let cmdline = table["cmdline"] as? String {
+            definition.cmdline = cmdline
+            definition.replaceCmdline = true
+        } else {
+            definition.cmdline = table["append"] as? String ?? ""
+        }
+        definition.install = (table["install"] as? String).flatMap(Distro.init(rawValue:))
+        definition.bootFrom = (table["boot_from"] as? String).flatMap(BootFrom.init(rawValue:)) ?? .auto
+        definition.hypervisor = table["hypervisor"] as? String
+        definition.hypervisorCmdline = table["hypervisor_cmdline"] as? String ?? ""
         definition.networks = table["networks"] as? [[String: Any]] ?? []
         for disk in table["disks"] as? [[String: Any]] ?? [] {
             guard let path = disk["path"] as? String else { continue }
@@ -153,6 +224,7 @@ final class MachineStore: ObservableObject {
         let sidecar = (try? JSONDecoder().decode(Sidecar.self, from: Data(contentsOf: folder.appendingPathComponent(Self.sidecarFile))))
             ?? Sidecar()
         definition.engine = sidecar.engine.flatMap(EngineKind.init(rawValue:))
+        definition.demo = sidecar.demo.flatMap(Demo.init(rawValue:))
         definition.bootsKernel = FileManager.default.fileExists(atPath: kernel(name).path)
         if let bookmark = sidecar.cdromBookmark {
             definition.cdrom = .bookmark(bookmark)
@@ -164,15 +236,27 @@ final class MachineStore: ObservableObject {
 
     func save(_ definition: MachineDefinition, as name: String) throws {
         let folder = directory(name)
+        let optional: (String) -> Any = { $0.isEmpty ? NSNull() : $0 }
         let changes: [String: Any] = [
             "memory": definition.memoryMib,
             "cpus": definition.cpus,
-            "firmware": definition.firmware,
+            "firmware": definition.firmware.rawValue,
             "display": Self.displayNames[definition.display] ?? "serial",
             "consoles": [definition.serialConsole ? "serial" : "virtio"],
             "tpm": definition.tpm,
             "secure_boot": definition.secureBoot,
-            "append": definition.cmdlineAppend.isEmpty ? NSNull() : definition.cmdlineAppend,
+            "iommu": definition.iommu,
+            "smt": definition.smt,
+            "smp": definition.timeshare ? "timeshare" : NSNull(),
+            "disable_rng": !definition.rng,
+            "disable_jit": !definition.jit,
+            "no_reboot": !definition.reboot,
+            "cmdline": definition.replaceCmdline ? definition.cmdline : NSNull(),
+            "append": definition.replaceCmdline ? NSNull() : optional(definition.cmdline),
+            "install": definition.install?.rawValue ?? NSNull(),
+            "boot_from": definition.install == nil ? NSNull() : definition.bootFrom.rawValue,
+            "hypervisor": definition.hypervisor ?? NSNull(),
+            "hypervisor_cmdline": definition.hypervisor == nil ? NSNull() : optional(definition.hypervisorCmdline),
             "disks": definition.disks.map { ["path": $0.url.path, "read_only": $0.readOnly] },
             "networks": definition.networks,
         ]
@@ -183,6 +267,7 @@ final class MachineStore: ObservableObject {
         }
         var sidecar = Sidecar()
         sidecar.engine = definition.engine?.rawValue
+        sidecar.demo = definition.demo?.rawValue
         switch definition.cdrom {
         case .bookmark(let data): sidecar.cdromBookmark = data
         case .documents(let file): sidecar.cdromDocumentsFile = file
@@ -191,36 +276,48 @@ final class MachineStore: ObservableObject {
         try JSONEncoder().encode(sidecar).write(to: folder.appendingPathComponent(Self.sidecarFile), options: .atomic)
     }
 
-    enum Source {
-        // The bundled Alpine demo (hack/web/demo.py's kernel and initramfs), booted directly.
-        case demo
-        // A CD image, by bookmark or in Documents.
-        case cdrom(CDROM)
-        // Nothing yet: insert a CD later, or a disk that already has a system.
-        case empty
+    enum Preset {
+        case demo(Demo)
+        // Easy mode: 2 GiB (Fedora 3), a 64 GiB disk, a NIC and the installer, downloaded on first
+        // start.
+        case install(Distro)
+        // Hardware only: the caller imports what it boots (`importDisk`, `importKernel`).
+        case custom(memoryMib: Int, diskGib: Int, display: DisplayChoice, network: Bool)
     }
 
-    func create(_ name: String, source: Source, diskMib: UInt64, memoryMib: Int, display: DisplayChoice, network: Bool = true) throws {
+    // Makes the machine's folder and machine.toml; returns its name (`base` or a free variant).
+    @discardableResult
+    func create(_ base: String, preset: Preset) throws -> String {
+        let name = freeName(base)
         if let problem = Self.validate(name) { throw MachineStoreError.failed(problem) }
         let folder = directory(name)
-        guard !FileManager.default.fileExists(atPath: folder.path) else {
-            throw MachineStoreError.failed("A machine named \(name) already exists")
-        }
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         do {
-            var definition = MachineDefinition(memoryMib: memoryMib, display: display)
-            definition.network = network
-            if diskMib > 0 { definition.disks = [try createDisk(name, sizeMib: diskMib)] }
-            switch source {
-            case .demo:
-                let resources = Bundle.main.resourceURL!.appendingPathComponent("demo")
-                try FileManager.default.createDirectory(at: kernel(name).deletingLastPathComponent(), withIntermediateDirectories: true)
+            var definition = MachineDefinition()
+            definition.network = true
+            switch preset {
+            case .demo(let demo):
+                definition.demo = demo
+                definition.memoryMib = Demo.memoryMib
+                let resources = Demo.resources
+                try FileManager.default.createDirectory(at: artifacts(name), withIntermediateDirectories: true)
                 try FileManager.default.copyItem(at: resources.appendingPathComponent("vmlinuz-virt"), to: kernel(name))
                 try FileManager.default.copyItem(at: resources.appendingPathComponent("initramfs.gz"), to: initrd(name))
-            case .cdrom(let cdrom):
-                definition.cdrom = cdrom
-            case .empty:
-                break
+                if demo == .xen, let manifest = demo.manifest, let image = manifest.hypervisor {
+                    try FileManager.default.copyItem(at: resources.appendingPathComponent(image), to: hypervisor(name))
+                    definition.hypervisor = image
+                    definition.hypervisorCmdline = manifest.hypervisorArgs ?? ""
+                    definition.iommu = manifest.iommu ?? false
+                }
+            case .install(let distro):
+                definition.install = distro
+                definition.memoryMib = distro.memoryMib
+                definition.disks = [try createDisk(name, sizeMib: UInt64(Distro.easyDiskGib) * Self.mibPerGib)]
+            case .custom(let memoryMib, let diskGib, let display, let network):
+                definition.memoryMib = memoryMib
+                definition.display = display
+                definition.network = network
+                if diskGib > 0 { definition.disks = [try createDisk(name, sizeMib: UInt64(diskGib) * Self.mibPerGib)] }
             }
             try save(definition, as: name)
         } catch {
@@ -228,6 +325,40 @@ final class MachineStore: ObservableObject {
             throw error
         }
         reload()
+        return name
+    }
+
+    // Copies `source` into the machine's folder and attaches it: an ISO first and read-only (the
+    // firmware tries the disks in order, and an installer must not see its medium as a target),
+    // anything else last.
+    func importDisk(_ name: String, from source: URL, readOnly: Bool) async throws {
+        let copy = try await Importer.copy(source, into: directory(name))
+        var definition = try load(name)
+        let disk = DiskImage(url: copy, readOnly: readOnly)
+        if readOnly { definition.disks.insert(disk, at: 0) } else { definition.disks.append(disk) }
+        try save(definition, as: name)
+        model(name).reload()
+    }
+
+    // A kernel (and initramfs) to boot directly, as artifacts/kernel and artifacts/initrd.
+    func importKernel(_ name: String, kernel: URL, initrd: URL?) async throws {
+        try FileManager.default.createDirectory(at: artifacts(name), withIntermediateDirectories: true)
+        _ = try await Importer.copy(kernel, into: artifacts(name), as: "kernel")
+        if let initrd { try await importInitrd(name, from: initrd) }
+        model(name).reload()
+    }
+
+    func importInitrd(_ name: String, from source: URL) async throws {
+        try FileManager.default.createDirectory(at: artifacts(name), withIntermediateDirectories: true)
+        _ = try await Importer.copy(source, into: artifacts(name), as: "initrd")
+    }
+
+    func importHypervisor(_ name: String, from source: URL) async throws {
+        _ = try await Importer.copy(source, into: directory(name), as: Self.hypervisorFile)
+        var definition = try load(name)
+        definition.hypervisor = source.lastPathComponent
+        try save(definition, as: name)
+        model(name).reload()
     }
 
     // The CLI's name for a machine's next disk: the first `disk-<n>.udisk` not taken.
@@ -243,23 +374,24 @@ final class MachineStore: ObservableObject {
         return DiskImage(url: disk, readOnly: false)
     }
 
+    static func diskInstalled(_ url: URL) -> Bool {
+        var error = [CChar](repeating: 0, count: errorCapacity)
+        return ua_disk_installed(url.path, &error, error.count) == 1
+    }
+
     func removeKernel(_ name: String) throws {
-        try FileManager.default.removeItem(at: kernel(name).deletingLastPathComponent())
+        try? FileManager.default.removeItem(at: kernel(name))
+        try? FileManager.default.removeItem(at: initrd(name))
+    }
+
+    func removeHypervisor(_ name: String) {
+        try? FileManager.default.removeItem(at: hypervisor(name))
     }
 
     func delete(_ name: String) throws {
         models.removeValue(forKey: name)?.stop()
         try FileManager.default.removeItem(at: directory(name))
         reload()
-    }
-
-    // A bookmark for a file the user picked, to find it again next launch.
-    static func bookmark(for url: URL) throws -> Data {
-        #if os(macOS)
-        try url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil)
-        #else
-        try url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil)
-        #endif
     }
 
     static func resolve(_ cdrom: CDROM) -> URL? {
@@ -278,6 +410,7 @@ final class MachineStore: ObservableObject {
 
     private struct Sidecar: Codable {
         var engine: String?
+        var demo: String?
         var cdromBookmark: Data?
         var cdromDocumentsFile: String?
     }

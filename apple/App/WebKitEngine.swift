@@ -50,11 +50,6 @@ final class WebKitEngine: NSObject, MachineEngine {
     private static let jitChaining = false
     #endif
 
-    // `www/protocol.js`'s FIRMWARE and OPTION values, which `uw_create` takes.
-    private enum Firmware {
-        static let none = 0
-        static let uefi = 1
-    }
     // The bridge's binary kinds (apple/WebEngine/engine.js has the layout).
     private enum ToPage {
         static let keys: UInt8 = 1
@@ -86,7 +81,7 @@ final class WebKitEngine: NSObject, MachineEngine {
     private static let wordBytes = MemoryLayout<UInt32>.size
     // worker.js's exit codes (protocol.js EXIT_NAMES), and the page's own for setup failures.
     private static let exitNames = [
-        0: "Powered off", 1: "Reset", 2: "Triple fault", 3: "Stopped", 4: "Emulator error",
+        0: "Powered off", 1: EngineState.resetReason, 2: "Triple fault", 3: "Stopped", 4: "Emulator error",
     ]
 
     override init() {
@@ -133,7 +128,9 @@ final class WebKitEngine: NSObject, MachineEngine {
             files.register(path, file: disk.url, writable: !disk.readOnly)
             disks.append(["url": path, "readOnly": disk.readOnly])
         }
-        if let firmware = settings.firmware { files.register(prefix + "firmware", firmware) }
+        let firmware = settings.firmware == .uefi ? settings.firmwareImage : nil
+        if let firmware { files.register(prefix + "firmware", firmware) }
+        if let hypervisor = settings.hypervisor { files.register(prefix + "hypervisor", hypervisor) }
         if settings.display.hasScreen { screen?.reset() }
         let boot: [String: Any] = [
             "type": "boot",
@@ -141,8 +138,10 @@ final class WebKitEngine: NSObject, MachineEngine {
             "kernel": settings.kernel.isEmpty ? NSNull() : prefix + "kernel",
             "initrd": settings.initrd.isEmpty ? NSNull() : prefix + "initrd",
             "disks": disks,
-            "firmware": settings.firmware == nil ? NSNull() : prefix + "firmware",
-            "firmwareKind": settings.firmware == nil ? Firmware.none : Firmware.uefi,
+            "firmware": firmware == nil ? NSNull() : prefix + "firmware",
+            "firmwareKind": settings.firmware.code,
+            "hypervisor": settings.hypervisor == nil ? NSNull() : prefix + "hypervisor",
+            "hypervisorCmdline": settings.hypervisorCmdline,
             "cmdline": settings.cmdlineAppend,
             "memoryMib": settings.memoryMib,
             "cpus": settings.cpus,

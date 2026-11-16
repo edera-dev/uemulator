@@ -22,9 +22,8 @@ struct UemulatorApp: App {
 //   -machine NAME             select it
 //   -autostart                start the selected machine
 //   -new-machine NAME         create it first if it does not exist, from -new-source demo (the
-//                             default), cdrom:FILE (in Documents) or empty, with a disk of
-//                             -new-disk-mib MIB (default none), -new-memory-mib, -new-display,
-//                             -new-network NO (a NIC unless NO)
+//                             default), demo:xen, install:alpine|debian|fedora, iso:FILE (in
+//                             Documents, imported) or empty
 //   -engine native|webkit, -debug-log FILE   see MachineModel
 struct LibraryView: View {
     @StateObject private var store = MachineStore()
@@ -32,8 +31,14 @@ struct LibraryView: View {
     @State private var creating = false
     @State private var problem: String?
     @State private var deleting: String?
-    // The machine a first launch gets, so the app opens on something that boots.
-    private static let firstMachine = "alpine-demo"
+    #if os(iOS)
+    // A phone opens on the list, so an empty library offers the presets there; wider layouts show
+    // them in the detail.
+    @Environment(\.horizontalSizeClass) private var sizeClass
+    private var compact: Bool { sizeClass == .compact }
+    #else
+    private let compact = false
+    #endif
 
     var body: some View {
         NavigationSplitView {
@@ -54,12 +59,29 @@ struct LibraryView: View {
                             .disabled(model.isRunning)
                     }
             }
-            .navigationTitle("Machines")
-            .navigationSplitViewColumnWidth(min: 200, ideal: 240)
+            .overlay {
+                if compact && store.names.isEmpty {
+                    ContentUnavailableView {
+                        Label("No Machines", systemImage: "cpu")
+                    } actions: {
+                        PresetButtons(onDemo: add, onInstall: add) { creating = true }
+                    }
+                }
+            }
+            .navigationTitle("uemulator")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
+            .navigationSplitViewColumnWidth(min: 220, ideal: 260)
             .toolbar {
-                ToolbarItem {
-                    Button("New Machine", systemImage: "plus") { creating = true }
-                        .help("Make a machine")
+                ToolbarItem(placement: Self.brandPlacement) { BrandMark() }
+                ToolbarItem(placement: .primaryAction) {
+                    Menu {
+                        NewMachineMenu(onDemo: add, onInstall: add) { creating = true }
+                    } label: {
+                        Label("New Machine", systemImage: "plus")
+                    }
+                    .help("New machine")
                 }
             }
         } detail: {
@@ -68,12 +90,11 @@ struct LibraryView: View {
                     .id(selection)
             } else {
                 ContentUnavailableView {
-                    Label("No Machine", systemImage: "cpu")
-                } description: {
-                    Text("Pick a machine, or make one from a CD image or the Alpine demo.")
+                    Label(store.names.isEmpty ? "No Machines" : "No Machine Selected", systemImage: "cpu")
                 } actions: {
-                    Button("New Machine…") { creating = true }
-                        .buttonStyle(.borderedProminent)
+                    if store.names.isEmpty {
+                        PresetButtons(onDemo: add, onInstall: add) { creating = true }
+                    }
                 }
             }
         }
@@ -85,11 +106,11 @@ struct LibraryView: View {
         }
         .confirmationDialog("Delete \(deleting ?? "")?", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
                             titleVisibility: .visible) {
-            Button("Delete Machine and Its Disks", role: .destructive) {
+            Button("Delete", role: .destructive) {
                 if let deleting { delete(deleting) }
             }
         } message: {
-            Text("Its disks and NVRAM are deleted. A CD image it used stays where it is.")
+            Text("Its disks and files are deleted.")
         }
         .alert("Machines", isPresented: Binding(get: { problem != nil }, set: { if !$0 { problem = nil } })) {
             Button("OK", role: .cancel) {}
@@ -97,6 +118,33 @@ struct LibraryView: View {
             Text(problem ?? "")
         }
         .task { launch() }
+    }
+
+    // The logo and name lead the sidebar's bar: centered where a phone or iPad has room for it,
+    // first in the toolbar on a Mac.
+    #if os(iOS)
+    private static let brandPlacement = ToolbarItemPlacement.principal
+    #else
+    private static let brandPlacement = ToolbarItemPlacement.navigation
+    #endif
+
+    private func add(_ demo: Demo) {
+        make(demo.machineName, .demo(demo))
+    }
+
+    private func add(_ distro: Distro) {
+        make(distro.rawValue, .install(distro))
+    }
+
+    // Demos and installs need nothing more from the user: made, selected and started.
+    private func make(_ base: String, _ preset: MachineStore.Preset) {
+        do {
+            let name = try store.create(base, preset: preset)
+            selection = name
+            store.model(name).start()
+        } catch {
+            problem = error.localizedDescription
+        }
     }
 
     private func delete(_ name: String) {
@@ -111,29 +159,96 @@ struct LibraryView: View {
     private func launch() {
         let defaults = UserDefaults.standard
         if let name = defaults.string(forKey: "new-machine"), !store.names.contains(name) {
-            let source: MachineStore.Source
-            switch defaults.string(forKey: "new-source") ?? "demo" {
-            case "empty": source = .empty
-            case let value where value.hasPrefix("cdrom:"): source = .cdrom(.documents(String(value.dropFirst("cdrom:".count))))
-            default: source = .demo
-            }
-            let display = DisplayChoice(rawValue: defaults.string(forKey: "new-display") ?? "") ?? .terminal
-            let memory = defaults.integer(forKey: "new-memory-mib")
-            let network = defaults.string(forKey: "new-network").map { !["no", "0", "false", "off"].contains($0) } ?? true
+            let source = defaults.string(forKey: "new-source") ?? "demo"
             do {
-                try store.create(name, source: source, diskMib: UInt64(max(0, defaults.integer(forKey: "new-disk-mib"))),
-                                 memoryMib: memory > 0 ? memory : MachineModel.demoMemoryMib, display: display, network: network)
+                switch source {
+                case let value where value.hasPrefix("install:"):
+                    guard let distro = Distro(rawValue: String(value.dropFirst("install:".count))) else { break }
+                    try store.create(name, preset: .install(distro))
+                case let value where value.hasPrefix("iso:"):
+                    let iso = MachineStore.documents.appendingPathComponent(String(value.dropFirst("iso:".count)))
+                    try store.create(name, preset: .custom(memoryMib: MachineModel.cdromMemoryMib, diskGib: Distro.easyDiskGib,
+                                                           display: .screen, network: true))
+                    Task {
+                        do {
+                            try await store.importDisk(name, from: iso, readOnly: true)
+                            if ProcessInfo.processInfo.arguments.contains("-autostart") { store.model(name).start() }
+                        } catch {
+                            problem = error.localizedDescription
+                        }
+                    }
+                case "empty":
+                    try store.create(name, preset: .custom(memoryMib: MachineModel.cdromMemoryMib, diskGib: 0, display: .screen, network: true))
+                default:
+                    try store.create(name, preset: .demo(source == "demo:xen" ? .xen : .alpine))
+                }
             } catch {
                 problem = error.localizedDescription
             }
         }
-        if store.names.isEmpty {
-            try? store.create(Self.firstMachine, source: .demo, diskMib: 0, memoryMib: MachineModel.demoMemoryMib, display: .terminal)
-        }
         selection = defaults.string(forKey: "machine") ?? defaults.string(forKey: "new-machine") ?? store.names.first
-        if ProcessInfo.processInfo.arguments.contains("-autostart"), let selection, store.names.contains(selection) {
+        let importing = defaults.string(forKey: "new-source")?.hasPrefix("iso:") == true
+        if ProcessInfo.processInfo.arguments.contains("-autostart"), !importing, let selection, store.names.contains(selection) {
             store.model(selection).start()
         }
+    }
+}
+
+struct BrandMark: View {
+    var body: some View {
+        HStack(spacing: 8) {
+            Image("Logo")
+                .resizable()
+                .interpolation(.high)
+                .frame(width: 24, height: 24)
+            Text("uemulator").font(.headline)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("uemulator")
+    }
+}
+
+// The Add menu: the demos, the easy installs, and a machine set up by hand.
+struct NewMachineMenu: View {
+    let onDemo: (Demo) -> Void
+    let onInstall: (Distro) -> Void
+    let onCustom: () -> Void
+
+    var body: some View {
+        Section("Demo") {
+            ForEach(Demo.allCases) { demo in Button(demo.title) { onDemo(demo) } }
+        }
+        Section("Install") {
+            ForEach(Distro.allCases) { distro in Button(distro.title) { onInstall(distro) } }
+        }
+        Button("Custom…", systemImage: "slider.horizontal.3", action: onCustom)
+    }
+}
+
+// The same choices as buttons, for an empty library.
+struct PresetButtons: View {
+    let onDemo: (Demo) -> Void
+    let onInstall: (Distro) -> Void
+    let onCustom: () -> Void
+
+    var body: some View {
+        VStack(spacing: 12) {
+            HStack {
+                ForEach(Demo.allCases) { demo in
+                    Button(demo.title, systemImage: "play.fill") { onDemo(demo) }
+                        .buttonStyle(.borderedProminent)
+                }
+            }
+            HStack {
+                Menu("Install", systemImage: "arrow.down.circle") {
+                    ForEach(Distro.allCases) { distro in Button(distro.title) { onInstall(distro) } }
+                }
+                .fixedSize()
+                Button("Custom…", systemImage: "slider.horizontal.3", action: onCustom)
+            }
+            .buttonStyle(.bordered)
+        }
+        .controlSize(.large)
     }
 }
 
@@ -144,7 +259,7 @@ struct MachineRow: View {
         Label {
             VStack(alignment: .leading, spacing: 2) {
                 Text(model.name).lineLimit(1)
-                Text(summary).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                Text(Self.summary(model)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
         } icon: {
             Image(systemName: model.definition.display.hasScreen ? "display" : "terminal")
@@ -158,49 +273,42 @@ struct MachineRow: View {
         .padding(.vertical, 2)
     }
 
-    private var summary: String { Self.summary(model) }
-
-    // What the machine is, in a line: memory, processors, what it boots.
+    // What the machine is, in a line: what it runs, then memory and processors.
     static func summary(_ model: MachineModel) -> String {
-        var parts = [MachineDefinition.memoryTitle(model.definition.memoryMib)]
+        var parts: [String] = []
+        if let subject = model.subject { parts.append(subject) }
+        parts.append(MachineDefinition.memoryTitle(model.definition.memoryMib))
         if model.definition.cpus > 1 { parts.append("\(model.definition.cpus) CPUs") }
-        if let cd = model.cdromName { parts.append(cd) }
-        if model.definition.bootsKernel { parts.append("kernel") }
-        if !model.definition.disks.isEmpty { parts.append("\(model.definition.disks.count) disk\(model.definition.disks.count == 1 ? "" : "s")") }
         return parts.joined(separator: " · ")
     }
 }
 
+// A machine set up by hand: what it boots (each file is copied into the machine's folder), and its
+// hardware. Everything else is in its settings.
 struct NewMachineSheet: View {
-    enum Source: String, CaseIterable, Identifiable {
-        case cdrom
-        case demo
-        case empty
-        var id: String { rawValue }
-        var title: String {
-            switch self {
-            case .cdrom: "CD image (installer or live ISO)"
-            case .demo: "Alpine Linux demo"
-            case .empty: "Nothing yet"
-            }
-        }
-    }
-
     let store: MachineStore
     let onCreated: (String) -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var name = ""
-    @State private var source = Source.cdrom
-    @State private var cdrom: URL?
-    @State private var choosingISO = false
+    @State private var iso: URL?
+    @State private var diskImage: URL?
+    @State private var kernel: URL?
+    @State private var initrd: URL?
+    @State private var picking: Pick?
     @State private var memoryMib = MachineModel.cdromMemoryMib
-    @State private var diskGib = 8
+    @State private var diskGib = Distro.easyDiskGib
     @State private var display = DisplayChoice.screen
     @State private var network = true
+    @State private var importing = false
     @State private var problem: String?
 
-    private static let memoryChoices = [256, 512, 1024, 2048, 3072, 4096]
-    private static let diskChoices = [0, 1, 4, 8, 16, 32, 64]
+    enum Pick: Identifiable {
+        case iso, disk, kernel, initrd
+        var id: Self { self }
+    }
+
+    static let memoryChoices = [512, 1024, 2048, 3072, 4096, 8192]
+    static let diskChoices = [0, 8, 16, 32, 64, 128]
 
     var body: some View {
         NavigationStack {
@@ -211,28 +319,26 @@ struct NewMachineSheet: View {
                         .textInputAutocapitalization(.never)
                         #endif
                         .autocorrectionDisabled()
-                    Picker("Boots", selection: $source) {
-                        ForEach(Source.allCases) { Text($0.title).tag($0) }
-                    }
-                    if source == .cdrom {
-                        Button(cdrom?.lastPathComponent ?? "Choose CD Image…", systemImage: "opticaldisc") { choosingISO = true }
+                }
+                Section("Boot") {
+                    FileRow(title: "ISO", systemImage: "opticaldisc", file: $iso) { picking = .iso }
+                    FileRow(title: "Disk Image", systemImage: "externaldrive", file: $diskImage) { picking = .disk }
+                    FileRow(title: "Kernel", systemImage: "cpu", file: $kernel) { picking = .kernel }
+                    if kernel != nil {
+                        FileRow(title: "Initrd", systemImage: "doc.zipper", file: $initrd) { picking = .initrd }
                     }
                 }
-                Section {
+                Section("Hardware") {
                     Picker("Memory", selection: $memoryMib) {
                         ForEach(Self.memoryChoices, id: \.self) { Text(MachineDefinition.memoryTitle($0)).tag($0) }
                     }
-                    Picker("Disk", selection: $diskGib) {
+                    Picker("New Disk", selection: $diskGib) {
                         ForEach(Self.diskChoices, id: \.self) { Text($0 == 0 ? "None" : "\($0) GiB").tag($0) }
                     }
                     Picker("Display", selection: $display) {
                         ForEach(DisplayChoice.allCases) { Text($0.title).tag($0) }
                     }
                     Toggle("Network", isOn: $network)
-                } header: {
-                    Text("Hardware")
-                } footer: {
-                    Text("Everything here can be changed later in the machine's settings. The network reaches the internet through the app.")
                 }
                 if let problem {
                     Section {
@@ -241,45 +347,130 @@ struct NewMachineSheet: View {
                 }
             }
             .formStyle(.grouped)
-            .navigationTitle("New Machine")
-            .fileImporter(isPresented: $choosingISO, allowedContentTypes: [UTType(filenameExtension: "iso") ?? .data, .data]) { result in
-                if case .success(let url) = result { cdrom = url }
+            .disabled(importing)
+            .overlay {
+                if importing {
+                    ProgressView("Importing…")
+                        .padding(24)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+                }
             }
-            .onChange(of: source) {
-                // The demo is a small initramfs on a serial console; CDs want room and a screen.
-                memoryMib = source == .demo ? MachineModel.demoMemoryMib : MachineModel.cdromMemoryMib
-                display = source == .demo ? .terminal : .screen
+            .navigationTitle("New Machine")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
+            .fileImporter(isPresented: Binding(get: { picking != nil }, set: { if !$0 { picking = nil } }),
+                          allowedContentTypes: picking == .iso ? [UTType(filenameExtension: "iso") ?? .data, .data] : [.data]) { result in
+                guard case .success(let url) = result, let target = picking else { return }
+                switch target {
+                case .iso: iso = url
+                case .disk: diskImage = url
+                case .kernel: kernel = url
+                case .initrd: initrd = url
+                }
+                if name.isEmpty { name = Self.suggestedName(for: url) }
             }
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() }.disabled(importing) }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Create") { create() }
-                        .disabled(name.isEmpty || (source == .cdrom && cdrom == nil))
+                        .disabled(name.isEmpty || importing)
                 }
             }
         }
         #if os(macOS)
-        .frame(minWidth: 420, minHeight: 360)
+        .frame(minWidth: 440, minHeight: 440)
+        #else
+        .formSheetSizing()
         #endif
     }
 
+    // "debian-13.1.0-amd64-netinst.iso" -> "debian-13.1.0-amd64-netinst"
+    private static func suggestedName(for url: URL) -> String {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
+        let stem = url.deletingPathExtension().lastPathComponent
+        let cleaned = String(stem.unicodeScalars.map { allowed.contains($0) && $0.isASCII ? Character($0) : "-" })
+        return String(cleaned.prefix(48))
+    }
+
     private func create() {
+        if let invalid = MachineStore.validate(name) {
+            problem = invalid
+            return
+        }
+        let created: String
         do {
-            let machineSource: MachineStore.Source
-            switch source {
-            case .demo: machineSource = .demo
-            case .empty: machineSource = .empty
-            case .cdrom:
-                guard let cdrom else { return }
-                let scoped = cdrom.startAccessingSecurityScopedResource()
-                defer { if scoped { cdrom.stopAccessingSecurityScopedResource() } }
-                machineSource = .cdrom(.bookmark(try MachineStore.bookmark(for: cdrom)))
-            }
-            try store.create(name, source: machineSource, diskMib: UInt64(diskGib) * MachineStore.mibPerGib,
-                             memoryMib: memoryMib, display: display, network: network)
-            onCreated(name)
+            created = try store.create(name, preset: .custom(memoryMib: memoryMib, diskGib: diskGib, display: display, network: network))
         } catch {
             problem = error.localizedDescription
+            return
         }
+        importing = true
+        Task {
+            do {
+                if let iso { try await store.importDisk(created, from: iso, readOnly: true) }
+                if let diskImage { try await store.importDisk(created, from: diskImage, readOnly: false) }
+                if let kernel { try await store.importKernel(created, kernel: kernel, initrd: initrd) }
+                importing = false
+                onCreated(created)
+            } catch {
+                importing = false
+                try? store.delete(created)
+                problem = error.localizedDescription
+            }
+        }
+    }
+}
+
+// A file to import: its name once chosen, with a button to clear it.
+struct FileRow: View {
+    let title: String
+    let systemImage: String
+    @Binding var file: URL?
+    let choose: () -> Void
+
+    var body: some View {
+        LabeledContent {
+            HStack {
+                Button(file?.lastPathComponent ?? "Choose…", action: choose)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if file != nil {
+                    Button("Clear", systemImage: "xmark.circle.fill") { file = nil }
+                        .labelStyle(.iconOnly)
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        } label: {
+            Label(title, systemImage: systemImage)
+        }
+    }
+}
+
+extension View {
+    // What a machine runs, under its name in the window's title. iOS draws its own (MachineView's
+    // principal item): the system's inline subtitle there is faint.
+    @ViewBuilder
+    func subtitle(_ text: String?) -> some View {
+        #if os(macOS)
+        navigationSubtitle(text ?? "")
+        #else
+        self
+        #endif
+    }
+
+    // A form-sized sheet on iPad instead of a page sheet, where the OS has it (iOS 18).
+    @ViewBuilder
+    func formSheetSizing() -> some View {
+        #if os(iOS)
+        if #available(iOS 18.0, *) {
+            presentationSizing(.form)
+        } else {
+            self
+        }
+        #else
+        self
+        #endif
     }
 }

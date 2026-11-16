@@ -122,8 +122,9 @@ async function boot(settings) {
     if (!response.ok) throw new Error(`${path}: ${response.status}`);
     return response.arrayBuffer();
   };
-  const [kernel, initrd, firmwareImage] = await Promise.all([
+  const [kernel, initrd, firmwareImage, hypervisor] = await Promise.all([
     fetchBytes(settings.kernel), fetchBytes(settings.initrd), fetchBytes(settings.firmware),
+    fetchBytes(settings.hypervisor),
   ]);
   const shared = new SharedArrayBuffer(CONTROL_BYTES);
   control = new Int32Array(shared, 0, RING_OFFSET / 4);
@@ -179,6 +180,8 @@ async function boot(settings) {
     initrd,
     cmdline: settings.cmdline,
     firmware: { kind: settings.firmwareKind, image: firmwareImage },
+    hypervisor,
+    hypervisorCmdline: settings.hypervisorCmdline,
     memoryMib: settings.memoryMib,
     cpus: settings.cpus,
     cols: settings.cols,
@@ -193,7 +196,7 @@ async function boot(settings) {
     disks: (settings.disks ?? []).map((disk) => ({
       url: new URL(disk.url, location.href).href, readOnly: disk.readOnly, writeThrough: !disk.readOnly,
     })),
-  }, [kernel, initrd, firmwareImage].filter(Boolean));
+  }, [kernel, initrd, firmwareImage, hypervisor].filter(Boolean));
 }
 
 socket.onopen = () => socket.send(`${token} ${params.get("run")}`);

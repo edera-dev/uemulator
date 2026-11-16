@@ -17,7 +17,7 @@ final class NativeEngine: MachineEngine, @unchecked Sendable {
     // Called on the main actor.
     var onOutput: (([UInt8]) -> Void)?
     var onState: ((EngineState) -> Void)?
-    // The library's log hook is not wired through the C ABI yet.
+    // The library's diagnostics; called on the main actor.
     var onLog: ((String) -> Void)?
     // Main actor only.
     var screen: ScreenSurface?
@@ -140,6 +140,7 @@ final class NativeEngine: MachineEngine, @unchecked Sendable {
         var error = [CChar](repeating: 0, count: NativeEngine.errorCapacity)
         var options = settings.options
         if settings.network { options |= UInt32(UA_OPTION_NETWORK) }
+        if settings.timeshare { options |= UInt32(UA_OPTION_TIMESHARE) }
         // C strings for the disks' paths, alive until ua_create has copied them.
         let paths = settings.disks.map { strdup($0.url.path) }
         let nvram = settings.nvram.map { strdup($0.path) } ?? nil
@@ -150,19 +151,30 @@ final class NativeEngine: MachineEngine, @unchecked Sendable {
         let disks = zip(settings.disks, paths).map { ua_disk(path: $1, read_only: $0.readOnly ? 1 : 0) }
         let created: OpaquePointer? = disks.withUnsafeBufferPointer { disks in settings.kernel.withUnsafeBytes { kernel in
             settings.initrd.withUnsafeBytes { initrd in
-                (settings.firmware ?? Data()).withUnsafeBytes { firmware in
-                    settings.cmdlineAppend.withCString { cmdline in
-                        var config = ua_config(
-                            kernel: kernel.bindMemory(to: UInt8.self).baseAddress, kernel_len: kernel.count,
-                            initrd: initrd.bindMemory(to: UInt8.self).baseAddress, initrd_len: initrd.count,
-                            firmware: firmware.bindMemory(to: UInt8.self).baseAddress, firmware_len: firmware.count,
-                            cmdline_append: cmdline,
-                            disks: disks.baseAddress, disk_count: disks.count,
-                            nvram_path: nvram,
-                            memory_mib: settings.memoryMib, cpus: settings.cpus, options: options,
-                            cols: settings.cols, rows: settings.rows)
-                        return ua_create(&config, NativeEngine.outputCallback, NativeEngine.exitCallback, context,
-                                         &error, error.count)
+                (settings.firmwareImage ?? Data()).withUnsafeBytes { firmware in
+                    (settings.hypervisor ?? Data()).withUnsafeBytes { hypervisor in
+                        settings.cmdlineAppend.withCString { cmdline in
+                            settings.hypervisorCmdline.withCString { hypervisorCmdline in
+                                var config = ua_config(
+                                    kernel: kernel.bindMemory(to: UInt8.self).baseAddress, kernel_len: kernel.count,
+                                    initrd: initrd.bindMemory(to: UInt8.self).baseAddress, initrd_len: initrd.count,
+                                    firmware: firmware.bindMemory(to: UInt8.self).baseAddress, firmware_len: firmware.count,
+                                    cmdline_append: cmdline,
+                                    disks: disks.baseAddress, disk_count: disks.count,
+                                    nvram_path: nvram,
+                                    memory_mib: settings.memoryMib, cpus: settings.cpus, options: options,
+                                    cols: settings.cols, rows: settings.rows,
+                                    firmware_kind: settings.firmware.code,
+                                    hypervisor: hypervisor.bindMemory(to: UInt8.self).baseAddress,
+                                    hypervisor_len: hypervisor.count,
+                                    hypervisor_cmdline: hypervisorCmdline,
+                                    unix_time: settings.unixTime,
+                                    display_width: 0, display_height: 0,
+                                    log: NativeEngine.logCallback)
+                                return ua_create(&config, NativeEngine.outputCallback, NativeEngine.exitCallback, context,
+                                                 &error, error.count)
+                            }
+                        }
                     }
                 }
             }
@@ -311,6 +323,16 @@ final class NativeEngine: MachineEngine, @unchecked Sendable {
         run.engine?.receive(run: run.id, UnsafeBufferPointer(start: bytes, count: len))
     }
 
+    private static let logCallback: ua_log_fn = { context, text, len in
+        guard let context, let text else { return }
+        let run = Unmanaged<Run>.fromOpaque(context).takeUnretainedValue()
+        let message = String(decoding: UnsafeBufferPointer(start: text, count: len), as: UTF8.self)
+        DispatchQueue.main.async { [weak engine = run.engine, id = run.id] in
+            guard let engine, engine.isCurrent(id) else { return }
+            engine.onLog?(message)
+        }
+    }
+
     private static let exitCallback: ua_exit_fn = { context, reason, message in
         guard let context else { return }
         let run = Unmanaged<Run>.fromOpaque(context).takeUnretainedValue()
@@ -354,7 +376,7 @@ final class NativeEngine: MachineEngine, @unchecked Sendable {
         let text: String
         switch reason {
         case Int32(UA_EXIT_SHUTDOWN): text = "Powered off"
-        case Int32(UA_EXIT_RESET): text = "Reset"
+        case Int32(UA_EXIT_RESET): text = EngineState.resetReason
         case Int32(UA_EXIT_TRIPLE_FAULT): text = "Triple fault"
         case Int32(UA_EXIT_STOPPED): text = "Stopped"
         default: text = "Emulator error: \(message)"

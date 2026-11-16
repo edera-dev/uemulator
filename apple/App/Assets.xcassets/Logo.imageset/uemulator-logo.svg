@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#6A5CFF"/>
+      <stop offset="1" stop-color="#2A1B9C"/>
+    </linearGradient>
+    <linearGradient id="package" gradientUnits="userSpaceOnUse" x1="0" y1="120" x2="0" y2="904">
+      <stop offset="0" stop-color="#D9D4FF"/>
+      <stop offset="1" stop-color="#A79DFF"/>
+    </linearGradient>
+    <linearGradient id="die" gradientUnits="userSpaceOnUse" x1="0" y1="304" x2="0" y2="720">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#E6E2FF"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="228" fill="url(#background)"/>
+  <g>
+    <rect x="316" y="120" width="56" height="100" rx="20" fill="url(#package)"/>
+    <rect x="316" y="804" width="56" height="100" rx="20" fill="url(#package)"/>
+    <rect x="120" y="316" width="100" height="56" rx="20" fill="url(#package)"/>
+    <rect x="804" y="316" width="100" height="56" rx="20" fill="url(#package)"/>
+    <rect x="428" y="120" width="56" height="100" rx="20" fill="url(#package)"/>
+    <rect x="428" y="804" width="56" height="100" rx="20" fill="url(#package)"/>
+    <rect x="120" y="428" width="100" height="56" rx="20" fill="url(#package)"/>
+    <rect x="804" y="428" width="100" height="56" rx="20" fill="url(#package)"/>
+    <rect x="540" y="120" width="56" height="100" rx="20" fill="url(#package)"/>
+    <rect x="540" y="804" width="56" height="100" rx="20" fill="url(#package)"/>
+    <rect x="120" y="540" width="100" height="56" rx="20" fill="url(#package)"/>
+    <rect x="804" y="540" width="100" height="56" rx="20" fill="url(#package)"/>
+    <rect x="652" y="120" width="56" height="100" rx="20" fill="url(#package)"/>
+    <rect x="652" y="804" width="56" height="100" rx="20" fill="url(#package)"/>
+    <rect x="120" y="652" width="100" height="56" rx="20" fill="url(#package)"/>
+    <rect x="804" y="652" width="100" height="56" rx="20" fill="url(#package)"/>
+  </g>
+  <path fill="url(#package)" fill-rule="evenodd" d="M300 200H724A100 100 0 0 1 824 300V724A100 100 0 0 1 724 824H300A100 100 0 0 1 200 724V300A100 100 0 0 1 300 200ZM300 244A56 56 0 0 0 244 300V724A56 56 0 0 0 300 780H724A56 56 0 0 0 780 724V300A56 56 0 0 0 724 244Z"/>
+  <path fill="url(#die)" fill-rule="evenodd" d="M348 304H676A44 44 0 0 1 720 348V676A44 44 0 0 1 676 720H348A44 44 0 0 1 304 676V348A44 44 0 0 1 348 304ZM374 386V638A28 28 0 0 0 430 638V601.8A110 110 0 0 0 571.3 573A84 84 0 0 0 622 590A28 28 0 0 0 622 534A28 28 0 0 1 594 506V386A28 28 0 0 0 538 386V506A54 54 0 0 1 430 506V386A28 28 0 0 0 374 386Z"/>
+</svg>

@@ -12,7 +12,9 @@ use crate::run::DEFAULT_MEMORY_MIB;
 const FEDORA_INSTALL_MEMORY_MIB: usize = 3072;
 const DOWNLOAD_CHUNK_LEN: usize = 1 << 16;
 
-/// The lowercase name is both the command-line value and what `machine.toml` stores.
+/// The lowercase name is both the command-line value and what `machine.toml` stores. The Apple
+/// app keeps a copy of these URLs, file names, command lines and memory sizes
+/// (`apple/App/Presets.swift`): change both.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Distro {

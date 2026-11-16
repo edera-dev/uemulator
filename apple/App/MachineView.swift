@@ -36,7 +36,12 @@ final class MachineModel: ObservableObject, ScreenInput {
     // Live ISOs want room: Fedora's 252 MB installer initramfs does not unpack in 1 GiB, and the
     // web page warns below 2 GiB for CDs (docs/plans/13-web.md).
     static let cdromMemoryMib = 2048
-    static let demoMemoryMib = 256
+    // An installer's kernel and initramfs, fetched on the first start that needs them.
+    private var preparing: Task<Void, Never>?
+    // Set while the machine starts again after the guest reset: its terminal keeps what the last
+    // boot printed (an installer's final screen, say).
+    private var restartingAfterReset = false
+    private let downloader = Downloader()
 
     init(name: String, store: MachineStore) {
         self.name = name
@@ -86,19 +91,49 @@ final class MachineModel: ObservableObject, ScreenInput {
             guard let self, let engine, engine === self.engine else { return }
             self.state = state
             if case .running = state { self.startedAt = Date() }
-            if case .stopped = state { self.releaseScope() }
+            if case .stopped(let reason) = state {
+                self.releaseScope()
+                // Booted afresh, so an installer that rebooted comes up on its disk.
+                if reason == EngineState.resetReason && self.definition.reboot {
+                    self.restartingAfterReset = true
+                    self.start()
+                }
+            }
         }
     }
 
     var isRunning: Bool {
         switch state {
-        case .starting, .running: true
+        case .preparing, .starting, .running: true
         case .stopped: false
         }
     }
 
     var cdromName: String? {
         definition.cdrom.flatMap(MachineStore.resolve)?.lastPathComponent
+    }
+
+    // What it runs, in a few words: the demo, the distro, the ISO.
+    var subject: String? {
+        if let demo = definition.demo { return demo.title }
+        if let distro = definition.install { return distro.title }
+        if let iso = definition.disks.first(where: \.readOnly) { return iso.url.lastPathComponent }
+        return cdromName
+    }
+
+    func reload() {
+        definition = (try? store.load(name)) ?? definition
+    }
+
+    // The CLI's `boot_from`: an installer machine boots its installer until something is on its
+    // first disk.
+    private var bootsInstaller: Bool {
+        guard definition.install != nil else { return false }
+        switch definition.bootFrom {
+        case .installer: return true
+        case .disk: return false
+        case .auto: return !(definition.disks.first.map { MachineStore.diskInstalled($0.url) } ?? false)
+        }
     }
 
     // The settings sheet's edits. The engine only changes while stopped: the engine object is the
@@ -111,6 +146,7 @@ final class MachineModel: ObservableObject, ScreenInput {
             // a kernel it is given before the disks (docs/plans/19-uefi-firmware.md); booting the
             // disks means dropping it.
             if definition.bootsKernel && !changed.bootsKernel { try store.removeKernel(name) }
+            if definition.hypervisor != nil && changed.hypervisor == nil { store.removeHypervisor(name) }
             try store.save(changed, as: name)
             let displayChanged = changed.display != definition.display
             definition = try store.load(name)
@@ -118,6 +154,19 @@ final class MachineModel: ObservableObject, ScreenInput {
         } catch {
             problem = error.localizedDescription
         }
+    }
+
+    // The settings sheet's picked files, copied into the machine's folder.
+    func importFiles(isos: [URL], images: [URL], kernel: URL?, initrd: URL?, hypervisor: URL?) async throws {
+        for iso in isos { try await store.importDisk(name, from: iso, readOnly: true) }
+        for image in images { try await store.importDisk(name, from: image, readOnly: false) }
+        if let kernel {
+            try await store.importKernel(name, kernel: kernel, initrd: initrd)
+        } else if let initrd {
+            try await store.importInitrd(name, from: initrd)
+        }
+        if let hypervisor { try await store.importHypervisor(name, from: hypervisor) }
+        reload()
     }
 
     // A new sparse disk in the machine's folder, for the settings sheet to attach.
@@ -128,13 +177,6 @@ final class MachineModel: ObservableObject, ScreenInput {
             problem = error.localizedDescription
             return nil
         }
-    }
-
-    // A picked CD image kept as a security-scoped bookmark, so the machine finds it next launch.
-    static func cdrom(for url: URL) -> CDROM? {
-        let scoped = url.startAccessingSecurityScopedResource()
-        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-        return (try? MachineStore.bookmark(for: url)).map(CDROM.bookmark)
     }
 
     // Asks the guest for a screen the size of the view, in pixels.
@@ -151,34 +193,103 @@ final class MachineModel: ObservableObject, ScreenInput {
 
     func start() {
         problem = nil
-        definition = (try? store.load(name)) ?? definition
+        reload()
+        if bootsInstaller, let distro = definition.install,
+           [distro.kernel, distro.initrd].contains(where: { !FileManager.default.fileExists(atPath: artifact($0, distro).path) }) {
+            hasStarted = true
+            state = .preparing("Downloading")
+            preparing = Task { [weak self] in
+                guard let self else { return }
+                do {
+                    for file in [distro.kernel, distro.initrd] where !FileManager.default.fileExists(atPath: artifact(file, distro).path) {
+                        try FileManager.default.createDirectory(at: artifact(file, distro).deletingLastPathComponent(),
+                                                                withIntermediateDirectories: true)
+                        let name = file.file
+                        try await downloader.fetch(file.url, to: artifact(file, distro)) { [weak self] fraction in
+                            Task { @MainActor in self?.downloaded(name, fraction) }
+                        }
+                    }
+                    preparing = nil
+                    boot()
+                } catch {
+                    preparing = nil
+                    if !Task.isCancelled { state = .stopped(error.localizedDescription) }
+                }
+            }
+            return
+        }
+        boot()
+    }
+
+    private func downloaded(_ file: String, _ fraction: Double) {
+        guard case .preparing = state else { return }
+        state = .preparing("Downloading \(file) \(Int(fraction * 100))%")
+    }
+
+    private func artifact(_ file: Distro.Download, _ distro: Distro) -> URL {
+        file.file == distro.kernel.file ? store.kernel(name, install: distro) : store.initrd(name, install: distro)
+    }
+
+    private func boot() {
         let size = terminal.size
-        var settings = MachineSettings(
-            kernel: Data(), initrd: Data(), disks: definition.disks, nvram: store.nvram(name),
-            memoryMib: UInt32(clamping: definition.memoryMib), cpus: UInt32(clamping: definition.cpus),
-            serialConsole: definition.serialConsole, display: definition.display,
-            tpm: definition.tpm, secureBoot: definition.secureBoot,
-            cols: UInt16(clamping: size.cols), rows: UInt16(clamping: size.rows))
-        settings.cmdlineAppend = definition.cmdlineAppend
+        var settings = MachineSettings(kernel: Data(), initrd: Data())
+        settings.disks = definition.disks
+        settings.nvram = store.nvram(name)
+        settings.memoryMib = UInt32(clamping: definition.memoryMib)
+        settings.cpus = UInt32(clamping: definition.cpus)
+        settings.serialConsole = definition.serialConsole
+        settings.jit = definition.jit
+        settings.display = definition.display
+        settings.tpm = definition.tpm
+        settings.secureBoot = definition.secureBoot
+        settings.iommu = definition.iommu
+        settings.rng = definition.rng
+        settings.smt = definition.smt
+        settings.timeshare = definition.timeshare
         settings.network = definition.network
-        if definition.firmware != "none" {
-            settings.firmware = try? Data(contentsOf: Bundle.main.resourceURL!.appendingPathComponent("uemulator-firmware.bin"))
-            guard settings.firmware != nil else {
+        settings.firmware = definition.firmware
+        settings.cols = UInt16(clamping: size.cols)
+        settings.rows = UInt16(clamping: size.rows)
+        var cmdline = [definition.cmdline]
+        if definition.firmware == .uefi {
+            settings.firmwareImage = try? Data(contentsOf: Bundle.main.resourceURL!.appendingPathComponent("uemulator-firmware.bin"))
+            guard settings.firmwareImage != nil else {
                 state = .stopped("The UEFI firmware is not in the app bundle; rebuild")
                 return
             }
         }
-        if definition.bootsKernel {
+        if bootsInstaller, let distro = definition.install {
+            guard let kernel = try? Data(contentsOf: store.kernel(name, install: distro)) else {
+                state = .stopped("The installer's kernel is missing")
+                return
+            }
+            settings.kernel = kernel
+            settings.initrd = (try? Data(contentsOf: store.initrd(name, install: distro))) ?? Data()
+            cmdline.insert(distro.cmdline, at: 0)
+        } else if definition.install == nil && definition.bootsKernel {
             guard let kernel = try? Data(contentsOf: store.kernel(name)) else {
-                state = .stopped("The machine's kernel is missing (artifacts/kernel)")
+                state = .stopped("The kernel is missing")
                 return
             }
             settings.kernel = kernel
             settings.initrd = (try? Data(contentsOf: store.initrd(name))) ?? Data()
         }
+        if definition.demo != nil { cmdline.append(Demo.hostArgument) }
+        settings.cmdlineAppend = cmdline.filter { !$0.isEmpty }.joined(separator: " ")
+        settings.replaceCmdline = definition.replaceCmdline
+        // A hypervisor boots the kernel as its dom0; an installed disk's boot loader cannot start
+        // under it, so the disk boots without (the CLI refuses that combination instead).
+        if definition.hypervisor != nil && !settings.kernel.isEmpty {
+            guard let image = try? Data(contentsOf: store.hypervisor(name)) else {
+                state = .stopped("The hypervisor image is missing")
+                return
+            }
+            settings.hypervisor = image
+            settings.hypervisorCmdline = definition.hypervisorCmdline
+        }
         if let cdrom = definition.cdrom {
             guard let url = MachineStore.resolve(cdrom) else {
-                state = .stopped("The CD image cannot be found; insert it again")
+                state = .stopped("The ISO cannot be found")
                 return
             }
             releaseScope()
@@ -187,15 +298,22 @@ final class MachineModel: ObservableObject, ScreenInput {
             settings.disks.insert(DiskImage(url: url, readOnly: true), at: 0)
         }
         guard !settings.kernel.isEmpty || !settings.disks.isEmpty else {
-            state = .stopped("Nothing to boot: insert a CD")
+            state = .stopped("Nothing to boot")
             return
         }
-        terminal.reset()
+        if !restartingAfterReset { terminal.reset() }
+        restartingAfterReset = false
         hasStarted = true
         engine.start(settings)
     }
 
     func stop() {
+        if let preparing {
+            preparing.cancel()
+            self.preparing = nil
+            state = .stopped("Stopped")
+            return
+        }
         engine.stop()
         releaseScope()
     }
@@ -234,8 +352,9 @@ final class MachineModel: ObservableObject, ScreenInput {
 }
 
 struct MachineView: View {
-    // A phone's navigation bar has room for the title and two buttons: the state and the
-    // Terminal | Screen switch go to the bottom bar there.
+    // A phone's navigation bar has room for the title and a few buttons: the Terminal | Screen
+    // switch and the screen's buttons go to the bottom bar there, and the state is behind an info
+    // button in the top bar (`MachineInfoButton`) instead of a chip.
     #if os(iOS)
     private static let statusPlacement = ToolbarItemPlacement.bottomBar
     #else
@@ -272,6 +391,14 @@ struct MachineView: View {
                 if !model.hasStarted && !model.isRunning {
                     StoppedPlaceholder(model: model) { editingSettings = true }
                 }
+                if case .preparing(let what) = model.state {
+                    VStack(spacing: 12) {
+                        ProgressView()
+                        Text(what).monospacedDigit().foregroundStyle(.secondary)
+                    }
+                    .padding(24)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+                }
             }
             .onAppear { viewSize = geometry.size }
             .onChange(of: geometry.size) { viewSize = geometry.size }
@@ -284,6 +411,7 @@ struct MachineView: View {
             }
         }
         .navigationTitle(model.name)
+        .subtitle(model.subject)
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
         #endif
@@ -296,10 +424,26 @@ struct MachineView: View {
             Text(model.problem ?? "")
         }
         .toolbar {
+            #if os(iOS)
+            // The system's inline title fades a subtitle out; the name and what it runs stay legible.
+            ToolbarItem(placement: .principal) {
+                VStack(spacing: 0) {
+                    Text(model.name).font(.headline)
+                    if let subject = model.subject {
+                        Text(subject).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                .lineLimit(1)
+            }
+            ToolbarItem {
+                MachineInfoButton(model: model)
+            }
+            #else
             // Toolbars show a Label's icon alone by default; the chip is mostly its text.
             ToolbarItem(placement: Self.statusPlacement) {
                 StateChip(state: model.state, startedAt: model.startedAt).labelStyle(.titleAndIcon)
             }
+            #endif
             if model.definition.display.hasScreen {
                 ToolbarItem(placement: Self.statusPlacement) {
                     Picker("View", selection: $model.view) {
@@ -328,15 +472,18 @@ struct MachineView: View {
             }
             ToolbarItem {
                 Button("Settings", systemImage: "slider.horizontal.3") { editingSettings = true }
-                    .help("Memory, disks, CD, engine")
+                    .keyboardShortcut("i", modifiers: .command)
+                    .help("Settings")
             }
             ToolbarItem {
                 if model.isRunning {
                     Button("Stop", systemImage: "stop.fill") { model.stop() }
-                        .help("Stop the machine")
+                        .keyboardShortcut(".", modifiers: .command)
+                        .help("Stop")
                 } else {
                     Button("Start", systemImage: "play.fill") { model.start() }
-                        .help("Start the machine")
+                        .keyboardShortcut("r", modifiers: .command)
+                        .help("Start")
                 }
             }
         }
@@ -373,6 +520,57 @@ struct StoppedPlaceholder: View {
     }
 }
 
+#if os(iOS)
+// The top bar's info button: its icon says starting, running or failed at a glance, and it opens
+// the state chip with the engine and the machine's summary.
+struct MachineInfoButton: View {
+    @ObservedObject var model: MachineModel
+    @State private var showing = false
+    // Ends that are not failures: the user's Stop, the guest's poweroff or reboot, and never
+    // started. Any other reason is an error the icon flags until the popover is read.
+    private static let normalStops: Set<String> = ["", "Stopped", "Powered off", "Reset"]
+
+    var body: some View {
+        Button { showing = true } label: {
+            Label("Info", systemImage: icon)
+        }
+        // The glass toolbar ignores a label's foreground style; it takes the button's tint.
+        .tint(tint)
+        .help("State, uptime and engine")
+        .popover(isPresented: $showing) {
+            VStack(alignment: .leading, spacing: 10) {
+                StateChip(state: model.state, startedAt: model.startedAt)
+                    .labelStyle(.titleAndIcon)
+                    .font(.headline)
+                    .fixedSize(horizontal: false, vertical: true)
+                LabeledContent("Engine", value: model.kind.title)
+                LabeledContent("Machine", value: MachineRow.summary(model))
+            }
+            .padding()
+            .frame(minWidth: 280, alignment: .leading)
+            // A phone would otherwise make it a full sheet.
+            .presentationCompactAdaptation(.popover)
+        }
+    }
+
+    private var icon: String {
+        switch model.state {
+        case .preparing, .starting: "hourglass"
+        case .running: "info.circle.fill"
+        case .stopped(let reason): Self.normalStops.contains(reason) ? "info.circle" : "exclamationmark.circle.fill"
+        }
+    }
+
+    private var tint: Color {
+        switch model.state {
+        case .preparing, .starting: .secondary
+        case .running: .green
+        case .stopped(let reason): Self.normalStops.contains(reason) ? .primary : .orange
+        }
+    }
+}
+#endif
+
 // The web page's state chip: the uptime and how the machine runs, or why it stopped.
 struct StateChip: View {
     let state: EngineState
@@ -380,6 +578,8 @@ struct StateChip: View {
 
     var body: some View {
         switch state {
+        case .preparing(let what):
+            Label(what, systemImage: "arrow.down.circle").monospacedDigit()
         case .starting:
             Label("Starting", systemImage: "hourglass")
         case .running(let detail):
