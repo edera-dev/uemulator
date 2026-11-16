@@ -18,15 +18,23 @@ use std::thread::JoinHandle;
 use uemulator::{
     BlockBackend, ConsoleHandle, ConsoleKind, Cursor, Disk, DisplayHandle, DisplayMode,
     EmulatedMachine, Error, ExitReason, FileKeyValueStore, ImageFile, InputHandle, JitMode,
-    MachineConfig, PointerButton, RawImage, ScreenMirror, StopHandle, Udisk,
+    MachineConfig, PointerButton, RawImage, ScreenMirror, SmpMode, StopHandle, Udisk,
 };
 
 // `ua_config.options`: the web build's OPTION_* bits (crates/uemulator-web/src/lib.rs), so one set
 // of choices drives either engine. Mirrored in include/uemulator.h.
 const OPTION_JIT: u32 = 1 << 0;
 const OPTION_ACPI: u32 = 1 << 1;
+/// An AMD IOMMU, found through ACPI's IVRS table: useless without `OPTION_ACPI`.
+const OPTION_IOMMU: u32 = 1 << 2;
 const OPTION_RNG: u32 = 1 << 3;
 const OPTION_SERIAL_CONSOLE: u32 = 1 << 4;
+/// A guest reset restarts the machine in place (`MachineConfig::reboot`); without it the run
+/// ends with `UA_EXIT_RESET`.
+const OPTION_REBOOT: u32 = 1 << 5;
+/// `cmdline` replaces the library's default command line instead of being appended to it.
+const OPTION_REPLACE_CMDLINE: u32 = 1 << 6;
+const OPTION_DEBUG: u32 = 1 << 7;
 /// A screen (virtio-gpu, the firmware's GOP framebuffer).
 const OPTION_DISPLAY: u32 = 1 << 8;
 /// A virtio keyboard and tablet.
@@ -37,10 +45,23 @@ const OPTION_SCREEN_CONSOLE: u32 = 1 << 10;
 const OPTION_TPM: u32 = 1 << 11;
 /// The firmware enforces Secure Boot, enrolling its keys into the NVRAM store on first use.
 const OPTION_SECURE_BOOT: u32 = 1 << 12;
+/// One vCPU per core instead of two threads a core.
+const OPTION_NO_SMT: u32 = 1 << 13;
 /// A virtio NIC behind the library's gateway, carried over Wisp to the app (`network.rs`). The
 /// app's own bit: the web build configures its network with `uw_set_network` instead, so the
 /// value is chosen clear of its OPTION_* bits.
 const OPTION_NETWORK: u32 = 1 << 16;
+/// The vCPUs take turns on one thread (`SmpMode::Timeshare`) instead of a thread each. The app's
+/// own bit, like `OPTION_NETWORK`: the web build always takes turns.
+const OPTION_TIMESHARE: u32 = 1 << 17;
+
+// `ua_config.firmware_kind`; mirrored in include/uemulator.h. The web build's FIRMWARE_* values.
+/// The kernel is entered directly.
+const FIRMWARE_NONE: u32 = 0;
+/// `ua_config.firmware` is the UEFI firmware image.
+const FIRMWARE_UEFI: u32 = 1;
+/// The library's BIOS boots the first disk (`MachineConfig::boot_disk`); no image.
+const FIRMWARE_BIOS: u32 = 2;
 /// Bytes in a MAC address.
 const MAC_BYTES: usize = 6;
 /// The first octet of the NIC's MAC: locally administered, unicast (bits 1 and 0 of the first
@@ -82,7 +103,35 @@ pub struct Config {
     options: u32,
     cols: u16,
     rows: u16,
+    // Everything below was added after the first layout; Swift builds this struct from the
+    // header, so the assertions under it pin the layout the header describes.
+    firmware_kind: u32,
+    hypervisor: *const u8,
+    hypervisor_len: usize,
+    hypervisor_cmdline: *const c_char,
+    unix_time: u64,
+    display_width: u32,
+    display_height: u32,
+    log: Option<LogFn>,
 }
+
+// The header's layout on the 64-bit Apple targets: a field moved or resized here and not there
+// would have Swift write past or beside it, silently.
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(std::mem::offset_of!(Config, rows) == 94);
+    assert!(std::mem::offset_of!(Config, firmware_kind) == 96);
+    assert!(std::mem::offset_of!(Config, hypervisor) == 104);
+    assert!(std::mem::offset_of!(Config, hypervisor_cmdline) == 120);
+    assert!(std::mem::offset_of!(Config, unix_time) == 128);
+    assert!(std::mem::offset_of!(Config, display_height) == 140);
+    assert!(std::mem::offset_of!(Config, log) == 144);
+    assert!(size_of::<Config>() == 152);
+};
+
+/// `ua_log_fn`: the library's diagnostics, on whichever machine thread logs. `text` is UTF-8 and
+/// valid only during the call.
+type LogFn = extern "C" fn(context: *mut c_void, text: *const u8, len: usize);
 
 type OutputFn = extern "C" fn(context: *mut c_void, bytes: *const u8, len: usize);
 type ExitFn = extern "C" fn(context: *mut c_void, reason: i32, message: *const c_char);
@@ -155,6 +204,14 @@ struct Settings {
     options: u32,
     cols: u16,
     rows: u16,
+    firmware_kind: u32,
+    /// The hypervisor image and its command line (empty: the library's default).
+    hypervisor: Option<(Vec<u8>, String)>,
+    /// 0: the host's clock.
+    unix_time: u64,
+    /// 0 by 0: the library's default size.
+    display_size: (u32, u32),
+    log: Option<(LogFn, Context)>,
 }
 
 impl Settings {
@@ -169,13 +226,17 @@ impl Settings {
             }
         };
         let firmware = bytes(config.firmware, config.firmware_len);
-        let cmdline_append = if config.cmdline_append.is_null() {
-            String::new()
-        } else {
-            unsafe { CStr::from_ptr(config.cmdline_append) }
-                .to_string_lossy()
-                .into_owned()
+        let string = |text: *const c_char| {
+            if text.is_null() {
+                String::new()
+            } else {
+                unsafe { CStr::from_ptr(text) }
+                    .to_string_lossy()
+                    .into_owned()
+            }
         };
+        let cmdline_append = string(config.cmdline_append);
+        let hypervisor = bytes(config.hypervisor, config.hypervisor_len);
         let disks = if config.disks.is_null() {
             Vec::new()
         } else {
@@ -209,6 +270,12 @@ impl Settings {
             options: config.options,
             cols: config.cols,
             rows: config.rows,
+            firmware_kind: config.firmware_kind,
+            hypervisor: (!hypervisor.is_empty())
+                .then(|| (hypervisor, string(config.hypervisor_cmdline))),
+            unix_time: config.unix_time,
+            display_size: (config.display_width, config.display_height),
+            log: None,
         }
     }
 
@@ -219,7 +286,16 @@ impl Settings {
             .memory_mib(self.memory_mib)
             .cpus(self.cpus)
             .acpi(has(OPTION_ACPI))
+            .iommu(has(OPTION_IOMMU))
             .rng(has(OPTION_RNG))
+            .reboot(has(OPTION_REBOOT))
+            .debug(has(OPTION_DEBUG))
+            .smt(!has(OPTION_NO_SMT))
+            .smp(if has(OPTION_TIMESHARE) {
+                SmpMode::Timeshare
+            } else {
+                SmpMode::Auto
+            })
             .jit(jit)
             .console(if has(OPTION_SERIAL_CONSOLE) {
                 ConsoleKind::Serial
@@ -229,8 +305,25 @@ impl Settings {
         if !self.initrd.is_empty() {
             config = config.initrd(self.initrd.clone());
         }
-        if !self.cmdline_append.is_empty() {
+        if has(OPTION_REPLACE_CMDLINE) {
+            config = config.cmdline(self.cmdline_append.clone());
+        } else if !self.cmdline_append.is_empty() {
             config = config.cmdline_append(self.cmdline_append.clone());
+        }
+        if let Some((image, cmdline)) = &self.hypervisor {
+            config = config.hypervisor(image.clone());
+            if !cmdline.is_empty() {
+                config = config.hypervisor_cmdline(cmdline.clone());
+            }
+        }
+        if self.unix_time != 0 {
+            config = config.unix_time(self.unix_time);
+        }
+        if let (width @ 1.., height @ 1..) = self.display_size {
+            config = config.display_size(width, height);
+        }
+        if let Some((log, context)) = self.log {
+            config = config.log(move |text| log(context.pointer(), text.as_ptr(), text.len()));
         }
         if has(OPTION_DISPLAY) {
             config = config
@@ -258,9 +351,15 @@ impl Settings {
         for (path, read_only) in &self.disks {
             config = config.disk(open_disk(path, *read_only)?);
         }
-        if let Some(firmware) = &self.firmware {
-            config = config.uefi_firmware(firmware.clone());
-        }
+        config = match (self.firmware_kind, &self.firmware) {
+            (FIRMWARE_UEFI, Some(firmware)) => config.uefi_firmware(firmware.clone()),
+            (FIRMWARE_UEFI, None) => {
+                return Err(Error::BadConfig("UEFI needs the firmware image".into()));
+            }
+            (FIRMWARE_BIOS, _) => config.boot_disk(true),
+            (FIRMWARE_NONE, _) => config,
+            (kind, _) => return Err(Error::BadConfig(format!("unknown firmware kind {kind}"))),
+        };
         EmulatedMachine::new(config)
     }
 }
@@ -289,6 +388,10 @@ pub struct Machine {
 /// A raw or udisk image file (`docs/spec/uemulator-disk-format.md`). An overlay's base is not
 /// followed: the app flattens or refuses those (M4), so one says so here rather than failing late.
 fn open_disk(path: &str, read_only: bool) -> Result<Disk, Error> {
+    Ok(Disk::from_backend(open_backend(path, read_only)?))
+}
+
+fn open_backend(path: &str, read_only: bool) -> Result<Box<dyn BlockBackend>, Error> {
     let failed = |what: String| Error::BadConfig(format!("{path}: {what}"));
     let mut file = ImageFile::open(path, read_only).map_err(|e| failed(e.to_string()))?;
     let backend: Box<dyn BlockBackend> =
@@ -301,7 +404,43 @@ fn open_disk(path: &str, read_only: bool) -> Result<Disk, Error> {
             Some(_) => Box::new(Udisk::open(file, None).map_err(|e| failed(e.to_string()))?),
             None => Box::new(RawImage::new(file)),
         };
-    Ok(Disk::from_backend(backend))
+    Ok(backend)
+}
+
+/// The CLI's test for "something is installed" (`machines.rs`, `disk_is_blank`): partition tables,
+/// boot sectors and the first filesystem structures all live in the first 32 KiB.
+const INSTALLED_CHECK_BYTES: u64 = 32 * 1024;
+
+/// 1 if the start of the disk image at `path` is not all zeros, as the guest sees it (a udisk's
+/// own header does not count); 0 if it is; -1 with the message in `error`.
+///
+/// # Safety
+/// `path` is a NUL-terminated string; `error` has `error_capacity` writable bytes or is null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ua_disk_installed(
+    path: *const c_char,
+    error: *mut c_char,
+    error_capacity: usize,
+) -> i32 {
+    let checked = (|| {
+        if path.is_null() {
+            return Err("no path".to_string());
+        }
+        let path = unsafe { CStr::from_ptr(path) }.to_string_lossy();
+        let mut backend = open_backend(&path, true).map_err(|e| e.to_string())?;
+        let mut start = vec![0u8; INSTALLED_CHECK_BYTES.min(backend.len()) as usize];
+        backend
+            .read_at(0, &mut start)
+            .map_err(|e| format!("{path}: {e}"))?;
+        Ok(start.iter().any(|&byte| byte != 0))
+    })();
+    match checked {
+        Ok(installed) => i32::from(installed),
+        Err(failure) => {
+            unsafe { write_message(error, error_capacity, &failure) };
+            -1
+        }
+    }
 }
 
 /// # Safety
@@ -316,7 +455,8 @@ pub unsafe extern "C" fn ua_create(
     error: *mut c_char,
     error_capacity: usize,
 ) -> *mut Machine {
-    let settings = unsafe { Settings::copy(&*config) };
+    let mut settings = unsafe { Settings::copy(&*config) };
+    settings.log = unsafe { (*config).log }.map(|log| (log, Context(context)));
     let wants_jit = settings.options & OPTION_JIT != 0;
     // `JitMode::On` instead of `Auto` so the app learns which one it got: `new` fails with
     // `JitUnavailable` where executable memory is refused (iOS), and the machine is built again
@@ -734,7 +874,89 @@ mod tests {
             options: OPTION_ACPI,
             cols: 80,
             rows: 25,
+            firmware_kind: FIRMWARE_NONE,
+            hypervisor: std::ptr::null(),
+            hypervisor_len: 0,
+            hypervisor_cmdline: std::ptr::null(),
+            unix_time: 0,
+            display_width: 0,
+            display_height: 0,
+            log: None,
         }
+    }
+
+    fn try_create(config: &Config) -> Result<*mut Machine, String> {
+        let mut error = [0 as c_char; 256];
+        let machine = unsafe {
+            ua_create(
+                config,
+                ignore_output,
+                ignore_exit,
+                std::ptr::null_mut(),
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if machine.is_null() {
+            Err(unsafe { CStr::from_ptr(error.as_ptr()) }
+                .to_string_lossy()
+                .into_owned())
+        } else {
+            Ok(machine)
+        }
+    }
+
+    // A udisk's header is not the guest's data: a new image is blank until a guest byte is
+    // written, the way `auto` tells an installer machine from an installed one.
+    #[test]
+    fn disk_counts_as_installed_once_its_start_has_data() {
+        let dir =
+            std::env::temp_dir().join(format!("uemulator-apple-installed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("disk-0.udisk");
+        let c_path = CString::new(path.to_str().unwrap()).unwrap();
+        let mut error = [0 as c_char; 256];
+        let installed = |error: &mut [c_char; 256]| unsafe {
+            ua_disk_installed(c_path.as_ptr(), error.as_mut_ptr(), error.len())
+        };
+        assert_eq!(
+            unsafe {
+                machine_file::ua_disk_create(c_path.as_ptr(), 1, error.as_mut_ptr(), error.len())
+            },
+            0
+        );
+        assert_eq!(installed(&mut error), 0);
+        {
+            let mut backend = open_backend(path.to_str().unwrap(), false).unwrap();
+            backend.write_at(INSTALLED_CHECK_BYTES - 1, &[1]).unwrap();
+            backend.flush().unwrap();
+        }
+        assert_eq!(installed(&mut error), 1);
+        let missing = CString::new(dir.join("missing.udisk").to_str().unwrap()).unwrap();
+        assert_eq!(
+            unsafe { ua_disk_installed(missing.as_ptr(), error.as_mut_ptr(), error.len()) },
+            -1
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // BIOS boots a disk, so it needs one; UEFI needs the image; anything else is refused by name.
+    #[test]
+    fn create_checks_the_firmware_kind() {
+        let kernel = halting_kernel();
+        let mut uefi = config(&kernel);
+        uefi.firmware_kind = FIRMWARE_UEFI;
+        assert!(try_create(&uefi).unwrap_err().contains("firmware image"));
+        let mut unknown = config(&kernel);
+        unknown.firmware_kind = 9;
+        assert!(
+            try_create(&unknown)
+                .unwrap_err()
+                .contains("unknown firmware kind 9")
+        );
+        let machine = try_create(&config(&kernel)).unwrap();
+        unsafe { ua_destroy(machine) };
     }
 
     /// A bzImage the loader accepts (the boot protocol header, 64-bit entry) whose 64-bit entry

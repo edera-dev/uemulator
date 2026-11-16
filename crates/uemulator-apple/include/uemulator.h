@@ -11,8 +11,15 @@
 // app passes one set of choices to either engine.
 #define UA_OPTION_JIT (1u << 0)
 #define UA_OPTION_ACPI (1u << 1)
+// An AMD IOMMU, found through ACPI (IVRS): needs UA_OPTION_ACPI.
+#define UA_OPTION_IOMMU (1u << 2)
 #define UA_OPTION_RNG (1u << 3)
 #define UA_OPTION_SERIAL_CONSOLE (1u << 4)
+// A guest reset restarts the machine in place; without it the run ends with UA_EXIT_RESET.
+#define UA_OPTION_REBOOT (1u << 5)
+// `cmdline_append` replaces the library's default command line instead of being appended to it.
+#define UA_OPTION_REPLACE_CMDLINE (1u << 6)
+#define UA_OPTION_DEBUG (1u << 7)
 // A screen (virtio-gpu and the firmware's framebuffer), shown through ua_screen_update.
 #define UA_OPTION_DISPLAY (1u << 8)
 // A virtio keyboard and tablet, fed through ua_key and the pointer calls.
@@ -23,9 +30,21 @@
 #define UA_OPTION_TPM (1u << 11)
 // The firmware enforces Secure Boot, enrolling its keys into the NVRAM store on first use.
 #define UA_OPTION_SECURE_BOOT (1u << 12)
+// One vCPU per core instead of two threads a core.
+#define UA_OPTION_NO_SMT (1u << 13)
 // A virtio NIC behind the library's gateway (10.0.2.0/24, DHCP, NAT), carried over Wisp v1 to the
 // app: start it with ua_network_start. The app's own bit, clear of the web build's OPTION_*.
 #define UA_OPTION_NETWORK (1u << 16)
+// The vCPUs take turns on one thread instead of a thread each. The app's own bit.
+#define UA_OPTION_TIMESHARE (1u << 17)
+
+// `ua_config.firmware_kind`: the web build's FIRMWARE_* values.
+// The kernel is entered directly.
+#define UA_FIRMWARE_NONE 0u
+// `firmware` is the UEFI firmware image (uemulator-firmware.bin).
+#define UA_FIRMWARE_UEFI 1u
+// The library's BIOS boots the first disk; no image.
+#define UA_FIRMWARE_BIOS 2u
 
 // ua_cursor_fn kinds: the guest has no pointer of its own (show the host's), hid it, or drew one.
 #define UA_CURSOR_HOST 0
@@ -53,6 +72,9 @@ typedef void (*ua_output_fn)(void *context, const uint8_t *bytes, size_t len);
 // The guest exited (once per ua_start). Runs on the machine's own thread; `message` is UTF-8,
 // empty unless UA_EXIT_INTERNAL, and only valid during the call.
 typedef void (*ua_exit_fn)(void *context, int32_t reason, const char *message);
+// The library's diagnostics, on whichever machine thread logs. `text` is UTF-8, not NUL-terminated,
+// and valid only during the call.
+typedef void (*ua_log_fn)(void *context, const uint8_t *text, size_t len);
 
 // A rectangle of the screen in pixels, origin top left.
 typedef struct {
@@ -89,7 +111,7 @@ typedef struct {
     // May be NULL with length 0.
     const uint8_t *initrd;
     size_t initrd_len;
-    // The UEFI firmware image (uemulator-firmware.bin); NULL boots the kernel directly.
+    // The UEFI firmware image, for UA_FIRMWARE_UEFI.
     const uint8_t *firmware;
     size_t firmware_len;
     // Appended to the library's default command line; NULL for none. UTF-8, NUL-terminated.
@@ -105,6 +127,20 @@ typedef struct {
     uint32_t options;
     uint16_t cols;
     uint16_t rows;
+    // UA_FIRMWARE_*.
+    uint32_t firmware_kind;
+    // A hypervisor (xen.gz or xen.efi) the UEFI firmware boots, with the kernel as its dom0; NULL
+    // with length 0 for none. Its command line may be NULL for the library's default.
+    const uint8_t *hypervisor;
+    size_t hypervisor_len;
+    const char *hypervisor_cmdline;
+    // The RTC's boot time in seconds since 1970; 0 follows the host's clock.
+    uint64_t unix_time;
+    // The screen's starting size; 0 by 0 is the library's default.
+    uint32_t display_width;
+    uint32_t display_height;
+    // May be NULL.
+    ua_log_fn log;
 } ua_config;
 
 // Builds a machine; it does not run until ua_start. The buffers are copied. On failure returns
@@ -148,6 +184,9 @@ char *ua_machine_load(const char *path, char *error, size_t error_capacity);
 // back atomically; keys the app does not know are kept. 0, or -1 with the message in `error`.
 int32_t ua_machine_save(const char *path, const char *changes, char *error, size_t error_capacity);
 void ua_string_free(char *text);
+// 1 if something is installed on the disk image at `path`: the first 32 KiB the guest sees are not
+// all zeros (the CLI's `boot_from = "auto"` test). 0 if blank, -1 with the message in `error`.
+int32_t ua_disk_installed(const char *path, char *error, size_t error_capacity);
 // A new, empty, sparse udisk image of `size_mib` at `path`; never replaces a file. 0, or -1.
 int32_t ua_disk_create(const char *path, uint64_t size_mib, char *error, size_t error_capacity);
 // One Wisp v1 packet from the machine's client, for the app's Wisp server. Runs on the network's
