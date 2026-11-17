@@ -3722,8 +3722,8 @@ mod fpu_tests {
 
         /// FPU state with a few registers pushed, distinctive XMM registers and a non-default MXCSR.
         fn dirty_state(harness: &mut Harness) {
-            for index in 0..16 {
-                harness.cpu.xmm[index] = xmm_pattern(index);
+            for (index, register) in harness.cpu.xmm.iter_mut().enumerate().take(16) {
+                *register = xmm_pattern(index);
             }
             harness.cpu.mxcsr = 0x1f80 | 0x2000;
         }

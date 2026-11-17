@@ -547,8 +547,8 @@ impl Cpu {
             _ => {
                 for k in 0..pending.zmm_extra.len() {
                     let at = base + k as u64 * HI16_ZMM_STRIDE;
-                    for lane in 0..4 {
-                        pending.zmm_extra[k][lane] = self.read128(at + 16 * lane as u64)?;
+                    for (lane, extra) in pending.zmm_extra[k].iter_mut().enumerate() {
+                        *extra = self.read128(at + 16 * lane as u64)?;
                     }
                 }
             }
@@ -708,8 +708,8 @@ mod tests {
             h.cpu.gpr[RAX] = u64::MAX;
             h.cpu.gpr[RDX] = u64::MAX;
             h.cpu.fcw = 0x027f;
-            for k in 0..16 {
-                h.cpu.xmm[k] = pattern(k);
+            for (k, register) in h.cpu.xmm.iter_mut().enumerate().take(16) {
+                *register = pattern(k);
             }
         });
         assert_eq!(stop, Stop::Halted);
@@ -763,8 +763,8 @@ mod tests {
             h.cpu.gpr[RDX] = 0;
             h.cpu.fcw = 0x0c7f;
             h.cpu.mxcsr = 0x1fa0;
-            for k in 0..16 {
-                h.cpu.xmm[k] = pattern(k);
+            for (k, register) in h.cpu.xmm.iter_mut().enumerate().take(16) {
+                *register = pattern(k);
             }
         });
         let image = saved.read(AREA, XSAVE_AREA_SIZE as usize);
@@ -775,8 +775,8 @@ mod tests {
         });
         assert_eq!(stop, Stop::Halted);
         assert_eq!((h.cpu.fcw, h.cpu.mxcsr), (0x0c7f, 0x1fa0));
-        for k in 0..16 {
-            assert_eq!(h.cpu.xmm[k], pattern(k));
+        for (k, register) in h.cpu.xmm.iter().enumerate().take(16) {
+            assert_eq!(*register, pattern(k));
         }
     }
 
@@ -942,8 +942,8 @@ mod tests {
                 pattern(k + 700),
             ];
         }
-        for k in 0..8 {
-            h.cpu.opmask[k] = 0x1111_0000_0000_0000u64 * (k as u64 + 1) + k as u64;
+        for (k, mask) in h.cpu.opmask.iter_mut().enumerate() {
+            *mask = 0x1111_0000_0000_0000u64 * (k as u64 + 1) + k as u64;
         }
     }
 

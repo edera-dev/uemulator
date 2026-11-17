@@ -9619,8 +9619,8 @@ mod tests {
     fn fxsave_stores_mxcsr_and_the_sixteen_vector_registers() {
         let mut rig = Rig::new();
         rig.h.write(DATA, &[SENTINEL; FXSAVE_AREA_BYTES + 16]);
-        for k in 0..16 {
-            rig.h.cpu.xmm[k] = A.rotate_left(8 * k as u32) ^ k as u128;
+        for (k, register) in rig.h.cpu.xmm.iter_mut().enumerate().take(16) {
+            *register = A.rotate_left(8 * k as u32) ^ k as u128;
         }
         rig.reset();
         rig.h.cpu.mxcsr = 0x1fa5;
@@ -9663,16 +9663,14 @@ mod tests {
     #[test]
     fn fxrstor_restores_mxcsr_and_the_vector_registers() {
         let mut rig = Rig::new();
-        for k in 0..16 {
-            rig.h.cpu.xmm[k] = A.rotate_left(8 * k as u32) ^ k as u128;
+        for (k, register) in rig.h.cpu.xmm.iter_mut().enumerate().take(16) {
+            *register = A.rotate_left(8 * k as u32) ^ k as u128;
         }
         rig.reset();
         rig.h.cpu.mxcsr = 0x1fa5;
         assert_eq!(rig.exec("fxsave [rsi]"), Stop::Halted);
         let saved: Vec<u128> = (0..16).map(|k| rig.xmm(k)).collect();
-        for k in 0..16 {
-            rig.h.cpu.xmm[k] = 0;
-        }
+        rig.h.cpu.xmm[..16].fill(0);
         rig.h.cpu.mxcsr = MXCSR_RESET;
         assert_eq!(rig.exec("fxrstor [rsi]"), Stop::Halted);
         assert_eq!(rig.mxcsr(), 0x1fa5);
@@ -10298,8 +10296,8 @@ mod tests {
             MMX_EXPONENT_MARKER,
             "reads leave the source alone"
         );
-        for k in 2..8 {
-            assert_eq!(rig.h.cpu.st[k], [0; 10], "other registers are untouched");
+        for register in &rig.h.cpu.st[2..8] {
+            assert_eq!(*register, [0; 10], "other registers are untouched");
         }
     }
 

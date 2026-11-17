@@ -4644,10 +4644,10 @@ mod tests {
             let seed = |h: &mut Harness| {
                 h.cpu.cr4 |= CR4_OSFXSR;
                 let mut state = 0x1357_9bdf_u128;
-                for register in 0..3 {
+                for register in &mut h.cpu.xmm[..3] {
                     state = state.wrapping_mul(0x2545_f491_4f6c_dd1d_u128 << 32 | 0x9e37_79b9)
                         ^ state >> 17;
-                    h.cpu.xmm[register] = state;
+                    *register = state;
                 }
             };
             for asm in [

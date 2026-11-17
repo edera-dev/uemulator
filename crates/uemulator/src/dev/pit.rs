@@ -436,11 +436,10 @@ impl Pit {
     fn control_word(&mut self, value: u8, now: u64) {
         let selected = (value >> CONTROL_CHANNEL_SHIFT) as usize;
         if selected == CONTROL_READ_BACK {
-            for index in 0..CHANNEL_COUNT {
+            for (index, channel) in self.channels.iter_mut().enumerate() {
                 if value & (READ_BACK_CHANNEL0 << index) == 0 {
                     continue;
                 }
-                let channel = &mut self.channels[index];
                 *channel = channel.settled(now);
                 if value & READ_BACK_NO_COUNT == 0 {
                     channel.latch_count(now);

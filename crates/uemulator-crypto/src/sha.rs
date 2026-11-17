@@ -151,15 +151,15 @@ impl Hasher {
         }
         fn words32<const N: usize>(bytes: &[u8]) -> [u32; N] {
             let mut out = [0; N];
-            for (word, chunk) in out.iter_mut().zip(bytes.chunks_exact(4)) {
-                *word = u32::from_le_bytes(chunk.try_into().unwrap());
+            for (word, chunk) in out.iter_mut().zip(bytes.as_chunks::<4>().0) {
+                *word = u32::from_le_bytes(*chunk);
             }
             out
         }
         fn words64(bytes: &[u8]) -> [u64; 8] {
             let mut out = [0; 8];
-            for (word, chunk) in out.iter_mut().zip(bytes.chunks_exact(8)) {
-                *word = u64::from_le_bytes(chunk.try_into().unwrap());
+            for (word, chunk) in out.iter_mut().zip(bytes.as_chunks::<8>().0) {
+                *word = u64::from_le_bytes(*chunk);
             }
             out
         }
