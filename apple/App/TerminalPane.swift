@@ -77,9 +77,12 @@ final class TerminalSession: NSObject, TerminalViewDelegate {
             guard folded != oldValue else { return }
             view.inputAccessoryView = folded ? nil : accessory
             if view.isFirstResponder { view.reloadInputViews() }
+            container.followsKeyboard = !folded
         }
     }
     private var keyBar: KeyAccessory { folded ? foldedKeyBar : accessory }
+    // What TerminalPane shows: the terminal, kept above the keyboard.
+    private(set) lazy var container = TerminalContainer(terminal: view)
     // A held arrow on the bar: terminal bytes have no key up, so the repeat is ours.
     private var repeatTimer: Timer?
     private static let repeatDelay: TimeInterval = 0.5
@@ -140,7 +143,67 @@ struct TerminalPane: NSViewRepresentable {
 #else
 struct TerminalPane: UIViewRepresentable {
     let session: TerminalSession
-    func makeUIView(context: Context) -> TerminalView { session.view }
-    func updateUIView(_ view: TerminalView, context: Context) {}
+    func makeUIView(context: Context) -> TerminalContainer { session.container }
+    func updateUIView(_ view: TerminalContainer, context: Context) {}
+}
+
+// Holds the terminal with its bottom on the keyboard's top (key bar included) while the terminal
+// has the keyboard, so the rows shrink and the cursor line stays in sight; SwiftTerm itself
+// leaves the keyboard over its last rows. Only the terminal's own keyboard counts: the screen's
+// would otherwise resize the hidden console under it. Folded, the keyboard is below the fold and
+// the terminal above it, so it keeps its full height.
+final class TerminalContainer: UIView {
+    private let terminal: TerminalView
+    private var toBottom: NSLayoutConstraint!
+    private var toKeyboard: NSLayoutConstraint!
+    var followsKeyboard = true {
+        didSet { if followsKeyboard != oldValue { update() } }
+    }
+
+    init(terminal: TerminalView) {
+        self.terminal = terminal
+        super.init(frame: terminal.frame)
+        terminal.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(terminal)
+        keyboardLayoutGuide.followsUndockedKeyboard = true
+        // Hidden, the guide is this view's bottom rather than the safe area's: the terminal goes
+        // under the home indicator as it did before, in full screen too.
+        keyboardLayoutGuide.usesBottomSafeArea = false
+        toBottom = terminal.bottomAnchor.constraint(equalTo: bottomAnchor)
+        toKeyboard = terminal.bottomAnchor.constraint(equalTo: keyboardLayoutGuide.topAnchor)
+        // Just short of required, so the `lessThanOrEqualTo` below wins when the two disagree.
+        toKeyboard.priority = .required - 1
+        NSLayoutConstraint.activate([
+            terminal.topAnchor.constraint(equalTo: topAnchor),
+            terminal.leadingAnchor.constraint(equalTo: leadingAnchor),
+            terminal.trailingAnchor.constraint(equalTo: trailingAnchor),
+            // A keyboard whose top is past this view's bottom never makes the terminal taller.
+            terminal.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor),
+            toBottom,
+        ])
+        for name in [UIResponder.keyboardWillShowNotification, UIResponder.keyboardWillHideNotification,
+                     UIResponder.keyboardWillChangeFrameNotification] {
+            NotificationCenter.default.addObserver(self, selector: #selector(keyboardChanging), name: name, object: nil)
+        }
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    // Sent before the keyboard animates, and after the first responder has changed, so the
+    // terminal moves with the keyboard rather than after it.
+    @objc private func keyboardChanging() { update() }
+
+    private func update() {
+        let follow = followsKeyboard && terminal.isFirstResponder
+        guard follow != toKeyboard.isActive else { return }
+        // Deactivate before activating: both active at once is a conflict.
+        if follow {
+            toBottom.isActive = false
+            toKeyboard.isActive = true
+        } else {
+            toKeyboard.isActive = false
+            toBottom.isActive = true
+        }
+    }
 }
 #endif

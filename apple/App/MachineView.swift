@@ -487,8 +487,6 @@ struct MachineView: View {
     @Binding var fullscreen: Bool
     let onDelete: () -> Void
     @State private var viewSize = CGSize.zero
-    // Duo unfolded in portrait: the screen above the software keyboard instead of under it.
-    @AppStorage("keyboardBelowScreen") private var keyboardBelowScreen = false
     @State private var softwareKeyboard = false
     @State private var editingSettings = false
     // Partially open in portrait (FoldedLayout.swift): the guest above the fold, the controls below.
@@ -500,27 +498,11 @@ struct MachineView: View {
     private var screenPane: ScreenPane {
         #if os(iOS)
         ScreenPane(surface: model.screen, input: model, showsSoftwareKeyboard: $softwareKeyboard,
-                   keepsAboveKeyboard: splitKeyboard || fold != nil, folded: fold != nil, foldedBar: model.screenFoldedKeyBar)
+                   folded: fold != nil, foldedBar: model.screenFoldedKeyBar)
         #else
         ScreenPane(surface: model.screen, input: model)
         #endif
     }
-
-    // A phone held upright whose screen is nearly square: a foldable unfolded. Measured without
-    // the keyboard, which would otherwise make it look landscape once shown.
-    private var unfoldedPortrait: Bool {
-        #if os(iOS)
-        UIDevice.current.userInterfaceIdiom == .phone && viewSize.height > viewSize.width
-            && viewSize.width / viewSize.height >= Self.unfoldedAspect
-        #else
-        false
-        #endif
-    }
-
-    // Width over height above any slab phone's (about 0.46) and below a foldable's inner screen.
-    private static let unfoldedAspect: CGFloat = 0.6
-
-    private var splitKeyboard: Bool { keyboardBelowScreen && unfoldedPortrait && model.view == .screen }
 
     // The guest's part of the view: above the fold, short of it by the clearance, when folded; else
     // all of it.
@@ -538,8 +520,7 @@ struct MachineView: View {
                         .opacity(model.view == .terminal ? 1 : 0)
                         .allowsHitTesting(model.view == .terminal)
                     if model.definition.display.hasScreen {
-                        // Under the keyboard by default; above it when split (ScreenUIView's
-                        // `keepsAboveKeyboard`).
+                        // Above the keyboard and its key bar (ScreenUIView's `contentRect`).
                         screenPane
                             .opacity(model.view == .screen ? 1 : 0)
                             .allowsHitTesting(model.view == .screen)
@@ -572,8 +553,6 @@ struct MachineView: View {
             .onChange(of: geometry.size) { viewSize = geometry.size }
         }
         .ignoresSafeArea(.keyboard)
-        // Turning the split on brings the keyboard up; a layout change (full screen, rotating) does not.
-        .onChange(of: keyboardBelowScreen) { if keyboardBelowScreen { softwareKeyboard = true } }
         #if os(iOS)
         // Folded upright is full screen; folding flat (or turning sideways) ends it. Set on a change,
         // not derived from the fold, so the Full Screen button and leaving the machine still work;
@@ -677,12 +656,6 @@ struct MachineView: View {
                     ToolbarItem(placement: Self.statusPlacement) {
                         Toggle(isOn: $softwareKeyboard) { Label("Keyboard", systemImage: "keyboard") }
                             .toggleStyle(.button)
-                    }
-                    if unfoldedPortrait {
-                        ToolbarItem(placement: Self.statusPlacement) {
-                            Toggle(isOn: $keyboardBelowScreen) { Label("Keyboard Below Screen", systemImage: "rectangle.split.1x2") }
-                                .toggleStyle(.button)
-                        }
                     }
                     #endif
                     ToolbarItem(placement: Self.statusPlacement) {

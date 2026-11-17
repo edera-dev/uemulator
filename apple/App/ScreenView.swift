@@ -308,12 +308,8 @@ final class ScreenUIView: UIView, UIKeyInput {
     private let imageLayer = CALayer()
     // The guest's pointer image, drawn where the pointer is: a touch has no host pointer to swap.
     private let pointerLayer = CALayer()
-    // The image above the software keyboard rather than under it (MachineView's Keyboard Below
-    // Screen). Follows the keyboard through `keyboardLayoutGuide`, accessory bar included.
-    var keepsAboveKeyboard = false {
-        didSet { if keepsAboveKeyboard != oldValue { setNeedsLayout() } }
-    }
-    // Pinned to the keyboard's top, so a keyboard that moves lays this view out again.
+    // Pinned to the keyboard's top, so a keyboard that moves lays this view out again: the image
+    // goes in the part above the software keyboard, key bar included, never under it.
     private let keyboardTop = UIView()
     private var pointerPixel = CGPoint.zero
     private var scrollRemainder: CGFloat = 0
@@ -421,7 +417,7 @@ final class ScreenUIView: UIView, UIKeyInput {
 
     // Where the image goes: all of the view, or the part above a shown keyboard.
     private var contentRect: CGRect {
-        guard keepsAboveKeyboard, showsSoftwareKeyboard, keyboardTop.frame.maxY < bounds.maxY else { return bounds }
+        guard showsSoftwareKeyboard, keyboardTop.frame.maxY < bounds.maxY else { return bounds }
         return CGRect(x: bounds.minX, y: bounds.minY, width: bounds.width, height: max(0, keyboardTop.frame.maxY - bounds.minY))
     }
 
@@ -551,7 +547,6 @@ struct ScreenPane: UIViewRepresentable {
     let surface: ScreenSurface
     let input: any ScreenInput
     @Binding var showsSoftwareKeyboard: Bool
-    var keepsAboveKeyboard = false
     var folded = false
     var foldedBar: KeyAccessory?
 
@@ -565,7 +560,6 @@ struct ScreenPane: UIViewRepresentable {
     func updateUIView(_ view: ScreenUIView, context: Context) {
         view.input = input
         view.showsSoftwareKeyboard = showsSoftwareKeyboard
-        view.keepsAboveKeyboard = keepsAboveKeyboard
         view.foldedBar = foldedBar
         view.folded = folded
         view.onHideKeyboard = { showsSoftwareKeyboard = false }
