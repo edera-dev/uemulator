@@ -324,3 +324,23 @@ What each step rests on, beyond `docs/plans/13-web.md`:
 - V8's tier-up: `--wasm-tiering-budget=1000` boots 15% faster (75 against 88 s to journald), `--no-liftoff` is slower (90 s: TurboFan compile time). A page cannot set flags. Liftoff spills every local at each if/else (every memory access has one), so it reloads `cpu` from its frame for every guest register access; what would help is fewer control-flow merges per block or getting warm blocks to TurboFan sooner, neither tried.
 - What is left in the interpreter by 400 s (576M instructions, from 964M): adcx (90M), adox (81M) and mulx (78M, inline since), the masked vmovdqu8 loads of glibc's string tails (63M), vpbroadcastb from a general register (16M), div (16M), cmpxchg (12M).
 - The userspace phase sent another 964M instructions through the interpreter in its first 400 s: glibc's AVX-512 string and copy functions (vmovdqu64 loads and stores, kmovd, vpcmpub/vpcmpeqb/vptestmb into opmasks, vpxorq, vpminub) and, later, bignum code (adcx, adox, mulx; most likely host key generation). The moves need only i64 loads and stores; the compares use wasm's fixed-width SIMD, which `Jit::new` probes for.
+
+## Round 6: strategies from a review of every backend (2026-11-21)
+
+A review of all three backends (ranked list of 20 items with code evidence) picked the cheap ones; four were built, each its own commit, on an M-series host at a load of 6 to 10 from other sessions. Boots are wall seconds to a console line, medians of interleaved runs (5 native, 5 or 3 under Node 26). `jit::bench` (`cargo test --release -p uemulator --lib jit::bench -- --ignored --nocapture --test-threads=1`, plus `--target x86_64-apple-darwin` and `--target wasm32-wasip1`) is new: guest loops timed in 4096-instruction slices after a check against the interpreter.
+
+| step | Debian installer | Alpine demo | Xen PV | Xen PVH |
+|---|---:|---:|---:|---:|
+| base (5246fc8) | 8.07 | 1.64 | 5.43 | 3.64 |
+| native blocks run on past a jcc (2192ec4) | 7.80 | 1.58 | 5.26 | 3.59 |
+| isb only after another handle wrote code (4bd77fa) | 7.79 | 1.55 | 5.32 | 3.60 |
+| memory string instructions do not end a block (29f6eb3) | 7.58 | 1.55 | 5.11 | 3.47 |
+
+Native aarch64; Debian netboot to the installer's first frame, the web demo's Alpine to its shell banner, `hack/perf/xen.sh pv` and `pvh-iommu`. Under Node (the wasm backend also gets the cold-block change, 440458f): Alpine 4.59 -> 4.13 s, Xen PVH 8.73 -> 7.83 s, Xen PV 13.26 -> 12.31 s.
+
+Microbenchmarks, ns per loop iteration, base -> final: `rep stosb` of 64 bytes 28.7 -> 19.0 (aarch64), 39.8 -> 26.0 (x86-64 under Rosetta), 42.6 -> 24.4 (wasm); a loop of three not-taken jcc 4.86 -> 4.22 (aarch64), 5.01 -> 4.37 (x86-64). Register, load/store, call/ret and indirect loops are unchanged within noise (Rosetta's spread is up to 20%).
+
+What was found and not built:
+
+- The run loop's exec `translate` was 10% of the Debian boot's busy samples and the page walker 17% with the data-side misses. Neither a 4096-entry TLB nor keeping kernel-half entries across CR3 writes (an experiment standing in for honouring global pages) moved the boot, so these are not capacity or CR3-flush misses; what they are is not known yet. Data and code share one TLB entry per slot: `jit::bench`'s `tlb-alias` loop (a jump table 4 MiB from its code) runs at 40 ns an iteration against 4.4 without the alias, every data access evicting the code page's exec tag.
+- Per-site indirect branches into the chain stub, cross-page links, pinning guest registers across blocks, lock-prefixed RMW on LSE, VEX moves and compares, a cheaper run-loop round trip (the device lock twice per trip in single-thread mode), and the wasm TLB-miss paths as side exits (Liftoff merges) remain from the review's list.
