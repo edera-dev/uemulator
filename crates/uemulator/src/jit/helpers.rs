@@ -51,8 +51,13 @@ pub(crate) extern "C" fn helper_exec(cpu: &mut Cpu, insn: &Insn, rip: u64) -> u6
     match cpu.exec(insn) {
         Ok(()) => {
             // An instruction that set TF, RF, DR7 or DEBUGCTL hands the rest to `step_debug`:
-            // generated code never checks for breakpoints.
-            if cpu.block_exit_requested || cpu.debug_slow_path() {
+            // generated code never checks for breakpoints. A rep string instruction that stopped
+            // after a slice of its iterations (`Cpu::string_op`) left `rip` on itself for the run
+            // loop to service events and resume it; the block must not run on past it.
+            if cpu.block_exit_requested
+                || cpu.debug_slow_path()
+                || (is_memory_string(insn) && cpu.rip == rip)
+            {
                 STATUS_EXIT_REQUESTED
             } else {
                 STATUS_OK
@@ -304,6 +309,11 @@ pub(crate) fn is_inline_terminator(insn: &Insn) -> bool {
     ) || (insn.op == 0xff && matches!(insn.reg & 7, 2 | 4))
 }
 
+/// movs, cmps, stos, lods and scas: with a rep prefix they may stop part way (`helper_exec`).
+pub(crate) fn is_memory_string(insn: &Insn) -> bool {
+    matches!(insn.op, 0xa4..=0xa7 | 0xaa..=0xaf)
+}
+
 /// rdsspd/rdsspq (`f3 0f 1e /1`, register form). It sits in the `0f 18..1f` hint-nop group the
 /// block compilers emit nothing for, but with a shadow stack in use it writes SSP, so they leave
 /// it to the interpreter (rare: a context switch, a stack unwinder).
@@ -339,18 +349,14 @@ pub(crate) fn ends_block(insn: &Insn) -> bool {
         | 0xcd
         | 0xcf
         | 0xf4 => true,
-        // ins/outs, movs/cmps, stos/lods/scas, in/out imm8, in/out dx, sti, popf, mov sreg.
-        // `cli` is not here: interrupts are only taken between blocks, so the rest of the block
-        // runs exactly as it would with IF already clear. `sti` must stay: its shadow covers one
-        // instruction, after which a pending interrupt has to be taken.
-        0x6c..=0x6f
-        | 0xa4..=0xa7
-        | 0xaa..=0xaf
-        | 0xe4..=0xe7
-        | 0xec..=0xef
-        | 0xfb
-        | 0x9d
-        | 0x8e => true,
+        // ins/outs, in/out imm8, in/out dx, sti, popf, mov sreg. `cli` is not here: interrupts
+        // are only taken between blocks, so the rest of the block runs exactly as it would with
+        // IF already clear. `sti` must stay: its shadow covers one instruction, after which a
+        // pending interrupt has to be taken. The memory string instructions (movs, cmps, stos,
+        // lods, scas) are not here either: `helper_exec` leaves the block when a rep stops part
+        // way, and otherwise the block runs on (the kernel's clear_page and memcpy are rep stos
+        // and rep movs, and each used to cost a trip through the run loop).
+        0x6c..=0x6f | 0xe4..=0xe7 | 0xec..=0xef | 0xfb | 0x9d | 0x8e => true,
         // swapgs, rdtscp, clac and stac change nothing a block caches: generated code reads the
         // GS base from `Cpu` on every access, and the soft TLB never caches a supervisor access
         // to a user page while SMAP is on (`Cpu::translate`), so AC is looked at afresh. They
@@ -1131,14 +1137,13 @@ mod tests {
     }
 
     #[test]
-    fn string_and_port_instructions_end_a_block() {
-        for op in (0x6c..=0x6f)
-            .chain(0xa4..=0xa7)
-            .chain(0xaa..=0xaf)
-            .chain(0xe4..=0xe7)
-            .chain(0xec..=0xef)
-        {
+    fn port_instructions_end_a_block_and_memory_string_ones_do_not() {
+        for op in (0x6c..=0x6f).chain(0xe4..=0xe7).chain(0xec..=0xef) {
             assert!(ends(op), "opcode {op:#x}");
+        }
+        for op in (0xa4..=0xa7).chain(0xaa..=0xaf) {
+            assert!(!ends(op), "opcode {op:#x}");
+            assert!(is_memory_string(&insn_with_op(op)), "opcode {op:#x}");
         }
     }
 
