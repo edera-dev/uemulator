@@ -1244,7 +1244,7 @@ impl Jit {
             // before the bytes are read.
             cpu.mark_code(phys_addr);
             let generation = self.shared.invalidations.load(Ordering::Acquire);
-            let decoded = decode_block(cpu, rip, phys_addr, true)?;
+            let decoded = decode_block(cpu, rip, phys_addr)?;
             match self.install(decoded, rip, phys_addr, generation, &cpu.page_has_code) {
                 Install::Ready(slot) => return Ok(Some(slot as u64)),
                 Install::Queued => {

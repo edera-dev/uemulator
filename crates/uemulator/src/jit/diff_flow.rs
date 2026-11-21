@@ -961,3 +961,73 @@ fn indirect_jump_to_an_unmapped_address_faults_at_the_target() {
     );
     assert_eq!(result.interpreter.cpu.rip, 0x1_0000_0000);
 }
+
+// clc; mov eax, 2; dec eax; jbe 1f; je 2f; mov ebx, 1; hlt; 1: mov ebx, 2; hlt; 2: mov ebx, 3; hlt
+const DEC_THEN_TWO_BRANCHES: [u8; 30] = [
+    0xf8, 0xb8, 0x02, 0x00, 0x00, 0x00, 0xff, 0xc8, 0x76, 0x08, 0x74, 0x0c, 0xbb, 0x01, 0x00, 0x00,
+    0x00, 0xf4, 0xbb, 0x02, 0x00, 0x00, 0x00, 0xf4, 0xbb, 0x03, 0x00, 0x00, 0x00, 0xf4,
+];
+const CARRY_OP_INDEX: usize = 0;
+const DEC_VALUE_INDEX: usize = 2;
+const FIRST_JCC_INDEX: usize = 8;
+const CLC: u8 = 0xf8;
+const STC: u8 = 0xf9;
+const JB_REL8: u8 = 0x72;
+const JBE_REL8: u8 = 0x76;
+
+/// Blocks run on past a jcc (`blocks::decode_block`). `dec` leaves host flags that describe ZF but
+/// not CF, so a jb or jbe after it rebuilds the flags or asks `helper_cond`, clobbering the host
+/// flags; the je after it must not test them as if they were still the `dec`'s.
+#[test]
+fn a_branch_past_a_branch_that_rebuilt_the_flags_tests_the_right_ones() {
+    for carry_op in [CLC, STC] {
+        for value in 0..3u8 {
+            for first_jcc in [JB_REL8, JBE_REL8] {
+                let mut code = DEC_THEN_TWO_BRANCHES;
+                code[CARRY_OP_INDEX] = carry_op;
+                code[DEC_VALUE_INDEX] = value;
+                code[FIRST_JCC_INDEX] = first_jcc;
+                check(&code);
+            }
+        }
+    }
+}
+
+/// A helper (cpuid) prepays the instructions before it (`Gen::helper`); a side exit of a later jcc
+/// must pay only the rest, whether it is taken (je) or falls through to another helper (jne).
+#[test]
+fn a_side_exit_after_a_helper_counts_every_instruction_once() {
+    // xor eax, eax; cpuid; cmp ebx, ebx; je 1f; xor eax, eax; cpuid; 1: add ecx, 1;
+    // xor eax, eax; cpuid; hlt
+    check(&[
+        0x31, 0xc0, 0x0f, 0xa2, 0x39, 0xdb, 0x74, 0x04, 0x31, 0xc0, 0x0f, 0xa2, 0x83, 0xc1, 0x01,
+        0x31, 0xc0, 0x0f, 0xa2, 0xf4,
+    ]);
+    // the same with jne, not taken
+    check(&[
+        0x31, 0xc0, 0x0f, 0xa2, 0x39, 0xdb, 0x75, 0x04, 0x31, 0xc0, 0x0f, 0xa2, 0x83, 0xc1, 0x01,
+        0x31, 0xc0, 0x0f, 0xa2, 0xf4,
+    ]);
+}
+
+/// A fault in the part of a block past a not-taken jcc counts the instructions before it, the
+/// branch included.
+#[test]
+fn a_fault_past_a_not_taken_branch_counts_the_branch() {
+    // mov rbx, 0x1_0000_0000; cmp eax, eax; jne 1f; add ecx, 1; mov rax, [rbx]; 1: hlt
+    let result = run_checked(
+        &[
+            0x48, 0xbb, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x39, 0xc0, 0x75, 0x06,
+            0x83, 0xc1, 0x01, 0x48, 0x8b, 0x03, 0xf4,
+        ],
+        seed_registers_and_memory,
+    );
+    assert!(
+        matches!(
+            result.interpreter_stop,
+            crate::testkit::Stop::Fault { vector: 14, .. }
+        ),
+        "{:?}",
+        result.interpreter_stop
+    );
+}

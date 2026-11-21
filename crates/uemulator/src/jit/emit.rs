@@ -468,6 +468,9 @@ pub(crate) struct Gen<'a> {
     /// Out-of-line exits taken after a store set `block_exit_requested`: (label, index of the
     /// storing instruction, rip after it).
     smc_exits: Vec<(Label, u32, u64)>,
+    /// Taken sides of conditional branches before the last instruction, emitted out of line
+    /// by `emit_slows`: (label, target, retired, `prepaid_insns` at the branch).
+    side_exits: Vec<(Label, u64, u32, u32)>,
     live: Option<LiveFlags>,
     /// An inline SSE instruction of this block already checks CR0.EM/TS and CR4.OSFXSR. Anything
     /// that changes them (mov to cr, clts, lmsw, vmrun...) ends a block, so one check at the first
@@ -512,6 +515,7 @@ impl<'a> Gen<'a> {
             insns,
             slow_paths: Vec::new(),
             smc_exits: Vec::new(),
+            side_exits: Vec::new(),
             live: None,
             sse_gated: false,
             evex_gated: false,
@@ -980,6 +984,15 @@ impl<'a> Gen<'a> {
     /// Placed after the block body (and after its final exit branch) so the hot path falls
     /// through. Also resolves all labels.
     fn emit_slows(&mut self) {
+        let side_exits = std::mem::take(&mut self.side_exits);
+        let prepaid_at_end = self.prepaid_insns;
+        for (label, target, retired, prepaid) in side_exits {
+            self.asm.bind(label);
+            // Pay as the branch would have: helpers after it may have prepaid more.
+            self.prepaid_insns = prepaid;
+            self.chain_to(target, retired);
+        }
+        self.prepaid_insns = prepaid_at_end;
         let smc_exits = std::mem::take(&mut self.smc_exits);
         for (exit, insn_index, next_rip) in smc_exits {
             self.asm.bind(exit);
@@ -2073,10 +2086,13 @@ impl<'a> Gen<'a> {
         CondMap::Cond(NE)
     }
 
-    /// Conditional branch ending the block; both outcomes exit with `retired` instructions done.
-    fn jcc(&mut self, condition: u8, target: u64, next_rip: u64, retired: u32) {
+    /// Conditional branch. As the block's last instruction both outcomes exit with `retired`
+    /// instructions done; before it (blocks run on past conditional branches,
+    /// `blocks::decode_block`) the taken side is a side exit emitted out of line by `emit_slows`
+    /// and the not-taken side falls through into the rest of the block, host flags untouched.
+    fn jcc(&mut self, condition: u8, target: u64, next_rip: u64, retired: u32, last: bool) {
         let chaining = self.addrs.chain != 0;
-        if chaining {
+        if chaining && last {
             // Both outcomes retire the same instructions, so pay once, ahead of the branch.
             self.pay_icount(retired);
         }
@@ -2100,7 +2116,16 @@ impl<'a> Gen<'a> {
                 self.call(self.addrs.cond);
                 self.asm.cbnz(0, taken, true);
                 self.asm.bind(resume);
+                // The rebuild and the helper call clobbered NZCV, which `live` may still describe
+                // (a live kind this condition has no mapping for): a later jcc of this block,
+                // past the branch, must not test them.
+                self.live = None;
             }
+        }
+        if !last {
+            self.side_exits
+                .push((taken, target, retired, self.prepaid_insns));
+            return;
         }
         if chaining {
             self.link_slot(next_rip);
@@ -2639,7 +2664,8 @@ impl<'a> Gen<'a> {
             // jcc rel8 / rel32
             0x70..=0x7f | 0x180..=0x18f => {
                 let target = next_rip.wrapping_add(insn.imm as u64);
-                self.jcc((insn.op & 15) as u8, target, next_rip, retired);
+                let last = index + 1 == self.insns.len();
+                self.jcc((insn.op & 15) as u8, target, next_rip, retired, last);
                 self.inlined += 1;
                 return true;
             }
@@ -3405,7 +3431,9 @@ impl<'a> Gen<'a> {
             };
             let terminal = ends_block(&self.insns[index]);
             if self.try_inline(index, rip, next_rip) {
-                if is_inline_terminator(&self.insns[index]) {
+                if is_inline_terminator(&self.insns[index])
+                    && !(is_conditional_branch(&self.insns[index]) && index + 1 < count)
+                {
                     self.emit_slows();
                     return;
                 }

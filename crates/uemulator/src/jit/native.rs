@@ -567,7 +567,7 @@ impl Jit {
                 hook(cpu);
             }
             let generation = self.shared.invalidations.load(Ordering::Acquire);
-            let decoded = decode_block(cpu, rip, phys_addr, false)?;
+            let decoded = decode_block(cpu, rip, phys_addr)?;
             #[cfg(test)]
             if let Some(hook) = BEFORE_INSTALL.with(|hook| hook.borrow_mut().take()) {
                 hook(cpu);
@@ -1540,7 +1540,9 @@ mod tests {
         let mut unchained = cpu_running(&COUNTDOWN_LOOP);
         unchained.jit = Some(Box::new(new_unchained_jit()));
         unchained.next_event = u64::MAX;
-        assert!(steps_to_halt(&mut unchained) > 100);
+        // One call per iteration: the taken jnz leaves for the caller each time (the hlt after it
+        // is in the same block, past the branch).
+        assert!(steps_to_halt(&mut unchained) >= 100);
         assert_eq!(unchained.icount, COUNTDOWN_LOOP_INSNS);
     }
 

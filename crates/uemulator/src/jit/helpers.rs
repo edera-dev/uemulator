@@ -291,7 +291,7 @@ pub(crate) extern "C" fn helper_cond(cpu: &mut Cpu, cc: u64) -> u64 {
 /// call/jmp (`ff /2`, `ff /4`; a form the emitter does not lower goes to the interpreter helper,
 /// which also ends the block). All of them are also `ends_block`. Keep in step with the terminal
 /// arms of `try_inline`.
-/// jcc rel8 and rel32: the one kind of block end the WebAssembly backend can decode past
+/// jcc rel8 and rel32: the one kind of block end the block compilers decode past
 /// (`blocks::decode_block`), making the taken branch a side exit.
 pub(crate) fn is_conditional_branch(insn: &Insn) -> bool {
     matches!(insn.op, 0x70..=0x7f | 0x180..=0x18f)

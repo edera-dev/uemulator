@@ -65,18 +65,15 @@ pub(super) struct Decoded {
 
 /// Reads the instructions of one block from guest RAM. Takes no lock.
 ///
-/// With `past_branches` a conditional branch does not end the block: decoding goes on with the
+/// A conditional branch does not end the block: decoding goes on with the
 /// instruction after it, as long as that is in the same page and the block has room, so the
-/// block runs on along the not-taken path and the taken one becomes a side exit. The
-/// WebAssembly backend asks for it: there a block boundary costs an indirect tail call into
-/// another module instance plus the checks of a linked exit, and blocks that end at every jcc
-/// averaged 4.5 instructions in a desktop boot.
-pub(super) fn decode_block(
-    cpu: &mut Cpu,
-    rip: u64,
-    phys_addr: u64,
-    past_branches: bool,
-) -> Result<Decoded, Exception> {
+/// block runs on along the not-taken path and the taken one becomes a side exit. On WebAssembly a block boundary costs an indirect tail call into another module
+/// instance plus the checks of a linked exit, and blocks that end at every jcc averaged 4.5
+/// instructions in a desktop boot; natively each boundary pays the icount store and a linked
+/// entry's deadline check. The side exits are what the generators must get right: flags they
+/// clobber deciding one branch are not live for the next (`emit::Gen::jcc`), and an exit pays
+/// icount with the prepayment as of its branch, not the block's end.
+pub(super) fn decode_block(cpu: &mut Cpu, rip: u64, phys_addr: u64) -> Result<Decoded, Exception> {
     let bytes_left_in_page = (PAGE_SIZE - (phys_addr & PAGE_MASK)) as usize;
     let mut insns: Vec<Insn> = Vec::new();
     let mut insn_rips: Vec<u64> = Vec::new();
@@ -97,9 +94,7 @@ pub(super) fn decode_block(
                 end_rip = entry_rip + offset as u64;
                 insns.push(insn);
                 let last = insns.last().unwrap();
-                if helpers::ends_block(last)
-                    && !(past_branches && helpers::is_conditional_branch(last))
-                {
+                if helpers::ends_block(last) && !helpers::is_conditional_branch(last) {
                     break;
                 }
             }

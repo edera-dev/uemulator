@@ -369,8 +369,8 @@ fn links_patched_by_one_handle_are_followed_by_blocks_another_runs() {
     assert_eq!(other.icount, COUNTDOWN_LOOP_INSNS);
     assert_eq!(
         other.jit.as_ref().unwrap().stats().translated,
-        translated + 1,
-        "only the final `hlt` block, which the warm-up never reached"
+        translated,
+        "nothing new: the loop's block runs on past its jnz to the final `hlt`"
     );
 }
 

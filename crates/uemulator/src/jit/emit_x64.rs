@@ -339,6 +339,9 @@ pub(crate) struct Gen<'a> {
     slows: Vec<Slow>,
     /// Out-of-line `(label, insn_index, next rip)` exits taken when a store requested a block exit.
     smc: Vec<(Label, u32, u64)>,
+    /// Taken sides of conditional branches before the last instruction, emitted out of line
+    /// by `emit_slows`: (label, target, retired, `prepaid_insns` at the branch).
+    side_exits: Vec<(Label, u64, u32, u32)>,
     /// Host flags currently equal the guest flags (set by the last inlined flag-setting
     /// instruction). Every instruction that emits code which may clobber them must clear this;
     /// the memory access paths do it in `tlb_probe`.
@@ -397,6 +400,7 @@ impl<'a> Gen<'a> {
             insns,
             slows: Vec::new(),
             smc: Vec::new(),
+            side_exits: Vec::new(),
             live: false,
             sse_gated: false,
             evex_gated: false,
@@ -779,6 +783,15 @@ impl<'a> Gen<'a> {
     /// on `dst`, for loads, and `ACC`/`OPERAND` for a preserving store) surviving a memory
     /// access.
     fn emit_slows(&mut self) {
+        let side_exits = std::mem::take(&mut self.side_exits);
+        let prepaid_at_end = self.prepaid_insns;
+        for (label, target, retired, prepaid) in side_exits {
+            self.a.bind(label);
+            // Pay as the branch would have: helpers after it may have prepaid more.
+            self.prepaid_insns = prepaid;
+            self.chain_to(target, retired);
+        }
+        self.prepaid_insns = prepaid_at_end;
         let smc = std::mem::take(&mut self.smc);
         for (label, insn_index, next) in smc {
             self.a.bind(label);
@@ -1605,7 +1618,11 @@ impl<'a> Gen<'a> {
     /// Conditional branch ending the block. With `live` host flags the guest condition code is
     /// also the host one; otherwise `helper_cond` evaluates it from the lazy flags. Both exits
     /// run `chain_exit` after the branch, which clobbers the flags the branch has already used.
-    fn jcc(&mut self, cc: u8, target: u64, next: u64, retired: u32) {
+    /// Conditional branch. As the block's last instruction both outcomes exit; before it (blocks
+    /// run on past conditional branches, `blocks::decode_block`) the taken side is a side exit
+    /// emitted out of line and the not-taken side falls through into the rest of the block,
+    /// with `live` as the branch left it.
+    fn jcc(&mut self, cc: u8, target: u64, next: u64, retired: u32, last: bool) {
         let taken = self.a.label();
         if self.live {
             self.a.jcc(cc & 15, taken);
@@ -1625,6 +1642,11 @@ impl<'a> Gen<'a> {
             self.a.test_rr(ACC, ACC, true);
             self.a.jcc(NE, taken);
             self.a.bind(resume);
+        }
+        if !last {
+            self.side_exits
+                .push((taken, target, retired, self.prepaid_insns));
+            return;
         }
         self.chain_to(next, retired);
         self.a.bind(taken);
@@ -2107,7 +2129,8 @@ impl<'a> Gen<'a> {
             // jcc rel8 / rel32
             0x70..=0x7f | 0x180..=0x18f => {
                 let target = next.wrapping_add(insn.imm as u64);
-                self.jcc((insn.op & 15) as u8, target, next, retired);
+                let last = index + 1 == self.insns.len();
+                self.jcc((insn.op & 15) as u8, target, next, retired, last);
                 self.inlined += 1;
                 return true;
             }
@@ -2760,7 +2783,9 @@ impl<'a> Gen<'a> {
             };
             let terminal = ends_block(&self.insns[index]);
             if self.try_inline(index, rip, next) {
-                if is_inline_terminator(&self.insns[index]) {
+                if is_inline_terminator(&self.insns[index])
+                    && !(is_conditional_branch(&self.insns[index]) && index + 1 < count)
+                {
                     self.emit_slows();
                     return;
                 }
