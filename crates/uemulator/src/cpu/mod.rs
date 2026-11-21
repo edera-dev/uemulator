@@ -370,11 +370,16 @@ pub(crate) const TLB_FLAG_PROTECTION_KEY_MASK: TlbFlags = 0xf;
 /// The page is a shadow-stack page (`cet.rs`): the leaf is read-only and dirty and every level
 /// above it writable. Only shadow-stack accesses look at it, and they always walk.
 pub(crate) const TLB_FLAG_SHADOW_STACK: TlbFlags = 1 << 8;
-pub(crate) const TLB_INDEX_BITS: usize = 10;
+/// The leaf is global (PTE bit 8 with CR4.PGE): a CR3 write keeps it (`flush_tlb_non_global`).
+pub(crate) const TLB_FLAG_GLOBAL: TlbFlags = 1 << 9;
+pub(crate) const TLB_INDEX_BITS: usize = 12;
 /// `Cpu::tlb` holds two halves of this many entries: supervisor first, then user. They are
 /// separate because the same page can be accessible to one privilege and not the other, and a
 /// CPL change then only has to swap `tlb_active_base` instead of flushing.
 pub(crate) const TLB_ENTRIES_PER_MODE: usize = 1 << TLB_INDEX_BITS;
+
+/// Length of `Cpu::tlb_filled`: a bit for each slot of both halves.
+pub(crate) const TLB_FILLED_WORDS: usize = 2 * TLB_ENTRIES_PER_MODE / u64::BITS as usize;
 
 /// Decoded instruction cache slot, keyed by guest physical address. Valid only while
 /// `generation` equals `Cpu::decode_cache_generation`.
@@ -572,6 +577,16 @@ pub(crate) struct Cpu {
     /// address is stable for `tlb_active_base`.
     #[snapshot(skip)]
     pub tlb: Vec<TlbEntry>,
+    /// One bit per `tlb` slot that may hold something: `flush_tlb` empties only those, since a
+    /// guest flushes thousands of times a second (every CR3 write) and fills only a few hundred
+    /// slots in between. Every fill must set its bit, or a flush leaves that entry behind; it
+    /// swaps with `tlb` (`svm::ParkedTlb`).
+    #[snapshot(skip)]
+    pub tlb_filled: Vec<u64>,
+    /// The slots of `tlb_filled` whose entry is a global page, which a CR3 write keeps. Never
+    /// set without the slot's `tlb_filled` bit.
+    #[snapshot(skip)]
+    pub tlb_global: Vec<u64>,
     #[snapshot(skip)]
     pub decode_cache: Vec<DecodeCacheEntry>,
     /// Bumping it invalidates the whole decode cache at once. Starts at 1 so the zeroed
@@ -976,6 +991,8 @@ impl Cpu {
             interrupt_shadow: false,
             ram,
             tlb: vec![TLB_EMPTY; 2 * TLB_ENTRIES_PER_MODE],
+            tlb_filled: vec![0; TLB_FILLED_WORDS],
+            tlb_global: vec![0; TLB_FILLED_WORDS],
             ram_base: 0,
             decode_cache: if has_machine_state {
                 vec![
@@ -2079,7 +2096,7 @@ mod cpu_tests {
         fn page_constants_agree() {
             assert_eq!(PAGE_SIZE, 4096);
             assert_eq!(PAGE_OFFSET_MASK, 0xfff);
-            assert_eq!(TLB_ENTRIES_PER_MODE, 1024);
+            assert_eq!(TLB_ENTRIES_PER_MODE, 4096);
             assert_eq!(USER_CPL, 3);
             assert_eq!(GPR_RSP, 4);
             assert_eq!(

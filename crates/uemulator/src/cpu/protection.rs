@@ -13,6 +13,9 @@ use super::{Cpu, ExecResult, MONITOR_WATCH_BYTES};
 const INVPCID_DESCRIPTOR_RESERVED: u64 = !0xfff;
 const INVPCID_TYPE_MAX: u64 = 3;
 const INVPCID_TYPE_INDIVIDUAL_ADDRESS: u64 = 0;
+/// Types 1 (one PCID) and 3 (every PCID) leave global translations alone; 0 and 2 do not.
+const INVPCID_TYPE_SINGLE_CONTEXT: u64 = 1;
+const INVPCID_TYPE_ALL_CONTEXTS_EXCEPT_GLOBAL: u64 = 3;
 
 /// MWAIT's ECX extensions: bit 0 = treat masked interrupts as break events. Other bits are
 /// reserved and #GP.
@@ -32,9 +35,10 @@ impl Cpu {
         Ok(())
     }
 
-    /// 66 0F 38 82 (invpcid r64, m128). The soft TLB is not tagged with PCIDs, so every type
-    /// flushes it entirely, which is always a legal over-approximation of the narrower ones;
-    /// operand validation is as specified so a guest probing the instruction sees the faults.
+    /// 66 0F 38 82 (invpcid r64, m128). The soft TLB is not tagged with PCIDs, so each type
+    /// flushes every PCID's entries, which is always a legal over-approximation of the narrower
+    /// ones; the types that keep global translations keep them here too. Operand validation is
+    /// as specified so a guest probing the instruction sees the faults.
     pub(super) fn invpcid(&mut self, i: &Insn, next: u64) -> ExecResult<()> {
         if i.md == 3 || !i.p66 {
             return Err(Exception::invalid_opcode());
@@ -55,7 +59,14 @@ impl Cpu {
         if kind == INVPCID_TYPE_INDIVIDUAL_ADDRESS && !self.is_canonical_linear(linear) {
             return Err(Exception::general_protection(0));
         }
-        self.flush_tlb();
+        if matches!(
+            kind,
+            INVPCID_TYPE_SINGLE_CONTEXT | INVPCID_TYPE_ALL_CONTEXTS_EXCEPT_GLOBAL
+        ) {
+            self.flush_tlb_non_global();
+        } else {
+            self.flush_tlb();
+        }
         self.rip = next;
         Ok(())
     }

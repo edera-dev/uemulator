@@ -188,7 +188,7 @@ Nested paging (`nested_translate`, used by `walk` for every guest page-table rea
 
 ## Control-register rules outside long mode
 
-`write_cr0`/`write_cr3`/CR4 writes/EFER follow SDM 2.5 and 9.8.5: CR3 is 32 bits wide unless EFER.LMA (bits 63:32 are #GP; 32-bit paging keeps bits 31:12 plus PWT/PCD, PAE keeps 31:5 plus PWT/PCD and latches the PDPTEs, #GP on a malformed present entry before CR3 changes); EFER.LME may only change while CR0.PG is clear; setting CR0.PG with LME needs CR4.PAE and a non-64-bit code segment (CS.L clear); CR4.PCIDE needs EFER.LMA and CR0.PG cannot be cleared while PCIDE is set. Any CR0/CR3/CR4 write flushes the soft TLB; a change of paging format also flushes the decode cache. The JIT is unaffected: it only runs 64-bit code and inlines TLB probes that are filled from `translate` in whatever format was active, so the TLB is always flushed on a format change.
+`write_cr0`/`write_cr3`/CR4 writes/EFER follow SDM 2.5 and 9.8.5: CR3 is 32 bits wide unless EFER.LMA (bits 63:32 are #GP; 32-bit paging keeps bits 31:12 plus PWT/PCD, PAE keeps 31:5 plus PWT/PCD and latches the PDPTEs, #GP on a malformed present entry before CR3 changes); EFER.LME may only change while CR0.PG is clear; setting CR0.PG with LME needs CR4.PAE and a non-64-bit code segment (CS.L clear); CR4.PCIDE needs EFER.LMA and CR0.PG cannot be cleared while PCIDE is set. Any CR0/CR4 write flushes the soft TLB, a CR3 write all but its global pages (04); a change of paging format also flushes the decode cache. The JIT is unaffected: it only runs 64-bit code and inlines TLB probes that are filled from `translate` in whatever format was active, so the TLB is always flushed on a format change.
 
 ## AVX-512
 

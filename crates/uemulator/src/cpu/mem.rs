@@ -2,7 +2,7 @@ use super::decode::{self, DecodeErr, Insn};
 use super::exception::{Exception, VECTOR_GENERAL_PROTECTION, VECTOR_PAGE_FAULT};
 use super::flags::*;
 use super::pku::{PKRU_ACCESS_DISABLE, PKRU_WRITE_DISABLE};
-use super::sys::{CR4_LA57, CR4_PKE, CR4_PSE, CR4_SMAP, CR4_SMEP, PHYSICAL_ADDRESS_BITS};
+use super::sys::{CR4_LA57, CR4_PGE, CR4_PKE, CR4_PSE, CR4_SMAP, CR4_SMEP, PHYSICAL_ADDRESS_BITS};
 use super::*;
 use crate::dev::guestmem::GuestMem;
 
@@ -33,6 +33,8 @@ const PTE_ACCESSED: u64 = 1 << 5;
 const PTE_DIRTY: u64 = 1 << 6;
 /// Makes a PDPT entry a 1 GiB leaf or a PD entry a 2 MiB leaf.
 const PTE_PAGE_SIZE: u64 = 1 << 7;
+/// Bit 8 of a leaf in every paging format; it means something only with CR4.PGE.
+const PTE_GLOBAL: u64 = 1 << 8;
 const PTE_NO_EXECUTE: u64 = 1 << 63;
 /// IA-32e leaf bits 62:59: the protection key. Ignored without CR4.PKE, and never reserved.
 const PTE_PROTECTION_KEY_SHIFT: u32 = 59;
@@ -376,6 +378,9 @@ impl Cpu {
         // can never produce, under levels that are all writable (APM 18.x, SDM 4.6).
         if upper_levels_writable && pte & PTE_WRITABLE == 0 && pte & PTE_DIRTY != 0 {
             tlb_flags |= TLB_FLAG_SHADOW_STACK;
+        }
+        if pte & PTE_GLOBAL != 0 && self.cr4 & CR4_PGE != 0 {
+            tlb_flags |= TLB_FLAG_GLOBAL;
         }
         tlb_flags
     }
@@ -838,7 +843,7 @@ impl Cpu {
             {
                 refilled.tag_w = page;
             }
-            self.tlb[slot] = refilled;
+            self.fill_tlb(slot, refilled, walk_flags & TLB_FLAG_GLOBAL != 0);
         }
         Ok(page_pa | (linear & PAGE_OFFSET_MASK))
     }
@@ -929,16 +934,56 @@ impl Cpu {
             };
             refilled.addend = (self.ram_base + page).wrapping_sub(linear_page);
             refilled.tag_w = linear_page | TLB_TAG_SHADOW_STACK;
-            self.tlb[slot] = refilled;
+            self.fill_tlb(slot, refilled, flags & TLB_FLAG_GLOBAL != 0);
         }
         Ok(page | (linear & PAGE_OFFSET_MASK))
     }
 
     pub fn flush_tlb(&mut self) {
-        for entry in self.tlb.iter_mut() {
-            *entry = TLB_EMPTY;
+        self.empty_tlb_slots(true);
+    }
+
+    /// What a CR3 write or INVPCID's non-global types drop (SDM 4.10.4.1): everything but the
+    /// global pages. Linux maps the kernel global and switches CR3 on every context switch, so
+    /// the kernel's translations survive the switch, as they do on hardware. Anything that
+    /// changes what "global" means (CR4.PGE, CR0.PG) must call `flush_tlb` instead.
+    pub(crate) fn flush_tlb_non_global(&mut self) {
+        self.empty_tlb_slots(false);
+    }
+
+    fn empty_tlb_slots(&mut self, including_global: bool) {
+        for (word_index, (filled_word, global_word)) in self
+            .tlb_filled
+            .iter_mut()
+            .zip(self.tlb_global.iter_mut())
+            .enumerate()
+        {
+            let kept = if including_global { 0 } else { *global_word };
+            let mut emptied = *filled_word & !kept;
+            *filled_word = kept;
+            *global_word = kept;
+            while emptied != 0 {
+                let slot = word_index * u64::BITS as usize + emptied.trailing_zeros() as usize;
+                self.tlb[slot] = TLB_EMPTY;
+                emptied &= emptied - 1;
+            }
         }
+        // Large leaves do not record whether they are global; a walk refills them.
         self.large_pages = [LARGE_PAGE_EMPTY; LARGE_PAGE_CACHE_ENTRIES];
+    }
+
+    /// Stores a TLB entry and records the slot for the flushes.
+    #[inline]
+    fn fill_tlb(&mut self, slot: usize, entry: TlbEntry, global: bool) {
+        self.tlb[slot] = entry;
+        let word = slot / u64::BITS as usize;
+        let bit = 1 << (slot % u64::BITS as usize);
+        self.tlb_filled[word] |= bit;
+        if global {
+            self.tlb_global[word] |= bit;
+        } else {
+            self.tlb_global[word] &= !bit;
+        }
     }
 
     /// Empties the page's slot in both halves; whatever other page shares the slot goes too.
@@ -1130,15 +1175,30 @@ impl Cpu {
     /// in the one SVM parked (`svm::ParkedTlb`), which comes back without a refill.
     pub(super) fn revoke_write_tags_for(&mut self, page: usize) {
         let ram_base = self.ram_base;
+        self.for_each_filled_tlb_entry(|entry| {
+            if entry.tag_w != TLB_TAG_INVALID && write_tag_page(entry, ram_base) == page {
+                entry.tag_w = TLB_TAG_INVALID;
+            }
+        });
+    }
+
+    /// Visits every entry `flush_tlb` would empty, in the running TLB and the parked one: the
+    /// others are empty. The TLB is too big to scan whole at every page that gains code.
+    pub(super) fn for_each_filled_tlb_entry(&mut self, mut visit: impl FnMut(&mut TlbEntry)) {
         let parked = self
             .svm
             .parked_tlb
             .as_deref_mut()
-            .map(|parked| &mut parked.entries);
-        for entries in core::iter::once(&mut self.tlb).chain(parked) {
-            for entry in entries.iter_mut() {
-                if entry.tag_w != TLB_TAG_INVALID && write_tag_page(entry, ram_base) == page {
-                    entry.tag_w = TLB_TAG_INVALID;
+            .map(|parked| parked.entries_and_filled());
+        for (entries, filled) in core::iter::once((&mut self.tlb, &self.tlb_filled)).chain(parked) {
+            for (word_index, word) in filled.iter().enumerate() {
+                let mut bits = *word;
+                while bits != 0 {
+                    visit(
+                        &mut entries
+                            [word_index * u64::BITS as usize + bits.trailing_zeros() as usize],
+                    );
+                    bits &= bits - 1;
                 }
             }
         }
@@ -2463,6 +2523,74 @@ mod tests {
             h.cpu.translate(VA, AccessKind::Write, false).unwrap();
             let entry = slot_of(&h.cpu, VA, false);
             assert_eq!((entry.tag_r, entry.tag_w, entry.tag_x), (VA, VA, VA));
+        }
+
+        #[test]
+        fn a_cr3_write_keeps_global_pages_and_drops_the_rest() {
+            let (mut h, mut tables) = paged();
+            h.cpu.cr4 |= CR4_PGE;
+            tables.map_4k(&mut h.cpu, VA, PA, PTE_PRESENT_WRITABLE_USER | PTE_GLOBAL);
+            tables.map_4k(&mut h.cpu, VA + PAGE, PA + PAGE, PTE_PRESENT_WRITABLE_USER);
+            for page in [VA, VA + PAGE] {
+                h.cpu.translate(page, AccessKind::Read, false).unwrap();
+            }
+            let cr3 = h.cpu.cr3;
+            h.cpu.write_cr3(cr3).unwrap();
+            assert_eq!(slot_of(&h.cpu, VA, false).tag_r, VA, "the global page went");
+            assert_eq!(slot_of(&h.cpu, VA + PAGE, false).tag_r, TLB_TAG_INVALID);
+            h.cpu.flush_tlb();
+            assert_eq!(slot_of(&h.cpu, VA, false).tag_r, TLB_TAG_INVALID);
+        }
+
+        #[test]
+        fn the_global_bit_means_nothing_without_cr4_pge() {
+            let (mut h, mut tables) = paged();
+            tables.map_4k(&mut h.cpu, VA, PA, PTE_PRESENT_WRITABLE_USER | PTE_GLOBAL);
+            h.cpu.translate(VA, AccessKind::Read, false).unwrap();
+            let cr3 = h.cpu.cr3;
+            h.cpu.write_cr3(cr3).unwrap();
+            assert_eq!(slot_of(&h.cpu, VA, false).tag_r, TLB_TAG_INVALID);
+        }
+
+        /// A slot that held a global page and was refilled with a non-global one must not keep
+        /// its global mark, or a CR3 write would leave the second page behind.
+        #[test]
+        fn a_non_global_page_refilling_a_global_slot_goes_at_the_next_cr3_write() {
+            let (mut h, mut tables) = paged();
+            h.cpu.cr4 |= CR4_PGE;
+            let aliasing_va = VA + TLB_ENTRIES_PER_MODE as u64 * PAGE;
+            tables.map_4k(&mut h.cpu, VA, PA, PTE_PRESENT_WRITABLE_USER | PTE_GLOBAL);
+            tables.map_4k(
+                &mut h.cpu,
+                aliasing_va,
+                PA + PAGE,
+                PTE_PRESENT_WRITABLE_USER,
+            );
+            h.cpu.translate(VA, AccessKind::Read, false).unwrap();
+            h.cpu
+                .translate(aliasing_va, AccessKind::Read, false)
+                .unwrap();
+            assert_eq!(slot_of(&h.cpu, VA, false).tag_r, aliasing_va);
+            let cr3 = h.cpu.cr3;
+            h.cpu.write_cr3(cr3).unwrap();
+            assert_eq!(slot_of(&h.cpu, VA, false).tag_r, TLB_TAG_INVALID);
+        }
+
+        /// Clearing CR4.PGE is how a kernel drops its global translations (Linux's
+        /// `__flush_tlb_global` without INVPCID).
+        #[test]
+        fn a_cr4_write_drops_global_pages() {
+            // mov cr4, rax; hlt
+            let mut h = Harness::new(&[0x0f, 0x22, 0xe0, HLT]);
+            let mut tables = PageTables::new(&mut h.cpu);
+            tables.map_4k(&mut h.cpu, CODE_BASE, CODE_BASE, PTE_PRESENT_WRITABLE_USER);
+            h.cpu.cr4 |= CR4_PGE;
+            tables.map_4k(&mut h.cpu, VA, PA, PTE_PRESENT_WRITABLE_USER | PTE_GLOBAL);
+            h.cpu.translate(VA, AccessKind::Read, false).unwrap();
+            h.cpu.gpr[crate::testkit::RAX] = h.cpu.cr4 & !CR4_PGE;
+            h.run(1);
+            assert_eq!(h.cpu.cr4 & CR4_PGE, 0, "the mov did not run");
+            assert_eq!(slot_of(&h.cpu, VA, false).tag_r, TLB_TAG_INVALID);
         }
 
         #[test]

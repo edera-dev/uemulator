@@ -41,6 +41,67 @@ fn pte_address(linear: u64) -> usize {
     (PAGE_TABLE + (linear - (SCRATCH & !((1 << HUGE_PAGE_SHIFT) - 1))) / PAGE_BYTES * 8) as usize
 }
 
+/// 2 MiB frames of harness RAM that nothing else uses (above the stack, around the fake kernel
+/// at 16 MiB). The TLB tests map linear windows onto them: identity-mapped RAM is too small to
+/// sweep more pages than the TLB holds or to put eight pages in one slot.
+const FREE_LARGE_FRAMES: [u64; 11] = [
+    0x80_0000, 0xa0_0000, 0xc0_0000, 0xe0_0000, 0x120_0000, 0x140_0000, 0x160_0000, 0x180_0000,
+    0x1a0_0000, 0x1c0_0000, 0x1e0_0000,
+];
+const PDE_LARGE_PAGE: u64 = 1 << 7;
+/// Linear addresses this far apart share a TLB slot.
+const TLB_SLOT_STRIDE: u64 = crate::cpu::TLB_ENTRIES_PER_MODE as u64 * PAGE_BYTES;
+/// The window the sweeps walk through, one 2 MiB frame after another.
+const SWEEP_WINDOW: u64 = 0x4000_0000;
+const SWEEP_WINDOW_FRAMES: usize = 9;
+/// Pages per half of a sweep; the two halves together visit more pages than the TLB has slots.
+const SWEEP_HALF_PAGES: u64 = 2304;
+const _: () = assert!(2 * SWEEP_HALF_PAGES > crate::cpu::TLB_ENTRIES_PER_MODE as u64);
+const _: () = assert!(
+    2 * SWEEP_HALF_PAGES * PAGE_BYTES <= SWEEP_WINDOW_FRAMES as u64 * (1 << HUGE_PAGE_SHIFT)
+);
+/// The conflict tests' pages: `TLB_SLOT_STRIDE` apart, one frame each.
+const CONFLICT_WINDOW: u64 = 0x5000_0000;
+const _: () = assert!(
+    TLB_SLOT_STRIDE == 0x100_0000,
+    "the conflict programs encode the stride"
+);
+
+/// Points the 2 MiB page-directory entry for `linear` (below 4 GiB, where `boot::load`'s page
+/// directories are consecutive) at `frame`.
+fn map_large(harness: &mut Harness, linear: u64, frame: u64) {
+    let directory_entry =
+        harness.cpu.cr3 + FIRST_PAGE_DIRECTORY_OFFSET + (linear >> HUGE_PAGE_SHIFT) * PDE_BYTES;
+    harness.write_u64(
+        directory_entry,
+        frame | PTE_PRESENT | PTE_WRITABLE | PDE_LARGE_PAGE,
+    );
+}
+
+fn sweep_window_setup(harness: &mut Harness) {
+    seed_registers_and_memory(harness);
+    for (index, frame) in FREE_LARGE_FRAMES[..SWEEP_WINDOW_FRAMES].iter().enumerate() {
+        map_large(
+            harness,
+            SWEEP_WINDOW + ((index as u64) << HUGE_PAGE_SHIFT),
+            *frame,
+        );
+    }
+    harness.cpu.flush_tlb();
+}
+
+fn conflict_window_setup(harness: &mut Harness) {
+    seed_registers_and_memory(harness);
+    for (index, frame) in FREE_LARGE_FRAMES[..8].iter().enumerate() {
+        map_large(
+            harness,
+            CONFLICT_WINDOW + index as u64 * TLB_SLOT_STRIDE,
+            *frame,
+        );
+    }
+    harness.cpu.flush_tlb();
+}
+
 /// Replaces the 2 MiB mapping that covers `SCRATCH` by a page table with identical translations,
 /// then edits individual entries.
 fn map_scratch_with_small_pages(harness: &mut Harness) {
@@ -604,44 +665,41 @@ fn a_fault_after_inline_instructions_reports_their_effects_and_count() {
     assert_eq!(result.interpreter.cpu.icount, 4);
 }
 
-/// The TLB has `TLB_ENTRIES_PER_MODE` (1024) entries per privilege level. The sweeps visit
-/// 496 + 752 = 1248 distinct pages of free RAM (away from the page tables below 1 MiB, the fake
-/// kernel at 16 MiB and the stack below 8 MiB), so every slot is refilled at least once.
-const _: () = assert!(496 + 752 > crate::cpu::TLB_ENTRIES_PER_MODE);
-
+/// The sweeps visit `2 * SWEEP_HALF_PAGES` pages of `SWEEP_WINDOW`, more than the TLB has slots,
+/// so every slot is refilled at least once.
 #[test]
 fn loads_sweeping_more_pages_than_the_tlb_holds_agree() {
-    check(&SWEEP_LOAD_LOW);
-    check(&SWEEP_LOAD_HIGH);
+    let both = [&SWEEP_LOAD_LOW[..], &SWEEP_LOAD_HIGH].concat();
+    check_with(&both, sweep_window_setup);
 }
 
 #[test]
 fn stores_sweeping_more_pages_than_the_tlb_holds_agree() {
-    check(&SWEEP_STORE_LOW);
-    check(&SWEEP_STORE_HIGH);
+    let both = [&SWEEP_STORE_LOW[..], &SWEEP_STORE_HIGH].concat();
+    check_with(&both, sweep_window_setup);
 }
 
 #[test]
 fn read_modify_write_sweeping_more_pages_than_the_tlb_holds_agree() {
-    check(&SWEEP_READ_MODIFY_WRITE_HIGH);
+    check_with(&SWEEP_READ_MODIFY_WRITE, sweep_window_setup);
 }
 
 #[test]
 fn values_stored_through_a_full_tlb_sweep_read_back_the_same() {
-    let result = check(&SWEEP_STORE_THEN_LOAD_BACK);
-    // sum of rcx over 752..=1
-    assert_eq!(result.interpreter.cpu.gpr[RDX], 752 * 753 / 2);
+    let result = check_with(&SWEEP_STORE_THEN_LOAD_BACK, sweep_window_setup);
+    let pages = 2 * SWEEP_HALF_PAGES;
+    // sum of rcx over pages..=1
+    assert_eq!(result.interpreter.cpu.gpr[RDX], pages * (pages + 1) / 2);
 }
 
 #[test]
 fn two_pages_that_share_a_tlb_slot_evict_each_other_correctly() {
-    // Pages 4 MiB apart map to the same slot of a 1024-entry TLB.
-    check(&TLB_CONFLICT_PING_PONG);
+    check_with(&TLB_CONFLICT_PING_PONG, conflict_window_setup);
 }
 
 #[test]
 fn eight_pages_sharing_one_tlb_slot_are_accessed_round_robin() {
-    check(&TLB_CONFLICT_EIGHT_WAY);
+    check_with(&TLB_CONFLICT_EIGHT_WAY, conflict_window_setup);
 }
 
 fn remap_setup(harness: &mut Harness) {
@@ -680,67 +738,68 @@ fn a_store_after_invlpg_lands_in_the_new_frame() {
     assert_eq!(result.interpreter.cpu.gpr[R8], 4);
 }
 
-// mov rsi, 0x100000; mov ecx, 496; 1: add rdx, [rsi]; add rsi, 4096; dec ecx; jnz 1b
-// hlt
-const SWEEP_LOAD_LOW: [u8; 27] = [
-    0x48, 0xc7, 0xc6, 0x00, 0x00, 0x10, 0x00, 0xb9, 0xf0, 0x01, 0x00, 0x00, 0x48, 0x03, 0x16, 0x48,
-    0x81, 0xc6, 0x00, 0x10, 0x00, 0x00, 0xff, 0xc9, 0x75, 0xf2, 0xf4,
+// mov rsi, SWEEP_WINDOW; mov ecx, SWEEP_HALF_PAGES; 1: add rdx, [rsi]; add rsi, 4096
+// dec ecx; jnz 1b
+const SWEEP_LOAD_LOW: [u8; 26] = [
+    0x48, 0xc7, 0xc6, 0x00, 0x00, 0x00, 0x40, 0xb9, 0x00, 0x09, 0x00, 0x00, 0x48, 0x03, 0x16, 0x48,
+    0x81, 0xc6, 0x00, 0x10, 0x00, 0x00, 0xff, 0xc9, 0x75, 0xf2,
 ];
 
-// mov rsi, 0x500000; mov ecx, 752; 1: add rdx, [rsi]; add rsi, 4096; dec ecx; jnz 1b
-// hlt
+// mov rsi, SWEEP_WINDOW + SWEEP_HALF_PAGES pages; mov ecx, SWEEP_HALF_PAGES
+// 1: add rdx, [rsi]; add rsi, 4096; dec ecx; jnz 1b; hlt
 const SWEEP_LOAD_HIGH: [u8; 27] = [
-    0x48, 0xc7, 0xc6, 0x00, 0x00, 0x50, 0x00, 0xb9, 0xf0, 0x02, 0x00, 0x00, 0x48, 0x03, 0x16, 0x48,
+    0x48, 0xc7, 0xc6, 0x00, 0x00, 0x90, 0x40, 0xb9, 0x00, 0x09, 0x00, 0x00, 0x48, 0x03, 0x16, 0x48,
     0x81, 0xc6, 0x00, 0x10, 0x00, 0x00, 0xff, 0xc9, 0x75, 0xf2, 0xf4,
 ];
 
-// mov rsi, 0x100000; mov ecx, 496; mov rdx, 5; 1: mov [rsi], rdx; add rdx, rcx
-// add rsi, 4096; dec ecx; jnz 1b; hlt
-const SWEEP_STORE_LOW: [u8; 37] = [
-    0x48, 0xc7, 0xc6, 0x00, 0x00, 0x10, 0x00, 0xb9, 0xf0, 0x01, 0x00, 0x00, 0x48, 0xc7, 0xc2, 0x05,
+// mov rsi, SWEEP_WINDOW; mov ecx, SWEEP_HALF_PAGES; mov rdx, 5; 1: mov [rsi], rdx
+// add rdx, rcx; add rsi, 4096; dec ecx; jnz 1b
+const SWEEP_STORE_LOW: [u8; 36] = [
+    0x48, 0xc7, 0xc6, 0x00, 0x00, 0x00, 0x40, 0xb9, 0x00, 0x09, 0x00, 0x00, 0x48, 0xc7, 0xc2, 0x05,
     0x00, 0x00, 0x00, 0x48, 0x89, 0x16, 0x48, 0x01, 0xca, 0x48, 0x81, 0xc6, 0x00, 0x10, 0x00, 0x00,
-    0xff, 0xc9, 0x75, 0xef, 0xf4,
+    0xff, 0xc9, 0x75, 0xef,
 ];
 
-// mov rsi, 0x500000; mov ecx, 752; mov rdx, 5; 1: mov [rsi], rdx; add rdx, rcx
-// add rsi, 4096; dec ecx; jnz 1b; hlt
+// mov rsi, SWEEP_WINDOW + SWEEP_HALF_PAGES pages; mov ecx, SWEEP_HALF_PAGES; mov rdx, 5
+// 1: mov [rsi], rdx; add rdx, rcx; add rsi, 4096; dec ecx; jnz 1b; hlt
 const SWEEP_STORE_HIGH: [u8; 37] = [
-    0x48, 0xc7, 0xc6, 0x00, 0x00, 0x50, 0x00, 0xb9, 0xf0, 0x02, 0x00, 0x00, 0x48, 0xc7, 0xc2, 0x05,
+    0x48, 0xc7, 0xc6, 0x00, 0x00, 0x90, 0x40, 0xb9, 0x00, 0x09, 0x00, 0x00, 0x48, 0xc7, 0xc2, 0x05,
     0x00, 0x00, 0x00, 0x48, 0x89, 0x16, 0x48, 0x01, 0xca, 0x48, 0x81, 0xc6, 0x00, 0x10, 0x00, 0x00,
     0xff, 0xc9, 0x75, 0xef, 0xf4,
 ];
 
-// mov rsi, 0x500000; mov ecx, 752; 1: add [rsi + 8], rcx; add rsi, 4096; dec ecx
-// jnz 1b; hlt
-const SWEEP_READ_MODIFY_WRITE_HIGH: [u8; 28] = [
-    0x48, 0xc7, 0xc6, 0x00, 0x00, 0x50, 0x00, 0xb9, 0xf0, 0x02, 0x00, 0x00, 0x48, 0x01, 0x4e, 0x08,
+// mov rsi, SWEEP_WINDOW; mov ecx, 2 * SWEEP_HALF_PAGES; 1: add [rsi + 8], rcx
+// add rsi, 4096; dec ecx; jnz 1b; hlt
+const SWEEP_READ_MODIFY_WRITE: [u8; 28] = [
+    0x48, 0xc7, 0xc6, 0x00, 0x00, 0x00, 0x40, 0xb9, 0x00, 0x12, 0x00, 0x00, 0x48, 0x01, 0x4e, 0x08,
     0x48, 0x81, 0xc6, 0x00, 0x10, 0x00, 0x00, 0xff, 0xc9, 0x75, 0xf1, 0xf4,
 ];
 
-// mov rsi, 0x500000; mov ecx, 752; 1: mov [rsi + 16], rcx; add rsi, 4096; dec ecx
-// jnz 1b; mov rsi, 0x500000; mov ecx, 752; xor edx, edx; 2: add rdx, [rsi + 16]
-// add rsi, 4096; dec ecx; jnz 2b; hlt
+// mov rsi, SWEEP_WINDOW; mov ecx, 2 * SWEEP_HALF_PAGES; 1: mov [rsi + 16], rcx
+// add rsi, 4096; dec ecx; jnz 1b; mov rsi, SWEEP_WINDOW; mov ecx, 2 * SWEEP_HALF_PAGES
+// xor edx, edx; 2: add rdx, [rsi + 16]; add rsi, 4096; dec ecx; jnz 2b; hlt
 const SWEEP_STORE_THEN_LOAD_BACK: [u8; 57] = [
-    0x48, 0xc7, 0xc6, 0x00, 0x00, 0x50, 0x00, 0xb9, 0xf0, 0x02, 0x00, 0x00, 0x48, 0x89, 0x4e, 0x10,
+    0x48, 0xc7, 0xc6, 0x00, 0x00, 0x00, 0x40, 0xb9, 0x00, 0x12, 0x00, 0x00, 0x48, 0x89, 0x4e, 0x10,
     0x48, 0x81, 0xc6, 0x00, 0x10, 0x00, 0x00, 0xff, 0xc9, 0x75, 0xf1, 0x48, 0xc7, 0xc6, 0x00, 0x00,
-    0x50, 0x00, 0xb9, 0xf0, 0x02, 0x00, 0x00, 0x31, 0xd2, 0x48, 0x03, 0x56, 0x10, 0x48, 0x81, 0xc6,
+    0x00, 0x40, 0xb9, 0x00, 0x12, 0x00, 0x00, 0x31, 0xd2, 0x48, 0x03, 0x56, 0x10, 0x48, 0x81, 0xc6,
     0x00, 0x10, 0x00, 0x00, 0xff, 0xc9, 0x75, 0xf1, 0xf4,
 ];
 
-// mov rsi, 0x600000; mov rdi, 0xa00000; mov ecx, 400; 1: mov [rsi], rcx
-// add rdx, [rdi]; mov [rdi + 8], rcx; add rdx, [rsi + 8]; dec ecx; jnz 1b; hlt
+// mov rsi, CONFLICT_WINDOW; mov rdi, CONFLICT_WINDOW + TLB_SLOT_STRIDE; mov ecx, 400
+// 1: mov [rsi], rcx; add rdx, [rdi]; mov [rdi + 8], rcx; add rdx, [rsi + 8]; dec ecx; jnz 1b
+// hlt
 const TLB_CONFLICT_PING_PONG: [u8; 38] = [
-    0x48, 0xc7, 0xc6, 0x00, 0x00, 0x60, 0x00, 0x48, 0xc7, 0xc7, 0x00, 0x00, 0xa0, 0x00, 0xb9, 0x90,
+    0x48, 0xc7, 0xc6, 0x00, 0x00, 0x00, 0x50, 0x48, 0xc7, 0xc7, 0x00, 0x00, 0x00, 0x51, 0xb9, 0x90,
     0x01, 0x00, 0x00, 0x48, 0x89, 0x0e, 0x48, 0x03, 0x17, 0x48, 0x89, 0x4f, 0x08, 0x48, 0x03, 0x56,
     0x08, 0xff, 0xc9, 0x75, 0xee, 0xf4,
 ];
 
-// mov rsi, 0x500000; mov r8d, 100; 1: mov ecx, 8; mov rdi, rsi; 2: add rdx, [rdi]
-// mov [rdi + 8], rdx; add rdi, 0x400000; dec ecx; jnz 2b; dec r8d; jnz 1b; hlt
+// mov rsi, CONFLICT_WINDOW; mov r8d, 100; 1: mov ecx, 8; mov rdi, rsi; 2: add rdx, [rdi]
+// mov [rdi + 8], rdx; add rdi, TLB_SLOT_STRIDE; dec ecx; jnz 2b; dec r8d; jnz 1b; hlt
 const TLB_CONFLICT_EIGHT_WAY: [u8; 45] = [
-    0x48, 0xc7, 0xc6, 0x00, 0x00, 0x50, 0x00, 0x41, 0xb8, 0x64, 0x00, 0x00, 0x00, 0xb9, 0x08, 0x00,
+    0x48, 0xc7, 0xc6, 0x00, 0x00, 0x00, 0x50, 0x41, 0xb8, 0x64, 0x00, 0x00, 0x00, 0xb9, 0x08, 0x00,
     0x00, 0x00, 0x48, 0x89, 0xf7, 0x48, 0x03, 0x17, 0x48, 0x89, 0x57, 0x08, 0x48, 0x81, 0xc7, 0x00,
-    0x00, 0x40, 0x00, 0xff, 0xc9, 0x75, 0xee, 0x41, 0xff, 0xc8, 0x75, 0xe1, 0xf4,
+    0x00, 0x00, 0x01, 0xff, 0xc9, 0x75, 0xee, 0x41, 0xff, 0xc8, 0x75, 0xe1, 0xf4,
 ];
 
 // mov rax, [rsi]; mov [rdi], rdx; invlpg [rsi]; mov rcx, [rsi]; hlt

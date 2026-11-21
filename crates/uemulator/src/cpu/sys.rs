@@ -682,7 +682,7 @@ impl Cpu {
         if self.efer & EFER_LMA != 0 {
             // With CR4.PCIDE, bits 11:0 are the PCID (not PWT/PCD) and bit 63 asks
             // not to flush; the TLB is untagged, so the hint is ignored (flushing
-            // more than asked is always allowed).
+            // more than asked is always allowed) and the non-global entries go.
             let pcide = self.cr4 & CR4_PCIDE != 0;
             let reserved = if pcide {
                 CR3_RESERVED & !CR3_NO_FLUSH
@@ -693,7 +693,7 @@ impl Cpu {
                 return Err(Exception::general_protection(0));
             }
             self.cr3 = v & if pcide { CR3_MASK_PCID } else { CR3_MASK };
-            self.flush_tlb();
+            self.flush_tlb_non_global();
             return Ok(());
         }
         if v & CR3_NON_LONG_RESERVED != 0 {
@@ -706,7 +706,7 @@ impl Cpu {
         } else {
             self.cr3 = v & CR3_MASK_LEGACY;
         }
-        self.flush_tlb();
+        self.flush_tlb_non_global();
         Ok(())
     }
 
@@ -2712,6 +2712,37 @@ mod sys_tests {
                 user_mode(h);
             });
             assert_invalid_opcode(INVPCID_REGISTER, |h| h.cpu.gpr[RAX] = 0);
+        }
+
+        /// Types 1 and 3 leave global translations; 0 (one address, any page) and 2 take them.
+        #[test]
+        fn invpcid_keeps_global_pages_only_for_the_types_that_spare_them() {
+            use crate::cpu::test_support::{PTE_PRESENT_WRITABLE_USER, PageTables};
+            // Its TLB slot (0x123) is not the code's, the descriptor's or the stack's.
+            const GLOBAL_PAGE: u64 = 0x0000_7f00_0012_3000;
+            const PTE_GLOBAL: u64 = 1 << 8;
+            for (kind, kept) in [(0, false), (1, true), (2, false), (3, true)] {
+                let h = run_ok(INVPCID, |h| {
+                    invpcid_setup(kind, 0, DATA)(h);
+                    let mut tables = PageTables::new(&mut h.cpu);
+                    for page in [CODE_BASE, DATA] {
+                        tables.map_4k(&mut h.cpu, page, page, PTE_PRESENT_WRITABLE_USER);
+                    }
+                    h.cpu.cr4 |= CR4_PGE;
+                    tables.map_4k(
+                        &mut h.cpu,
+                        GLOBAL_PAGE,
+                        SCRATCH,
+                        PTE_PRESENT_WRITABLE_USER | PTE_GLOBAL,
+                    );
+                    h.cpu.read(GLOBAL_PAGE, 8).unwrap();
+                });
+                assert_eq!(
+                    h.cpu.tlb.iter().any(|entry| entry.tag_r == GLOBAL_PAGE),
+                    kept,
+                    "type {kind}"
+                );
+            }
         }
 
         #[test]

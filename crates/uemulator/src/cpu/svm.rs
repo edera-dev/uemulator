@@ -625,6 +625,9 @@ impl Svm {
 /// store to a page that became code while it was out skips `code_written`.
 pub(crate) struct ParkedTlb {
     pub(crate) entries: Vec<TlbEntry>,
+    /// `Cpu::tlb_filled` and `Cpu::tlb_global` for `entries`.
+    filled: Vec<u64>,
+    global: Vec<u64>,
     pub(crate) large_pages: [LargePage; LARGE_PAGE_CACHE_ENTRIES],
     owner: TlbOwner,
 }
@@ -805,9 +808,15 @@ impl NestedLeafCache {
 }
 
 impl ParkedTlb {
+    pub(super) fn entries_and_filled(&mut self) -> (&mut Vec<TlbEntry>, &Vec<u64>) {
+        (&mut self.entries, &self.filled)
+    }
+
     fn empty() -> Box<Self> {
         Box::new(ParkedTlb {
             entries: vec![TLB_EMPTY; 2 * TLB_ENTRIES_PER_MODE],
+            filled: vec![0; TLB_FILLED_WORDS],
+            global: vec![0; TLB_FILLED_WORDS],
             large_pages: [LARGE_PAGE_EMPTY; LARGE_PAGE_CACHE_ENTRIES],
             owner: TlbOwner::Nobody,
         })
@@ -1073,6 +1082,8 @@ impl Cpu {
     /// Swaps the running TLB with the parked one; `tlb_active_base` follows the new array.
     fn swap_parked_tlb(&mut self, parked: &mut ParkedTlb) {
         core::mem::swap(&mut self.tlb, &mut parked.entries);
+        core::mem::swap(&mut self.tlb_filled, &mut parked.filled);
+        core::mem::swap(&mut self.tlb_global, &mut parked.global);
         core::mem::swap(&mut self.large_pages, &mut parked.large_pages);
         self.set_cpl(self.cpl);
     }
@@ -2304,6 +2315,41 @@ mod tests {
 
     /// Runs `test` with the JIT enabled in every rig it builds, so the intercepts, state swaps and
     /// nested translation are also exercised through compiled blocks and the `exec` helper.
+    /// `flush_tlb` empties only the slots filled since the last flush, so which slots those are
+    /// has to travel with the TLB when VMRUN and #VMEXIT swap it with the parked one. A record
+    /// left behind would have the host's flush clear the guest's slots and leave its own.
+    #[test]
+    fn a_flush_after_a_world_switch_empties_the_slots_that_side_filled() {
+        const HOST_PAGE: u64 = 0x5000;
+        const GUEST_PAGE: u64 = 0x7000;
+        let mut h = Harness::new(&[0xf4]);
+        let space = GuestAddressSpace {
+            asid: 1,
+            nested_cr3: None,
+            nested_walk_controls: 0,
+            cr0: 0,
+            cr3: 0,
+            cr4: 0,
+            efer: 0,
+        };
+        let cached = |h: &Harness, page: u64| h.cpu.tlb.iter().any(|entry| entry.tag_r == page);
+        h.cpu.translate(HOST_PAGE, AccessKind::Read, true).unwrap();
+        assert!(cached(&h, HOST_PAGE));
+        h.cpu.enter_guest_tlb(space, TLB_CONTROL_NOTHING);
+        h.cpu.translate(GUEST_PAGE, AccessKind::Read, true).unwrap();
+        h.cpu.leave_guest_tlb(space);
+        assert!(cached(&h, HOST_PAGE));
+        h.cpu.flush_tlb();
+        assert!(!cached(&h, HOST_PAGE), "the host's flush left its own page");
+        h.cpu.enter_guest_tlb(space, TLB_CONTROL_NOTHING);
+        assert!(cached(&h, GUEST_PAGE), "the guest's TLB did not come back");
+        h.cpu.flush_tlb();
+        assert!(
+            !cached(&h, GUEST_PAGE),
+            "the guest's flush left its own page"
+        );
+    }
+
     fn under_jit(test: fn()) {
         USE_JIT.with(|flag| flag.set(true));
         test();

@@ -15,8 +15,8 @@
 - Two MMU indexes: kernel (CPL 0–2) and user (CPL 3), plus a physical (paging off) index. Size 256–1024 entries per index, direct mapped, power of two, `#[repr(C)]` so the JIT inlines the lookup.
 - Entry: `{ tag_read, tag_write, tag_exec: u64 (page-aligned vaddr | flag bits), addend: i64 /* host_ptr - vaddr */, gpa }`. Mismatch or flag bits set (MMIO, code-page, not-dirty) → slow path.
 - Fast path (JIT inline, interpreter calls the same function): `idx = (va >> 12) & mask; if va_page == entry.tag_x { host = va + entry.addend }`. Accesses crossing a page boundary always go slow.
-- Flush: CR3 write, CR0.PG/WP and CR4.PGE/PAE/PSE changes, `invlpg` (single page), CPL change selects the other index (no flush needed), INVPCID not advertised.
-- Global pages (CR4.PGE) survive CR3 writes if tracked; optimization, not required.
+- Built: 4096 entries per index (`TLB_INDEX_BITS`; 1024 had five conflict misses for every three refills on a Debian boot, and the walks were a sixth of its time).
+- Flush: CR0 and CR4 writes, `invlpg` (single page), INVPCID types 0 and 2 empty everything; CR3 writes and INVPCID types 1 and 3 keep global pages (CR4.PGE, `TLB_FLAG_GLOBAL`, `flush_tlb_non_global`), as hardware does, which keeps a Linux kernel's own translations across context switches. A flush empties only the slots filled since the last one (`Cpu::tlb_filled`, `tlb_global`; they travel with the TLB when SVM parks it): a guest flushes tens of thousands of times a boot and fills a few hundred slots in between, so the size costs nothing at a flush. CPL change selects the other index (no flush needed). PCIDs are not kept apart: a CR3 write drops every non-global entry whatever its no-flush bit says.
 
 ## Page walk (`mmu.rs`)
 

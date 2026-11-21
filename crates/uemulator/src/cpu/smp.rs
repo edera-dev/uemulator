@@ -272,23 +272,14 @@ impl Cpu {
         self.code_mark_seen = self.code_mark_epoch;
         let ram_base = self.ram_base;
         // The TLB SVM parked comes back without a refill, so it is revoked too.
-        let parked = self
-            .svm
-            .parked_tlb
-            .as_deref_mut()
-            .map(|parked| &mut parked.entries);
-        for entries in core::iter::once(&mut self.tlb).chain(parked) {
-            for entry in entries.iter_mut() {
-                if entry.tag_w != TLB_TAG_INVALID
-                    && self
-                        .page_has_code
-                        .get_or_zero(super::mem::write_tag_page(entry, ram_base))
-                        != 0
-                {
-                    entry.tag_w = TLB_TAG_INVALID;
-                }
+        let page_has_code = self.page_has_code.clone();
+        self.for_each_filled_tlb_entry(|entry| {
+            if entry.tag_w != TLB_TAG_INVALID
+                && page_has_code.get_or_zero(super::mem::write_tag_page(entry, ram_base)) != 0
+            {
+                entry.tag_w = TLB_TAG_INVALID;
             }
-        }
+        });
     }
 
     /// INIT (SDM 9.1, table 9-1): the registers go back to their reset values and the vCPU waits
