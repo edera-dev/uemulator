@@ -39,8 +39,8 @@ use core::mem::{offset_of, size_of};
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use super::blocks::{
-    BlockKey, Decoded, JUMP_CACHE_BITS, NO_SECOND_PAGE, PAGE_MASK, PAGE_SHIFT, PAGE_SIZE,
-    SLOT_BLOCK_BITS, SLOT_BLOCK_MASK, STRADDLER_TAG, decode_block, jump_cache_hash,
+    BlockKey, Decoded, JUMP_CACHE_BITS, MAX_INSNS, NO_SECOND_PAGE, PAGE_MASK, PAGE_SHIFT,
+    PAGE_SIZE, SLOT_BLOCK_BITS, SLOT_BLOCK_MASK, STRADDLER_TAG, decode_block, jump_cache_hash,
 };
 use super::emit_wasm::{self, Addrs, ChainTables, LINK_CELL_SIZE, link_cells_for};
 use super::helpers;
@@ -1193,7 +1193,9 @@ impl Jit {
     }
 
     /// A miss in the block map: the block's slot if it can run compiled now. Otherwise the
-    /// caller interprets one instruction, and this counts toward compiling the block.
+    /// caller interprets, and this counts toward compiling the block: the whole cold block
+    /// (`Cpu::step_cold_block`), or one instruction when the block waits for its module
+    /// (`Miss::Waiting`), whose `PATIENCE` is counted in steps.
     ///
     /// Any instruction of a pending block checks whether modules are back. Its instructions after
     /// the first run in the interpreter until then without counting heat: if they did, every
@@ -1205,23 +1207,30 @@ impl Jit {
         cpu: &mut Cpu,
         rip: u64,
         phys_addr: u64,
-    ) -> Result<Option<u64>, Exception> {
+    ) -> Result<Miss, Exception> {
         match self.pending_at(phys_addr) {
             PendingAt::Head => {
                 self.pump(cpu, Some(phys_addr));
-                return Ok(self.lookup(rip, phys_addr));
+                return Ok(match self.lookup(rip, phys_addr) {
+                    Some(slot) => Miss::Compiled(slot),
+                    None => Miss::Waiting,
+                });
             }
             // Once the outer block is installed this address counts heat again, next time.
             PendingAt::Inside(start) => {
                 self.pump(cpu, Some(start));
-                return Ok(None);
+                return Ok(Miss::Waiting);
             }
             PendingAt::Outside => {}
         }
         if !self.is_hot(phys_addr) {
-            return Ok(None);
+            return Ok(Miss::Cold);
         }
-        self.try_translate(cpu, rip, phys_addr)
+        Ok(match self.try_translate(cpu, rip, phys_addr)? {
+            Some(slot) => Miss::Compiled(slot),
+            // Queued for the compile worker, or refused by the host.
+            None => Miss::Waiting,
+        })
     }
 
     /// Decodes up to `MAX_INSNS` instructions at `rip` (physical `phys_addr`) and compiles them.
@@ -1420,9 +1429,62 @@ impl Jit {
     }
 }
 
+/// What `Jit::compile_on_miss` found for a block that was not in the jump cache.
+enum Miss {
+    /// Its table slot: run it.
+    Compiled(u64),
+    /// Not hot yet: interpret the block.
+    Cold,
+    /// Hot, but its module is out with the compile worker (or the host refused it): interpret one
+    /// instruction, so the wait is counted in steps.
+    Waiting,
+}
+
 impl Cpu {
+    /// Runs the block at `self.rip`, which is not compiled (yet), in the interpreter: up to where
+    /// its compiled form would end (`blocks::decode_block`: a block end other than a jcc, a jump
+    /// away from the straight line, the page end, `MAX_INSNS`), or sooner at the event deadline,
+    /// as the chained blocks stop at it. Stepping the whole block in one call instead of one
+    /// instruction per trip through the run loop saves that trip's interrupt check, exec
+    /// translation, jump cache and heat lookups (a lock) for every instruction after the first;
+    /// and only a block's first instruction gets hotter, as compiled code is keyed by it. Each
+    /// instruction is counted (`icount`, `interrupt_shadow`) as `Cpu::run` counts a step; the
+    /// first was counted by the caller. Interrupts are taken only after the block, as after a
+    /// compiled one: every instruction after which one must be taken ends a block.
+    fn step_cold_block(&mut self) -> Result<(), Exception> {
+        let page = self.rip >> PAGE_SHIFT;
+        let mut stepped: u64 = 0;
+        loop {
+            let insn = self.fetch_decode()?;
+            self.trace_step();
+            let next = self.rip.wrapping_add(insn.len as u64);
+            stepped += 1;
+            self.last_block_insns = stepped;
+            self.exec_interpreted(&insn)?;
+            let block_ends = helpers::ends_block(&insn) && !helpers::is_conditional_branch(&insn);
+            if block_ends
+                || self.halted
+                || self.rip != next
+                || self.rip >> PAGE_SHIFT != page
+                || stepped >= MAX_INSNS as u64
+                || self.icount >= self.next_event
+            {
+                break;
+            }
+            self.interrupt_shadow = false;
+            self.icount += 1;
+        }
+        if let Some(jit) = &self.jit {
+            // The first was counted by `known_cold` or the caller.
+            jit.shared
+                .cold_steps
+                .fetch_add(stepped - 1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
     /// Runs one block (or, on a miss, translates then runs it) starting at `self.rip`; a block that
-    /// is not hot yet is not compiled, and one instruction runs in the interpreter instead.
+    /// is not hot yet is not compiled, and runs in the interpreter instead (`step_cold_block`).
     ///
     /// The block is a function `(cpu: *mut Cpu) -> u64` in the function table, returning
     /// `(retired_insns << helpers::EXIT_COUNT_SHIFT) | status` exactly as the native blocks do
@@ -1443,30 +1505,33 @@ impl Cpu {
                 // Already counted as a cold step.
                 None if jit.known_cold(phys_addr) => {
                     self.jit = Some(jit);
-                    self.last_block_insns = 1;
-                    return self.step();
+                    return self.step_cold_block();
                 }
                 None => jit.lookup(rip, phys_addr),
             },
         };
-        let slot = match cached {
-            Some(slot) => Some(slot),
+        let miss = match cached {
+            Some(slot) => Miss::Compiled(slot),
             None => match jit.compile_on_miss(self, rip, phys_addr) {
-                Ok(slot) => slot,
+                Ok(miss) => miss,
                 Err(exception) => {
                     self.jit = Some(jit);
                     return Err(exception);
                 }
             },
         };
-        if slot.is_none() {
+        if !matches!(miss, Miss::Compiled(_)) {
             jit.shared.cold_steps.fetch_add(1, Ordering::Relaxed);
         }
         self.jit = Some(jit);
-        let Some(slot) = slot else {
-            // `Cpu::run` already counted this instruction, as `step` expects.
-            self.last_block_insns = 1;
-            return self.step();
+        let slot = match miss {
+            Miss::Compiled(slot) => slot,
+            Miss::Cold => return self.step_cold_block(),
+            Miss::Waiting => {
+                // `Cpu::run` already counted this instruction, as `step` expects.
+                self.last_block_insns = 1;
+                return self.step();
+            }
         };
         // SAFETY: the host put a function of this type in the slot (`CompiledBlock::function`).
         let run_block: extern "C" fn(*mut Cpu) -> u64 =
@@ -1561,6 +1626,55 @@ mod tests {
         let stats = harness.cpu.jit.as_ref().unwrap().stats();
         assert!(stats.cold_steps >= 18, "{stats:?}");
         assert_eq!(stats.translated, 1, "only the loop head got hot: {stats:?}");
+    }
+
+    /// A cold block is interpreted to its end in one `step_block` (`Cpu::step_cold_block`), but
+    /// stops at the event deadline like a chain of compiled blocks: run in slices of every size,
+    /// the count of retired instructions and the result are the interpreter's.
+    #[test]
+    fn cold_blocks_stop_at_the_deadline_and_count_every_instruction_once() {
+        const NEVER_HOT: u32 = u32::MAX;
+        for slice in 1..8 {
+            let mut harness = Harness::new(&COUNTDOWN_LOOP);
+            assert!(harness.enable_jit());
+            harness
+                .cpu
+                .jit
+                .as_ref()
+                .unwrap()
+                .set_compile_threshold(NEVER_HOT);
+            let mut calls = 0;
+            loop {
+                calls += 1;
+                match harness.run(slice) {
+                    Stop::Limit => assert!(calls < 10_000),
+                    Stop::Halted => break,
+                    other => panic!("{other:?}"),
+                }
+            }
+            assert_eq!(harness.cpu.gpr[1], 0);
+            assert_eq!(harness.cpu.icount, COUNTDOWN_LOOP_INSNS, "slice {slice}");
+            assert_eq!(harness.cpu.jit.as_ref().unwrap().stats().translated, 0);
+        }
+    }
+
+    /// The loop body is entered at its head every time, so a whole cold pass is one step.
+    #[test]
+    fn a_cold_block_runs_whole_in_one_step() {
+        let mut cpu = Harness::new(&COUNTDOWN_LOOP);
+        assert!(cpu.enable_jit());
+        cpu.cpu
+            .jit
+            .as_ref()
+            .unwrap()
+            .set_compile_threshold(u32::MAX);
+        cpu.cpu.next_event = u64::MAX;
+        // `Cpu::run`'s count of the first instruction, then [mov, sub, jnz] up to the jnz back
+        cpu.cpu.icount += 1;
+        cpu.cpu.step_block().unwrap();
+        assert_eq!(cpu.cpu.icount, 3);
+        assert_eq!(cpu.cpu.last_block_insns, 3);
+        assert_eq!(cpu.cpu.gpr[1], 99);
     }
 
     #[test]
