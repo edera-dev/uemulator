@@ -12,7 +12,7 @@
 
 ## Soft TLB (`tlb.rs`)
 
-- Two MMU indexes: kernel (CPL 0–2) and user (CPL 3), plus a physical (paging off) index. Size 256–1024 entries per index, direct mapped, power of two, `#[repr(C)]` so the JIT inlines the lookup.
+- Two MMU indexes: kernel (CPL 0–2) and user (CPL 3), plus a physical (paging off) index. Direct mapped, power of two, `#[repr(C)]` so the JIT inlines the lookup.
 - Entry: `{ tag_read, tag_write, tag_exec: u64 (page-aligned vaddr | flag bits), addend: i64 /* host_ptr - vaddr */, gpa }`. Mismatch or flag bits set (MMIO, code-page, not-dirty) → slow path.
 - Fast path (JIT inline, interpreter calls the same function): `idx = (va >> 12) & mask; if va_page == entry.tag_x { host = va + entry.addend }`. Accesses crossing a page boundary always go slow.
 - Built: 4096 entries per index (`TLB_INDEX_BITS`; 1024 had five conflict misses for every three refills on a Debian boot, and the walks were a sixth of its time).

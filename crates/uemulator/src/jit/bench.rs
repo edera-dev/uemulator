@@ -21,9 +21,21 @@ const CHECK_ITERATIONS: u64 = 2000;
 /// About 0.1 to 0.3 s natively per loop.
 const TIMED_ITERATIONS: u64 = 10_000_000;
 const R10: usize = 10;
-/// Not `SCRATCH` itself: that is 4 MiB from `CODE_BASE`'s page and so shares its soft-TLB slot,
-/// and every data access through it would evict the code page's exec tag.
 const DATA: u64 = SCRATCH + 0x3000;
+/// A linear page in `CODE_BASE`'s soft-TLB slot, so every data access through it evicts the code
+/// page's exec tag. Identity-mapped RAM is too small for one (the slots repeat every 16 MiB), so
+/// `setup` maps the 2 MiB around it onto `ALIAS_FRAME`, free harness RAM.
+const ALIAS_DATA: u64 = 0x4100_0000;
+const ALIAS_FRAME: u64 = 0x120_0000;
+const PAGE_BYTES: u64 = 4096;
+const _: () = assert!(
+    (ALIAS_DATA / PAGE_BYTES) % crate::cpu::TLB_ENTRIES_PER_MODE as u64
+        == (CODE_BASE / PAGE_BYTES) % crate::cpu::TLB_ENTRIES_PER_MODE as u64
+);
+/// `boot::load` lays out PML4, PDPT and the page directories back to back from `cr3`.
+const FIRST_PAGE_DIRECTORY_OFFSET: u64 = 2 * PAGE_BYTES;
+const LARGE_PAGE_SHIFT: u32 = 21;
+const PDE_PRESENT_WRITABLE_LARGE: u64 = 1 | 2 | 1 << 7;
 /// A page of its own for the far call target, so call and ret cross pages.
 const FAR_TARGET: u64 = SCRATCH + 0x8_0000;
 
@@ -92,6 +104,12 @@ fn setup(harness: &mut Harness, iterations: u64, data: u64) {
     harness.cpu.gpr[RDI] = SCRATCH + 0x1_0000;
     harness.cpu.gpr[R10] = FAR_TARGET;
     harness.write(FAR_TARGET, FAR_FUNCTION);
+    if data == ALIAS_DATA {
+        let directory_entry =
+            harness.cpu.cr3 + FIRST_PAGE_DIRECTORY_OFFSET + (ALIAS_DATA >> LARGE_PAGE_SHIFT) * 8;
+        harness.write_u64(directory_entry, ALIAS_FRAME | PDE_PRESENT_WRITABLE_LARGE);
+        harness.cpu.flush_tlb();
+    }
 }
 
 fn run_sliced(harness: &mut Harness) {
@@ -199,5 +217,5 @@ fn rep_stos_loop() {
 #[test]
 #[ignore]
 fn aliased_indirect_loop() {
-    bench_with_data("tlb-alias", INDIRECT_LOOP, TIMED_ITERATIONS, SCRATCH);
+    bench_with_data("tlb-alias", INDIRECT_LOOP, TIMED_ITERATIONS, ALIAS_DATA);
 }
