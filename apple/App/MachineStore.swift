@@ -1,5 +1,8 @@
 import Foundation
 import UemulatorCore
+#if os(iOS)
+import UIKit
+#endif
 
 // Named machines in the app's Documents/Machines (docs/plans/28-apple.md), one folder each in
 // the CLI's layout (`crates/uemulator-cli/src/machines.rs`):
@@ -215,6 +218,19 @@ final class MachineStore: ObservableObject {
 
     func initrd(_ name: String, install: Distro? = nil) -> URL {
         artifacts(name).appendingPathComponent(install?.initrd.file ?? "initrd")
+    }
+
+    // The display stays on while any machine runs or suspends (iOS): the idle timer locking the
+    // phone would background the app, which suspends every running machine. App-wide rather
+    // than per machine, so one machine stopping does not let the phone sleep under another.
+    // Set again on every change and foregrounding: iOS does not promise to keep the flag.
+    func updateKeepAwake() {
+        #if os(iOS)
+        let anyRunning = models.values.contains { $0.isRunning }
+        if UIApplication.shared.isIdleTimerDisabled != anyRunning {
+            UIApplication.shared.isIdleTimerDisabled = anyRunning
+        }
+        #endif
     }
 
     func model(_ name: String) -> MachineModel {
@@ -460,6 +476,7 @@ final class MachineStore: ObservableObject {
 
     func delete(_ name: String) throws {
         models.removeValue(forKey: name)?.stop()
+        updateKeepAwake()
         try FileManager.default.removeItem(at: directory(name))
         reload()
     }

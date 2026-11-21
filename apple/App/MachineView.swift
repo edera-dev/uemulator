@@ -98,7 +98,11 @@ final class MachineModel: ObservableObject, ScreenInput {
     }
 
     private func willEnterForeground() {
+        store.updateKeepAwake()
         guard resumeOnForeground else { return }
+        // A large guest may still be writing its snapshot when the user is back (unlocked at
+        // once, say): `onState` resumes it once the suspend is complete.
+        if isSuspending { return }
         resumeOnForeground = false
         // Only a finished suspend: one that failed says why and waits for the user.
         if case .stopped(EngineState.suspendedReason) = state { start() }
@@ -184,6 +188,7 @@ final class MachineModel: ObservableObject, ScreenInput {
         engine.onState = { [weak self, weak engine] state in
             guard let self, let engine, engine === self.engine else { return }
             self.state = state
+            self.store.updateKeepAwake()
             if case .running = state {
                 self.startedAt = Date()
                 self.scheduleDebugSuspend()
@@ -199,6 +204,16 @@ final class MachineModel: ObservableObject, ScreenInput {
                 self.suspended = self.store.hasSnapshot(self.name)
                 #if os(iOS)
                 self.endSuspendTask()
+                // The background's suspend finished after the app came back (see
+                // `willEnterForeground`). Not `.active`: between willEnterForeground and
+                // didBecomeActive the app is `.inactive`, and the resume would be missed.
+                if self.resumeOnForeground && reason == EngineState.suspendedReason
+                    && UIApplication.shared.applicationState != .background {
+                    self.resumeOnForeground = false
+                    self.start()
+                } else if reason != EngineState.suspendedReason {
+                    self.resumeOnForeground = false
+                }
                 #endif
                 // Booted afresh, so an installer that rebooted comes up on its disk.
                 if reason == EngineState.resetReason && self.definition.reboot {
