@@ -21,6 +21,9 @@ const CHECK_ITERATIONS: u64 = 2000;
 /// About 0.1 to 0.3 s natively per loop.
 const TIMED_ITERATIONS: u64 = 10_000_000;
 const R10: usize = 10;
+/// Not `SCRATCH` itself: that is 4 MiB from `CODE_BASE`'s page and so shares its soft-TLB slot,
+/// and every data access through it would evict the code page's exec tag.
+const DATA: u64 = SCRATCH + 0x3000;
 /// A page of its own for the far call target, so call and ret cross pages.
 const FAR_TARGET: u64 = SCRATCH + 0x8_0000;
 
@@ -82,10 +85,10 @@ fn backend() -> &'static str {
     }
 }
 
-fn setup(harness: &mut Harness, iterations: u64) {
+fn setup(harness: &mut Harness, iterations: u64, data: u64) {
     harness.cpu.gpr[RCX] = iterations;
     harness.cpu.gpr[RBX] = 7;
-    harness.cpu.gpr[RSI] = SCRATCH;
+    harness.cpu.gpr[RSI] = data;
     harness.cpu.gpr[RDI] = SCRATCH + 0x1_0000;
     harness.cpu.gpr[R10] = FAR_TARGET;
     harness.write(FAR_TARGET, FAR_FUNCTION);
@@ -102,15 +105,19 @@ fn run_sliced(harness: &mut Harness) {
 }
 
 fn bench(name: &str, code: &[u8], iterations: u64) {
+    bench_with_data(name, code, iterations, DATA);
+}
+
+fn bench_with_data(name: &str, code: &[u8], iterations: u64, data: u64) {
     let mut interpreted = Harness::new(code);
-    setup(&mut interpreted, CHECK_ITERATIONS);
+    setup(&mut interpreted, CHECK_ITERATIONS, data);
     run_sliced(&mut interpreted);
     let mut compiled = Harness::new(code);
     if !compiled.enable_jit() {
         println!("bench {name} {} no-jit", backend());
         return;
     }
-    setup(&mut compiled, CHECK_ITERATIONS);
+    setup(&mut compiled, CHECK_ITERATIONS, data);
     run_sliced(&mut compiled);
     assert_eq!(
         compiled.cpu.gpr, interpreted.cpu.gpr,
@@ -123,7 +130,7 @@ fn bench(name: &str, code: &[u8], iterations: u64) {
 
     let mut timed = Harness::new(code);
     timed.enable_jit();
-    setup(&mut timed, iterations);
+    setup(&mut timed, iterations, data);
     let started = Instant::now();
     run_sliced(&mut timed);
     let elapsed = started.elapsed();
@@ -186,4 +193,11 @@ fn indirect_loop() {
 #[ignore]
 fn rep_stos_loop() {
     bench("rep-stos", REP_STOS_LOOP, TIMED_ITERATIONS / 4);
+}
+
+/// The indirect loop with its jump table on a page that shares the code page's soft-TLB slot.
+#[test]
+#[ignore]
+fn aliased_indirect_loop() {
+    bench_with_data("tlb-alias", INDIRECT_LOOP, TIMED_ITERATIONS, SCRATCH);
 }
