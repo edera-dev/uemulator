@@ -1,0 +1,189 @@
+//! Microbenchmarks of the JIT, one guest loop per cost the generators pay: register ALU, loads
+//! and stores, branches inside a block, call/ret, indirect jumps, `rep stos`. All `#[ignore]`;
+//! run them on each backend with
+//!
+//!   cargo test --release -p uemulator --lib jit::bench -- --ignored --nocapture --test-threads=1
+//!
+//! (add `--target x86_64-apple-darwin` for the x86-64 backend under Rosetta, or
+//! `--target wasm32-wasip1` for the WebAssembly one under Node). Each prints `bench <name>
+//! <backend> <ns per guest instruction> <guest instructions>`. The loops run in slices of
+//! `EVENT_SLICE` instructions, like `Cpu::run` between event checks, so a chain that stops at the
+//! deadline and the run loop's re-entry are part of what is measured. Before timing, a short
+//! run of the same loop is checked against the interpreter, so a fast but wrong backend does not
+//! report a number.
+
+use crate::testkit::*;
+use std::time::Instant;
+
+/// `Cpu::run`'s `EVENT_INTERVAL`: how far a chain of blocks runs before the run loop takes over.
+const EVENT_SLICE: u64 = 4096;
+const CHECK_ITERATIONS: u64 = 2000;
+/// About 0.1 to 0.3 s natively per loop.
+const TIMED_ITERATIONS: u64 = 10_000_000;
+const R10: usize = 10;
+/// A page of its own for the far call target, so call and ret cross pages.
+const FAR_TARGET: u64 = SCRATCH + 0x8_0000;
+
+// 1: add rax, rbx; xor rdx, rax; add rbx, 3; dec rcx; jnz 1b; hlt
+const REGISTER_LOOP: &[u8] = &[
+    0x48, 0x01, 0xd8, 0x48, 0x31, 0xc2, 0x48, 0x83, 0xc3, 0x03, 0x48, 0xff, 0xc9, 0x75, 0xf1, 0xf4,
+];
+
+// 2: mov r8, 512; 1: mov rax, [rsi + r8*8]; add [rdi + r8*8], rax; dec r8; jnz 1b;
+// dec rcx; jnz 2b; hlt   (rcx counts 512-iteration passes)
+const LOAD_STORE_LOOP: &[u8] = &[
+    0x49, 0xc7, 0xc0, 0x00, 0x02, 0x00, 0x00, 0x4a, 0x8b, 0x04, 0xc6, 0x4a, 0x01, 0x04, 0xc7, 0x49,
+    0xff, 0xc8, 0x75, 0xf3, 0x48, 0xff, 0xc9, 0x75, 0xe7, 0xf4,
+];
+const LOAD_STORE_INNER: u64 = 512;
+
+// 1: test rax, 1; jnz 2f; add rbx, 1; 2: cmp rbx, rdx; je 3f; add rdx, 2;
+// 3: test rbx, 0x40000000; jnz 4f; xor rsi, rbx; 4: inc rax; inc rax; dec rcx; jnz 1b; hlt
+const BRANCHY_LOOP: &[u8] = &[
+    0x48, 0xa9, 0x01, 0x00, 0x00, 0x00, 0x75, 0x04, 0x48, 0x83, 0xc3, 0x01, 0x48, 0x39, 0xd3, 0x74,
+    0x04, 0x48, 0x83, 0xc2, 0x02, 0x48, 0xf7, 0xc3, 0x00, 0x00, 0x00, 0x40, 0x75, 0x03, 0x48, 0x31,
+    0xde, 0x48, 0xff, 0xc0, 0x48, 0xff, 0xc0, 0x48, 0xff, 0xc9, 0x75, 0xd4, 0xf4,
+];
+
+// 1: call 2f; dec rcx; jnz 1b; hlt; 2: add rax, 1; ret
+const CALL_RET_LOOP: &[u8] = &[
+    0xe8, 0x06, 0x00, 0x00, 0x00, 0x48, 0xff, 0xc9, 0x75, 0xf6, 0xf4, 0x48, 0x83, 0xc0, 0x01, 0xc3,
+];
+
+// 1: call r10; dec rcx; jnz 1b; hlt
+const FAR_CALL_LOOP: &[u8] = &[0x41, 0xff, 0xd2, 0x48, 0xff, 0xc9, 0x75, 0xf8, 0xf4];
+// add rax, 1; ret
+const FAR_FUNCTION: &[u8] = &[0x48, 0x83, 0xc0, 0x01, 0xc3];
+
+// Fills a table at [rsi] with four targets, then cycles `jmp [rsi + (rax & 3) * 8]` through them.
+const INDIRECT_LOOP: &[u8] = &[
+    0x4c, 0x8d, 0x0d, 0x2f, 0x00, 0x00, 0x00, 0x4c, 0x89, 0x0e, 0x4c, 0x8d, 0x0d, 0x2b, 0x00, 0x00,
+    0x00, 0x4c, 0x89, 0x4e, 0x08, 0x4c, 0x8d, 0x0d, 0x26, 0x00, 0x00, 0x00, 0x4c, 0x89, 0x4e, 0x10,
+    0x4c, 0x8d, 0x0d, 0x21, 0x00, 0x00, 0x00, 0x4c, 0x89, 0x4e, 0x18, 0x31, 0xc0, 0x48, 0x89, 0xc2,
+    0x83, 0xe2, 0x03, 0xff, 0x24, 0xd6, 0x48, 0x83, 0xc3, 0x01, 0xeb, 0x10, 0x48, 0x83, 0xc3, 0x02,
+    0xeb, 0x0a, 0x48, 0x83, 0xc3, 0x03, 0xeb, 0x04, 0x48, 0x83, 0xc3, 0x04, 0x48, 0xff, 0xc0, 0x48,
+    0xff, 0xc9, 0x75, 0xd9, 0xf4,
+];
+
+// 1: mov rdi, rsi; mov r8, rcx; mov ecx, 64; rep stosb; mov rcx, r8; add rbx, 1; dec rcx;
+// jnz 1b; hlt
+const REP_STOS_LOOP: &[u8] = &[
+    0x48, 0x89, 0xf7, 0x49, 0x89, 0xc8, 0xb9, 0x40, 0x00, 0x00, 0x00, 0xf3, 0xaa, 0x4c, 0x89, 0xc1,
+    0x48, 0x83, 0xc3, 0x01, 0x48, 0xff, 0xc9, 0x75, 0xe7, 0xf4,
+];
+
+fn backend() -> &'static str {
+    if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else {
+        "wasm"
+    }
+}
+
+fn setup(harness: &mut Harness, iterations: u64) {
+    harness.cpu.gpr[RCX] = iterations;
+    harness.cpu.gpr[RBX] = 7;
+    harness.cpu.gpr[RSI] = SCRATCH;
+    harness.cpu.gpr[RDI] = SCRATCH + 0x1_0000;
+    harness.cpu.gpr[R10] = FAR_TARGET;
+    harness.write(FAR_TARGET, FAR_FUNCTION);
+}
+
+fn run_sliced(harness: &mut Harness) {
+    loop {
+        match harness.run(EVENT_SLICE) {
+            Stop::Limit => {}
+            Stop::Halted => return,
+            other => panic!("benchmark stopped: {other:?}\n{}", harness.cpu.dump_regs()),
+        }
+    }
+}
+
+fn bench(name: &str, code: &[u8], iterations: u64) {
+    let mut interpreted = Harness::new(code);
+    setup(&mut interpreted, CHECK_ITERATIONS);
+    run_sliced(&mut interpreted);
+    let mut compiled = Harness::new(code);
+    if !compiled.enable_jit() {
+        println!("bench {name} {} no-jit", backend());
+        return;
+    }
+    setup(&mut compiled, CHECK_ITERATIONS);
+    run_sliced(&mut compiled);
+    assert_eq!(
+        compiled.cpu.gpr, interpreted.cpu.gpr,
+        "{name}: JIT differs from the interpreter"
+    );
+    assert_eq!(
+        compiled.cpu.icount, interpreted.cpu.icount,
+        "{name}: retired counts differ"
+    );
+
+    let mut timed = Harness::new(code);
+    timed.enable_jit();
+    setup(&mut timed, iterations);
+    let started = Instant::now();
+    run_sliced(&mut timed);
+    let elapsed = started.elapsed();
+    let instructions = timed.cpu.icount;
+    assert_eq!(
+        timed.cpu.gpr[RCX],
+        0,
+        "{name}: stopped early\n{}",
+        timed.cpu.dump_regs()
+    );
+    println!(
+        "bench {name:<12} {:<8} {:>8.3} ns/iteration {:>7.3} ns/insn {instructions:>11} insns",
+        backend(),
+        elapsed.as_nanos() as f64 / iterations as f64,
+        elapsed.as_nanos() as f64 / instructions as f64
+    );
+}
+
+#[test]
+#[ignore]
+fn register_loop() {
+    bench("register", REGISTER_LOOP, TIMED_ITERATIONS);
+}
+
+#[test]
+#[ignore]
+fn load_store_loop() {
+    bench(
+        "load-store",
+        LOAD_STORE_LOOP,
+        TIMED_ITERATIONS / LOAD_STORE_INNER,
+    );
+}
+
+#[test]
+#[ignore]
+fn branchy_loop() {
+    bench("branchy", BRANCHY_LOOP, TIMED_ITERATIONS);
+}
+
+#[test]
+#[ignore]
+fn call_ret_loop() {
+    bench("call-ret", CALL_RET_LOOP, TIMED_ITERATIONS);
+}
+
+#[test]
+#[ignore]
+fn far_call_loop() {
+    bench("far-call", FAR_CALL_LOOP, TIMED_ITERATIONS);
+}
+
+#[test]
+#[ignore]
+fn indirect_loop() {
+    bench("indirect", INDIRECT_LOOP, TIMED_ITERATIONS);
+}
+
+#[test]
+#[ignore]
+fn rep_stos_loop() {
+    bench("rep-stos", REP_STOS_LOOP, TIMED_ITERATIONS / 4);
+}

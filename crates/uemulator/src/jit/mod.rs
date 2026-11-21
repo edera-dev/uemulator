@@ -129,6 +129,8 @@ impl Drop for JitTestGuard {
 }
 
 #[cfg(test)]
+mod bench;
+#[cfg(test)]
 mod diff_alias;
 #[cfg(test)]
 mod diff_alias_cases;
