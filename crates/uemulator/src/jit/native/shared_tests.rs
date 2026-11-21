@@ -372,6 +372,27 @@ fn links_patched_by_one_handle_are_followed_by_blocks_another_runs() {
         translated,
         "nothing new: the loop's block runs on past its jnz to the final `hlt`"
     );
+    assert!(
+        other.jit.as_ref().unwrap().stats().barriers >= 1,
+        "the blocks the other handle wrote are entered after an instruction barrier"
+    );
+}
+
+/// A lone handle wrote every block it runs, so taking them from the block map after a jump
+/// cache miss needs no instruction barrier beyond its first (`Jit::barrier_if_foreign`).
+#[test]
+fn a_lone_handle_runs_its_own_blocks_without_instruction_barriers() {
+    let _guard = serialize_jit_tests();
+    let mut cpu = cpu_running(&COUNTDOWN_LOOP);
+    cpu.jit = Some(Box::new(new_jit()));
+    warm_up_loop(&mut cpu);
+    // Forget the jump cache, so every block comes from the block map again.
+    let jit = cpu.jit.as_mut().unwrap();
+    jit.jump_cache.fill(JumpEntry::default());
+    let before = jit.stats().barriers;
+    run_to_halt(&mut cpu);
+    assert_eq!(cpu.gpr[1], 0);
+    assert_eq!(cpu.jit.as_ref().unwrap().stats().barriers, before);
 }
 
 #[test]

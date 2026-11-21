@@ -125,6 +125,9 @@ pub(crate) struct Jit {
     jump_cache: Box<[JumpEntry]>,
     /// `SharedJit::epoch` when this handle last cleared its jump cache.
     seen_epoch: u64,
+    /// `State::code_writes` as of this handle's last instruction barrier or its own last write,
+    /// so anything past it was written by another handle (`barrier_if_foreign`).
+    synced_writes: u64,
 }
 
 /// What every handle shares. Blocks and links are added and patched under `state`; the chain
@@ -182,6 +185,13 @@ struct State {
     /// Unpatched slots by the physical address of the block they want: the destination was not
     /// translated yet, or was invalidated since.
     pending: HashMap<u64, Vec<LinkedSite>>,
+    /// Counts writes to generated code that a core other than the writer's could have fetched
+    /// stale: blocks, link patches and unlinks. A handle runs an instruction barrier before code
+    /// it found in the block map only when this moved past its own `Jit::synced_writes`, so a
+    /// lone vCPU (which writes all its code itself, and whose `ExecMem` writes already end in the
+    /// cache maintenance its own core needs) never pays one: an `isb` costs about 8 ns on an M3,
+    /// and every jump cache miss that hits the block map paid it.
+    code_writes: u64,
     stats: JitStats,
 }
 
@@ -206,6 +216,8 @@ pub(crate) struct JitStats {
     pub flag_records_skipped: u64,
     /// Decodes thrown away because the page was written before the block was registered.
     pub stale_decodes: u64,
+    /// Instruction barriers run because another handle wrote code (`Jit::barrier_if_foreign`).
+    pub barriers: u64,
 }
 
 // Test hooks: each runs once, on the calling thread, with the CPU that is translating. The first
@@ -274,6 +286,7 @@ impl State {
         shared
             .exec_mem
             .write_word(site.exec_offset + arch::LINK_WORD_OFFSET, word);
+        self.code_writes += 1;
         self.incoming
             .entry(destination)
             .or_default()
@@ -344,6 +357,7 @@ impl Jit {
                 page_blocks: HashMap::new(),
                 incoming: HashMap::new(),
                 pending: HashMap::new(),
+                code_writes: 0,
                 stats: JitStats::default(),
             }),
         });
@@ -353,6 +367,9 @@ impl Jit {
     fn with_shared(shared: Arc<SharedJit>) -> Jit {
         Jit {
             seen_epoch: shared.epoch.load(Ordering::Acquire),
+            // Never equal to `code_writes`: a new handle's first block from the map takes a
+            // barrier, whatever its thread's core ran before.
+            synced_writes: u64::MAX,
             shared,
             jump_cache: vec![JumpEntry::default(); 1 << JUMP_CACHE_BITS].into_boxed_slice(),
         }
@@ -473,6 +490,9 @@ impl Jit {
                     site.exec_offset + arch::LINK_WORD_OFFSET,
                     arch::unlink_word(),
                 );
+                // Counted as another handle's write even for this one: `invalidate_page` takes
+                // `&self` and an extra barrier after an invalidation is cheap.
+                state.code_writes += 1;
                 state.stats.unlinked += 1;
                 state
                     .pending
@@ -503,12 +523,12 @@ impl Jit {
         {
             return Some(slot.code_addr);
         }
-        let state = self.shared.lock();
+        let mut state = self.shared.lock();
         let index = *state.block_map.get(&(phys_addr, NO_SECOND_PAGE))?;
         let code_addr = state.blocks[index as usize].code_addr;
-        drop(state);
         // Another vCPU may have written this block.
-        crate::sys::instruction_barrier();
+        Self::barrier_if_foreign(&mut self.synced_writes, &mut state);
+        drop(state);
         self.jump_cache[jump_cache_hash(rip)] = JumpEntry {
             rip,
             phys_addr,
@@ -516,6 +536,17 @@ impl Jit {
             block: index as u64,
         };
         Some(code_addr)
+    }
+
+    /// Runs an instruction barrier if another handle wrote code since this one last ran one or
+    /// wrote code itself. Under the lock, so `code_writes` and the writes it counts are ordered
+    /// before this handle runs any of that code.
+    fn barrier_if_foreign(synced_writes: &mut u64, state: &mut State) {
+        if state.code_writes != *synced_writes {
+            crate::sys::instruction_barrier();
+            *synced_writes = state.code_writes;
+            state.stats.barriers += 1;
+        }
     }
 
     /// The straddling block cached for `rip`, if its slot is still good: the block is valid and the
@@ -622,10 +653,11 @@ impl Jit {
         self.sync();
         let key = (phys_addr, decoded.second_page);
         // Another vCPU may have translated it since this one missed.
+        // Another vCPU may have written the block found below, or code this one is about to
+        // link to; afterwards `synced_writes` can follow this handle's own writes.
+        Self::barrier_if_foreign(&mut self.synced_writes, &mut state);
         if let Some(&index) = state.block_map.get(&key) {
             let code_addr = state.blocks[index as usize].code_addr;
-            // Translated by another vCPU while this one decoded.
-            crate::sys::instruction_barrier();
             self.fill_jump_cache(rip, phys_addr, decoded.second_page, code_addr, index);
             return Install::Ready(code_addr);
         }
@@ -657,6 +689,7 @@ impl Jit {
         state.stats.total += insns.len() as u64;
         let block_offset = state.used_bytes;
         shared.exec_mem.write_bytes(block_offset, &compiled.code);
+        state.code_writes += 1;
         state.used_bytes += compiled.code.len();
         let link_addr = code_addr;
         let code_addr = link_addr + compiled.body_offset as u64;
@@ -696,6 +729,8 @@ impl Jit {
             state.page_blocks.entry(page).or_default().push(index);
         }
         state.stats.translated += 1;
+        // Everything since the barrier above was this handle's own writing.
+        self.synced_writes = state.code_writes;
         self.fill_jump_cache(rip, phys_addr, second_page, code_addr, index);
         Install::Ready(code_addr)
     }
