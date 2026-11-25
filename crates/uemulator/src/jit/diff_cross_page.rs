@@ -123,6 +123,47 @@ fn a_loop_across_two_pages_runs_through_its_links_without_the_jump_cache() {
     assert_eq!(stats(&jitted.harness).translated, translated);
 }
 
+/// The exit is translated while its target page is out of the TLB, so it waits for a block at
+/// the target's address; the block already exists, and a vCPU that has translated nothing yet
+/// (another handle on the cache) finds it in the block map. The link it makes must name the host
+/// page the exit will compare with, which takes `Cpu::ram_base` from the cache, not the handle.
+#[test]
+fn a_vcpu_that_has_translated_nothing_links_a_waiting_exit_to_an_existing_block() {
+    let Some(mut jitted) = rig(true) else {
+        return;
+    };
+    let harness = &mut jitted.harness;
+    // The second half alone (it falls through to its hlt), so its block exists.
+    harness.cpu.halted = false;
+    harness.cpu.rip = PAGE_B;
+    harness.cpu.gpr[R8] = 1;
+    harness.cpu.next_event = u64::MAX;
+    while !harness.cpu.halted {
+        harness.cpu.icount += 1;
+        harness.cpu.dispatch_step().unwrap();
+    }
+    // The first half is translated without PAGE_B in the TLB; its exit then reaches PAGE_B's
+    // block through this handle's jump cache and the chain stub, which never link.
+    harness.cpu.flush_tlb();
+    run_loop(harness, 1);
+    let before = stats(harness);
+    // A fresh handle: its jump cache is empty, so its first step at PAGE_B is a block-map hit.
+    let sibling = harness.cpu.jit.as_ref().unwrap().sibling();
+    harness.cpu.jit = Some(Box::new(sibling));
+    harness.cpu.halted = false;
+    harness.cpu.rip = PAGE_B;
+    harness.cpu.gpr[R8] = 1;
+    while !harness.cpu.halted {
+        harness.cpu.icount += 1;
+        harness.cpu.dispatch_step().unwrap();
+    }
+    assert!(stats(harness).cross_page_linked > before.cross_page_linked);
+    // Both exits linked: the loop never comes back to the run loop.
+    run_loop(harness, 10);
+    harness.cpu.jit.as_mut().unwrap().clear_jump_cache();
+    assert_eq!(run_loop(harness, 1000), 1);
+}
+
 /// Remapping the second page (and invalidating its TLB entry, as the guest must) makes the link's
 /// check fail, so the loop runs the code the page maps to now.
 #[test]

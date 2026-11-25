@@ -455,12 +455,13 @@ fn has_segment_base(insn: &Insn) -> bool {
 /// block (`CODE_SIZE`).
 #[derive(Clone)]
 pub(crate) struct Addrs {
-    /// Tail-call stubs for `helper_exec_pair` and `helper_cond`.
+    /// Stubs that call `helper_exec_pair` and `helper_cond`, storing and reloading the pinned
+    /// guest registers around the call (`arch_a64::helper_stub`).
     pub exec: Stub,
     pub cond: Stub,
-    /// Tail-call stub for `helper_set_rotate_flags(cpu, packed CF/OF)`.
+    /// The same for `helper_set_rotate_flags(cpu, packed CF/OF)`.
     pub rotate_flags: Stub,
-    /// Tail-call stub for `helper_whole_vector(cpu, packed, source low, source high)`.
+    /// The same for `helper_whole_vector(cpu, packed, source low, source high)`.
     pub whole_vector: Stub,
     pub exit_ok: u64,
     pub exit_fail: u64,
@@ -544,6 +545,10 @@ impl<'a> Gen<'a> {
     pub fn new(base: u64, addrs: &'a Addrs, insns: &'a [Insn]) -> Self {
         let mut asm = Asm::new(base);
         asm.reserve(PINNED_HOST_MASK);
+        asm.reserve_slots(
+            CPU,
+            GPR_OFFSET..GPR_OFFSET + GPR_SIZE * PINNED_GUEST_COUNT as u32,
+        );
         Gen {
             asm,
             addrs,
@@ -3973,7 +3978,26 @@ mod tests {
     fn block_code_cannot_load_into_a_pinned_register() {
         let insns: [Insn; 0] = [];
         let mut generator = Gen::new(0, &DUMMY_ADDRESSES, &insns);
-        generator.asm.ldp_off(0, PINNED_HOST_FIRST + 7, CPU, 0);
+        generator
+            .asm
+            .ldp_off(0, PINNED_HOST_FIRST + 7, SCRATCH_A, 0);
+    }
+
+    /// The pinned registers' slots in `Cpu` are stale while a block runs.
+    #[test]
+    #[should_panic(expected = "guest register held in a host register")]
+    fn block_code_cannot_read_a_pinned_register_from_cpu() {
+        let insns: [Insn; 0] = [];
+        let mut generator = Gen::new(0, &DUMMY_ADDRESSES, &insns);
+        generator.asm.ldr(0, CPU, GPR_OFFSET + GPR_SIZE * 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "guest register held in a host register")]
+    fn block_code_cannot_store_a_pinned_register_to_cpu() {
+        let insns: [Insn; 0] = [];
+        let mut generator = Gen::new(0, &DUMMY_ADDRESSES, &insns);
+        generator.asm.strb(0, CPU, GPR_OFFSET + GPR_SIZE * 7 + 1);
     }
 
     #[test]

@@ -159,9 +159,6 @@ pub(crate) struct Jit {
     /// `State::code_writes` as of this handle's last instruction barrier or its own last write,
     /// so anything past it was written by another handle (`barrier_if_foreign`).
     synced_writes: u64,
-    /// `Cpu::ram_base`, learnt at the first translation: a block's physical address plus this is
-    /// the host page a cross-page exit checks for (`link_unresolved`).
-    ram_base: u64,
 }
 
 /// What every handle shares. Blocks and links are added and patched under `state`; the chain
@@ -226,6 +223,11 @@ struct State {
     /// address space may map the address elsewhere; the exit's check then fails and it takes the
     /// chain stub, as it would have anyway.
     unresolved: HashMap<u64, Vec<UnresolvedSite>>,
+    /// `Cpu::ram_base` (the same for every vCPU of the machine), set by `install` before it adds
+    /// to `unresolved`: a block's physical address plus this is the host page a cross-page exit
+    /// checks for. Kept here and not per handle, because a vCPU's first act may be a block-map
+    /// hit in `lookup` that links a site another vCPU's translation left waiting.
+    ram_base: u64,
     /// Counts writes to generated code that a core other than the writer's could have fetched
     /// stale: blocks, link patches and unlinks. A handle runs an instruction barrier before code
     /// it found in the block map only when this moved past its own `Jit::synced_writes`, so a
@@ -277,6 +279,14 @@ thread_local! {
 
 pub(crate) const fn jump_cache_mask() -> u64 {
     (1 << JUMP_CACHE_BITS) - 1
+}
+
+/// What `Jit::install` needs from the translating vCPU besides the decoded block: the code page
+/// flags, where cross-page targets map (`ResolveTarget`) and `Cpu::ram_base`.
+struct InstallContext<'a> {
+    flags: &'a CodePages,
+    resolve: ResolveTarget<'a>,
+    ram_base: u64,
 }
 
 /// What `Jit::install` found.
@@ -403,6 +413,7 @@ impl Jit {
                 incoming: HashMap::new(),
                 pending: HashMap::new(),
                 unresolved: HashMap::new(),
+                ram_base: 0,
                 code_writes: 0,
                 stats: JitStats::default(),
             }),
@@ -416,7 +427,6 @@ impl Jit {
             // Never equal to `code_writes`: a new handle's first block from the map takes a
             // barrier, whatever its thread's core ran before.
             synced_writes: u64::MAX,
-            ram_base: 0,
             shared,
             jump_cache: vec![JumpEntry::default(); 1 << JUMP_CACHE_BITS].into_boxed_slice(),
         }
@@ -601,7 +611,7 @@ impl Jit {
         let Some(sites) = state.unresolved.remove(&rip) else {
             return;
         };
-        let host_page = self.ram_base + (phys_addr & !PAGE_MASK);
+        let host_page = state.ram_base + (phys_addr & !PAGE_MASK);
         for site in sites {
             self.shared.exec_mem.write_u64(site.word_offset, host_page);
             state.code_writes += 1;
@@ -660,7 +670,6 @@ impl Jit {
     /// the lock is never held into `Cpu::with_exclusive`: the vCPUs that section waits for may be
     /// waiting for the lock.
     pub fn translate(&mut self, cpu: &mut Cpu, rip: u64, phys_addr: u64) -> Result<u64, Exception> {
-        self.ram_base = cpu.ram_base;
         loop {
             // Code can only execute from RAM; reported as a not-present fetch fault.
             if !cpu.ram.contains(phys_addr, 1) {
@@ -709,8 +718,11 @@ impl Jit {
                 rip,
                 phys_addr,
                 generation,
-                &cpu.page_has_code,
-                &resolve,
+                InstallContext {
+                    flags: &cpu.page_has_code,
+                    resolve: &resolve,
+                    ram_base: cpu.ram_base,
+                },
             ) {
                 Install::Ready(code_addr) => return Ok(code_addr),
                 Install::Stale => {}
@@ -727,11 +739,16 @@ impl Jit {
         rip: u64,
         phys_addr: u64,
         generation: u64,
-        flags: &CodePages,
-        resolve: ResolveTarget,
+        machine: InstallContext,
     ) -> Install {
+        let InstallContext {
+            flags,
+            resolve,
+            ram_base,
+        } = machine;
         let shared = self.shared.clone();
         let mut state = shared.lock();
+        state.ram_base = ram_base;
         // A write to the page since the bytes were read: its `invalidate_page` may have run
         // before this block existed (so dropped nothing), and the block would outlive it.
         if shared.invalidations.load(Ordering::Acquire) != generation {

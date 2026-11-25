@@ -125,6 +125,9 @@ pub(crate) struct Asm {
     reserved: u32,
     /// The one instruction `write_pinned` lets through.
     pinned_write_allowed: bool,
+    /// Memory no load or store may address through `[base, #offset]`: the `Cpu::gpr` slots of
+    /// the pinned registers, which are stale while generated code runs (`reserve_slots`).
+    reserved_slots: Option<(u32, std::ops::Range<u32>)>,
 }
 
 /// The general registers an encoded instruction writes, which every encoder must declare when it
@@ -206,6 +209,7 @@ impl Asm {
             pool: Vec::new(),
             reserved: 0,
             pinned_write_allowed: false,
+            reserved_slots: None,
         }
     }
 
@@ -214,8 +218,23 @@ impl Asm {
         self.reserved = mask;
     }
 
-    pub fn reserved(&self) -> u32 {
-        self.reserved
+    /// Makes a load or store at `[base, #offset]` with `offset` in `bytes` a bug: in block code the
+    /// pinned registers' slots in `Cpu::gpr` are only right at the trampoline and in the stubs.
+    pub fn reserve_slots(&mut self, base: u32, bytes: std::ops::Range<u32>) {
+        self.reserved_slots = Some((base, bytes));
+    }
+
+    /// Panics in tests on an access to a reserved slot (see `reserve_slots`).
+    fn check_slot(&self, rn: u32, offset: u32, size: u32) {
+        if cfg!(test)
+            && let Some((base, bytes)) = &self.reserved_slots
+        {
+            assert!(
+                rn != *base || offset + size <= bytes.start || offset >= bytes.end,
+                "access at offset {offset:#x} of a guest register held in a host register; \
+                 use Gen::load_gpr/store_gpr (docs/plans/06-jit.md, \"Pinned guest registers\")"
+            );
+        }
     }
 
     /// Emits one instruction that writes a reserved register on purpose: the generator's own
@@ -405,7 +424,9 @@ impl Asm {
         self.bl_stub(target);
     }
 
-    /// `bl_abs` to a stub that spills and reloads the pinned registers itself (`Gen::call`).
+    /// `bl_abs` without the check, for the two calls block code may make: a `Stub`, which spills
+    /// and reloads the pinned registers itself (`Gen::call`), and `arch_a64::cross_page_check`,
+    /// which touches neither them nor Rust. Nothing else may use it.
     pub fn bl_stub(&mut self, target: u64) {
         let offset = (target as i64 - self.here() as i64) / 4;
         assert!(offset.abs() < IMM26_SIGNED_LIMIT, "branch out of range");
@@ -739,6 +760,7 @@ impl Asm {
             off.is_multiple_of(1 << scale) && (off >> scale) < IMM12_LIMIT,
             "bad ldst offset {off}"
         );
+        self.check_slot(rn, off, 1 << scale);
         self.put(
             base | (off >> scale) << IMM12_SHIFT | rn << RN_SHIFT | rt,
             writes,
@@ -840,12 +862,14 @@ impl Asm {
         );
     }
     pub fn stp_off(&mut self, rt: u32, rt2: u32, rn: u32, imm: i32) {
+        self.check_slot(rn, imm as u32, 2 * PAIR_OFFSET_SCALE as u32);
         self.put(
             0xa900_0000 | Self::pair_imm7(imm) | rt2 << RT2_SHIFT | rn << RN_SHIFT | rt,
             Writes::Nothing,
         );
     }
     pub fn ldp_off(&mut self, rt: u32, rt2: u32, rn: u32, imm: i32) {
+        self.check_slot(rn, imm as u32, 2 * PAIR_OFFSET_SCALE as u32);
         self.put(
             0xa940_0000 | Self::pair_imm7(imm) | rt2 << RT2_SHIFT | rn << RN_SHIFT | rt,
             Writes::GpPair(rt, rt2),
