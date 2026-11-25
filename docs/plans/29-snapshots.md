@@ -2,6 +2,8 @@
 
 **Status:** implemented in the library, the CLI, the web build and both Apple engines. Checked on real Linux (the Alpine demo kernel) natively and under Node; the Apple app builds for macOS and iOS but its suspend and resume are not yet checked running (see "Checked").
 
+Format 2, delta snapshots, compression and checkpoints of a running machine: `34-incremental-snapshots.md`.
+
 ## Why
 
 iOS suspends a backgrounded app after a short grace, and may then end it, or only the WebKit engine's WebContent process, to reclaim memory (`28-apple.md`, "Backgrounding"). Until now that lost the machine: an install in progress started over. A snapshot of the whole machine, taken when the app goes to the background, lets it come back. The snapshot is the same on every host, so it also moves a machine between the native engine and the WebKit one (the WebAssembly build), and between the CLI, Node and the app.
@@ -10,12 +12,12 @@ iOS suspends a backgrounded app after a short grace, and may then end it, or onl
 
 A stopped machine's guest-visible state, written to a host sink as one stream (`crates/uemulator/src/machine/suspend.rs`):
 
-1. `UEMUSNAP`, format version.
+1. `UEMUSNAP`, format version; from format 2 also whether it is a delta, its id and its parent's (`34-incremental-snapshots.md`).
 2. The machine's shape: RAM size, vCPU count, and the devices (`Devices::snapshot_shape`: local APICs, each PCI function's slot and virtio type, IOMMU, key-value store, TPM, boot framebuffer). A restore compares it before reading any state, and refuses another machine's snapshot with a message naming both.
 3. Guest time in nanoseconds.
 4. Every vCPU (`Cpu`), then the machine-wide `rng_state`.
 5. The devices (`Devices`).
-6. RAM in groups of 64 pages, each a bitmap of the non-zero pages followed by those pages; an idle 512 MiB Alpine guest is about 80 MB.
+6. RAM in groups of 64 pages, each a bitmap of the non-zero pages (in a delta, of the pages written since the parent) followed by those pages, each one repeated byte, compressed, or raw (format 1 wrote them raw: an idle 512 MiB Alpine guest was about 80 MB).
 7. A CRC-32 of everything before it (`snapshot::Writer::finish`).
 
 The encoding is explicit little-endian with fixed widths, `usize` as `u64`, so wasm32 and 64-bit hosts read each other's. Each saved struct and enum writes a 32-bit tag hashed from its name and saved field names: a snapshot from a build whose layout differs fails at the first changed type ("X is laid out differently: it comes from another build"). Snapshots are meant to resume in the build that wrote them; the app's two engines come from one commit.
@@ -86,6 +88,6 @@ Guest wall time continues from the snapshot: the RTC and the guest clock do not 
 
 ## Limits and next steps
 
-- RAM goes out whole (zero pages skipped). A 2 GiB guest that has touched most of its memory writes about 2 GB, through 1 MiB POSTs on the WebKit engine: measured in M0 at 6 to 11 ms each, so up to about 20 s, close to iOS's background grace. Compressing pages or writing only the pages dirtied since an earlier snapshot would shorten it.
+- A suspend writes all of RAM (zero pages skipped). A 2 GiB guest that has touched most of its memory wrote about 2 GB, through 1 MiB POSTs on the WebKit engine: measured in M0 at 6 to 11 ms each, so up to about 20 s, close to iOS's background grace. Pages are compressed now (format 2: 1.76x smaller on an Alpine guest with text and random data in a tmpfs), and checkpoints write only the pages dirtied since the one before (`34-incremental-snapshots.md`); a suspend that is a delta against a base the app keeps is the next step there.
 - Suspending as soon as the app goes to the background trades the grace period's running time for safety: a quick app switch costs a suspend and a resume.
 - No snapshot with a virgl GPU, under `verify_jit`, or after a BIOS disk boot.

@@ -398,6 +398,10 @@ pub struct RuntimeArgs {
     /// resume from)
     #[arg(long, value_name = "SECS")]
     pub checkpoint_every: Option<u64>,
+    /// Emulator self-check: each checkpoint fails if a page changed that the dirty log missed
+    /// (keeps a copy of RAM)
+    #[arg(long, hide = true)]
+    pub check_dirty_tracking: bool,
     /// Where the viewer of a machine with a screen or input listens, as HOST:PORT: an address or
     /// a host name (the viewer then answers to that name), port 0 picks a free one. Anyone who
     /// can reach it controls the machine's keyboard and mouse [default: 127.0.0.1:5800]

@@ -210,7 +210,8 @@ fn build_config(
     let mut cfg = MachineConfig::new()
         .kernel(kernel)
         .debug(runtime.debug)
-        .verify_jit(runtime.verify);
+        .verify_jit(runtime.verify)
+        .check_dirty_tracking(runtime.check_dirty_tracking);
     if let Some(path) = &runtime.suspend_to {
         cfg = cfg.suspend_to(FileSnapshotSink::new(path));
     }
