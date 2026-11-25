@@ -3,7 +3,8 @@ use std::time::Duration;
 
 use uemulator::{
     ConsoleKind, Disk, DisplayMode, EmulatedMachine, ExitReason, FileSnapshotSink,
-    FileSnapshotSource, JitMode, MachineConfig, NetHandle, NetOffloads, SmpMode, StopHandle,
+    FileSnapshotSource, GdbStub, JitMode, MachineConfig, NetHandle, NetOffloads, SmpMode,
+    StopHandle,
 };
 
 use crate::args::{
@@ -27,6 +28,8 @@ const UDP_MAX_DATAGRAM: usize = 65536;
 /// time out quickly to keep guest-to-host frames flowing.
 const UDP_RECV_TIMEOUT: Duration = Duration::from_millis(2);
 const GATEWAY_RECV_TIMEOUT: Duration = Duration::from_millis(5);
+const GDB_READ_CHUNK: usize = 4096;
+const GDB_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Splits `--network-link-udp LOCAL,REMOTE` at the first comma.
 fn parse_udp_spec(spec: &str) -> Result<(&str, &str), String> {
@@ -144,6 +147,9 @@ fn build_config(
     }
     if let Some(path) = &runtime.resume_from {
         cfg = cfg.resume_from(FileSnapshotSource::open(path).map_err(|e| e.to_string())?);
+    }
+    if runtime.gdb.is_some() {
+        cfg = cfg.gdb_stub(runtime.gdb_wait);
     }
     if runtime.debug {
         cfg = cfg.log(|line| eprintln!("{line}"));
@@ -376,6 +382,10 @@ fn run_config(
         // Before raw mode, so a plain newline ends the line.
         eprintln!("{}", viewer.start(screen)?);
     }
+    if let (Some(address), Some(stub)) = (&runtime.gdb, machine.gdb_stub()) {
+        // Before raw mode, so a plain newline ends the line.
+        eprintln!("{}", serve_gdb(stub, address)?);
+    }
     let console = machine.console();
     if machine.consoles().len() > 1 {
         eprintln!(
@@ -473,6 +483,45 @@ fn run_config(
         _ => {}
     }
     Ok(reason)
+}
+
+/// Listens for a debugger on `address` and moves bytes between each connection (one at a time)
+/// and the machine's stub. Returns the line to print.
+fn serve_gdb(stub: GdbStub, address: &str) -> Result<String, String> {
+    let listener =
+        std::net::TcpListener::bind(address).map_err(|e| format!("--gdb {address}: {e}"))?;
+    let bound = listener.local_addr().map_err(|e| e.to_string())?;
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            // Every packet waits for its answer: Nagle would hold each one back.
+            let _ = stream.set_nodelay(true);
+            // Output is written from the stopped vCPU's thread: a client that stops reading must
+            // not keep the machine from noticing it is told to stop.
+            let _ = stream.set_write_timeout(Some(GDB_WRITE_TIMEOUT));
+            let Ok(writer) = stream.try_clone() else {
+                continue;
+            };
+            let writer = std::sync::Mutex::new(writer);
+            stub.on_output(move |bytes| {
+                let _ = writer.lock().unwrap().write_all(bytes);
+            });
+            stub.connected();
+            let mut buf = [0u8; GDB_READ_CHUNK];
+            while let Ok(n) = stream.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                stub.from_client(&buf[..n]);
+            }
+            stub.disconnected();
+        }
+    });
+    Ok(format!(
+        "gdb: listening on {bound} (gdb: target remote {bound}, lldb: gdb-remote {bound})"
+    ))
 }
 
 /// Seed for the guest's rdrand/rdseed from the host's per-process random hasher keys (which the
@@ -787,6 +836,50 @@ mod tests {
         // The empty kernel fails only after the configuration (device count, console rules)
         // was accepted.
         assert!(!machine_error(cfg).contains("virtio devices"));
+    }
+
+    #[test]
+    fn the_gdb_options_parse_with_and_without_an_address() {
+        let (_, runtime) = boot_args(&["--gdb"]);
+        assert_eq!(
+            runtime.gdb.as_deref(),
+            Some(crate::args::DEFAULT_GDB_ADDRESS)
+        );
+        assert!(!runtime.gdb_wait);
+        let (_, runtime) = boot_args(&["--gdb", "0.0.0.0:9000", "--gdb-wait"]);
+        assert_eq!(runtime.gdb.as_deref(), Some("0.0.0.0:9000"));
+        assert!(runtime.gdb_wait);
+        let (_, runtime) = boot_args(&[]);
+        assert_eq!(runtime.gdb, None);
+        assert!(
+            crate::parse_cli([
+                "uemulator",
+                "advanced",
+                "boot",
+                "--kernel",
+                "k",
+                "--gdb-wait"
+            ])
+            .is_err(),
+            "--gdb-wait needs --gdb"
+        );
+        // The stub is the library's: the config takes it, and the library refuses it together
+        // with verification.
+        assert!(build(&["--gdb"], None).is_ok());
+        let refused = EmulatedMachine::new(build(&["--gdb", "--verify"], None).unwrap());
+        assert!(refused.err().unwrap().to_string().contains("GDB"));
+    }
+
+    #[test]
+    fn a_gdb_address_in_use_is_an_error() {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = taken.local_addr().unwrap().to_string();
+        let config = MachineConfig::new()
+            .firmware(vec![0xf4; 16])
+            .gdb_stub(false);
+        let machine = EmulatedMachine::new(config).unwrap();
+        let message = serve_gdb(machine.gdb_stub().unwrap(), &address).unwrap_err();
+        assert!(message.contains(&address), "{message}");
     }
 
     #[test]

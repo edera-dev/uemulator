@@ -3,7 +3,7 @@
 //! shared code such as the console and net queues compiles unchanged on both.
 
 #[cfg(not(freestanding))]
-pub(crate) use std::sync::{Arc, Condvar, Mutex};
+pub(crate) use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 /// Lets another thread run while this one waits for a lock. A freestanding host has no scheduler
 /// to offer the slice to, so it only tells the CPU it is spinning.
@@ -17,7 +17,7 @@ pub(crate) fn yield_now() {
 #[cfg(freestanding)]
 pub(crate) use alloc::sync::Arc;
 #[cfg(freestanding)]
-pub(crate) use uefi_stubs::{Condvar, Mutex};
+pub(crate) use uefi_stubs::{Condvar, Guard as MutexGuard, Mutex};
 
 // Also built for tests so the stand-ins' logic runs on the host; nothing outside the tests uses
 // them there.
