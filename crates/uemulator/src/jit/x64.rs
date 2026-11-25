@@ -393,6 +393,19 @@ impl Asm {
         self.sse_rr(OPERAND_SIZE_PREFIX, OPCODE_PMOVMSKB, d, x);
     }
 
+    /// `66 0f 73 /group ib` on xmm `x`: psrlq (2), psrldq (3), psllq (6) or pslldq (7) by
+    /// `count`, the guest instruction's own encoding.
+    pub fn xmm_shift_immediate(&mut self, group: u8, x: u8, count: u8) {
+        const OPCODE_SHIFT_QUADWORD_IMMEDIATE: u8 = 0x73;
+        self.sse_rr(
+            OPERAND_SIZE_PREFIX,
+            OPCODE_SHIFT_QUADWORD_IMMEDIATE,
+            group,
+            x,
+        );
+        self.code.push(count);
+    }
+
     /// `pshufd d, s, order`: result dword `k` is dword `order[2k+1:2k]` of `s`.
     pub fn pshufd(&mut self, d: u8, s: u8, order: u8) {
         self.sse_rr(OPERAND_SIZE_PREFIX, OPCODE_PSHUFD, d, s);

@@ -1,10 +1,12 @@
 //! AVX and AVX2 (VEX-encoded) instructions the JIT lowers inline (`helpers::evex_form`, which
 //! hands VEX to `vex_form`): whole-vector moves, integer logic, arithmetic and compares, and
 //! vpmovmskb; plus the EVEX broadcasts from a general register and kmov of every width, which
-//! share the machinery. The register fillings, the TLB warm-up and the comparison are
-//! `diff_evex`'s. The assembly is the string in each table entry (`hack/asm.sh`).
+//! share the machinery; and the legacy psrlq/psllq/psrldq/pslldq by an immediate and movq
+//! xmm/m64, xmm, the hottest SSE integer forms left in a Fedora live boot. The register
+//! fillings, the TLB warm-up and the comparison are `diff_evex`'s. The assembly is the string in
+//! each table entry (`hack/asm.sh`).
 
-use super::diff_evex::{CR4_OSXSAVE, run_table, setup, warmed};
+use super::diff_evex::{CR4_OSFXSR, CR4_OSXSAVE, run_table, setup, warmed};
 use super::diff_tests::*;
 
 #[test]
@@ -31,6 +33,69 @@ fn broadcasts_from_general_registers_match_the_interpreter() {
 fn kmov_of_every_width_matches_the_interpreter() {
     run_table(KMOVS);
 }
+
+#[test]
+fn quadword_and_byte_shifts_and_movq_stores_match_the_interpreter() {
+    run_table(SHIFTS_AND_MOVQ);
+}
+
+const SHIFTS_AND_MOVQ: &[(&str, &[u8])] = &[
+    ("psrlq xmm1, 0", &[0x66, 0x0f, 0x73, 0xd1, 0x00, 0xf4]),
+    ("psrlq xmm1, 1", &[0x66, 0x0f, 0x73, 0xd1, 0x01, 0xf4]),
+    ("psrlq xmm1, 7", &[0x66, 0x0f, 0x73, 0xd1, 0x07, 0xf4]),
+    ("psrlq xmm1, 63", &[0x66, 0x0f, 0x73, 0xd1, 0x3f, 0xf4]),
+    ("psrlq xmm1, 64", &[0x66, 0x0f, 0x73, 0xd1, 0x40, 0xf4]),
+    ("psrlq xmm1, 200", &[0x66, 0x0f, 0x73, 0xd1, 0xc8, 0xf4]),
+    ("psllq xmm9, 1", &[0x66, 0x41, 0x0f, 0x73, 0xf1, 0x01, 0xf4]),
+    (
+        "psllq xmm9, 33",
+        &[0x66, 0x41, 0x0f, 0x73, 0xf1, 0x21, 0xf4],
+    ),
+    (
+        "psllq xmm9, 63",
+        &[0x66, 0x41, 0x0f, 0x73, 0xf1, 0x3f, 0xf4],
+    ),
+    (
+        "psllq xmm9, 64",
+        &[0x66, 0x41, 0x0f, 0x73, 0xf1, 0x40, 0xf4],
+    ),
+    ("psrldq xmm2, 0", &[0x66, 0x0f, 0x73, 0xda, 0x00, 0xf4]),
+    ("psrldq xmm2, 1", &[0x66, 0x0f, 0x73, 0xda, 0x01, 0xf4]),
+    ("psrldq xmm2, 8", &[0x66, 0x0f, 0x73, 0xda, 0x08, 0xf4]),
+    ("psrldq xmm2, 15", &[0x66, 0x0f, 0x73, 0xda, 0x0f, 0xf4]),
+    ("psrldq xmm2, 16", &[0x66, 0x0f, 0x73, 0xda, 0x10, 0xf4]),
+    ("psrldq xmm2, 255", &[0x66, 0x0f, 0x73, 0xda, 0xff, 0xf4]),
+    (
+        "pslldq xmm15, 1",
+        &[0x66, 0x41, 0x0f, 0x73, 0xff, 0x01, 0xf4],
+    ),
+    (
+        "pslldq xmm15, 15",
+        &[0x66, 0x41, 0x0f, 0x73, 0xff, 0x0f, 0xf4],
+    ),
+    (
+        "pslldq xmm15, 16",
+        &[0x66, 0x41, 0x0f, 0x73, 0xff, 0x10, 0xf4],
+    ),
+    ("pslldq xmm0, 9", &[0x66, 0x0f, 0x73, 0xf8, 0x09, 0xf4]),
+    // the MMX forms (no 66) are other instructions, left to the interpreter
+    ("psrlq mm1, 3", &[0x0f, 0x73, 0xd1, 0x03, 0xf4]),
+    ("movq [rbx], xmm3", &[0x66, 0x0f, 0xd6, 0x1b, 0xf4]),
+    (
+        "movq [rbx+7], xmm10",
+        &[0x66, 0x44, 0x0f, 0xd6, 0x53, 0x07, 0xf4],
+    ),
+    (
+        "movq [rbx+rcx*8+0x41], xmm0",
+        &[0x66, 0x0f, 0xd6, 0x44, 0xcb, 0x41, 0xf4],
+    ),
+    // the register form: xmm4 gets xmm5's low quadword and a clear high one
+    ("movq xmm4, xmm5 (d6)", &[0x66, 0x0f, 0xd6, 0xec, 0xf4]),
+    (
+        "movq xmm12, xmm12 (d6)",
+        &[0x66, 0x45, 0x0f, 0xd6, 0xe4, 0xf4],
+    ),
+];
 
 const MOVES: &[(&str, &[u8])] = &[
     ("vmovdqu ymm1, [rbx]", &[0xc5, 0xfe, 0x6f, 0x0b, 0xf4]),
@@ -266,15 +331,17 @@ const STORE_32: &[u8] = &[0xc5, 0xfe, 0x7f, 0x53, 0x3d, 0xf4];
 const COMPARE_32: &[u8] = &[0xc5, 0xed, 0x74, 0x4b, 0x3d, 0xf4];
 /// vmovdqu xmm1, [rbx+0x3d]
 const LOAD_16: &[u8] = &[0xc5, 0xfa, 0x6f, 0x4b, 0x3d, 0xf4];
+/// movq [rbx+0x3d], xmm1
+const MOVQ_STORE: &[u8] = &[0x66, 0x0f, 0xd6, 0x4b, 0x3d, 0xf4];
 
 /// Memory operands the inline path hands to the interpreter: a page crossing at every offset
 /// around the end of a page.
 #[test]
 fn vex_memory_operands_at_the_end_of_a_page_match() {
     const PAGE: u64 = 4096;
-    for code in [LOAD_32, STORE_32, COMPARE_32, LOAD_16] {
+    for code in [LOAD_32, STORE_32, COMPARE_32, LOAD_16, MOVQ_STORE] {
         let code = &warmed(code);
-        for back in [0u64, 1, 15, 16, 17, 31, 32, 33, 0x3d + 31] {
+        for back in [0u64, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 0x3d + 31] {
             check_with(code, |harness| {
                 setup(harness, 2);
                 // rbx + 0x3d is the operand: put it `back` bytes before the end of a page
@@ -288,7 +355,13 @@ fn vex_memory_operands_at_the_end_of_a_page_match() {
 #[test]
 fn unmapped_vex_memory_operands_fault_alike() {
     const UNMAPPED: u64 = 0x1_0000_0000;
-    for (code, error_code) in [(LOAD_32, 0), (STORE_32, 2), (COMPARE_32, 0), (LOAD_16, 0)] {
+    for (code, error_code) in [
+        (LOAD_32, 0),
+        (STORE_32, 2),
+        (COMPARE_32, 0),
+        (LOAD_16, 0),
+        (MOVQ_STORE, 2),
+    ] {
         check_stop_with(
             code,
             |harness| {
@@ -361,6 +434,42 @@ fn the_avx_state_gate_raises_ud_and_nm() {
     }
 }
 
+/// The legacy forms are behind `Cpu::sse`'s gate: #UD under CR0.EM or without CR4.OSFXSR, #NM
+/// under CR0.TS; the AVX state does not matter.
+#[test]
+fn the_sse_gate_of_the_shifts_and_movq_raises_ud_and_nm() {
+    for code in [SHIFTS_AND_MOVQ[12].1, SHIFTS_AND_MOVQ[21].1] {
+        check_stop_with(
+            code,
+            |harness| {
+                setup(harness, 0);
+                harness.cpu.cr0 |= CR0_EM_BIT;
+            },
+            fault(UD, None),
+        );
+        check_stop_with(
+            code,
+            |harness| {
+                setup(harness, 0);
+                harness.cpu.cr4 &= !CR4_OSFXSR;
+            },
+            fault(UD, None),
+        );
+        check_stop_with(
+            code,
+            |harness| {
+                setup(harness, 0);
+                harness.cpu.cr0 |= CR0_TS_BIT;
+            },
+            fault(NM, None),
+        );
+        check_with(code, |harness| {
+            setup(harness, 0);
+            harness.cpu.cr4 &= !CR4_OSXSAVE;
+        });
+    }
+}
+
 /// pxor xmm1, xmm2 (legacy SSE)
 const LEGACY: &[u8] = &[0x66, 0x0f, 0xef, 0xca];
 /// vpxor ymm1, ymm2, ymm3 (VEX)
@@ -409,6 +518,7 @@ fn the_sse_avx_and_avx512_gates_of_one_block_stay_apart() {
 /// agrees with the interpreter by construction), so count what reaches the interpreter: after
 /// `WARM_TLB` none of these may, on any backend, masked forms included.
 #[test]
+#[cfg(feature = "jit")]
 fn the_lowered_forms_run_without_the_interpreter() {
     use crate::testkit::{Harness, Stop};
     const REPEATS: usize = 3;
@@ -427,6 +537,11 @@ fn the_lowered_forms_run_without_the_interpreter() {
         // kmovd k6, esp | kmovb eax, k1
         &[0xc5, 0xfb, 0x92, 0xf4],
         &[0xc5, 0xf9, 0x93, 0xc1],
+        // psrldq xmm2, 8 | psllq xmm9, 33 | movq [rbx+7], xmm10 | movq xmm4, xmm5
+        &[0x66, 0x0f, 0x73, 0xda, 0x08],
+        &[0x66, 0x41, 0x0f, 0x73, 0xf1, 0x21],
+        &[0x66, 0x44, 0x0f, 0xd6, 0x53, 0x07],
+        &[0x66, 0x0f, 0xd6, 0xec],
         // vmovdqu8 zmm1{k1}, [rbx] | vmovdqu16 ymm2{k2}, [rbx] | vpaddb ymm4{k1}{z}, ymm5, [rbx+32]
         &[0x62, 0xf1, 0x7f, 0x49, 0x6f, 0x0b],
         &[0x62, 0xf1, 0xff, 0x2a, 0x6f, 0x13],

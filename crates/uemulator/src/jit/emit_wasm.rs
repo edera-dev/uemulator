@@ -110,6 +110,9 @@ const LANE_MASK_BITS: i64 = 16;
 /// `66 0f 6e` (movd/movq xmm, r/m) and `66 0f 7e` (movd/movq r/m, xmm).
 const MOVD_TO_VECTOR: u16 = 0x16e;
 const MOVD_FROM_VECTOR: u16 = 0x17e;
+/// `0f 73` (the quadword and byte shifts by an immediate) and `0f d6` (movq xmm/m64, xmm).
+const PSHIFT_QUADWORD_IMMEDIATE: u16 = 0x173;
+const MOVQ_STORE: u16 = 0x1d6;
 const SEG_SIZE: u32 = size_of::<Seg>() as u32;
 const SHADOW_STACK_ON: u32 = offset_of!(Cpu, shadow_stack_on) as u32;
 const SSP: u32 = (offset_of!(Cpu, cet) + offset_of!(Cet, ssp)) as u32;
@@ -1380,6 +1383,85 @@ impl<'a> Gen<'a> {
                 .simd_mem(simd::V128_STORE, vector_lane_offset(insn.reg, 0) as u32);
         }
         self.end_vector_access(opened, index, rip);
+    }
+
+    /// psrlq/psllq (i64x2 shifts) and psrldq/pslldq (a byte shuffle against zero) of xmm `rm`
+    /// by an immediate. wasm takes shift counts modulo the lane width, so a count past the width
+    /// (which clears the register) and a zero count are decided here.
+    fn vector_shift(&mut self, insn: &Insn, shift: VectorShift, count: u8, index: usize, rip: u64) {
+        const BYTES: u8 = LANE_BYTES as u8;
+        let gated = self.vector_gate(None);
+        if gated {
+            self.c.begin_if(BLOCK_VOID);
+        }
+        let xmm = vector_lane_offset(insn.rm, 0) as u32;
+        if shift.clears(count) {
+            for half in [0, HALF_LANE_BYTES] {
+                self.c
+                    .local_get(CPU)
+                    .i64_const(0)
+                    .mem(op::I64_STORE, xmm + half);
+            }
+        } else if count != 0 {
+            self.c.local_get(CPU);
+            self.push_register_lane(insn.rm, 0);
+            match shift {
+                VectorShift::RightQuadwords => {
+                    self.c.i32_const(count as i32).simd(simd::I64X2_SHR_U);
+                }
+                VectorShift::LeftQuadwords => {
+                    self.c.i32_const(count as i32).simd(simd::I64X2_SHL);
+                }
+                // byte i is byte i + count, from the zero operand past 15
+                VectorShift::RightBytes => {
+                    self.c
+                        .v128_const(0)
+                        .shuffle(core::array::from_fn(|i| i as u8 + count));
+                }
+                // byte i is byte i - count, from the zero operand (byte 16) below count
+                VectorShift::LeftBytes => {
+                    self.c.v128_const(0).shuffle(core::array::from_fn(|i| {
+                        let i = i as u8;
+                        if i < count { BYTES } else { i - count }
+                    }));
+                }
+            }
+            self.c.simd_mem(simd::V128_STORE, xmm);
+        }
+        if gated {
+            self.c.op(op::ELSE);
+            self.helper_in_branch(index, rip);
+            self.end();
+        }
+    }
+
+    /// movq xmm/m64, xmm (`is_movq_store`): the low quadword of xmm `reg` to memory inside one
+    /// page (no alignment rule; otherwise the interpreter), or to xmm `rm` with its high quadword
+    /// cleared. Returns true for a store to memory.
+    fn movq_store(&mut self, insn: &Insn, next: u64, index: usize, rip: u64) -> bool {
+        const QUADWORD_BYTES: u32 = 8;
+        let source = vector_lane_offset(insn.reg, 0) as u32;
+        let memory = insn.md != MODRM_MOD_REGISTER;
+        let opened = self.begin_vector_access(insn, QUADWORD_BYTES, false, true, None, next);
+        if memory {
+            self.c
+                .local_get(SLOT)
+                .local_get(CPU)
+                .mem(op::I64_LOAD, source)
+                .mem(op::I64_STORE, 0);
+        } else {
+            let destination = vector_lane_offset(insn.rm, 0) as u32;
+            self.c
+                .local_get(CPU)
+                .local_get(CPU)
+                .mem(op::I64_LOAD, source)
+                .mem(op::I64_STORE, destination)
+                .local_get(CPU)
+                .i64_const(0)
+                .mem(op::I64_STORE, destination + HALF_LANE_BYTES);
+        }
+        self.end_vector_access(opened, index, rip);
+        memory
     }
 
     /// `66 [REX.W] 0f 6e` movd/movq xmm, r/m32/64 (the value zero-extended into all 128 bits of
@@ -3420,6 +3502,17 @@ impl<'a> Gen<'a> {
                 }
                 self.legacy_vector_alu(&insn, form, next, index, rip);
             }
+            // psrlq/psllq/psrldq/pslldq xmm, imm8 (66 0f 73 /2 /6 /3 /7)
+            PSHIFT_QUADWORD_IMMEDIATE if plain && self.addrs.simd => {
+                let Some((shift, count)) = vector_shift(&insn) else {
+                    return false;
+                };
+                self.vector_shift(&insn, shift, count, index, rip);
+            }
+            // movq xmm/m64, xmm (66 0f d6)
+            MOVQ_STORE if plain && is_movq_store(&insn) => {
+                store = self.movq_store(&insn, next, index, rip);
+            }
             // movd/movq between xmm and a general register or memory
             MOVD_TO_VECTOR | MOVD_FROM_VECTOR if plain && insn.p66 && insn.rep == 0 => {
                 store = self.movd(&insn, insn.op == MOVD_TO_VECTOR, next, index, rip);
@@ -3851,6 +3944,7 @@ fn keeps_pending_record(insn: &Insn) -> bool {
         VEX_BMI_MULX => insn.rep == PREFIX_F2,
         // the vector moves and integer instructions, legacy, VEX and EVEX, movd/movq and kmov
         0x110 | 0x111 | 0x128 | 0x129 | 0x16f | 0x17f | MOVD_TO_VECTOR | MOVD_FROM_VECTOR => true,
+        PSHIFT_QUADWORD_IMMEDIATE | MOVQ_STORE => true,
         0x1d4 | 0x1d7 | 0x1da | 0x1db | 0x1de | 0x1df | 0x1eb | 0x1ef | 0x174..=0x176 => true,
         0x1f8..=0x1fe => true,
         _ => insn.evex || (insn.vex && evex_form(insn).is_some()),

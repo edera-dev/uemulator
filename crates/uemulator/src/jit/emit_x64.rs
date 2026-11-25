@@ -2209,6 +2209,17 @@ impl<'a> Gen<'a> {
                 }
                 store = self.vector_alu(&insn, form, next, insn_index, rip);
             }
+            // psrlq/psllq/psrldq/pslldq xmm, imm8 (66 0f 73 /2 /6 /3 /7)
+            0x173 if plain => {
+                let Some((_, count)) = vector_shift(&insn) else {
+                    return false;
+                };
+                self.vector_shift(&insn, count, insn_index, rip);
+            }
+            // movq xmm/m64, xmm (66 0f d6)
+            0x1d6 if plain && is_movq_store(&insn) => {
+                store = self.movq_store(&insn, next, insn_index, rip);
+            }
             // The SHA extensions (no prefix), pshufd, palignr and pshufb (66 prefix): see
             // `whole_vector`
             0x170 | 0x200 | 0x30f | 0x2c8..=0x2cd | 0x3cc if plain => {
@@ -2783,6 +2794,46 @@ impl<'a> Gen<'a> {
         self.a.bind(resume);
         self.live = false;
         false
+    }
+
+    /// psrlq/psllq/psrldq/pslldq of xmm `rm` by an immediate (`vector_shift`): the host's own SSE2
+    /// instruction, whose counts past the width clear the register as the guest's do.
+    fn vector_shift(&mut self, insn: &Insn, count: u8, insn_index: u32, rip: u64) {
+        let (_, resume) = self.sse_entry(insn_index, rip);
+        let xmm = XMM + XMM_SIZE * insn.rm as i32;
+        self.a.xmm_ld(HOST_XMM_DST, mem(CPU, xmm));
+        self.a
+            .xmm_shift_immediate(insn.reg & OPCODE_REG_MASK, HOST_XMM_DST, count);
+        self.a.xmm_st(mem(CPU, xmm), HOST_XMM_DST);
+        self.a.bind(resume);
+        self.live = false;
+    }
+
+    /// movq xmm/m64, xmm (`is_movq_store`): the low quadword of xmm `reg` to memory inside one
+    /// page (no alignment rule; a miss or a page crossing runs in the interpreter), or to xmm `rm`
+    /// with its high quadword cleared. Returns whether it stores to memory.
+    fn movq_store(&mut self, insn: &Insn, next: u64, insn_index: u32, rip: u64) -> bool {
+        const QUADWORD_BYTES: u8 = 8;
+        let (slow, resume) = self.sse_entry(insn_index, rip);
+        let xmm = |reg: u8| XMM + XMM_SIZE * reg as i32;
+        let memory = insn.md != MODRM_MOD_REGISTER;
+        if memory {
+            self.ea(insn, next);
+            self.tlb_probe(QUADWORD_BYTES, TLB_TAG_WRITE, slow);
+            self.a.ld(SCRATCH_B, mem(SCRATCH_A, TLB_ADDEND));
+            self.a.ld(VALUE, mem(CPU, xmm(insn.reg)));
+            self.a
+                .st(mem_idx(ADDR, SCRATCH_B, 0, 0), VALUE, QUADWORD_BYTES);
+        } else {
+            self.a.ld(VALUE, mem(CPU, xmm(insn.reg)));
+            self.a.st(mem(CPU, xmm(insn.rm)), VALUE, QUADWORD_BYTES);
+            self.a.mov_imm(VALUE, 0);
+            self.a
+                .st(mem(CPU, xmm(insn.rm) + XMM_HALF), VALUE, QUADWORD_BYTES);
+        }
+        self.a.bind(resume);
+        self.live = false;
+        memory
     }
 
     /// A `WholeVector` instruction (the SHA extensions, pshufd, palignr, pshufb), the source being

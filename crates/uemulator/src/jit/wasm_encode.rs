@@ -104,6 +104,8 @@ pub(crate) mod simd {
     pub const V128_STORE: u32 = 0x0b;
     /// Followed by the 16 bytes of the constant (`Code::v128_const`).
     pub const V128_CONST: u32 = 0x0c;
+    /// Followed by 16 lane indices into the 32 bytes of its two operands (`Code::shuffle`).
+    pub const I8X16_SHUFFLE: u32 = 0x0d;
     pub const I8X16_SWIZZLE: u32 = 0x0e;
     pub const I8X16_SPLAT: u32 = 0x0f;
     pub const I16X8_SPLAT: u32 = 0x10;
@@ -137,6 +139,8 @@ pub(crate) mod simd {
     pub const I32X4_ADD: u32 = 0xae;
     pub const I32X4_SUB: u32 = 0xb1;
     pub const I64X2_ADD: u32 = 0xce;
+    pub const I64X2_SHL: u32 = 0xcb;
+    pub const I64X2_SHR_U: u32 = 0xcd;
     pub const I64X2_SUB: u32 = 0xd1;
     pub const I64X2_EQ: u32 = 0xd6;
 }
@@ -258,6 +262,14 @@ impl Code {
     pub fn v128_const(&mut self, value: u128) -> &mut Self {
         self.simd(simd::V128_CONST);
         self.bytes.extend_from_slice(&value.to_le_bytes());
+        self
+    }
+
+    /// `i8x16.shuffle`: byte `i` of the result is byte `lanes[i]` of the first operand followed
+    /// by the second (0..32).
+    pub fn shuffle(&mut self, lanes: [u8; 16]) -> &mut Self {
+        self.simd(simd::I8X16_SHUFFLE);
+        self.bytes.extend_from_slice(&lanes);
         self
     }
 

@@ -12,6 +12,8 @@ use crate::testkit::Harness;
 /// vector-aligned offset of a case sees the same bytes and a register filled from it compares equal.
 /// CR4.OSXSAVE; `cpu::CR4_OSXSAVE` is only exported to the generators' own hosts.
 pub(super) const CR4_OSXSAVE: u64 = 1 << 18;
+/// CR4.OSFXSR, which the legacy SSE forms `diff_vex` runs through `setup` need.
+pub(super) const CR4_OSFXSR: u64 = 1 << 9;
 const PATTERN_BYTES: usize = 64;
 const PATTERN_REPEATS: usize = 6;
 const VECTOR_REGISTERS: usize = 32;
@@ -23,7 +25,7 @@ pub(super) const FILLINGS: u64 = 6;
 /// changed, 3 all zero, 4 all ones, 5 the pattern exactly.
 pub(super) fn setup(harness: &mut Harness, filling: u64) {
     seed_registers_and_memory(harness);
-    harness.cpu.cr4 |= CR4_OSXSAVE;
+    harness.cpu.cr4 |= CR4_OSXSAVE | CR4_OSFXSR;
     harness.cpu.xcr0 = XCR0_SUPPORTED;
     let mut rng = Rng(0x1234_5678_9abc_def0 ^ filling.wrapping_mul(0x9e37_79b9));
     let mut pattern = [0u8; PATTERN_BYTES];

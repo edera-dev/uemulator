@@ -2737,6 +2737,17 @@ impl<'a> Gen<'a> {
                 }
                 is_store = self.vector_alu(&insn, form, next_rip, insn_index, rip);
             }
+            // psrlq/psllq/psrldq/pslldq xmm, imm8 (66 0f 73 /2 /6 /3 /7)
+            0x173 if plain => {
+                let Some((shift, count)) = vector_shift(&insn) else {
+                    return false;
+                };
+                self.vector_shift(&insn, shift, count, insn_index, rip);
+            }
+            // movq xmm/m64, xmm (66 0f d6)
+            0x1d6 if plain && is_movq_store(&insn) => {
+                is_store = self.movq_store(&insn, next_rip, insn_index, rip);
+            }
             // The SHA extensions (no prefix), pshufd, palignr and pshufb (66 prefix): see
             // `whole_vector`
             0x170 | 0x200 | 0x30f | 0x2c8..=0x2cd | 0x3cc if plain => {
@@ -3348,6 +3359,82 @@ impl<'a> Gen<'a> {
         self.asm.bind(resume);
         self.live = None;
         false
+    }
+
+    /// psrlq/psllq (`ushr`/`shl` of the two quadwords) and psrldq/pslldq (`ext` against a zero
+    /// vector) of xmm `rm` by an immediate. A count of 0 leaves the register as it is, one past
+    /// the width clears it; neither is encodable as a NEON shift, so both are decided here.
+    fn vector_shift(
+        &mut self,
+        insn: &Insn,
+        shift: VectorShift,
+        count: u8,
+        insn_index: u32,
+        rip: u64,
+    ) {
+        const QUADWORD_BITS: u32 = 64;
+        let (_, resume) = self.sse_entry(insn_index, rip);
+        let xmm = XMM_OFFSET + XMM_SIZE * insn.rm as u32;
+        let count = count as u32;
+        if shift.clears(count as u8) {
+            self.asm.str(XZR, CPU, xmm);
+            self.asm.str(XZR, CPU, xmm + XMM_HALF);
+        } else if count != 0 {
+            self.asm.ldr_q(VECTOR_SRC, CPU, xmm);
+            match shift {
+                VectorShift::RightQuadwords => {
+                    self.asm
+                        .vec_ushr(VECTOR_DST, VECTOR_SRC, QUADWORD_BITS, count)
+                }
+                VectorShift::LeftQuadwords => {
+                    self.asm
+                        .vec_shl(VECTOR_DST, VECTOR_SRC, QUADWORD_BITS, count)
+                }
+                // bytes count..16 of the source, then zeros
+                VectorShift::RightBytes => {
+                    self.asm.vec_zero(VECTOR_DST);
+                    self.asm.ext_16b(VECTOR_DST, VECTOR_SRC, VECTOR_DST, count);
+                }
+                // `count` zero bytes, then bytes 0..16 - count of the source
+                VectorShift::LeftBytes => {
+                    self.asm.vec_zero(VECTOR_DST);
+                    self.asm
+                        .ext_16b(VECTOR_DST, VECTOR_DST, VECTOR_SRC, XMM_SIZE - count);
+                }
+            }
+            self.asm.str_q(VECTOR_DST, CPU, xmm);
+        }
+        self.asm.bind(resume);
+        self.live = None;
+    }
+
+    /// movq xmm/m64, xmm (`is_movq_store`): the low quadword of xmm `reg` to memory inside one
+    /// page (no alignment rule; a miss or a page crossing runs in the interpreter), or to xmm `rm`
+    /// with its high quadword cleared. Returns whether it stores to memory.
+    fn movq_store(&mut self, insn: &Insn, next_rip: u64, insn_index: u32, rip: u64) -> bool {
+        const QUADWORD_BYTES: u8 = 8;
+        let (slow, resume) = self.sse_entry(insn_index, rip);
+        let xmm = |reg: u8| XMM_OFFSET + XMM_SIZE * reg as u32;
+        let memory = insn.md != MODRM_MOD_REGISTER;
+        if memory {
+            self.effective_address(insn, next_rip, ADDRESS);
+            self.tlb_probe(QUADWORD_BYTES, TLB_TAG_WRITE_OFFSET, slow);
+            self.asm.ldr(SCRATCH_B, SCRATCH_A, TLB_ADDEND_OFFSET);
+            self.asm.add(SCRATCH_B, ADDRESS, SCRATCH_B, true);
+            self.asm.ldr(VALUE, CPU, xmm(insn.reg));
+            if self.ordered_memory {
+                self.asm.stlr(VALUE, SCRATCH_B, QUADWORD_BYTES);
+            } else {
+                self.asm.str(VALUE, SCRATCH_B, 0);
+            }
+        } else {
+            self.asm.ldr(VALUE, CPU, xmm(insn.reg));
+            self.asm.str(VALUE, CPU, xmm(insn.rm));
+            self.asm.str(XZR, CPU, xmm(insn.rm) + XMM_HALF);
+        }
+        self.asm.bind(resume);
+        self.live = None;
+        memory
     }
 
     /// A `WholeVector` instruction (the SHA extensions, pshufd, palignr, pshufb), the source being

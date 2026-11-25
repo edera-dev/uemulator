@@ -595,6 +595,71 @@ pub(crate) fn vector_alu(insn: &Insn) -> Option<VectorAlu> {
     Some(VectorAlu { op, lane_log2 })
 }
 
+/// A legacy `66 0f 73` shift of a whole xmm register by an immediate count: psrlq (/2) and psllq
+/// (/6) shift each quadword by bits, psrldq (/3) and pslldq (/7) the whole register by bytes. A
+/// count past the width (63 bits, 15 bytes) clears the register (`cpu::sse::shift_immediate`).
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "x86_64",
+    target_arch = "wasm32"
+))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum VectorShift {
+    RightQuadwords,
+    LeftQuadwords,
+    RightBytes,
+    LeftBytes,
+}
+
+// The x86-64 host runs the guest's own instruction, which clears the register by itself.
+#[cfg(any(target_arch = "aarch64", target_arch = "wasm32"))]
+impl VectorShift {
+    /// Whether `count` (the whole immediate byte) leaves nothing of the register.
+    pub fn clears(self, count: u8) -> bool {
+        const QUADWORD_BITS: u8 = 64;
+        const XMM_BYTES: u8 = 16;
+        match self {
+            VectorShift::RightQuadwords | VectorShift::LeftQuadwords => count >= QUADWORD_BITS,
+            VectorShift::RightBytes | VectorShift::LeftBytes => count >= XMM_BYTES,
+        }
+    }
+}
+
+/// `Some((shift, count))` for `66 0f 73 /2, /3, /6, /7 ib` on an xmm register: the forms
+/// `VectorShift` lists, with exactly the encoding `Cpu::sse` accepts (no other prefix, register
+/// operand only). VEX forms carry a flag in `Insn::op`, so they never match.
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "x86_64",
+    target_arch = "wasm32"
+))]
+pub(crate) fn vector_shift(insn: &Insn) -> Option<(VectorShift, u8)> {
+    const PSHIFT_QUADWORD_IMMEDIATE: u16 = 0x173;
+    if insn.op != PSHIFT_QUADWORD_IMMEDIATE || insn.rep != 0 || !insn.p66 || insn.md != 3 {
+        return None;
+    }
+    let shift = match insn.reg & 7 {
+        2 => VectorShift::RightQuadwords,
+        3 => VectorShift::RightBytes,
+        6 => VectorShift::LeftQuadwords,
+        7 => VectorShift::LeftBytes,
+        _ => return None,
+    };
+    Some((shift, insn.imm as u8))
+}
+
+/// `66 0f d6`, movq xmm/m64, xmm: the low quadword of xmm `reg` to memory or to xmm `rm`, whose
+/// high quadword it clears.
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "x86_64",
+    target_arch = "wasm32"
+))]
+pub(crate) fn is_movq_store(insn: &Insn) -> bool {
+    const MOVQ_STORE: u16 = 0x1d6;
+    insn.op == MOVQ_STORE && insn.rep == 0 && insn.p66
+}
+
 /// A legacy-encoded instruction that computes a whole xmm register from the destination, a
 /// register or 16-byte aligned memory source and, for `Sha256Rounds2`, the implicit xmm0: the SHA
 /// extensions plus pshufd, palignr and pshufb, which the SHA-256 loops of firmware and kernels
