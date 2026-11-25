@@ -50,12 +50,12 @@ impl Smp {
         }
     }
 
-    /// Already built vCPUs (`secondary_cpus`, then a snapshot restored into them), the first
-    /// owning the machine-wide state.
-    pub fn with_cpus(cpus: Vec<Cpu>) -> Self {
+    /// Already built vCPUs (`secondary_cpus`, then a snapshot restored into them, or what
+    /// `into_cpus` handed back before a checkpoint), `active` owning the machine-wide state.
+    pub fn with_cpus(cpus: Vec<Cpu>, active: usize) -> Self {
         Smp {
             cpus,
-            active: 0,
+            active,
             stalled_slices: 0,
         }
     }

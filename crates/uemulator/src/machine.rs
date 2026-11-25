@@ -25,7 +25,7 @@ use crate::kv::{KeyValueStore, MemoryKeyValueStore};
 use crate::netdev::NetHandle;
 use crate::platform::{DEFAULT_CMDLINE, DEFAULT_SERIAL_CMDLINE};
 use crate::ram::GuestRam;
-use crate::snapshot::{SnapshotSink, SnapshotSource};
+use crate::snapshot::{SnapshotError, SnapshotInfo, SnapshotSink, SnapshotSource};
 use crate::sync::{Arc, Mutex};
 
 #[derive(Debug)]
@@ -238,7 +238,8 @@ pub struct MachineConfig {
     random_seed: Option<u64>,
     reboot: bool,
     suspend_to: Option<Box<dyn SnapshotSink>>,
-    resume_from: Option<Box<dyn SnapshotSource>>,
+    resume_from: Vec<Box<dyn SnapshotSource>>,
+    check_dirty_tracking: bool,
 }
 
 impl Default for MachineConfig {
@@ -284,7 +285,8 @@ impl Default for MachineConfig {
             random_seed: None,
             reboot: true,
             suspend_to: None,
-            resume_from: None,
+            resume_from: Vec::new(),
+            check_dirty_tracking: false,
         }
     }
 }
@@ -583,7 +585,28 @@ impl MachineConfig {
     /// returns `ResumeFailed` when it cannot be. The disks must be as the suspend left them: the
     /// guest's file systems are mid-flight in the snapshot.
     pub fn resume_from(mut self, source: impl SnapshotSource + 'static) -> Self {
-        self.resume_from = Some(Box::new(source));
+        self.resume_from = vec![Box::new(source)];
+        self
+    }
+
+    /// `resume_from` for a delta snapshot: a full snapshot followed by the deltas down to the one
+    /// to resume, each the child of the one before (`read_snapshot_info` says whose child a
+    /// snapshot is). Each is checked before the next is applied.
+    ///
+    /// When every one is kept (`SnapshotSource::retained`), the machine's next checkpoint is a
+    /// delta against the last; otherwise it is a full snapshot.
+    pub fn resume_from_chain(mut self, sources: Vec<Box<dyn SnapshotSource>>) -> Self {
+        self.resume_from = sources;
+        self
+    }
+
+    /// For checking the emulator, not for use: keeps a copy of RAM from each checkpoint and makes
+    /// the next one fail, naming the pages, if a page changed that the dirty log did not record
+    /// (a store path that skips it, which would make deltas silently wrong). Doubles the memory
+    /// used.
+    #[doc(hidden)]
+    pub fn check_dirty_tracking(mut self, on: bool) -> Self {
+        self.check_dirty_tracking = on;
         self
     }
 
@@ -676,19 +699,79 @@ impl MachineConfig {
 #[derive(Clone)]
 pub struct StopHandle {
     stop: Arc<AtomicBool>,
-    suspend: Arc<AtomicBool>,
+    requests: Arc<HostRequests>,
+}
+
+/// Called once a checkpoint is written (or could not be): its header, or why not.
+pub type CheckpointDone = Box<dyn FnOnce(Result<SnapshotInfo, SnapshotError>) + Send>;
+
+struct CheckpointRequest {
+    sink: Box<dyn SnapshotSink>,
+    done: CheckpointDone,
+}
+
+/// What the host asked of the run besides `stop`. The vCPUs only watch `stop`; a checkpoint
+/// raises it too, so the run that notices it has to tell a real stop (`ended`) from a pause.
+#[derive(Default)]
+struct HostRequests {
+    /// Raised with `stop` by `stop()` and `suspend()`; never cleared.
+    ended: AtomicBool,
+    suspend: AtomicBool,
+    checkpoints: Mutex<Vec<CheckpointRequest>>,
+}
+
+impl HostRequests {
+    fn end(&self, stop: &AtomicBool) {
+        // Before the stop: the run must see why once it notices the stop.
+        self.ended.store(true, Ordering::SeqCst);
+        stop.store(true, Ordering::SeqCst);
+    }
+
+    /// Answers every pending checkpoint with `why`.
+    fn refuse_checkpoints(&self, why: &str) {
+        let pending = core::mem::take(&mut *self.checkpoints.lock().unwrap());
+        for request in pending {
+            (request.done)(Err(SnapshotError(why.into())));
+        }
+    }
 }
 
 impl StopHandle {
     pub fn stop(&self) {
-        self.stop.store(true, Ordering::SeqCst);
+        self.requests.end(&self.stop);
     }
 
     /// Stops the machine and writes its snapshot to `MachineConfig::suspend_to`; `wait()` then
     /// returns `Suspended` (or `SuspendFailed`). Without a sink it is `stop()`.
     pub fn suspend(&self) {
-        // Before the stop: the run must see the request once it notices the stop.
-        self.suspend.store(true, Ordering::SeqCst);
+        self.requests.suspend.store(true, Ordering::SeqCst);
+        self.requests.end(&self.stop);
+    }
+
+    /// Takes a checkpoint of the running machine (`docs/plans/34-incremental-snapshots.md`): it
+    /// pauses at its next event check, flushes the disks, writes its snapshot to `sink`, and runs
+    /// on. The snapshot is a delta against the machine's previous checkpoint, or against the
+    /// snapshot it resumed from when that is kept; otherwise (the first one, or after a guest
+    /// reboot) it is full. `sink.finish` runs while the machine is still paused and the disks are
+    /// flushed: the place to copy the disk images that belong with the checkpoint, before the
+    /// snapshot itself is made visible.
+    ///
+    /// `done` gets the snapshot's header, or why there is none; a failed checkpoint changes
+    /// nothing, and the next delta is against the last one that succeeded. A machine that stops,
+    /// suspends, resets or ends before it gets there answers with an error.
+    pub fn checkpoint(
+        &self,
+        sink: impl SnapshotSink + 'static,
+        done: impl FnOnce(Result<SnapshotInfo, SnapshotError>) + Send + 'static,
+    ) {
+        self.requests
+            .checkpoints
+            .lock()
+            .unwrap()
+            .push(CheckpointRequest {
+                sink: Box::new(sink),
+                done: Box::new(done),
+            });
         self.stop.store(true, Ordering::SeqCst);
     }
 }
@@ -720,11 +803,12 @@ struct Vcpu {
     devcfg: DevConfig,
     /// What a restart needs; `None` when a reset should end the run.
     reboot: Option<RebootImage>,
-    /// Set by `StopHandle::suspend`: a stopped run is saved to `suspend_to`.
-    suspend_requested: Arc<AtomicBool>,
+    /// Suspend and checkpoint requests, shared with every `StopHandle`.
+    requests: Arc<HostRequests>,
     suspend_to: Option<Box<dyn SnapshotSink>>,
     /// Taken by the first run: a reboot after resuming boots afresh.
-    resume_from: Option<Box<dyn SnapshotSource>>,
+    resume_from: Vec<Box<dyn SnapshotSource>>,
+    check_dirty_tracking: bool,
 }
 
 /// The display devices for one boot: the embedder's handle, and the boot framebuffer only
@@ -1148,6 +1232,91 @@ impl Vcpu {
             && self.thread_spawner.is_some()
     }
 
+    /// Runs every vCPU of the machine (threaded, time-shared, or the only one) until the run
+    /// ends, starting with `active` holding the machine-wide state; hands them all back, and
+    /// which one holds it now. Called again after a checkpoint, so whatever a run takes from the
+    /// vCPUs it must give back.
+    fn run_vcpus(
+        &self,
+        mut cpus: Vec<Cpu>,
+        active: usize,
+        threaded: bool,
+        summary: &mut String,
+    ) -> (ExitReason, Vec<Cpu>, usize) {
+        if threaded {
+            let spawner = self
+                .thread_spawner
+                .clone()
+                .expect("checked by runs_on_threads");
+            // Every vCPU runs the one code cache the bootstrap processor made, through a handle
+            // of its own (`Jit::sibling`); with the JIT off there is none.
+            let jit_source = cpus[0].jit.as_ref().map(|jit| jit.sibling());
+            let make_jit = || jit_source.as_ref().map(|jit| Box::new(jit.sibling()));
+            // A vCPU that left the last run on `ATTENTION_EXIT` may not have drained the
+            // invalidations published just before; the new run's links start empty.
+            for cpu in cpus.iter_mut() {
+                cpu.decode_cache_generation = cpu.decode_cache_generation.wrapping_add(1);
+            }
+            let (reason, cpus, vcpu_summary) =
+                crate::cpu::vcpus::run_threaded(cpus, &spawner, &make_jit);
+            *summary = vcpu_summary;
+            (reason, cpus, 0)
+        } else if cpus.len() > 1 {
+            let mut smp = Smp::with_cpus(cpus, active);
+            let reason = smp.run();
+            *summary = smp.summary();
+            let (cpus, active) = smp.into_cpus();
+            (reason, cpus, active)
+        } else {
+            let reason = cpus[0].run();
+            (reason, cpus, 0)
+        }
+    }
+
+    /// Writes one checkpoint of the stopped machine to `sink`, and on success starts the dirty
+    /// log's next generation against it (`StopHandle::checkpoint`).
+    fn checkpoint(
+        &self,
+        cpus: &mut [Cpu],
+        active: usize,
+        threaded: bool,
+        sink: &mut dyn SnapshotSink,
+        armed_copy: &mut Option<GuestRam>,
+    ) -> Result<SnapshotInfo, SnapshotError> {
+        if cpus.len() != cpus[active].cpu_count as usize {
+            return Err(SnapshotError("a vCPU thread ended abnormally".into()));
+        }
+        if let Some(copy) = armed_copy.as_ref() {
+            let log = cpus[active].page_has_code.dirty_log();
+            let missed = suspend::unmarked_changes(&cpus[active].ram, copy, log);
+            if !missed.is_empty() {
+                let pages: Vec<String> = missed
+                    .iter()
+                    .take(16)
+                    .map(|page| format!("{:#x}", page << crate::cpu::PAGE_SHIFT))
+                    .collect();
+                return Err(SnapshotError(format!(
+                    "dirty tracking missed {} written pages: {}",
+                    missed.len(),
+                    pages.join(" ")
+                )));
+            }
+        }
+        // The pause is not guest time: the clock resumes where the guest left it.
+        let paused_at = cpus[active].now_ns();
+        let saved = suspend::save(cpus, active, threaded, sink, SaveKind::Checkpoint);
+        suspend::unpark_after_save(cpus, active, threaded);
+        if let Some(wall) = &cpus[active].wall_clock {
+            wall.resume_at(paused_at);
+        }
+        let info = saved?;
+        suspend::arm_dirty_log(cpus, info.id);
+        if self.check_dirty_tracking {
+            *armed_copy = cpus[active].ram.duplicate();
+        }
+        Ok(info)
+    }
+
     /// One power-on to the next exit. Everything the CPU owns is built here, so a reboot starts
     /// from a CPU with no leftover state and from a JIT with an empty code cache: a reused cache
     /// would never see stores to the new CPU's empty `page_has_code` map and could run
@@ -1268,46 +1437,77 @@ impl Vcpu {
                 } else {
                     vec![cpu]
                 };
-                let resumed = match self.resume_from.take() {
-                    Some(mut source) => suspend::restore(&mut cpus, threaded, &mut *source)
-                        .map_err(|error| ExitReason::ResumeFailed(error.to_string())),
-                    None => Ok(()),
-                };
-                let (reason, mut cpus, active) = match resumed {
-                    Err(reason) => (reason, cpus, 0),
-                    Ok(()) if threaded => {
-                        let spawner = self
-                            .thread_spawner
-                            .clone()
-                            .expect("checked by runs_on_threads");
-                        // Every vCPU runs the one code cache the bootstrap processor made,
-                        // through a handle of its own (`Jit::sibling`); with the JIT off there
-                        // is none.
-                        let jit_source = cpus[0].jit.as_ref().map(|jit| jit.sibling());
-                        let make_jit = || jit_source.as_ref().map(|jit| Box::new(jit.sibling()));
-                        let (reason, cpus, summary) =
-                            crate::cpu::vcpus::run_threaded(cpus, &spawner, &make_jit);
-                        vcpu_summary = summary;
-                        (reason, cpus, 0)
-                    }
-                    Ok(()) if cpus.len() > 1 => {
-                        let mut smp = Smp::with_cpus(cpus);
-                        let reason = smp.run();
-                        vcpu_summary = smp.summary();
-                        let (cpus, active) = smp.into_cpus();
-                        (reason, cpus, active)
-                    }
-                    Ok(()) => {
-                        let reason = cpus[0].run();
-                        (reason, cpus, 0)
+                let mut sources = core::mem::take(&mut self.resume_from);
+                let resumed = if sources.is_empty() {
+                    Ok(())
+                } else {
+                    match suspend::restore(&mut cpus, threaded, &mut sources) {
+                        Ok((info, parent_capable)) => {
+                            if parent_capable {
+                                suspend::arm_dirty_log(&mut cpus, info.id);
+                            }
+                            Ok(())
+                        }
+                        Err(error) => Err(ExitReason::ResumeFailed(error.to_string())),
                     }
                 };
+                drop(sources);
+                // `check_dirty_tracking`'s copy of RAM as of the dirty log's parent.
+                let mut armed_copy = None;
+                if self.check_dirty_tracking && cpus[0].page_has_code.dirty_log().is_armed() {
+                    armed_copy = cpus[0].ram.duplicate();
+                }
+                let mut active = 0;
+                let reason = loop {
+                    let reason = match &resumed {
+                        Err(reason) => reason.clone(),
+                        Ok(()) => {
+                            let (reason, ran, now_active) =
+                                self.run_vcpus(cpus, active, threaded, &mut vcpu_summary);
+                            cpus = ran;
+                            active = now_active;
+                            reason
+                        }
+                    };
+                    if reason == ExitReason::Stopped && !self.requests.ended.load(Ordering::SeqCst)
+                    {
+                        let pending =
+                            core::mem::take(&mut *self.requests.checkpoints.lock().unwrap());
+                        if !pending.is_empty() {
+                            for request in pending {
+                                let mut sink = request.sink;
+                                let result = self.checkpoint(
+                                    &mut cpus,
+                                    active,
+                                    threaded,
+                                    &mut *sink,
+                                    &mut armed_copy,
+                                );
+                                (request.done)(result);
+                            }
+                            // A stop that came in meanwhile stays: `ended` is set first.
+                            self.stop.store(false, Ordering::SeqCst);
+                            if self.requests.ended.load(Ordering::SeqCst) {
+                                self.stop.store(true, Ordering::SeqCst);
+                            }
+                            continue;
+                        }
+                    }
+                    break reason;
+                };
+                // Whatever ended the run, the checkpoints asked for meanwhile will not happen,
+                // and a stop raised only for them must not end the next boot.
+                self.requests
+                    .refuse_checkpoints("the machine stopped before the checkpoint");
+                if !self.requests.ended.load(Ordering::SeqCst) {
+                    self.stop.store(false, Ordering::SeqCst);
+                }
                 let reason = match (&reason, self.suspend_to.as_deref_mut()) {
                     (ExitReason::Stopped, Some(sink))
-                        if self.suspend_requested.load(Ordering::SeqCst) =>
+                        if self.requests.suspend.load(Ordering::SeqCst) =>
                     {
-                        match suspend::save(&mut cpus, active, threaded, sink) {
-                            Ok(()) => ExitReason::Suspended,
+                        match suspend::save(&mut cpus, active, threaded, sink, SaveKind::Full) {
+                            Ok(_) => ExitReason::Suspended,
                             Err(error) => ExitReason::SuspendFailed(error.to_string()),
                         }
                     }
@@ -1376,7 +1576,7 @@ pub struct EmulatedMachine {
     /// With `MachineConfig::input` (by default together with the screen): keyboard and tablet.
     input: Option<InputHandle>,
     stop: Arc<AtomicBool>,
-    suspend: Arc<AtomicBool>,
+    requests: Arc<HostRequests>,
 }
 
 impl EmulatedMachine {
@@ -1396,7 +1596,7 @@ impl EmulatedMachine {
                 "cpus must be between {MIN_CPUS} and {MAX_CPUS}"
             )));
         }
-        let snapshots = cfg.suspend_to.is_some() || cfg.resume_from.is_some();
+        let snapshots = cfg.suspend_to.is_some() || !cfg.resume_from.is_empty();
         if snapshots && (cfg.verify || cfg.boot_disk) {
             return Err(Error::BadConfig(
                 "suspend and resume cannot be combined with verify_jit (its twin is not saved) or \
@@ -1727,7 +1927,7 @@ impl EmulatedMachine {
                 }
             });
         let stop = Arc::new(AtomicBool::new(false));
-        let suspend = Arc::new(AtomicBool::new(false));
+        let requests = Arc::new(HostRequests::default());
         Ok(Self {
             vcpu: Some(Vcpu {
                 ram,
@@ -1749,9 +1949,10 @@ impl EmulatedMachine {
                 boot_ram,
                 devcfg,
                 reboot,
-                suspend_requested: suspend.clone(),
+                requests: requests.clone(),
                 suspend_to: cfg.suspend_to,
                 resume_from: cfg.resume_from,
+                check_dirty_tracking: cfg.check_dirty_tracking,
             }),
             #[cfg(not(freestanding))]
             thread: None,
@@ -1762,7 +1963,7 @@ impl EmulatedMachine {
             display,
             input,
             stop,
-            suspend,
+            requests,
         })
     }
 
@@ -1802,12 +2003,12 @@ impl EmulatedMachine {
     pub fn stop_handle(&self) -> StopHandle {
         StopHandle {
             stop: self.stop.clone(),
-            suspend: self.suspend.clone(),
+            requests: self.requests.clone(),
         }
     }
 
     pub fn stop(&self) {
-        self.stop.store(true, Ordering::SeqCst);
+        self.stop_handle().stop();
     }
 
     /// `StopHandle::suspend`.
@@ -1856,5 +2057,7 @@ impl EmulatedMachine {
 }
 
 mod suspend;
+use suspend::SaveKind;
+pub use suspend::read_snapshot_info;
 #[cfg(test)]
 mod tests;

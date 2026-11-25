@@ -1339,3 +1339,83 @@ fn invlpgb_and_tlbsync_drop_another_running_vcpus_stale_translation() {
         );
     });
 }
+
+/// Delta snapshots (`ram::DirtyLog`) with a vCPU per thread: every vCPU's stores reach the one
+/// shared log, and arming revokes the write tags each of them filled in the run before. Without
+/// the revocation the second run's stores would go through the old tags and mark nothing.
+#[test]
+fn each_threads_stores_after_arming_reach_the_shared_dirty_log() {
+    /// mov [rdi], rax; mov [rsi], rax; cli; hlt
+    const STORE_TWICE_THEN_STOP: [u8; 8] = [0x48, 0x89, 0x07, 0x48, 0x89, 0x06, 0xfa, 0xf4];
+    const WORKER_CODE: u64 = 0x5000;
+    const PAGES: [u64; 4] = [0x40_0000, 0x40_3000, 0x40_6000, 0x40_9000];
+    const WORKER_STACK: u64 = 0x70_0000;
+    use crate::testkit::{RAX, RDI, RSI};
+    both_engines(|jit| {
+        let mut ram = vec![0u8; crate::testkit::HARNESS_RAM_BYTES];
+        let state = crate::boot::load(
+            &mut ram,
+            &crate::testkit::fake_bzimage(&STORE_TWICE_THEN_STOP),
+            None,
+            "",
+        )
+        .unwrap();
+        let mut cpu = Cpu::new(
+            ram,
+            state,
+            Default::default(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            DevConfig {
+                cpus: 2,
+                ..Default::default()
+            },
+        );
+        cpu.wall_clock = Some(WallClock::new(std_host_clock()));
+        let _turn = jit.then(crate::jit::serialize_jit_tests);
+        if jit {
+            cpu.jit = crate::jit::Jit::new(true).map(Box::new);
+        }
+        place(&mut cpu, WORKER_CODE, &STORE_TWICE_THEN_STOP);
+        let jit_source = cpu.jit.as_ref().map(|jit| jit.sibling());
+        let make_jit = || jit_source.as_ref().map(|jit| Box::new(jit.sibling()));
+        let mut cpus = super::smp::secondary_cpus(cpu);
+        let starts = [crate::testkit::CODE_BASE, WORKER_CODE];
+        let prepare = |cpus: &mut Vec<Cpu>, value: u64| {
+            let (bsp, worker) = cpus.split_first_mut().unwrap();
+            start_in_long_mode(&mut worker[0], bsp, WORKER_CODE, WORKER_STACK);
+            for (index, cpu) in cpus.iter_mut().enumerate() {
+                cpu.rip = starts[index];
+                cpu.halted = false;
+                cpu.gpr[RDI] = PAGES[2 * index];
+                cpu.gpr[RSI] = PAGES[2 * index + 1];
+                cpu.gpr[RAX] = value;
+            }
+        };
+        prepare(&mut cpus, 1);
+        let spawner = super::vcpus::std_thread_spawner();
+        let (exit, mut cpus, summary) = super::vcpus::run_threaded(cpus, &spawner, &make_jit);
+        assert_eq!(exit, ExitReason::Shutdown, "{summary}");
+        let log = cpus[0].page_has_code.dirty_log();
+        assert!(
+            PAGES
+                .iter()
+                .all(|&page| !log.is_dirty((page >> PAGE_SHIFT) as usize))
+        );
+        log.arm([1; 16]);
+        for cpu in cpus.iter_mut() {
+            cpu.revoke_all_write_tags();
+        }
+        prepare(&mut cpus, 2);
+        let (exit, cpus, summary) = super::vcpus::run_threaded(cpus, &spawner, &make_jit);
+        assert_eq!(exit, ExitReason::Shutdown, "{summary}");
+        let log = cpus[0].page_has_code.dirty_log();
+        for page in PAGES {
+            assert_eq!(cpus[0].ram[page as usize], 2);
+            assert!(
+                log.is_dirty((page >> PAGE_SHIFT) as usize),
+                "{page:#x} written but clean (jit {jit})"
+            );
+        }
+    });
+}

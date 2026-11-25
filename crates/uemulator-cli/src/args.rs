@@ -388,6 +388,16 @@ pub struct RuntimeArgs {
     /// guest then writes its disks and the file no longer matches them
     #[arg(long, value_name = "FILE")]
     pub resume_from: Option<std::path::PathBuf>,
+    /// Take checkpoints of the running machine into DIR: Ctrl-] then c takes one (Ctrl-] then any
+    /// other key stops as before). The first is a full snapshot, each later one a delta against
+    /// the one before; the writable disks and the nvram are copied beside each. Resume one with
+    /// --resume-from DIR/NNNN.checkpoint, which keeps it, so it can be gone back to again
+    #[arg(long, value_name = "DIR")]
+    pub checkpoint_dir: Option<std::path::PathBuf>,
+    /// Also take a checkpoint every SECS seconds (needs --checkpoint-dir, or a checkpoint to
+    /// resume from)
+    #[arg(long, value_name = "SECS")]
+    pub checkpoint_every: Option<u64>,
     /// Where the viewer of a machine with a screen or input listens, as HOST:PORT: an address or
     /// a host name (the viewer then answers to that name), port 0 picks a free one. Anyone who
     /// can reach it controls the machine's keyboard and mouse [default: 127.0.0.1:5800]

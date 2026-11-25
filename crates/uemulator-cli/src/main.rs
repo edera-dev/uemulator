@@ -1,4 +1,5 @@
 mod args;
+mod checkpoints;
 mod firmware;
 mod frontend;
 mod images;

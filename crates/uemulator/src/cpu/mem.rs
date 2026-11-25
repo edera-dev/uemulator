@@ -239,6 +239,10 @@ impl Cpu {
     /// entry changed, walk again.
     pub(super) fn update_ram_u64(&mut self, pa: u64, seen: u64, updated: u64) -> bool {
         let start = pa as usize;
+        // Even if the exchange fails: a page marked needlessly costs a page in the next delta.
+        self.page_has_code
+            .dirty_log()
+            .mark(start >> PAGE_SHIFT as usize);
         if self.ordered_memory && start & (PTE_BYTES as usize - 1) == 0 {
             let host = self.ram[start..][..PTE_BYTES as usize].as_mut_ptr();
             return unsafe { atomic::update_entry_u64(host, seen, updated) }.is_ok();
@@ -250,6 +254,9 @@ impl Cpu {
     /// `update_ram_u64` for the 4-byte entries of 32-bit paging.
     fn update_ram_u32(&mut self, pa: u64, seen: u32, updated: u32) -> bool {
         let start = pa as usize;
+        self.page_has_code
+            .dirty_log()
+            .mark(start >> PAGE_SHIFT as usize);
         if self.ordered_memory && start & (LEGACY_PTE_BYTES as usize - 1) == 0 {
             let host = self.ram[start..][..LEGACY_PTE_BYTES as usize].as_mut_ptr();
             return unsafe { atomic::update_entry_u32(host, seen, updated) }.is_ok();
@@ -790,6 +797,14 @@ impl Cpu {
                 .wrapping_sub(self.ram_base));
         }
         let (page_pa, walk_flags) = self.walk(linear, access, user)?;
+        // A resolved store is about to happen, through this TLB entry or through the host
+        // pointer the caller forms (locked RMW, `rep_bulk`), so the page is dirty now. This is
+        // what lets the write tag below go to a page while the dirty log is armed.
+        if access == AccessKind::Write {
+            self.page_has_code
+                .dirty_log()
+                .mark((page_pa >> PAGE_SHIFT) as usize);
+        }
         // A supervisor access to a user page is never cached while SMEP or SMAP is on: whether it
         // is allowed depends on EFLAGS.AC (SMAP), which changes without any TLB flush (stac,
         // clac, popf), and a cached entry would let a later access skip the check.
@@ -840,6 +855,10 @@ impl Cpu {
             if write_permitted
                 && key_rights == 0
                 && self.page_has_code[(page_pa >> PAGE_SHIFT) as usize] == 0
+                && !self
+                    .page_has_code
+                    .dirty_log()
+                    .needs_mark((page_pa >> PAGE_SHIFT) as usize)
             {
                 refilled.tag_w = page;
             }
@@ -894,6 +913,11 @@ impl Cpu {
         };
         if self.paging_mode() == PagingMode::Off {
             let page = self.nested_translate(linear & !PAGE_OFFSET_MASK, access, false)?;
+            if write {
+                self.page_has_code
+                    .dirty_log()
+                    .mark((page >> PAGE_SHIFT) as usize);
+            }
             return Ok(page | (linear & PAGE_OFFSET_MASK));
         }
         let linear_page = linear & !PAGE_OFFSET_MASK;
@@ -905,6 +929,12 @@ impl Cpu {
                 .wrapping_sub(self.ram_base));
         }
         let (page, flags) = self.walk(linear, AccessKind::Read, user).map_err(mark)?;
+        // As in `translate`: the shadow-stack tag below serves stores too.
+        if write {
+            self.page_has_code
+                .dirty_log()
+                .mark((page >> PAGE_SHIFT) as usize);
+        }
         if flags & TLB_FLAG_SHADOW_STACK == 0 || (flags & TLB_FLAG_USER != 0) != user {
             return Err(mark(self.page_fault(
                 linear,
@@ -926,6 +956,10 @@ impl Cpu {
             && flags & TLB_FLAG_DIRTY != 0
             && !key_restricted
             && self.page_has_code[(page >> PAGE_SHIFT) as usize] == 0
+            && !self
+                .page_has_code
+                .dirty_log()
+                .needs_mark((page >> PAGE_SHIFT) as usize)
         {
             let mut refilled = if entry_maps_page(&entry, linear_page) {
                 entry
@@ -1057,6 +1091,9 @@ impl Cpu {
         let start = pa as usize;
         let len = size as usize;
         if self.ram.contains(pa, len as u64) {
+            // Physical writers (the VMCB, AVIC backing pages, shadow stacks) come here without
+            // `translate`; a store through it was marked there already.
+            self.page_has_code.dirty_log().mark(start >> PAGE_SHIFT);
             if self.ordered_memory {
                 // Store first, then look at the flag: a vCPU that flags the page and decodes it
                 // after our check must see these bytes, and one that flagged it before is seen
@@ -1078,7 +1115,7 @@ impl Cpu {
             self.dev.lock().set_time(now);
             let written_code_pages = {
                 let barrier = self.threads.as_ref().map(|t| &t.links.dma_in_flight);
-                let mut mem = GuestMem::new(&mut self.ram, self.page_has_code.as_bytes())
+                let mut mem = GuestMem::for_pages(&mut self.ram, &self.page_has_code)
                     .with_code_write_barrier(barrier);
                 if self.dev.lock().mmio_write(pa, size, val, &mut mem) {
                     mem.code_pages_written
@@ -1180,6 +1217,13 @@ impl Cpu {
                 entry.tag_w = TLB_TAG_INVALID;
             }
         });
+    }
+
+    /// Drops every write tag, in the running TLB and the parked one, keeping the read and exec
+    /// tags: the dirty log was just armed, and a store through a surviving tag would never mark
+    /// its page.
+    pub(crate) fn revoke_all_write_tags(&mut self) {
+        self.for_each_filled_tlb_entry(|entry| entry.tag_w = TLB_TAG_INVALID);
     }
 
     /// Visits every entry `flush_tlb` would empty, in the running TLB and the parked one: the

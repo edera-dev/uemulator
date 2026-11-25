@@ -9,6 +9,7 @@ use uemulator::{
 use crate::args::{
     ConsoleArg, DEFAULT_VIEWER_ADDRESS, DisplayArg, NetLink, RuntimeArgs, Settings, SmpArg,
 };
+use crate::checkpoints::{self, MachineFiles};
 use crate::frontend::web::WebViewer;
 use crate::frontend::{Frontend, Screen};
 use crate::netgw;
@@ -75,6 +76,76 @@ fn contains_escape(chunk: &[u8]) -> bool {
     chunk.contains(&ESCAPE_BYTE)
 }
 
+/// The key that, after Ctrl-], takes a checkpoint.
+const CHECKPOINT_KEY: u8 = b'c';
+
+/// What Ctrl-] means for a machine that takes checkpoints: the next key decides.
+#[derive(Debug, PartialEq, Eq)]
+enum Escape {
+    /// Forward these bytes to the guest.
+    Forward(Vec<u8>),
+    Checkpoint,
+    Stop,
+}
+
+/// Splits a chunk of terminal input for a machine that takes checkpoints. `pending` carries a
+/// Ctrl-] that ended the previous chunk. Bytes after a decision are dropped, as a chunk with
+/// Ctrl-] always was.
+fn read_escape(chunk: &[u8], pending: &mut bool) -> Vec<Escape> {
+    let mut out = Vec::new();
+    let mut rest = chunk;
+    if *pending {
+        let Some((&key, _)) = rest.split_first() else {
+            return out;
+        };
+        *pending = false;
+        out.push(if key == CHECKPOINT_KEY {
+            Escape::Checkpoint
+        } else {
+            Escape::Stop
+        });
+        return out;
+    }
+    if let Some(at) = rest.iter().position(|&byte| byte == ESCAPE_BYTE) {
+        if at > 0 {
+            out.push(Escape::Forward(rest[..at].to_vec()));
+        }
+        rest = &rest[at + 1..];
+        match rest.first() {
+            None => *pending = true,
+            Some(&CHECKPOINT_KEY) => out.push(Escape::Checkpoint),
+            Some(_) => out.push(Escape::Stop),
+        }
+    } else if !rest.is_empty() {
+        out.push(Escape::Forward(rest.to_vec()));
+    }
+    out
+}
+
+/// The writable disks of `settings` and the nvram: what a checkpoint copies beside itself.
+fn machine_files(settings: &Settings, nvram: Option<&std::path::Path>) -> MachineFiles {
+    let disks: Vec<std::path::PathBuf> = settings
+        .disks
+        .iter()
+        .filter(|disk| !disk.read_only)
+        .map(|disk| disk.path.clone())
+        .collect();
+    MachineFiles::new(&disks, nvram)
+}
+
+/// Where this run's checkpoints go: `--checkpoint-dir`, else beside the checkpoint it resumed.
+fn checkpoint_directory(runtime: &RuntimeArgs) -> Option<std::path::PathBuf> {
+    runtime.checkpoint_dir.clone().or_else(|| {
+        let resumed = runtime.resume_from.as_deref()?;
+        checkpoints::is_checkpoint(resumed).then(|| {
+            resumed
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .to_path_buf()
+        })
+    })
+}
+
 /// Puts the terminal behind `stty` into raw mode. Returns the settings to hand back to `stty` on
 /// exit, or `None` if raw mode was not entered (no `stty`, not a terminal, not unix). Without the
 /// saved settings the terminal could not be restored, so raw mode is not attempted then.
@@ -134,6 +205,7 @@ fn build_config(
     initramfs: Option<Vec<u8>>,
     settings: &Settings,
     runtime: &RuntimeArgs,
+    files: &MachineFiles,
 ) -> Result<MachineConfig, String> {
     let mut cfg = MachineConfig::new()
         .kernel(kernel)
@@ -142,8 +214,20 @@ fn build_config(
     if let Some(path) = &runtime.suspend_to {
         cfg = cfg.suspend_to(FileSnapshotSink::new(path));
     }
-    if let Some(path) = &runtime.resume_from {
-        cfg = cfg.resume_from(FileSnapshotSource::open(path).map_err(|e| e.to_string())?);
+    match &runtime.resume_from {
+        // Before the disks are opened below: they go back to what the checkpoint saw.
+        Some(path) if checkpoints::is_checkpoint(path) => {
+            let chain = checkpoints::sources(path)?;
+            files.restore_from(path)?;
+            cfg = cfg.resume_from_chain(chain);
+        }
+        Some(path) => {
+            cfg = cfg.resume_from(FileSnapshotSource::open(path).map_err(|e| e.to_string())?);
+        }
+        None => {}
+    }
+    if runtime.checkpoint_every.is_some() && checkpoint_directory(runtime).is_none() {
+        return Err("--checkpoint-every needs --checkpoint-dir".into());
     }
     if runtime.debug {
         cfg = cfg.log(|line| eprintln!("{line}"));
@@ -234,8 +318,9 @@ pub fn run(
 ) -> Result<ExitReason, String> {
     let tty = std::io::stdin().is_terminal();
     refuse_secure_boot_without_uefi(settings)?;
-    let cfg = build_config(kernel, initramfs, settings, runtime)?;
-    run_config(cfg, settings, runtime, tty)
+    let files = machine_files(settings, None);
+    let cfg = build_config(kernel, initramfs, settings, runtime, &files)?;
+    run_config(cfg, settings, runtime, tty, &files)
 }
 
 /// Secure Boot is the UEFI firmware's: the direct boot and the BIOS check nothing.
@@ -251,8 +336,9 @@ fn refuse_secure_boot_without_uefi(settings: &Settings) -> Result<(), String> {
 pub fn run_disk(settings: &Settings, runtime: &RuntimeArgs) -> Result<ExitReason, String> {
     let tty = std::io::stdin().is_terminal();
     refuse_secure_boot_without_uefi(settings)?;
-    let cfg = build_config(Vec::new(), None, settings, runtime)?.boot_disk(true);
-    run_config(cfg, settings, runtime, tty)
+    let files = machine_files(settings, None);
+    let cfg = build_config(Vec::new(), None, settings, runtime, &files)?.boot_disk(true);
+    run_config(cfg, settings, runtime, tty, &files)
 }
 
 /// Like `run`, for a firmware image started in real mode at the reset vector.
@@ -263,8 +349,9 @@ pub fn run_firmware(
 ) -> Result<ExitReason, String> {
     let tty = std::io::stdin().is_terminal();
     refuse_secure_boot_without_uefi(settings)?;
-    let cfg = build_config(Vec::new(), None, settings, runtime)?.firmware(image);
-    run_config(cfg, settings, runtime, tty)
+    let files = machine_files(settings, None);
+    let cfg = build_config(Vec::new(), None, settings, runtime, &files)?.firmware(image);
+    run_config(cfg, settings, runtime, tty, &files)
 }
 
 /// A hypervisor for `run_uefi`, as read from disk (gzipped or not).
@@ -304,8 +391,9 @@ pub fn run_uefi(
         serial_console_first(&mut settings);
     }
     let settings = &settings;
-    let mut cfg =
-        build_config(kernel, initramfs, settings, runtime)?.uefi_firmware(crate::firmware::IMAGE);
+    let files = machine_files(settings, nvram);
+    let mut cfg = build_config(kernel, initramfs, settings, runtime, &files)?
+        .uefi_firmware(crate::firmware::IMAGE);
     if let Some(hypervisor) = hypervisor {
         cfg = cfg.hypervisor(hypervisor.image);
         if let Some(cmdline) = hypervisor.cmdline {
@@ -323,7 +411,7 @@ pub fn run_uefi(
         }
         None => {}
     }
-    run_config(cfg, settings, runtime, tty)
+    run_config(cfg, settings, runtime, tty, &files)
 }
 
 /// Where the viewer was asked to listen: `--viewer-address`, or `--viewer-host` and
@@ -365,6 +453,7 @@ fn run_config(
     settings: &Settings,
     runtime: &RuntimeArgs,
     tty: bool,
+    files: &MachineFiles,
 ) -> Result<ExitReason, String> {
     let mut machine = EmulatedMachine::new(cfg).map_err(|e| e.to_string())?;
     let screen = Screen {
@@ -426,19 +515,51 @@ fn run_config(
             handle.stop();
         }
     };
+    let checkpoint_dir = checkpoint_directory(runtime);
+    let checkpoint = checkpoint_dir.clone().map(|directory| {
+        let files = files.clone();
+        move |handle: &StopHandle| checkpoints::take(handle, &directory, &files)
+    });
     std::thread::spawn(move || {
         let mut buf = [0u8; STDIN_CHUNK_LEN];
+        let mut pending = false;
         while let Ok(n) = std::io::stdin().read(&mut buf) {
             if n == 0 {
                 break;
             }
-            if contains_escape(&buf[..n]) {
-                end(&stopper);
-                break;
+            let Some(checkpoint) = &checkpoint else {
+                if contains_escape(&buf[..n]) {
+                    end(&stopper);
+                    break;
+                }
+                input.write(&buf[..n]);
+                continue;
+            };
+            for action in read_escape(&buf[..n], &mut pending) {
+                match action {
+                    Escape::Forward(bytes) => input.write(&bytes),
+                    Escape::Checkpoint => checkpoint(&stopper),
+                    Escape::Stop => {
+                        end(&stopper);
+                        return;
+                    }
+                }
             }
-            input.write(&buf[..n]);
+            if pending {
+                eprint!("\r\n[c: checkpoint, any other key: stop]\r\n");
+            }
         }
     });
+    if let (Some(secs), Some(directory)) = (runtime.checkpoint_every, checkpoint_dir) {
+        let handle = machine.stop_handle();
+        let files = files.clone();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_secs(secs));
+                checkpoints::take(&handle, &directory, &files);
+            }
+        });
+    }
     if let Some(secs) = runtime.timeout {
         let stop = machine.stop_handle();
         std::thread::spawn(move || {
@@ -554,7 +675,13 @@ mod tests {
 
     fn build(extra: &[&str], initramfs: Option<Vec<u8>>) -> Result<MachineConfig, String> {
         let (settings, runtime) = boot_args(extra);
-        build_config(Vec::new(), initramfs, &settings, &runtime)
+        build_config(
+            Vec::new(),
+            initramfs,
+            &settings,
+            &runtime,
+            &MachineFiles::default(),
+        )
     }
 
     /// What the library says about `cfg` before it looks at the kernel. The kernel is empty, so
@@ -950,6 +1077,30 @@ mod tests {
         assert!(contains_escape(&[b'a', b'b', ESCAPE_BYTE]));
         assert!(contains_escape(&[ESCAPE_BYTE, b'a']));
         assert!(contains_escape(b"typed ahead \x1d and more"));
+    }
+
+    #[test]
+    fn with_checkpoints_the_key_after_the_escape_decides() {
+        let mut pending = false;
+        assert_eq!(
+            read_escape(b"ls\x1dc", &mut pending),
+            [Escape::Forward(b"ls".to_vec()), Escape::Checkpoint]
+        );
+        assert_eq!(read_escape(b"\x1dq", &mut pending), [Escape::Stop]);
+        assert_eq!(
+            read_escape(b"abc", &mut pending),
+            [Escape::Forward(b"abc".to_vec())]
+        );
+        // Ctrl-] at the end of one chunk, its key in the next.
+        assert_eq!(
+            read_escape(b"x\x1d", &mut pending),
+            [Escape::Forward(b"x".to_vec())]
+        );
+        assert!(pending);
+        assert_eq!(read_escape(b"c", &mut pending), [Escape::Checkpoint]);
+        assert!(!pending);
+        assert_eq!(read_escape(b"\x1d", &mut pending), []);
+        assert_eq!(read_escape(b"\x1d", &mut pending), [Escape::Stop]);
     }
 
     #[test]

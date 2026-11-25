@@ -21,7 +21,7 @@ use crate::sync::Arc;
 use alloc::alloc::{Layout, alloc_zeroed};
 use core::marker::PhantomData;
 use core::ops::{Index, IndexMut, Range, RangeFrom};
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 /// First guest physical address of the hole below 4 GiB that holds the PCI BARs, the ECAM, the
 /// I/O APIC and the local APIC. RAM that does not fit below it continues at `PCI_HOLE_END`.
@@ -402,9 +402,14 @@ ram_views!(RamSpan<'_>);
 /// for such pages so the store takes the slow path. With several threads a flag is set by one
 /// vCPU and read by the others, so the accessors are atomic (relaxed: callers that need ordering
 /// against guest data add the fences themselves, see `Cpu::mark_code`).
+///
+/// It also carries the machine's `DirtyLog`: both decide when a store may skip the slow path,
+/// and every holder of the flags (each vCPU, the device thread, `GuestMem`) is a place that
+/// writes RAM.
 #[derive(Clone)]
 pub(crate) struct CodePages {
     flags: Arc<Vec<AtomicU8>>,
+    dirty: Arc<DirtyLog>,
 }
 
 impl CodePages {
@@ -421,7 +426,13 @@ impl CodePages {
             unsafe { Vec::from_raw_parts(zeroed.as_mut_ptr().cast::<AtomicU8>(), pages, pages) };
         CodePages {
             flags: Arc::new(flags),
+            dirty: Arc::new(DirtyLog::new(pages)),
         }
+    }
+
+    /// The pages written since the last snapshot (`DirtyLog`).
+    pub fn dirty_log(&self) -> &DirtyLog {
+        &self.dirty
     }
 
     pub fn len(&self) -> usize {
@@ -454,6 +465,138 @@ impl CodePages {
     pub fn iter(&self) -> impl Iterator<Item = u8> + '_ {
         self.flags.iter().map(|flag| flag.load(Ordering::Relaxed))
     }
+}
+
+/// Which guest pages were written since the snapshot a delta would be taken against
+/// (`docs/plans/34-incremental-snapshots.md`). One bit per page of the flat RAM buffer.
+///
+/// While armed, a clean page (bit clear) never has a write tag in any soft TLB: `translate`
+/// marks the page when it resolves a store and only then grants the tag, so the JIT's inline
+/// stores and the interpreter's fast path, which store only through write tags, cannot reach a
+/// clean page unnoticed. Everything that writes RAM by physical address (`phys_write`, the
+/// page-table A/D updates, `GuestMem` DMA, the BIOS) marks it itself. Arming revokes every write
+/// tag of every vCPU (`Cpu::revoke_all_write_tags`); a tag that survived would be a silently
+/// incomplete delta.
+///
+/// Armed means "has a parent": the id of the snapshot the bits are relative to. Arming,
+/// clearing and reading the bits happen only while every vCPU is stopped (a checkpoint or a
+/// restore), so marking needs no ordering beyond its own atomicity.
+pub(crate) struct DirtyLog {
+    armed: AtomicBool,
+    parent: [AtomicU64; 2],
+    bits: Vec<AtomicU64>,
+}
+
+impl DirtyLog {
+    fn new(pages: usize) -> Self {
+        let words = pages.div_ceil(u64::BITS as usize);
+        DirtyLog {
+            armed: AtomicBool::new(false),
+            parent: [AtomicU64::new(0), AtomicU64::new(0)],
+            bits: zeroed_atomic_words(words),
+        }
+    }
+
+    pub fn is_armed(&self) -> bool {
+        self.armed.load(Ordering::Relaxed)
+    }
+
+    /// Records a write to `page`; pages past the end of RAM (MMIO) are ignored.
+    #[inline]
+    pub fn mark(&self, page: usize) {
+        if !self.is_armed() {
+            return;
+        }
+        if let Some(word) = self.bits.get(page / u64::BITS as usize) {
+            let bit = 1 << (page % u64::BITS as usize);
+            // Test first: once a page is dirty every later slow-path store finds it so.
+            if word.load(Ordering::Relaxed) & bit == 0 {
+                word.fetch_or(bit, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// `mark` for every page `len` bytes at physical address `start` touch.
+    pub fn mark_range(&self, start: u64, len: u64) {
+        if len == 0 || !self.is_armed() {
+            return;
+        }
+        let first = start >> crate::cpu::PAGE_SHIFT;
+        let last = start.saturating_add(len - 1) >> crate::cpu::PAGE_SHIFT;
+        for page in first..=last {
+            self.mark(page as usize);
+        }
+    }
+
+    /// Whether a store to `page` must take the slow path to be recorded.
+    #[inline]
+    pub fn needs_mark(&self, page: usize) -> bool {
+        self.is_armed() && !self.is_dirty(page)
+    }
+
+    pub fn is_dirty(&self, page: usize) -> bool {
+        self.bits
+            .get(page / u64::BITS as usize)
+            .is_some_and(|word| {
+                word.load(Ordering::Relaxed) & (1 << (page % u64::BITS as usize)) != 0
+            })
+    }
+
+    /// The dirty bits of pages `64 * index ..`, for the snapshot writer.
+    pub fn word(&self, index: usize) -> u64 {
+        self.bits
+            .get(index)
+            .map_or(0, |word| word.load(Ordering::Relaxed))
+    }
+
+    /// The snapshot the bits are relative to, while armed.
+    pub fn parent(&self) -> Option<[u8; 16]> {
+        if !self.is_armed() {
+            return None;
+        }
+        let mut id = [0; 16];
+        id[..8].copy_from_slice(&self.parent[0].load(Ordering::Relaxed).to_le_bytes());
+        id[8..].copy_from_slice(&self.parent[1].load(Ordering::Relaxed).to_le_bytes());
+        Some(id)
+    }
+
+    /// Every page clean, relative to snapshot `parent`. The caller must hold every vCPU stopped
+    /// and revoke their write tags before any of them runs again.
+    pub fn arm(&self, parent: [u8; 16]) {
+        for word in self.bits.iter() {
+            word.store(0, Ordering::Relaxed);
+        }
+        let (low, high) = parent.split_at(8);
+        self.parent[0].store(
+            u64::from_le_bytes(low.try_into().unwrap()),
+            Ordering::Relaxed,
+        );
+        self.parent[1].store(
+            u64::from_le_bytes(high.try_into().unwrap()),
+            Ordering::Relaxed,
+        );
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    /// No parent: the next snapshot is a full one.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn disarm(&self) {
+        self.armed.store(false, Ordering::SeqCst);
+    }
+}
+
+/// `words` zeroed atomics straight from the allocator (see `CodePages::new`).
+fn zeroed_atomic_words(words: usize) -> Vec<AtomicU64> {
+    if words == 0 {
+        return Vec::new();
+    }
+    let layout = Layout::array::<AtomicU64>(words).unwrap();
+    let pointer = unsafe { alloc_zeroed(layout) };
+    if pointer.is_null() {
+        alloc::alloc::handle_alloc_error(layout);
+    }
+    // Allocated at exactly the layout `Vec<AtomicU64>` frees with; zero is a valid `AtomicU64`.
+    unsafe { Vec::from_raw_parts(pointer.cast::<AtomicU64>(), words, words) }
 }
 
 // Indexing is for tests and the single-threaded paths that already hold a `&Cpu`/`&mut Cpu`:
