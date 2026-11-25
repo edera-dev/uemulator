@@ -625,6 +625,24 @@ impl VectorShift {
     }
 }
 
+/// `Insn::op` of `0f 73` (the quadword and byte shifts by an immediate) and of `0f d6` (movq
+/// xmm/m64, xmm).
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "x86_64",
+    target_arch = "wasm32"
+))]
+pub(crate) const PSHIFT_QUADWORD_IMMEDIATE: u16 = 0x173;
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "x86_64",
+    target_arch = "wasm32"
+))]
+pub(crate) const MOVQ_STORE: u16 = 0x1d6;
+/// Bits of a byte mask (pmovmskb, a byte compare into an opmask) that one 128-bit lane gives.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+pub(crate) const LANE_BYTE_MASK_BITS: u32 = 16;
+
 /// `Some((shift, count))` for `66 0f 73 /2, /3, /6, /7 ib` on an xmm register: the forms
 /// `VectorShift` lists, with exactly the encoding `Cpu::sse` accepts (no other prefix, register
 /// operand only). VEX forms carry a flag in `Insn::op`, so they never match.
@@ -634,7 +652,6 @@ impl VectorShift {
     target_arch = "wasm32"
 ))]
 pub(crate) fn vector_shift(insn: &Insn) -> Option<(VectorShift, u8)> {
-    const PSHIFT_QUADWORD_IMMEDIATE: u16 = 0x173;
     if insn.op != PSHIFT_QUADWORD_IMMEDIATE || insn.rep != 0 || !insn.p66 || insn.md != 3 {
         return None;
     }
@@ -656,7 +673,6 @@ pub(crate) fn vector_shift(insn: &Insn) -> Option<(VectorShift, u8)> {
     target_arch = "wasm32"
 ))]
 pub(crate) fn is_movq_store(insn: &Insn) -> bool {
-    const MOVQ_STORE: u16 = 0x1d6;
     insn.op == MOVQ_STORE && insn.rep == 0 && insn.p66
 }
 

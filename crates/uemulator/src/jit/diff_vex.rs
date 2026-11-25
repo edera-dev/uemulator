@@ -294,10 +294,13 @@ const KMOVS: &[(&str, &[u8])] = &[
     ("kmovw k4, r10d", &[0xc4, 0xc1, 0x78, 0x92, 0xe2, 0xf4]),
     ("kmovb k5, r15d", &[0xc4, 0xc1, 0x79, 0x92, 0xef, 0xf4]),
     ("kmovd k6, esp", &[0xc5, 0xfb, 0x92, 0xf4, 0xf4]),
+    // r/m 4 is esp's low byte, never ah
+    ("kmovb k1, esp", &[0xc5, 0xf9, 0x92, 0xcc, 0xf4]),
 ];
 
 /// Encodings the classifier must refuse, which the interpreter raises #UD for: vvvv other than
-/// 1111 on a move and on vpmovmskb, vpbroadcastb with W1, kmov with F3.
+/// 1111 on a move, vpmovmskb, a broadcast or a kmov, a memory operand where only a register is
+/// allowed, the W bit where it selects nothing, VEX.L1 on a kmov, and kmov with F3.
 const UNDEFINED: &[(&str, &[u8])] = &[
     (
         "vmovdqu ymm1, [rbx] (vvvv=1)",
@@ -312,6 +315,27 @@ const UNDEFINED: &[(&str, &[u8])] = &[
         &[0x62, 0xf2, 0xfd, 0x48, 0x7a, 0xc8, 0xf4],
     ),
     ("kmov k1, eax (F3)", &[0xc5, 0xfa, 0x92, 0xc8, 0xf4]),
+    ("kmovw k1, eax (W1)", &[0xc4, 0xe1, 0xf8, 0x92, 0xc8, 0xf4]),
+    ("kmovb eax, k1 (W1)", &[0xc4, 0xe1, 0xf9, 0x93, 0xc1, 0xf4]),
+    ("kmovd k1, eax (L1)", &[0xc5, 0xff, 0x92, 0xc8, 0xf4]),
+    ("kmovd k1, eax (vvvv=1)", &[0xc5, 0xf3, 0x92, 0xc8, 0xf4]),
+    (
+        "vpbroadcastw zmm1, eax (W1)",
+        &[0x62, 0xf2, 0xfd, 0x48, 0x7b, 0xc8, 0xf4],
+    ),
+    (
+        "vpbroadcastb zmm1, eax (vvvv=1)",
+        &[0x62, 0xf2, 0x75, 0x48, 0x7a, 0xc8, 0xf4],
+    ),
+    (
+        "vpbroadcastb zmm1, [rbx]",
+        &[0x62, 0xf2, 0x7d, 0x48, 0x7a, 0x0b, 0xf4],
+    ),
+    ("vpmovmskb ecx, [rbx]", &[0xc5, 0xfd, 0xd7, 0x0b, 0xf4]),
+    (
+        "vmovaps ymm1, [rbx] (vvvv=1)",
+        &[0xc5, 0xf4, 0x28, 0x0b, 0xf4],
+    ),
 ];
 
 #[test]
@@ -430,6 +454,7 @@ fn the_avx_state_gate_raises_ud_and_nm() {
             setup(harness, 0);
             harness.cpu.xcr0 &= !crate::cpu::xsave::XCR0_AVX512;
             harness.cpu.cr0 |= CR0_EM_BIT;
+            harness.cpu.cr4 &= !CR4_OSFXSR;
         });
     }
 }
@@ -485,8 +510,9 @@ const KMOV: &[u8] = &[0xc5, 0xfb, 0x93, 0xc1];
 #[test]
 fn the_sse_avx_and_avx512_gates_of_one_block_stay_apart() {
     let instructions = [LEGACY, VEX, EVEX, KMOV];
-    let states: [&dyn Fn(&mut crate::testkit::Harness); 3] = [
+    let states: [&dyn Fn(&mut crate::testkit::Harness); 4] = [
         &|harness| harness.cpu.cr0 |= CR0_EM_BIT,
+        &|harness| harness.cpu.cr4 &= !CR4_OSFXSR,
         &|harness| harness.cpu.xcr0 &= !crate::cpu::xsave::XCR0_AVX512,
         &|harness| harness.cpu.cr4 &= !CR4_OSXSAVE,
     ];

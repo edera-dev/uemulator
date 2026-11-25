@@ -2738,14 +2738,14 @@ impl<'a> Gen<'a> {
                 is_store = self.vector_alu(&insn, form, next_rip, insn_index, rip);
             }
             // psrlq/psllq/psrldq/pslldq xmm, imm8 (66 0f 73 /2 /6 /3 /7)
-            0x173 if plain => {
+            PSHIFT_QUADWORD_IMMEDIATE if plain => {
                 let Some((shift, count)) = vector_shift(&insn) else {
                     return false;
                 };
                 self.vector_shift(&insn, shift, count, insn_index, rip);
             }
             // movq xmm/m64, xmm (66 0f d6)
-            0x1d6 if plain && is_movq_store(&insn) => {
+            MOVQ_STORE if plain && is_movq_store(&insn) => {
                 is_store = self.movq_store(&insn, next_rip, insn_index, rip);
             }
             // The SHA extensions (no prefix), pshufd, palignr and pshufb (66 prefix): see
@@ -2756,8 +2756,9 @@ impl<'a> Gen<'a> {
                 };
                 is_store = self.whole_vector(&insn, form, next_rip, insn_index, rip);
             }
-            // AVX-512 data movement, integer logic and arithmetic, byte compares into an opmask
-            // register, and kmov of an opmask register (see `evex_form`)
+            // AVX and AVX-512 data movement, integer logic, arithmetic and compares, byte compares
+            // into an opmask register, vpmovmskb, broadcasts from a general register and kmov
+            // (see `evex_form`)
             _ if insn.evex || insn.vex => {
                 let Some(form) = evex_form(&insn) else {
                     return false;
@@ -2840,13 +2841,12 @@ impl<'a> Gen<'a> {
         (entry, resume)
     }
 
-    /// Starts an inline AVX-512 instruction: registers its out-of-line interpreter fallback and,
-    /// for the first one of the block, checks `Cpu::evex_gate` (#UD without CR4.OSXSAVE or the
-    /// SSE, AVX and AVX-512 state in XCR0, #NM under CR0.TS), jumping to the fallback so the
-    /// interpreter raises the exception. Like the SSE gate it holds for the whole block: whatever
-    /// changes CR0, CR4 or XCR0 ends it.
-    /// With `VectorGate::Avx` the gate is `Cpu::vex_gate` (no AVX-512 state needed), which the
-    /// AVX-512 one implies.
+    /// Starts an inline AVX or AVX-512 instruction: registers its out-of-line interpreter fallback
+    /// and, for the first one of the block that needs `gate`, checks `Cpu::vex_gate` (`Avx`) or
+    /// `Cpu::evex_gate` (`Avx512`): #UD without CR4.OSXSAVE or the state in XCR0, #NM under
+    /// CR0.TS, jumping to the fallback so the interpreter raises the exception. A passed AVX-512
+    /// check covers later AVX ones, not the reverse. Like the SSE gate it holds for the whole
+    /// block: whatever changes CR0, CR4 or XCR0 ends it.
     fn evex_entry(&mut self, gate: VectorGate, insn_index: u32, rip: u64) -> (Label, Label) {
         let entry = self.asm.label();
         let resume = self.asm.label();
@@ -2987,7 +2987,7 @@ impl<'a> Gen<'a> {
         }
     }
 
-    /// An inline AVX-512 instruction (`EvexForm`): whole 128, 256 or 512-bit vectors processed
+    /// An inline AVX or AVX-512 instruction (`EvexForm`): whole 128, 256 or 512-bit vectors processed
     /// one 128-bit lane at a time through v0 and v1, loaded from and stored to `Cpu` per lane, so
     /// nothing lives in host vector registers across instructions. A memory operand that is
     /// misaligned (for the aligned moves), misses the TLB or crosses a page, and a failing gate,
@@ -3071,7 +3071,7 @@ impl<'a> Gen<'a> {
                     if lane == 0 {
                         self.asm.mov(0, VALUE);
                     } else {
-                        self.asm.add_lsl(0, 0, VALUE, 16 * lane);
+                        self.asm.add_lsl(0, 0, VALUE, LANE_BYTE_MASK_BITS * lane);
                     }
                 }
                 self.write_reg(insn.reg, false, 4, 0);
@@ -3187,7 +3187,7 @@ impl<'a> Gen<'a> {
                             if lane == 0 {
                                 self.asm.mov(0, VALUE);
                             } else {
-                                self.asm.add_lsl(0, 0, VALUE, 16 * lane);
+                                self.asm.add_lsl(0, 0, VALUE, LANE_BYTE_MASK_BITS * lane);
                             }
                         }
                     }

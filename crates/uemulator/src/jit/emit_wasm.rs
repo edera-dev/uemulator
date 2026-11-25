@@ -110,9 +110,6 @@ const LANE_MASK_BITS: i64 = 16;
 /// `66 0f 6e` (movd/movq xmm, r/m) and `66 0f 7e` (movd/movq r/m, xmm).
 const MOVD_TO_VECTOR: u16 = 0x16e;
 const MOVD_FROM_VECTOR: u16 = 0x17e;
-/// `0f 73` (the quadword and byte shifts by an immediate) and `0f d6` (movq xmm/m64, xmm).
-const PSHIFT_QUADWORD_IMMEDIATE: u16 = 0x173;
-const MOVQ_STORE: u16 = 0x1d6;
 const SEG_SIZE: u32 = size_of::<Seg>() as u32;
 const SHADOW_STACK_ON: u32 = offset_of!(Cpu, shadow_stack_on) as u32;
 const SSP: u32 = (offset_of!(Cpu, cet) + offset_of!(Cet, ssp)) as u32;
