@@ -76,6 +76,8 @@ const VECTOR_ALIGNMENT: i64 = XMM_SIZE as i64;
 const XCR0: u32 = offset_of!(Cpu, xcr0) as u32;
 /// What `Cpu::evex_gate` requires of XCR0: the SSE, AVX and AVX-512 state components.
 const XCR0_EVEX_STATE: u64 = XCR0_SSE | XCR0_AVX | XCR0_AVX512;
+/// What `Cpu::vex_gate` requires of XCR0.
+const XCR0_VEX_STATE: u64 = XCR0_SSE | XCR0_AVX;
 /// A vector register is four 128-bit lanes (`helpers::vector_lane_offset`), each two i64 halves.
 const VECTOR_LANES: u32 = 4;
 const LANE_BYTES: u32 = 16;
@@ -84,11 +86,21 @@ const OPMASK: u32 = offset_of!(Cpu, opmask) as u32;
 const OPMASK_SIZE: u32 = size_of::<u64>() as u32;
 /// k0-k7: the register fields of a kmov name one with their low three bits.
 const OPMASK_REGISTER_MASK: u8 = 7;
-/// `Insn::op` of VEX `0f 92` (kmov k, r) and `0f 93` (kmov r, k); with F2, kmovd/kmovq.
-const VEX_KMOV_FROM_GENERAL: u16 = VEX_OP_FLAG | 0x192;
-const VEX_KMOV_TO_GENERAL: u16 = VEX_OP_FLAG | 0x193;
 /// `Insn::rep` of an F2 prefix.
 const PREFIX_F2: u8 = 2;
+/// `ELEMENT_BITS[log2]`: element `i` of a 128-bit lane of elements of `1 << log2` bytes holds
+/// bit `i` (of the element count), for turning write-mask bits into a vector mask
+/// (`Gen::push_write_mask`). Bytes and words count to 128 and repeat for the second half of the
+/// byte form, whose mask bits arrive as two bytes swizzled across the halves.
+const ELEMENT_BITS: [u128; 4] = [
+    0x8040_2010_0804_0201_8040_2010_0804_0201,
+    0x0080_0040_0020_0010_0008_0004_0002_0001,
+    0x0000_0008_0000_0004_0000_0002_0000_0001,
+    0x0000_0000_0000_0002_0000_0000_0000_0001,
+];
+/// i8x16.swizzle indices that spread the two mask bytes of a byte lane over its halves: byte 0
+/// of the splat in bytes 0-7, byte 1 in bytes 8-15.
+const MASK_BYTE_SPREAD: u128 = 0x0101_0101_0101_0101_0000_0000_0000_0000;
 /// The vpcmp immediate's predicates (SDM table of VPCMP), in order: eq, lt, le, false, ne, nlt,
 /// nle, true.
 const VPCMP_FALSE: u8 = 3;
@@ -428,6 +440,8 @@ pub(crate) struct Gen<'a> {
     /// or XCR0 ends a block, and an earlier check that failed left it through the interpreter.
     sse_gated: bool,
     evex_gated: bool,
+    /// The same for `Cpu::vex_gate`, which the AVX-512 gate implies and the SSE one does not.
+    vex_gated: bool,
 }
 
 impl<'a> Gen<'a> {
@@ -449,6 +463,7 @@ impl<'a> Gen<'a> {
             self_loop: None,
             sse_gated: false,
             evex_gated: false,
+            vex_gated: false,
         }
     }
 
@@ -756,16 +771,21 @@ impl<'a> Gen<'a> {
             .mem(op::I64_STORE, ICOUNT);
     }
 
-    /// Pushes an i32 that is 1 when `Cpu::sse` (with `evex`, `Cpu::evex_gate`) would let a vector
-    /// instruction run, and returns true; returns false, pushing nothing, when an earlier
-    /// instruction of the block checked it already.
-    fn vector_gate(&mut self, evex: bool) -> bool {
-        if evex {
-            if self.evex_gated {
+    /// Pushes an i32 that is 1 when `Cpu::sse` (with `gate`, `Cpu::vex_gate` or `Cpu::evex_gate`)
+    /// would let a vector instruction run, and returns true; returns false, pushing nothing, when
+    /// an earlier instruction of the block checked it already.
+    fn vector_gate(&mut self, gate: Option<VectorGate>) -> bool {
+        if let Some(gate) = gate {
+            let (gated, state) = match gate {
+                VectorGate::Avx512 => (self.evex_gated, XCR0_EVEX_STATE),
+                VectorGate::Avx => (self.vex_gated || self.evex_gated, XCR0_VEX_STATE),
+            };
+            if gated {
                 return false;
             }
-            self.evex_gated = true;
-            // CR4.OSXSAVE, the AVX-512 state in XCR0, and no CR0.TS
+            self.vex_gated = true;
+            self.evex_gated |= gate == VectorGate::Avx512;
+            // CR4.OSXSAVE, the state in XCR0, and no CR0.TS
             self.c
                 .local_get(CPU)
                 .mem(op::I64_LOAD, CR4)
@@ -775,9 +795,9 @@ impl<'a> Gen<'a> {
                 .op(op::I32_EQZ)
                 .local_get(CPU)
                 .mem(op::I64_LOAD, XCR0)
-                .i64_const(XCR0_EVEX_STATE as i64)
+                .i64_const(state as i64)
                 .op(op::I64_AND)
-                .i64_const(XCR0_EVEX_STATE as i64)
+                .i64_const(state as i64)
                 .op(op::I64_EQ)
                 .op(op::I32_AND)
                 .local_get(CPU)
@@ -810,9 +830,9 @@ impl<'a> Gen<'a> {
     }
 
     /// A whole-vector move of `bytes` (16, 32 or 64) between vector registers or a vector
-    /// register and memory: the legacy movups/movaps/movdqu/movdqa (`evex` false: only the low
-    /// lane is written) and the unmasked EVEX vmovdqu*/vmovdqa*/vmovup*/vmovap* (which zero the
-    /// register's lanes above `bytes`). The inline path needs the gate to hold, an aligned form's
+    /// register and memory: the legacy movups/movaps/movdqu/movdqa (`gate` `None`: only the low
+    /// lane is written) and the unmasked VEX and EVEX vmovdqu*/vmovdqa*/vmovup*/vmovap* (which
+    /// zero the register's lanes above `bytes`). The inline path needs the gate to hold, an aligned form's
     /// operand to be aligned to `bytes`, and the operand to be inside one page with a TLB hit;
     /// otherwise the interpreter runs the instruction (`helper_in_branch`), which also raises
     /// every fault. Returns true for a store to memory.
@@ -823,7 +843,7 @@ impl<'a> Gen<'a> {
         load: bool,
         aligned: bool,
         bytes: u32,
-        evex: bool,
+        gate: Option<VectorGate>,
         next: u64,
         index: usize,
         rip: u64,
@@ -831,7 +851,7 @@ impl<'a> Gen<'a> {
         let lanes = bytes / LANE_BYTES;
         let lane = |register: u8, lane: u32| vector_lane_offset(register, lane) as u32;
         let zero_upper = |generator: &mut Self, register: u8| {
-            if !evex {
+            if gate.is_none() {
                 return;
             }
             for upper in lanes..VECTOR_LANES {
@@ -850,7 +870,7 @@ impl<'a> Gen<'a> {
             } else {
                 (insn.reg, insn.rm)
             };
-            let gated = self.vector_gate(evex);
+            let gated = self.vector_gate(gate);
             if gated {
                 self.c.begin_if(BLOCK_VOID);
             }
@@ -877,7 +897,7 @@ impl<'a> Gen<'a> {
             scaled.disp *= bytes as i64;
         }
         self.ea(&scaled, next);
-        let gated = self.vector_gate(evex);
+        let gated = self.vector_gate(gate);
         if aligned {
             self.c
                 .local_get(ADDR)
@@ -924,29 +944,36 @@ impl<'a> Gen<'a> {
         !load
     }
 
-    /// kmovd/kmovq between an opmask register and a general register (`to_general`: `reg` gets
-    /// opmask `rm`, else opmask `reg` gets general `rm`), 32 bits zero-extended or all 64, as
-    /// `Cpu::exec_kmov` does. Behind the AVX-512 gate like the other inline EVEX instructions.
-    fn kmov(&mut self, insn: &Insn, to_general: bool, index: usize, rip: u64) {
-        let size = if insn.opsize == 8 { 8 } else { 4 };
-        let gated = self.vector_gate(true);
+    /// kmov between an opmask register and a general register (`MaskToGeneral`: `reg` gets
+    /// opmask `rm`; `GeneralToMask`: opmask `reg` gets general `rm`), `bits` wide, zero-extended,
+    /// as `Cpu::exec_kmov` does. Behind the AVX-512 gate like the other opmask instructions.
+    fn kmov(&mut self, insn: &Insn, kind: EvexKind, index: usize, rip: u64) {
+        let gated = self.vector_gate(Some(VectorGate::Avx512));
         if gated {
             self.c.begin_if(BLOCK_VOID);
         }
-        if to_general {
-            self.c.local_get(CPU).mem(
-                load_opcode(size, false),
-                OPMASK + OPMASK_SIZE * (insn.rm & OPMASK_REGISTER_MASK) as u32,
-            );
-            self.c.local_set(VALUE);
-            self.write_reg(insn.reg, false, 8, VALUE);
-        } else {
-            self.c.local_get(CPU);
-            self.read_reg(insn.rm, false, size);
-            self.c.mem(
-                op::I64_STORE,
-                OPMASK + OPMASK_SIZE * (insn.reg & OPMASK_REGISTER_MASK) as u32,
-            );
+        match kind {
+            EvexKind::MaskToGeneral { bits } => {
+                self.c.local_get(CPU).mem(
+                    load_opcode((bits / u8::BITS) as u8, false),
+                    OPMASK + OPMASK_SIZE * (insn.rm & OPMASK_REGISTER_MASK) as u32,
+                );
+                self.c.local_set(VALUE);
+                self.write_reg(insn.reg, false, 8, VALUE);
+            }
+            EvexKind::GeneralToMask { bits } => {
+                self.c.local_get(CPU);
+                self.read_reg(
+                    insn.rm & GENERAL_REGISTER_MASK,
+                    false,
+                    (bits / u8::BITS) as u8,
+                );
+                self.c.mem(
+                    op::I64_STORE,
+                    OPMASK + OPMASK_SIZE * (insn.reg & OPMASK_REGISTER_MASK) as u32,
+                );
+            }
+            _ => unreachable!("not a kmov: {kind:?}"),
         }
         if gated {
             self.c.op(op::ELSE);
@@ -968,11 +995,11 @@ impl<'a> Gen<'a> {
         bytes: u32,
         aligned: bool,
         write: bool,
-        evex: bool,
+        gate: Option<VectorGate>,
         next: u64,
     ) -> bool {
         if insn.md == MODRM_MOD_REGISTER {
-            let gated = self.vector_gate(evex);
+            let gated = self.vector_gate(gate);
             if gated {
                 self.c.begin_if(BLOCK_VOID);
             }
@@ -983,7 +1010,7 @@ impl<'a> Gen<'a> {
             scaled.disp *= bytes as i64;
         }
         self.ea(&scaled, next);
-        let gated = self.vector_gate(evex);
+        let gated = self.vector_gate(gate);
         if aligned {
             self.c
                 .local_get(ADDR)
@@ -1066,114 +1093,255 @@ impl<'a> Gen<'a> {
         self.c.simd(opcode);
     }
 
-    /// The AVX-512 integer instructions of `evex_form` that are not moves: lane-wise logic and
-    /// arithmetic without a write mask (`reg = vvvv op rm`, the lanes above the vector zeroed),
-    /// and the byte compares and tests into an opmask register (ANDed with the write mask), from
-    /// a register or a memory operand inside one page. Each 128-bit lane's comparison becomes
-    /// 16 mask bits through i8x16.bitmask.
-    fn evex_vector(&mut self, insn: &Insn, form: EvexForm, next: u64, index: usize, rip: u64) {
+    /// Pushes the vector mask of write-mask bits for 128-bit lane `lane` of an instruction with
+    /// a write mask: elements of `1 << element_log2` bytes all ones where their bit of opmask
+    /// `insn.evex_mask` is set. The lane's bits are shifted down and splatted, each element ANDed
+    /// with its own bit (`ELEMENT_BITS`) and compared with it; the byte form first spreads its two
+    /// mask bytes over the halves of the vector (`MASK_BYTE_SPREAD`). Bits above the elements of
+    /// the lane never reach an element.
+    fn push_write_mask(&mut self, insn: &Insn, element_log2: u32, lane: u32) {
+        let elements_per_lane = LANE_BYTES >> element_log2;
+        self.c
+            .local_get(CPU)
+            .mem(op::I64_LOAD, OPMASK + OPMASK_SIZE * insn.evex_mask as u32);
+        if lane != 0 {
+            self.c
+                .i64_const((lane * elements_per_lane) as i64)
+                .op(op::I64_SHR_U);
+        }
+        let (splat, equal) = match element_log2 {
+            0 => (simd::I16X8_SPLAT, simd::I8X16_EQ),
+            1 => (simd::I16X8_SPLAT, simd::I16X8_EQ),
+            2 => (simd::I32X4_SPLAT, simd::I32X4_EQ),
+            _ => (simd::I64X2_SPLAT, simd::I64X2_EQ),
+        };
+        if splat != simd::I64X2_SPLAT {
+            self.c.op(op::I32_WRAP_I64);
+        }
+        self.c.simd(splat);
+        if element_log2 == 0 {
+            self.c
+                .v128_const(MASK_BYTE_SPREAD)
+                .simd(simd::I8X16_SWIZZLE);
+        }
+        let bits = ELEMENT_BITS[element_log2 as usize];
+        self.c
+            .v128_const(bits)
+            .simd(simd::V128_AND)
+            .v128_const(bits)
+            .simd(equal);
+    }
+
+    /// Stores the v128 on the stack (above a `CPU` pushed before it) to lane `lane` of vector
+    /// register `register`, under the write mask when the instruction has one: elements whose bit
+    /// is clear keep the old value, or become zero with EVEX.z.
+    fn commit_lane(&mut self, insn: &Insn, element_log2: u32, register: u8, lane: u32) {
+        let offset = vector_lane_offset(register, lane) as u32;
+        if insn.evex_mask != 0 {
+            if insn.evex_zeroing {
+                self.push_write_mask(insn, element_log2, lane);
+                self.c.simd(simd::V128_AND);
+            } else {
+                self.push_register_lane(register, lane);
+                self.push_write_mask(insn, element_log2, lane);
+                self.c.simd(simd::V128_BITSELECT);
+            }
+        }
+        self.c.simd_mem(simd::V128_STORE, offset);
+    }
+
+    /// Zeroes the 128-bit lanes `from..4` of vector register `register`: every VEX or EVEX write
+    /// of a vector shorter than 512 bits clears the rest of the register.
+    fn zero_vector_lanes(&mut self, register: u8, from: u32) {
+        for upper in from..VECTOR_LANES {
+            for half in [0, HALF_LANE_BYTES] {
+                self.c.local_get(CPU).i64_const(0).mem(
+                    op::I64_STORE,
+                    vector_lane_offset(register, upper) as u32 + half,
+                );
+            }
+        }
+    }
+
+    /// The instructions of `evex_form` that need wasm SIMD: masked moves into a register,
+    /// lane-wise logic, arithmetic and compares into a vector (`reg = vvvv op rm`) with or
+    /// without a write mask, the byte compares and tests into an opmask register (ANDed with the
+    /// write mask), broadcasts from a general register and vpmovmskb, from a register or a memory
+    /// operand inside one page. Each 128-bit lane's byte comparison becomes 16 mask bits through
+    /// i8x16.bitmask. A masked load reads the whole vector inside the page the TLB vouches for,
+    /// which cannot fault, so the elements the mask drops are read and discarded; anything else
+    /// (a page crossing, a TLB miss, a misaligned aligned move, a failing gate) runs in the
+    /// interpreter. Every source lane is read before its destination lane is written, so a
+    /// destination that is also a source is fine. Returns true for a store to memory.
+    fn evex_vector(
+        &mut self,
+        insn: &Insn,
+        form: EvexForm,
+        next: u64,
+        index: usize,
+        rip: u64,
+    ) -> bool {
         let lanes = form.bytes / LANE_BYTES;
-        let opened = self.begin_vector_access(insn, form.bytes, false, false, true, next);
-        if let EvexKind::Alu {
-            op: operation,
-            lane_log2,
-        } = form.kind
-        {
-            for lane in 0..lanes {
-                self.c.local_get(CPU);
-                if operation == VectorOp::AndNot {
-                    // !vvvv & rm = v128.andnot(rm, vvvv)
-                    self.push_rm_lane(insn, lane);
-                    self.push_register_lane(insn.vex_v, lane);
-                    self.c.simd(simd::V128_ANDNOT);
+        let (aligned, write) = match form.kind {
+            EvexKind::Move { load, aligned } => (aligned, !load),
+            _ => (false, false),
+        };
+        let opened =
+            self.begin_vector_access(insn, form.bytes, aligned, write, Some(form.gate), next);
+        let memory = insn.md != MODRM_MOD_REGISTER;
+        match form.kind {
+            EvexKind::Move { load, .. } => {
+                // A masked store to memory is not classified (see `evex_form`): with memory this
+                // is a load, else a move between registers whose destination is `reg` for the
+                // load opcodes and `rm` for the store ones.
+                let (from, to) = if load {
+                    (insn.rm, insn.reg)
                 } else {
-                    self.push_register_lane(insn.vex_v, lane);
-                    self.push_rm_lane(insn, lane);
-                    self.vector_op(operation, lane_log2);
+                    (insn.reg, insn.rm)
+                };
+                for lane in 0..lanes {
+                    self.c.local_get(CPU);
+                    if memory {
+                        self.push_rm_lane(insn, lane);
+                    } else {
+                        self.push_register_lane(from, lane);
+                    }
+                    self.commit_lane(insn, form.element_log2, to, lane);
                 }
-                self.c
-                    .simd_mem(simd::V128_STORE, vector_lane_offset(insn.reg, lane) as u32);
+                self.zero_vector_lanes(to, lanes);
             }
-            for upper in lanes..VECTOR_LANES {
-                for half in [0, HALF_LANE_BYTES] {
-                    self.c.local_get(CPU).i64_const(0).mem(
-                        op::I64_STORE,
-                        vector_lane_offset(insn.reg, upper) as u32 + half,
-                    );
-                }
-            }
-        } else {
-            self.c.local_get(CPU);
-            match form.kind {
-                EvexKind::CompareBytes {
-                    predicate: VPCMP_FALSE,
-                    ..
-                } => {
-                    self.c.i64_const(0);
-                }
-                EvexKind::CompareBytes {
-                    predicate: VPCMP_TRUE,
-                    ..
-                } => {
-                    self.c.i64_const(width_mask(form.bytes as u8 / 8));
-                }
-                _ => {
-                    for lane in 0..lanes {
+            EvexKind::Alu {
+                op: operation,
+                lane_log2,
+            } => {
+                for lane in 0..lanes {
+                    self.c.local_get(CPU);
+                    if operation == VectorOp::AndNot {
+                        // !vvvv & rm = v128.andnot(rm, vvvv)
+                        self.push_rm_lane(insn, lane);
+                        self.push_register_lane(insn.vex_v, lane);
+                        self.c.simd(simd::V128_ANDNOT);
+                    } else {
                         self.push_register_lane(insn.vex_v, lane);
                         self.push_rm_lane(insn, lane);
-                        match form.kind {
-                            EvexKind::CompareEqualBytes => {
-                                self.c.simd(simd::I8X16_EQ);
-                            }
-                            EvexKind::CompareBytes { signed, predicate } => {
-                                self.c.simd(match (predicate, signed) {
-                                    (0, _) => simd::I8X16_EQ,
-                                    (1, true) => simd::I8X16_LT_S,
-                                    (1, false) => simd::I8X16_LT_U,
-                                    (2, true) => simd::I8X16_LE_S,
-                                    (2, false) => simd::I8X16_LE_U,
-                                    (4, _) => simd::I8X16_NE,
-                                    (5, true) => simd::I8X16_GE_S,
-                                    (5, false) => simd::I8X16_GE_U,
-                                    (_, true) => simd::I8X16_GT_S,
-                                    (_, false) => simd::I8X16_GT_U,
-                                });
-                            }
-                            // (vvvv & rm) != 0, or == 0 for vptestnmb
-                            _ => {
-                                self.c
-                                    .simd(simd::V128_AND)
-                                    .i32_const(0)
-                                    .simd(simd::I8X16_SPLAT)
-                                    .simd(if form.kind == EvexKind::TestBytes {
-                                        simd::I8X16_NE
-                                    } else {
-                                        simd::I8X16_EQ
+                        self.vector_op(operation, lane_log2);
+                    }
+                    self.commit_lane(insn, form.element_log2, insn.reg, lane);
+                }
+                self.zero_vector_lanes(insn.reg, lanes);
+            }
+            EvexKind::BroadcastGeneral => {
+                let (size, splat) = match form.element_log2 {
+                    0 => (1, simd::I8X16_SPLAT),
+                    1 => (2, simd::I16X8_SPLAT),
+                    2 => (4, simd::I32X4_SPLAT),
+                    _ => (8, simd::I64X2_SPLAT),
+                };
+                for lane in 0..lanes {
+                    self.c.local_get(CPU);
+                    self.read_reg(insn.rm & GENERAL_REGISTER_MASK, false, size);
+                    if size != 8 {
+                        self.c.op(op::I32_WRAP_I64);
+                    }
+                    self.c.simd(splat);
+                    self.commit_lane(insn, form.element_log2, insn.reg, lane);
+                }
+                self.zero_vector_lanes(insn.reg, lanes);
+            }
+            EvexKind::MoveMaskBytes => {
+                for lane in 0..lanes {
+                    self.push_register_lane(insn.rm, lane);
+                    self.c.simd(simd::I8X16_BITMASK).op(op::I64_EXTEND_I32_U);
+                    if lane > 0 {
+                        self.c
+                            .i64_const(LANE_MASK_BITS * lane as i64)
+                            .op(op::I64_SHL)
+                            .op(op::I64_OR);
+                    }
+                }
+                self.c.local_set(VALUE);
+                self.write_reg(insn.reg, false, 8, VALUE);
+            }
+            EvexKind::MaskToGeneral { .. } | EvexKind::GeneralToMask { .. } => {
+                unreachable!("kmov goes through `kmov`")
+            }
+            EvexKind::CompareEqualBytes
+            | EvexKind::TestBytes
+            | EvexKind::TestNotBytes
+            | EvexKind::CompareBytes { .. } => {
+                self.c.local_get(CPU);
+                match form.kind {
+                    EvexKind::CompareBytes {
+                        predicate: VPCMP_FALSE,
+                        ..
+                    } => {
+                        self.c.i64_const(0);
+                    }
+                    EvexKind::CompareBytes {
+                        predicate: VPCMP_TRUE,
+                        ..
+                    } => {
+                        self.c.i64_const(width_mask(form.bytes as u8 / 8));
+                    }
+                    _ => {
+                        for lane in 0..lanes {
+                            self.push_register_lane(insn.vex_v, lane);
+                            self.push_rm_lane(insn, lane);
+                            match form.kind {
+                                EvexKind::CompareEqualBytes => {
+                                    self.c.simd(simd::I8X16_EQ);
+                                }
+                                EvexKind::CompareBytes { signed, predicate } => {
+                                    self.c.simd(match (predicate, signed) {
+                                        (0, _) => simd::I8X16_EQ,
+                                        (1, true) => simd::I8X16_LT_S,
+                                        (1, false) => simd::I8X16_LT_U,
+                                        (2, true) => simd::I8X16_LE_S,
+                                        (2, false) => simd::I8X16_LE_U,
+                                        (4, _) => simd::I8X16_NE,
+                                        (5, true) => simd::I8X16_GE_S,
+                                        (5, false) => simd::I8X16_GE_U,
+                                        (_, true) => simd::I8X16_GT_S,
+                                        (_, false) => simd::I8X16_GT_U,
                                     });
+                                }
+                                // (vvvv & rm) != 0, or == 0 for vptestnmb
+                                _ => {
+                                    self.c
+                                        .simd(simd::V128_AND)
+                                        .i32_const(0)
+                                        .simd(simd::I8X16_SPLAT)
+                                        .simd(if form.kind == EvexKind::TestBytes {
+                                            simd::I8X16_NE
+                                        } else {
+                                            simd::I8X16_EQ
+                                        });
+                                }
                             }
-                        }
-                        self.c.simd(simd::I8X16_BITMASK).op(op::I64_EXTEND_I32_U);
-                        if lane > 0 {
-                            self.c
-                                .i64_const(LANE_MASK_BITS * lane as i64)
-                                .op(op::I64_SHL)
-                                .op(op::I64_OR);
+                            self.c.simd(simd::I8X16_BITMASK).op(op::I64_EXTEND_I32_U);
+                            if lane > 0 {
+                                self.c
+                                    .i64_const(LANE_MASK_BITS * lane as i64)
+                                    .op(op::I64_SHL)
+                                    .op(op::I64_OR);
+                            }
                         }
                     }
                 }
+                if insn.evex_mask != 0 {
+                    self.c
+                        .local_get(CPU)
+                        .mem(op::I64_LOAD, OPMASK + OPMASK_SIZE * insn.evex_mask as u32)
+                        .op(op::I64_AND);
+                }
+                self.c.mem(
+                    op::I64_STORE,
+                    OPMASK + OPMASK_SIZE * (insn.reg & OPMASK_REGISTER_MASK) as u32,
+                );
             }
-            if insn.evex_mask != 0 {
-                self.c
-                    .local_get(CPU)
-                    .mem(op::I64_LOAD, OPMASK + OPMASK_SIZE * insn.evex_mask as u32)
-                    .op(op::I64_AND);
-            }
-            self.c.mem(
-                op::I64_STORE,
-                OPMASK + OPMASK_SIZE * (insn.reg & OPMASK_REGISTER_MASK) as u32,
-            );
         }
         self.end_vector_access(opened, index, rip);
+        write && memory
     }
 
     /// A legacy `66 0f xx` integer instruction on a whole xmm register (`VectorAlu`):
@@ -1188,7 +1356,7 @@ impl<'a> Gen<'a> {
         index: usize,
         rip: u64,
     ) {
-        let opened = self.begin_vector_access(insn, LANE_BYTES, true, false, false, next);
+        let opened = self.begin_vector_access(insn, LANE_BYTES, true, false, None, next);
         if form.op == VectorOp::MoveMask {
             self.push_rm_lane(insn, 0);
             self.c
@@ -1221,7 +1389,7 @@ impl<'a> Gen<'a> {
         let size = if insn.opsize == 8 { 8 } else { 4 };
         let xmm = vector_lane_offset(insn.reg, 0) as u32;
         let memory = insn.md != MODRM_MOD_REGISTER;
-        let opened = self.begin_vector_access(insn, size as u32, false, !to_vector, false, next);
+        let opened = self.begin_vector_access(insn, size as u32, false, !to_vector, None, next);
         if to_vector {
             self.c.local_get(CPU);
             if memory {
@@ -3228,17 +3396,7 @@ impl<'a> Gen<'a> {
                     return false;
                 };
                 store =
-                    self.vector_move(&insn, form.load, form.aligned, 16, false, next, index, rip);
-            }
-            // kmovd/kmovq k, r and r, k (VEX.L0, no vvvv, register forms)
-            VEX_KMOV_FROM_GENERAL | VEX_KMOV_TO_GENERAL
-                if insn.vex
-                    && insn.rep == PREFIX_F2
-                    && !is_mem
-                    && !insn.vex_l
-                    && insn.vex_v == 0 =>
-            {
-                self.kmov(&insn, insn.op == VEX_KMOV_TO_GENERAL, index, rip);
+                    self.vector_move(&insn, form.load, form.aligned, 16, None, next, index, rip);
             }
             // pxor/por/pand/pandn, pcmpeq*, pminub/pmaxub, padd*, psub*, pmovmskb (66 prefix)
             0x1d4
@@ -3266,27 +3424,31 @@ impl<'a> Gen<'a> {
             MOVD_TO_VECTOR | MOVD_FROM_VECTOR if plain && insn.p66 && insn.rep == 0 => {
                 store = self.movd(&insn, insn.op == MOVD_TO_VECTOR, next, index, rip);
             }
-            // AVX-512 moves without a write mask, integer logic and arithmetic without one, and
-            // the byte compares and tests into an opmask register
-            _ if insn.evex && (!is_mem || plain) => {
+            // AVX and AVX-512 moves, integer logic, arithmetic and compares, byte compares and
+            // tests into an opmask register, broadcasts from a general register, vpmovmskb and
+            // kmov (see `evex_form`). Unmasked moves are i64 copies; the rest need wasm SIMD.
+            _ if (insn.evex || insn.vex) && (!is_mem || plain) => {
                 let Some(form) = evex_form(&insn) else {
                     return false;
                 };
                 match form.kind {
                     EvexKind::Move { load, aligned } if insn.evex_mask == 0 => {
-                        store = self
-                            .vector_move(&insn, load, aligned, form.bytes, true, next, index, rip);
+                        store = self.vector_move(
+                            &insn,
+                            load,
+                            aligned,
+                            form.bytes,
+                            Some(form.gate),
+                            next,
+                            index,
+                            rip,
+                        );
                     }
-                    EvexKind::Alu { .. } if insn.evex_mask == 0 && self.addrs.simd => {
-                        self.evex_vector(&insn, form, next, index, rip);
+                    EvexKind::MaskToGeneral { .. } | EvexKind::GeneralToMask { .. } => {
+                        self.kmov(&insn, form.kind, index, rip);
                     }
-                    EvexKind::CompareEqualBytes
-                    | EvexKind::TestBytes
-                    | EvexKind::TestNotBytes
-                    | EvexKind::CompareBytes { .. }
-                        if self.addrs.simd =>
-                    {
-                        self.evex_vector(&insn, form, next, index, rip);
+                    _ if self.addrs.simd => {
+                        store = self.evex_vector(&insn, form, next, index, rip);
                     }
                     _ => return false,
                 }
@@ -3685,15 +3847,13 @@ fn keeps_pending_record(insn: &Insn) -> bool {
         | 0xeb
         | 0xc3
         | 0x1c8..=0x1cf
-        | VEX_BMI_SHIFT_OR_BEXTR
-        | VEX_KMOV_FROM_GENERAL
-        | VEX_KMOV_TO_GENERAL => true,
+        | VEX_BMI_SHIFT_OR_BEXTR => true,
         VEX_BMI_MULX => insn.rep == PREFIX_F2,
-        // the vector moves and integer instructions, legacy and EVEX, and movd/movq
+        // the vector moves and integer instructions, legacy, VEX and EVEX, movd/movq and kmov
         0x110 | 0x111 | 0x128 | 0x129 | 0x16f | 0x17f | MOVD_TO_VECTOR | MOVD_FROM_VECTOR => true,
         0x1d4 | 0x1d7 | 0x1da | 0x1db | 0x1de | 0x1df | 0x1eb | 0x1ef | 0x174..=0x176 => true,
         0x1f8..=0x1fe => true,
-        _ => insn.evex,
+        _ => insn.evex || (insn.vex && evex_form(insn).is_some()),
     }
 }
 

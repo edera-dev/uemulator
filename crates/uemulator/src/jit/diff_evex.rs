@@ -11,17 +11,17 @@ use crate::testkit::Harness;
 /// The 64-byte pattern repeated over the memory the cases read and write, so every
 /// vector-aligned offset of a case sees the same bytes and a register filled from it compares equal.
 /// CR4.OSXSAVE; `cpu::CR4_OSXSAVE` is only exported to the generators' own hosts.
-const CR4_OSXSAVE: u64 = 1 << 18;
+pub(super) const CR4_OSXSAVE: u64 = 1 << 18;
 const PATTERN_BYTES: usize = 64;
 const PATTERN_REPEATS: usize = 6;
 const VECTOR_REGISTERS: usize = 32;
 const OPMASK_REGISTERS: usize = 8;
-const FILLINGS: u64 = 6;
+pub(super) const FILLINGS: u64 = 6;
 
 /// Enables the AVX-512 state and fills the vector registers and opmasks. `filling` picks what the
 /// registers hold relative to the memory pattern: 0 and 1 random, 2 the pattern with a few bytes
 /// changed, 3 all zero, 4 all ones, 5 the pattern exactly.
-fn setup(harness: &mut Harness, filling: u64) {
+pub(super) fn setup(harness: &mut Harness, filling: u64) {
     seed_registers_and_memory(harness);
     harness.cpu.cr4 |= CR4_OSXSAVE;
     harness.cpu.xcr0 = XCR0_SUPPORTED;
@@ -77,11 +77,11 @@ fn setup(harness: &mut Harness, filling: u64) {
 /// (mov rax, [rbx]; mov [rbx + 0x300], rax)
 const WARM_TLB: &[u8] = &[0x48, 0x8b, 0x03, 0x48, 0x89, 0x83, 0x00, 0x03, 0x00, 0x00];
 
-fn warmed(code: &[u8]) -> Vec<u8> {
+pub(super) fn warmed(code: &[u8]) -> Vec<u8> {
     [WARM_TLB, code].concat()
 }
 
-fn run_table(table: &[(&str, &[u8])]) {
+pub(super) fn run_table(table: &[(&str, &[u8])]) {
     for (name, code) in table {
         let code = warmed(code);
         for filling in 0..FILLINGS {

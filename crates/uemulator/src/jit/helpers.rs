@@ -757,11 +757,12 @@ pub(crate) extern "C" fn helper_whole_vector(
     STATUS_OK
 }
 
-/// What an inline AVX-512 instruction does. Whole-vector data movement and integer logic and
-/// arithmetic (the shapes of glibc's EVEX string and copy loops, with merge or zero masking
-/// except for stores to memory), byte compares into an opmask register, and `kmov` of an opmask
-/// register to a general register are lowered; broadcast, rounding and the rest stay in the
-/// interpreter, which also raises every #UD, so a form that could be one is not accepted here.
+/// What an inline AVX or AVX-512 instruction does. Whole-vector data movement and integer logic
+/// and arithmetic (the shapes of glibc's AVX2 and EVEX string and copy loops, with merge or zero
+/// masking except for stores to memory), byte compares into an opmask register or a vector,
+/// vpmovmskb, broadcasts from a general register, and `kmov` between an opmask register and a
+/// general register are lowered; memory broadcast, rounding and the rest stay in the interpreter,
+/// which also raises every #UD, so a form that could be one is not accepted here.
 #[cfg(any(
     target_arch = "aarch64",
     target_arch = "x86_64",
@@ -769,10 +770,12 @@ pub(crate) extern "C" fn helper_whole_vector(
 ))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum EvexKind {
-    /// vmovdqu8/16/32/64, vmovdqa32/64, vmovups/vmovupd, vmovaps/vmovapd between a register and
-    /// a register or memory. The aligned forms need an operand aligned to the vector length.
+    /// vmovdqu8/16/32/64, vmovdqa32/64, vmovups/vmovupd, vmovaps/vmovapd (and the VEX vmovdqu,
+    /// vmovdqa, vmovups/pd, vmovaps/pd) between a register and a register or memory. The aligned
+    /// forms need an operand aligned to the vector length.
     Move { load: bool, aligned: bool },
-    /// `reg = vvvv op rm`, lane by lane (`VectorOp` as for the legacy forms, without `MoveMask`).
+    /// `reg = vvvv op rm`, lane by lane (`VectorOp` as for the legacy forms, without `MoveMask`;
+    /// `CompareEqual` only from VEX, where vpcmpeq writes a vector instead of an opmask).
     Alu { op: VectorOp, lane_log2: u32 },
     /// `k[reg] = (vvvv == rm)` per byte, ANDed with the write mask when there is one.
     CompareEqualBytes,
@@ -783,8 +786,41 @@ pub(crate) enum EvexKind {
     /// vpcmpub/vpcmpb `k[reg] = predicate(vvvv, rm)` per byte, ANDed with the write mask. The
     /// predicate is the low three bits of the immediate (`PREDICATE_*` order of the SDM table).
     CompareBytes { signed: bool, predicate: u8 },
-    /// VEX `kmovd`/`kmovq r, k`: the opmask register `rm` into general register `reg`.
-    MaskToGeneral { wide: bool },
+    /// VEX `kmovb/w/d/q r, k`: the low `bits` of opmask register `rm` into general register
+    /// `reg`, zero-extended to 32 bits (64 for kmovq).
+    MaskToGeneral { bits: u32 },
+    /// VEX `kmovb/w/d/q k, r`: the low `bits` of general register `rm` into opmask `reg`.
+    GeneralToMask { bits: u32 },
+    /// EVEX vpbroadcastb/w/d/q from general register `rm`: the low element (`element_log2`) of
+    /// it in every element of `reg`, under the write mask.
+    BroadcastGeneral,
+    /// VEX vpmovmskb r32, xmm/ymm: the sign bit of every byte of vector register `rm` into
+    /// general register `reg`, zero-extended.
+    MoveMaskBytes,
+}
+
+/// EVEX.X extends ModRM.rm to five bits for vector registers; an instruction whose r/m names a
+/// general register (vpbroadcastb r32, kmov k, r) ignores it, as `Cpu::read_gpr(rm & 0xf)` does.
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "x86_64",
+    target_arch = "wasm32"
+))]
+pub(crate) const GENERAL_REGISTER_MASK: u8 = 0xf;
+
+/// Which state the OS must have enabled for an inline vector instruction: `Avx` is
+/// `Cpu::vex_gate` (CR4.OSXSAVE, XCR0 SSE and AVX, no CR0.TS), `Avx512` is `Cpu::evex_gate`
+/// (also the XCR0 AVX-512 state), which the opmask instructions use even though they are VEX
+/// encoded. Neither checks CR0.EM or CR4.OSFXSR, unlike legacy SSE.
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "x86_64",
+    target_arch = "wasm32"
+))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum VectorGate {
+    Avx,
+    Avx512,
 }
 
 #[cfg(any(
@@ -799,11 +835,89 @@ pub(crate) struct EvexForm {
     pub bytes: u32,
     /// log2 of the element size the write mask applies to (0 = bytes .. 3 = quadwords).
     pub element_log2: u32,
+    pub gate: VectorGate,
+}
+
+/// The width in bits of a `kmov` between an opmask and a general register (0f 92/93), which the
+/// prefix and W select: none = w, 66 = b, F2 = d (W0) or q (W1); F3 is #UD.
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "x86_64",
+    target_arch = "wasm32"
+))]
+fn kmov_general_bits(insn: &Insn) -> Option<u32> {
+    let wide = insn.opsize == 8;
+    match (insn.rep, insn.p66, wide) {
+        (0, false, false) => Some(16),
+        (0, true, false) => Some(8),
+        (2, _, false) => Some(32),
+        (2, _, true) => Some(64),
+        _ => None,
+    }
+}
+
+/// `Some` for the VEX-encoded instructions `EvexKind` lists: no write mask, 128 or 256 bits, the
+/// same `#UD` rules as `Cpu::exec_vex_vector` (vvvv must be 0 where it names no operand).
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "x86_64",
+    target_arch = "wasm32"
+))]
+fn vex_form(insn: &Insn) -> Option<EvexForm> {
+    use crate::cpu::decode::VEX_OP_FLAG;
+    const MAP_0F: u16 = 1;
+    let bytes = if insn.vex_l { 32 } else { 16 };
+    let op = insn.op & !VEX_OP_FLAG;
+    let (map, opcode) = (op >> 8, (op & 0xff) as u8);
+    if map != MAP_0F {
+        return None;
+    }
+    // The implied prefix, as `Cpu::exec_vex_vector` reads it: F3 and F2 win over 66.
+    let (no_prefix, p66, f3) = (
+        insn.rep == 0 && !insn.p66,
+        insn.rep == 0 && insn.p66,
+        insn.rep == 1,
+    );
+    let no_vvvv = insn.vex_v == 0;
+    let alu = |op, lane_log2| EvexKind::Alu { op, lane_log2 };
+    let kind = match opcode {
+        // vmovdqa (66, aligned) and vmovdqu (F3)
+        0x6f | 0x7f if no_vvvv && (p66 || f3) => EvexKind::Move {
+            load: opcode == 0x6f,
+            aligned: p66,
+        },
+        // vmovups/vmovupd and vmovaps/vmovapd; with F3/F2 0x10/0x11 are vmovss/vmovsd
+        0x10 | 0x11 | 0x28 | 0x29 if no_vvvv && (no_prefix || p66) => EvexKind::Move {
+            load: matches!(opcode, 0x10 | 0x28),
+            aligned: opcode >= 0x28,
+        },
+        0xd7 if no_vvvv && p66 && insn.md == 3 => EvexKind::MoveMaskBytes,
+        _ if !p66 => return None,
+        0xdb => alu(VectorOp::And, 0),
+        0xdf => alu(VectorOp::AndNot, 0),
+        0xeb => alu(VectorOp::Or, 0),
+        0xef => alu(VectorOp::Xor, 0),
+        0xda => alu(VectorOp::MinUnsigned8, 0),
+        0xde => alu(VectorOp::MaxUnsigned8, 0),
+        // vpcmpeqb/w/d (vpcmpeqq is 0f38 29)
+        0x74..=0x76 => alu(VectorOp::CompareEqual, (opcode - 0x74) as u32),
+        0xfc..=0xfe => alu(VectorOp::Add, (opcode - 0xfc) as u32),
+        0xd4 => alu(VectorOp::Add, 3),
+        0xf8..=0xfa => alu(VectorOp::Subtract, (opcode - 0xf8) as u32),
+        0xfb => alu(VectorOp::Subtract, 3),
+        _ => return None,
+    };
+    Some(EvexForm {
+        kind,
+        bytes,
+        element_log2: 0,
+        gate: VectorGate::Avx,
+    })
 }
 
 /// `Some` for the instructions `EvexKind` lists, with the encodings the interpreter accepts as
-/// valid (see `Cpu::exec_evex`): no broadcast or rounding (EVEX.b), no reserved length, and no
-/// EVEX.z without a write mask.
+/// valid (see `Cpu::exec_evex` and `Cpu::exec_vex_vector`): no broadcast or rounding (EVEX.b), no
+/// reserved length, and no EVEX.z without a write mask.
 #[cfg(any(
     target_arch = "aarch64",
     target_arch = "x86_64",
@@ -814,21 +928,37 @@ pub(crate) fn evex_form(insn: &Insn) -> Option<EvexForm> {
     const MAP_0F: u16 = 1;
     const MAP_0F38: u16 = 2;
     const MAP_0F3A: u16 = 3;
+    const OPCODE_KMOV_FROM_GENERAL: u16 = 0x92;
     const OPCODE_KMOV_TO_GENERAL: u16 = 0x93;
     const VECTOR_LENGTH_RESERVED: u8 = 3;
     const OPMASK_REGISTERS: u8 = 8;
     const PREDICATE_MASK: i64 = 7;
-    if insn.vex && insn.op == VEX_OP_FLAG | (MAP_0F << 8) | OPCODE_KMOV_TO_GENERAL {
-        // F2 0F 93: kmovd (W0) / kmovq (W1) r32/r64, k. Register source only, L0, no vvvv.
-        return (insn.rep == 2 && insn.md == 3 && !insn.vex_l && insn.vex_v == 0).then_some(
-            EvexForm {
-                kind: EvexKind::MaskToGeneral {
-                    wide: insn.opsize == 8,
-                },
-                bytes: 0,
-                element_log2: 0,
+    let kmov = |to_general: bool| {
+        // 0f 92/93: kmov k, r / r, k. Register operand only, L0, no vvvv (`Cpu::exec_kmov`). The
+        // opmask instructions are behind the AVX-512 gate.
+        if insn.md != 3 || insn.vex_l || insn.vex_v != 0 {
+            return None;
+        }
+        let bits = kmov_general_bits(insn)?;
+        Some(EvexForm {
+            kind: if to_general {
+                EvexKind::MaskToGeneral { bits }
+            } else {
+                EvexKind::GeneralToMask { bits }
             },
-        );
+            bytes: 0,
+            element_log2: 0,
+            gate: VectorGate::Avx512,
+        })
+    };
+    if insn.vex && insn.op == VEX_OP_FLAG | (MAP_0F << 8) | OPCODE_KMOV_TO_GENERAL {
+        return kmov(true);
+    }
+    if insn.vex && insn.op == VEX_OP_FLAG | (MAP_0F << 8) | OPCODE_KMOV_FROM_GENERAL {
+        return kmov(false);
+    }
+    if insn.vex && !insn.evex {
+        return vex_form(insn);
     }
     if !insn.evex || insn.evex_b || insn.evex_ll == VECTOR_LENGTH_RESERVED {
         return None;
@@ -931,12 +1061,25 @@ pub(crate) fn evex_form(insn: &Insn) -> Option<EvexForm> {
                 0,
             )
         }
+        // vpbroadcastb (7a), vpbroadcastw (7b) with W0, vpbroadcastd/q (7c) by W, from a general
+        // register (`Cpu::broadcast_general`)
+        (MAP_0F38, 0x7a..=0x7c) if p66 && zeroing_ok && insn.md == 3 && insn.vex_v == 0 => {
+            let element_log2 = match (opcode, wide) {
+                (0x7a, false) => 0,
+                (0x7b, false) => 1,
+                (0x7c, false) => 2,
+                (0x7c, true) => 3,
+                _ => return None,
+            };
+            (EvexKind::BroadcastGeneral, element_log2)
+        }
         _ => return None,
     };
     Some(EvexForm {
         kind,
         bytes,
         element_log2,
+        gate: VectorGate::Avx512,
     })
 }
 

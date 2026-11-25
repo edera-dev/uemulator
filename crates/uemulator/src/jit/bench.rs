@@ -1,5 +1,6 @@
 //! Microbenchmarks of the JIT, one guest loop per cost the generators pay: register ALU, loads
-//! and stores, branches inside a block, call/ret, indirect jumps, `rep stos`. All `#[ignore]`;
+//! and stores, branches inside a block, call/ret, indirect jumps, `rep stos`, and glibc-shaped
+//! AVX2 and AVX-512 string loops. All `#[ignore]`;
 //! run them on each backend with
 //!
 //!   cargo test --release -p uemulator --lib jit::bench -- --ignored --nocapture --test-threads=1
@@ -87,6 +88,51 @@ const REP_STOS_LOOP: &[u8] = &[
     0x48, 0x83, 0xc3, 0x01, 0x48, 0xff, 0xc9, 0x75, 0xe7, 0xf4,
 ];
 
+// glibc's strlen-avx2 core: 32 bytes a step through vpcmpeqb against zero and vpmovmskb, over
+// 4 KiB without a zero. vpxor xmm0, xmm0, xmm0; 2: mov rdx, rsi; mov r8d, 128;
+// 1: vpcmpeqb ymm1, ymm0, [rdx]; vpmovmskb eax, ymm1; test eax, eax; jnz 3f; add rdx, 32;
+// dec r8d; jnz 1b; 3: dec rcx; jnz 2b; hlt
+const AVX2_STRLEN_LOOP: &[u8] = &[
+    0xc5, 0xf9, 0xef, 0xc0, 0x48, 0x89, 0xf2, 0x41, 0xb8, 0x80, 0x00, 0x00, 0x00, 0xc5, 0xfd, 0x74,
+    0x0a, 0xc5, 0xfd, 0xd7, 0xc1, 0x85, 0xc0, 0x75, 0x09, 0x48, 0x83, 0xc2, 0x20, 0x41, 0xff, 0xc8,
+    0x75, 0xeb, 0x48, 0xff, 0xc9, 0x75, 0xdd, 0xf4,
+];
+
+// A 4 KiB copy 32 bytes a step. 2: xor r8d, r8d; 1: vmovdqu ymm0, [rsi + r8];
+// vmovdqu [rdi + r8], ymm0; add r8, 32; cmp r8, 4096; jb 1b; dec rcx; jnz 2b; hlt
+const AVX2_MEMCPY_LOOP: &[u8] = &[
+    0x45, 0x31, 0xc0, 0xc4, 0xa1, 0x7e, 0x6f, 0x04, 0x06, 0xc4, 0xa1, 0x7e, 0x7f, 0x04, 0x07, 0x49,
+    0x83, 0xc0, 0x20, 0x49, 0x81, 0xf8, 0x00, 0x10, 0x00, 0x00, 0x72, 0xe7, 0x48, 0xff, 0xc9, 0x75,
+    0xdf, 0xf4,
+];
+
+// glibc's strlen-evex core: 64 bytes a step through vpcmpeqb into an opmask and kmovq.
+// vpxorq zmm16, zmm16, zmm16; 2: mov rdx, rsi; mov r8d, 64; 1: vpcmpeqb k0, zmm16, [rdx];
+// kmovq rax, k0; test rax, rax; jnz 3f; add rdx, 64; dec r8d; jnz 1b; 3: dec rcx; jnz 2b; hlt
+const EVEX_STRLEN_LOOP: &[u8] = &[
+    0x62, 0xa1, 0xfd, 0x40, 0xef, 0xc0, 0x48, 0x89, 0xf2, 0x41, 0xb8, 0x40, 0x00, 0x00, 0x00, 0x62,
+    0xf1, 0x7d, 0x40, 0x74, 0x02, 0xc4, 0xe1, 0xfb, 0x93, 0xc0, 0x48, 0x85, 0xc0, 0x75, 0x09, 0x48,
+    0x83, 0xc2, 0x40, 0x41, 0xff, 0xc8, 0x75, 0xe7, 0x48, 0xff, 0xc9, 0x75, 0xd9, 0xf4,
+];
+
+// memchr-evex's shape: the byte broadcast from a general register, 64 bytes a step, and a tail
+// through a masked zeroing load. 2: mov eax, 0x11; vpbroadcastb zmm17, eax; mov rdx, rsi;
+// mov r8d, 63; 1: vpcmpeqb k1, zmm17, [rdx]; kmovq r9, k1; test r9, r9; jnz 3f; add rdx, 64;
+// dec r8d; jnz 1b; mov r9d, 0xffff; kmovq k2, r9; vmovdqu8 zmm18 {k2} {z}, [rdx];
+// vpcmpeqb k1 {k2}, zmm17, zmm18; 3: dec rcx; jnz 2b; hlt
+const EVEX_MEMCHR_LOOP: &[u8] = &[
+    0xb8, 0x11, 0x00, 0x00, 0x00, 0x62, 0xe2, 0x7d, 0x48, 0x7a, 0xc8, 0x48, 0x89, 0xf2, 0x41, 0xb8,
+    0x3f, 0x00, 0x00, 0x00, 0x62, 0xf1, 0x75, 0x40, 0x74, 0x0a, 0xc4, 0x61, 0xfb, 0x93, 0xc9, 0x4d,
+    0x85, 0xc9, 0x75, 0x20, 0x48, 0x83, 0xc2, 0x40, 0x41, 0xff, 0xc8, 0x75, 0xe7, 0x41, 0xb9, 0xff,
+    0xff, 0x00, 0x00, 0xc4, 0xc1, 0xfb, 0x92, 0xd1, 0x62, 0xe1, 0x7f, 0xca, 0x6f, 0x12, 0x62, 0xb1,
+    0x75, 0x42, 0x74, 0xca, 0x48, 0xff, 0xc9, 0x75, 0xb7, 0xf4,
+];
+/// Inner steps of the string loops: 4 KiB at 32 or 64 bytes a step.
+const STRING_INNER: u64 = 128;
+/// What the string loops scan: no zero byte and no 0x11.
+const STRING_FILL: u8 = 0x5a;
+const STRING_BYTES: usize = 4096;
+
 fn backend() -> &'static str {
     if cfg!(target_arch = "aarch64") {
         "aarch64"
@@ -104,6 +150,13 @@ fn setup(harness: &mut Harness, iterations: u64, data: u64) {
     harness.cpu.gpr[RDI] = SCRATCH + 0x1_0000;
     harness.cpu.gpr[R10] = FAR_TARGET;
     harness.write(FAR_TARGET, FAR_FUNCTION);
+    // The vector loops need the AVX and AVX-512 state enabled, and data without the bytes they
+    // search for.
+    harness.cpu.cr4 |= super::diff_evex::CR4_OSXSAVE;
+    harness.cpu.xcr0 = crate::cpu::xsave::XCR0_SUPPORTED;
+    if data == DATA {
+        harness.write(DATA, &[STRING_FILL; STRING_BYTES]);
+    }
     if data == ALIAS_DATA {
         let directory_entry =
             harness.cpu.cr3 + FIRST_PAGE_DIRECTORY_OFFSET + (ALIAS_DATA >> LARGE_PAGE_SHIFT) * 8;
@@ -218,4 +271,44 @@ fn rep_stos_loop() {
 #[ignore]
 fn aliased_indirect_loop() {
     bench_with_data("tlb-alias", INDIRECT_LOOP, TIMED_ITERATIONS, ALIAS_DATA);
+}
+
+#[test]
+#[ignore]
+fn avx2_strlen_loop() {
+    bench(
+        "avx2-strlen",
+        AVX2_STRLEN_LOOP,
+        TIMED_ITERATIONS / STRING_INNER,
+    );
+}
+
+#[test]
+#[ignore]
+fn avx2_memcpy_loop() {
+    bench(
+        "avx2-memcpy",
+        AVX2_MEMCPY_LOOP,
+        TIMED_ITERATIONS / STRING_INNER,
+    );
+}
+
+#[test]
+#[ignore]
+fn evex_strlen_loop() {
+    bench(
+        "evex-strlen",
+        EVEX_STRLEN_LOOP,
+        TIMED_ITERATIONS / STRING_INNER,
+    );
+}
+
+#[test]
+#[ignore]
+fn evex_memchr_loop() {
+    bench(
+        "evex-memchr",
+        EVEX_MEMCHR_LOOP,
+        TIMED_ITERATIONS / STRING_INNER,
+    );
 }

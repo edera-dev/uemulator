@@ -95,6 +95,7 @@ const VPCMP_NOT_LESS_EQUAL: u8 = 6;
 const XCR0_OFFSET: u32 = offset_of!(Cpu, xcr0) as u32;
 /// What `Cpu::evex_gate` requires of XCR0: the SSE, AVX and AVX-512 state components.
 const XCR0_EVEX_STATE: u64 = XCR0_SSE | XCR0_AVX | XCR0_AVX512;
+const XCR0_VEX_STATE: u64 = XCR0_SSE | XCR0_AVX;
 /// Every 128-bit lane `ldr_q`/`str_q` of a vector register reaches must be within the 12-bit
 /// scaled offset of the instruction (the highest lane of zmm31).
 const _: () =
@@ -478,6 +479,9 @@ pub(crate) struct Gen<'a> {
     sse_gated: bool,
     /// The block already checked the AVX-512 state gate (CR4.OSXSAVE, XCR0, CR0.TS).
     evex_gated: bool,
+    /// The block already checked the AVX state gate (`VectorGate::Avx`), or the AVX-512 one,
+    /// which implies it. Not implied by `sse_gated`: the SSE gate checks other bits.
+    vex_gated: bool,
     /// Instructions of this block already added to `Cpu::icount` ahead of an interpreter helper
     /// (the block index of the last one). Exact at translation time because a block is
     /// straight-line code: every instruction before a reachable one has executed.
@@ -519,6 +523,7 @@ impl<'a> Gen<'a> {
             live: None,
             sse_gated: false,
             evex_gated: false,
+            vex_gated: false,
             prepaid_insns: 0,
             inlined: 0,
             entry_rip: 0,
@@ -2829,7 +2834,9 @@ impl<'a> Gen<'a> {
     /// SSE, AVX and AVX-512 state in XCR0, #NM under CR0.TS), jumping to the fallback so the
     /// interpreter raises the exception. Like the SSE gate it holds for the whole block: whatever
     /// changes CR0, CR4 or XCR0 ends it.
-    fn evex_entry(&mut self, insn_index: u32, rip: u64) -> (Label, Label) {
+    /// With `VectorGate::Avx` the gate is `Cpu::vex_gate` (no AVX-512 state needed), which the
+    /// AVX-512 one implies.
+    fn evex_entry(&mut self, gate: VectorGate, insn_index: u32, rip: u64) -> (Label, Label) {
         let entry = self.asm.label();
         let resume = self.asm.label();
         self.slow_paths.push(SlowPath {
@@ -2839,15 +2846,19 @@ impl<'a> Gen<'a> {
             insn_index,
             rip,
         });
-        if !self.evex_gated {
-            self.evex_gated = true;
+        let (gated, state) = match gate {
+            VectorGate::Avx512 => (self.evex_gated, XCR0_EVEX_STATE),
+            VectorGate::Avx => (self.vex_gated || self.evex_gated, XCR0_VEX_STATE),
+        };
+        if !gated {
+            self.vex_gated = true;
+            self.evex_gated |= gate == VectorGate::Avx512;
             self.asm.ldr(SCRATCH_A, CPU, CR4_OFFSET);
             self.and_constant(SCRATCH_A, SCRATCH_A, CR4_OSXSAVE);
             self.asm.cbz(SCRATCH_A, entry, true);
             self.asm.ldr(SCRATCH_A, CPU, XCR0_OFFSET);
-            self.and_constant(SCRATCH_A, SCRATCH_A, XCR0_EVEX_STATE);
-            self.asm
-                .sub_imm(SCRATCH_A, SCRATCH_A, XCR0_EVEX_STATE as u32, true);
+            self.and_constant(SCRATCH_A, SCRATCH_A, state);
+            self.asm.sub_imm(SCRATCH_A, SCRATCH_A, state as u32, true);
             self.asm.cbnz(SCRATCH_A, entry, true);
             self.asm.ldr(SCRATCH_A, CPU, CR0_OFFSET);
             self.and_constant(SCRATCH_A, SCRATCH_A, CR0_TS);
@@ -2981,27 +2992,78 @@ impl<'a> Gen<'a> {
         insn_index: u32,
         rip: u64,
     ) -> bool {
-        let (slow, resume) = self.evex_entry(insn_index, rip);
+        let (slow, resume) = self.evex_entry(form.gate, insn_index, rip);
         let lanes = form.bytes / XMM_SIZE;
         let lane_offset = |register: u8, lane: u32| vector_lane_offset(register, lane) as u32;
         let mut is_store = false;
-        let writes_vector = matches!(form.kind, EvexKind::Alu { .. } | EvexKind::Move { .. });
+        let writes_vector = matches!(
+            form.kind,
+            EvexKind::Alu { .. } | EvexKind::Move { .. } | EvexKind::BroadcastGeneral
+        );
         let memory_store = matches!(form.kind, EvexKind::Move { load: false, .. })
             && insn.md != MODRM_MOD_REGISTER;
         if writes_vector && !memory_store && insn.evex_mask != 0 {
             self.begin_masked_write(insn, form.element_log2);
         }
         match form.kind {
-            EvexKind::MaskToGeneral { wide } => {
+            EvexKind::MaskToGeneral { bits } => {
                 self.asm.ldr(
                     VALUE,
                     CPU,
                     OPMASK_OFFSET + OPMASK_SIZE * (insn.rm & OPMASK_REGISTER_MASK) as u32,
                 );
-                if !wide {
-                    self.asm.uxtw(VALUE, VALUE);
+                if bits < u64::BITS {
+                    self.and_constant(VALUE, VALUE, (1 << bits) - 1);
                 }
-                self.write_reg(insn.reg, false, if wide { 8 } else { 4 }, VALUE);
+                self.write_reg(
+                    insn.reg,
+                    false,
+                    if bits == u64::BITS { 8 } else { 4 },
+                    VALUE,
+                );
+            }
+            EvexKind::GeneralToMask { bits } => {
+                self.read_reg(VALUE, insn.rm & GENERAL_REGISTER_MASK, false);
+                if bits < u64::BITS {
+                    self.and_constant(VALUE, VALUE, (1 << bits) - 1);
+                }
+                self.asm.str(
+                    VALUE,
+                    CPU,
+                    OPMASK_OFFSET + OPMASK_SIZE * (insn.reg & OPMASK_REGISTER_MASK) as u32,
+                );
+            }
+            EvexKind::BroadcastGeneral => {
+                // The element in every element of v1, copied to v0 for each commit (a zeroing
+                // commit ANDs v0 in place). `dup` ignores the register bits above the element.
+                self.read_reg(VALUE, insn.rm & GENERAL_REGISTER_MASK, false);
+                self.asm
+                    .vec_dup_general(VECTOR_SRC, VALUE, form.element_log2);
+                for lane in 0..lanes {
+                    self.asm
+                        .vec_op(VEC_ORR, 0, VECTOR_DST, VECTOR_SRC, VECTOR_SRC);
+                    self.commit_vector_lane(insn, form.element_log2, insn.reg, lane);
+                }
+                self.zero_vector_lanes(insn.reg, lanes);
+            }
+            EvexKind::MoveMaskBytes => {
+                // As for `vector_alu`'s pmovmskb, 16 bits per lane, gathered in x0.
+                for lane in 0..lanes {
+                    self.asm.ldr_q(VECTOR_SRC, CPU, lane_offset(insn.rm, lane));
+                    self.asm.vec_ushr(VECTOR_SRC, VECTOR_SRC, 8, 7);
+                    self.asm.vec_usra(VECTOR_SRC, VECTOR_SRC, 16, 7);
+                    self.asm.vec_usra(VECTOR_SRC, VECTOR_SRC, 32, 14);
+                    self.asm.vec_usra(VECTOR_SRC, VECTOR_SRC, 64, 28);
+                    self.asm.umov_byte(VALUE, VECTOR_SRC, 0);
+                    self.asm.umov_byte(SCRATCH_A, VECTOR_SRC, XMM_HALF);
+                    self.asm.add_lsl(VALUE, VALUE, SCRATCH_A, u8::BITS);
+                    if lane == 0 {
+                        self.asm.mov(0, VALUE);
+                    } else {
+                        self.asm.add_lsl(0, 0, VALUE, 16 * lane);
+                    }
+                }
+                self.write_reg(insn.reg, false, 4, 0);
             }
             EvexKind::Move { load, aligned } => {
                 if insn.md == MODRM_MOD_REGISTER {
@@ -3075,7 +3137,10 @@ impl<'a> Gen<'a> {
                                 VectorOp::MaxUnsigned8 => (VEC_UMAX, 0, VECTOR_DST, VECTOR_SRC),
                                 VectorOp::Add => (VEC_ADD, lane_log2, VECTOR_DST, VECTOR_SRC),
                                 VectorOp::Subtract => (VEC_SUB, lane_log2, VECTOR_DST, VECTOR_SRC),
-                                VectorOp::CompareEqual | VectorOp::MoveMask => {
+                                VectorOp::CompareEqual => {
+                                    (VEC_CMEQ, lane_log2, VECTOR_DST, VECTOR_SRC)
+                                }
+                                VectorOp::MoveMask => {
                                     unreachable!("not an EvexKind::Alu operation")
                                 }
                             };

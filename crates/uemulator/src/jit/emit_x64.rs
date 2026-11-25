@@ -67,6 +67,14 @@ const OPMASK_SIZE: i32 = size_of::<u64>() as i32;
 const XCR0: i32 = offset_of!(Cpu, xcr0) as i32;
 /// What `Cpu::evex_gate` requires of XCR0: the SSE, AVX and AVX-512 state components.
 const XCR0_EVEX_STATE: u64 = XCR0_SSE | XCR0_AVX | XCR0_AVX512;
+const XCR0_VEX_STATE: u64 = XCR0_SSE | XCR0_AVX;
+/// Multiplying an element zero-extended to 64 bits by `BROADCAST_MULTIPLIER[log2]` copies it
+/// into every element of a quadword (byte, word, dword; a quadword needs nothing).
+const BROADCAST_MULTIPLIER: [u64; 3] = [
+    0x0101_0101_0101_0101,
+    0x0001_0001_0001_0001,
+    0x0000_0001_0000_0001,
+];
 /// An opmask register number is the low three bits of its ModRM field.
 const OPMASK_REGISTER_MASK: u8 = 7;
 /// 128-bit lanes of a 512-bit vector register.
@@ -352,6 +360,9 @@ pub(crate) struct Gen<'a> {
     sse_gated: bool,
     /// The block already checked the AVX-512 state gate (CR4.OSXSAVE, XCR0, CR0.TS).
     evex_gated: bool,
+    /// The block already checked the AVX state gate (`VectorGate::Avx`), or the AVX-512 one,
+    /// which implies it. Not implied by `sse_gated`: the SSE gate checks other bits.
+    vex_gated: bool,
     /// Block index of the last instruction whose clock read was paid for in advance; see
     /// `Gen::helper` and the field of the same name in `emit.rs`.
     prepaid_insns: u32,
@@ -404,6 +415,7 @@ impl<'a> Gen<'a> {
             live: false,
             sse_gated: false,
             evex_gated: false,
+            vex_gated: false,
             prepaid_insns: 0,
             inlined: 0,
             entry_rip: 0,
@@ -2292,7 +2304,9 @@ impl<'a> Gen<'a> {
     /// for the first one of the block, checks `Cpu::evex_gate` (#UD without CR4.OSXSAVE or the
     /// SSE, AVX and AVX-512 state in XCR0, #NM under CR0.TS), jumping to the fallback so the
     /// interpreter raises the exception. Like the SSE gate it holds for the whole block.
-    fn evex_entry(&mut self, insn_index: u32, rip: u64) -> (Label, Label) {
+    /// With `VectorGate::Avx` the gate is `Cpu::vex_gate` (no AVX-512 state needed), which the
+    /// AVX-512 one implies.
+    fn evex_entry(&mut self, gate: VectorGate, insn_index: u32, rip: u64) -> (Label, Label) {
         let slow = self.a.label();
         let resume = self.a.label();
         self.slows.push(Slow {
@@ -2302,14 +2316,19 @@ impl<'a> Gen<'a> {
             insn_index,
             rip,
         });
-        if !self.evex_gated {
-            self.evex_gated = true;
+        let (gated, state) = match gate {
+            VectorGate::Avx512 => (self.evex_gated, XCR0_EVEX_STATE),
+            VectorGate::Avx => (self.vex_gated || self.evex_gated, XCR0_VEX_STATE),
+        };
+        if !gated {
+            self.vex_gated = true;
+            self.evex_gated |= gate == VectorGate::Avx512;
             self.a.ld(SCRATCH_A, mem(CPU, CR4));
             self.a.alu_ri(AND, SCRATCH_A, CR4_OSXSAVE as i32, true);
             self.a.jcc(E, slow);
             self.a.ld(SCRATCH_A, mem(CPU, XCR0));
-            self.a.alu_ri(AND, SCRATCH_A, XCR0_EVEX_STATE as i32, true);
-            self.a.alu_ri(CMP, SCRATCH_A, XCR0_EVEX_STATE as i32, true);
+            self.a.alu_ri(AND, SCRATCH_A, state as i32, true);
+            self.a.alu_ri(CMP, SCRATCH_A, state as i32, true);
             self.a.jcc(NE, slow);
             self.a.ld(SCRATCH_A, mem(CPU, CR0));
             self.a.alu_ri(AND, SCRATCH_A, CR0_TS as i32, true);
@@ -2469,31 +2488,86 @@ impl<'a> Gen<'a> {
     /// vector inside the page the TLB vouches for, which cannot fault, so the elements the mask
     /// drops are read and discarded. Returns whether the instruction stores to memory.
     fn evex(&mut self, insn: &Insn, form: EvexForm, next: u64, insn_index: u32, rip: u64) -> bool {
-        let (slow, resume) = self.evex_entry(insn_index, rip);
+        let (slow, resume) = self.evex_entry(form.gate, insn_index, rip);
         let lanes = form.bytes / XMM_SIZE as u32;
         let lane_offset = |register: u8, lane: u32| vector_lane_offset(register, lane) as i32;
         let lane_in_memory =
             |lane: u32| mem_idx(ADDR, SCRATCH_B, 0, (lane * XMM_SIZE as u32) as i32);
         let mut store = false;
-        let writes_vector = matches!(form.kind, EvexKind::Alu { .. } | EvexKind::Move { .. });
+        let writes_vector = matches!(
+            form.kind,
+            EvexKind::Alu { .. } | EvexKind::Move { .. } | EvexKind::BroadcastGeneral
+        );
         let memory_store = matches!(form.kind, EvexKind::Move { load: false, .. })
             && insn.md != MODRM_MOD_REGISTER;
         if writes_vector && !memory_store && insn.evex_mask != 0 {
             self.begin_masked_write(insn, form.element_log2);
         }
         match form.kind {
-            EvexKind::MaskToGeneral { wide } => {
-                self.a.ld(
+            EvexKind::MaskToGeneral { bits } => {
+                // A zero-extending load of the width's bytes is the masking.
+                self.a.ld_ext(
                     VALUE,
                     mem(
                         CPU,
                         OPMASK + OPMASK_SIZE * (insn.rm & OPMASK_REGISTER_MASK) as i32,
                     ),
+                    (bits / u8::BITS) as u8,
+                    false,
                 );
-                if !wide {
-                    self.a.mov_rr(VALUE, VALUE, false);
+                self.write_reg(
+                    insn.reg,
+                    false,
+                    if bits == u64::BITS { 8 } else { 4 },
+                    VALUE,
+                );
+            }
+            EvexKind::GeneralToMask { bits } => {
+                self.read_reg(
+                    VALUE,
+                    insn.rm & GENERAL_REGISTER_MASK,
+                    false,
+                    (bits / u8::BITS) as u8,
+                );
+                self.a.st(
+                    mem(
+                        CPU,
+                        OPMASK + OPMASK_SIZE * (insn.reg & OPMASK_REGISTER_MASK) as i32,
+                    ),
+                    VALUE,
+                    8,
+                );
+            }
+            EvexKind::BroadcastGeneral => {
+                // SSE2 only: the element repeated across a quadword by a multiply, then both
+                // halves of xmm1, copied to xmm0 for each commit (which rewrites xmm0).
+                let element_bytes = 1u8 << form.element_log2;
+                self.read_reg(VALUE, insn.rm & GENERAL_REGISTER_MASK, false, element_bytes);
+                if let Some(&multiplier) = BROADCAST_MULTIPLIER.get(form.element_log2 as usize) {
+                    self.a.mov_imm(SCRATCH_A, multiplier);
+                    self.a.imul_rr(VALUE, SCRATCH_A, true);
                 }
-                self.write_reg(insn.reg, false, if wide { 8 } else { 4 }, VALUE);
+                self.a.movq_xmm_gpr(HOST_XMM_SRC, VALUE);
+                self.a.xmm_op(OPCODE_PUNPCKLQDQ, HOST_XMM_SRC, HOST_XMM_SRC);
+                for lane in 0..lanes {
+                    self.a.xmm_op(OPCODE_MOVDQA, HOST_XMM_DST, HOST_XMM_SRC);
+                    self.commit_vector_lane(insn, form.element_log2, insn.reg, lane);
+                }
+                self.zero_vector_lanes(insn.reg, lanes);
+            }
+            EvexKind::MoveMaskBytes => {
+                for lane in 0..lanes {
+                    self.a
+                        .xmm_ld(HOST_XMM_SRC, mem(CPU, lane_offset(insn.rm, lane)));
+                    self.a.pmovmskb(VALUE, HOST_XMM_SRC);
+                    if lane == 0 {
+                        self.a.mov_rr(ACC, VALUE, false);
+                    } else {
+                        self.a.shift_ri(SHL, VALUE, 16 * lane as u8, false);
+                        self.a.alu_rr(OR, ACC, VALUE, false);
+                    }
+                }
+                self.write_reg(insn.reg, false, 4, ACC);
             }
             EvexKind::Move { load, aligned } => {
                 if insn.md == MODRM_MOD_REGISTER {

@@ -102,7 +102,13 @@ pub(crate) mod op {
 pub(crate) mod simd {
     pub const V128_LOAD: u32 = 0x00;
     pub const V128_STORE: u32 = 0x0b;
+    /// Followed by the 16 bytes of the constant (`Code::v128_const`).
+    pub const V128_CONST: u32 = 0x0c;
+    pub const I8X16_SWIZZLE: u32 = 0x0e;
     pub const I8X16_SPLAT: u32 = 0x0f;
+    pub const I16X8_SPLAT: u32 = 0x10;
+    pub const I32X4_SPLAT: u32 = 0x11;
+    pub const I64X2_SPLAT: u32 = 0x12;
     pub const I8X16_EQ: u32 = 0x23;
     pub const I8X16_NE: u32 = 0x24;
     pub const I8X16_LT_S: u32 = 0x25;
@@ -119,6 +125,8 @@ pub(crate) mod simd {
     pub const V128_ANDNOT: u32 = 0x4f;
     pub const V128_OR: u32 = 0x50;
     pub const V128_XOR: u32 = 0x51;
+    /// `v128.bitselect(a, b, c)`: the bits of `a` where `c` is set, of `b` elsewhere.
+    pub const V128_BITSELECT: u32 = 0x52;
     pub const I8X16_BITMASK: u32 = 0x64;
     pub const I8X16_ADD: u32 = 0x6e;
     pub const I8X16_SUB: u32 = 0x71;
@@ -130,6 +138,7 @@ pub(crate) mod simd {
     pub const I32X4_SUB: u32 = 0xb1;
     pub const I64X2_ADD: u32 = 0xce;
     pub const I64X2_SUB: u32 = 0xd1;
+    pub const I64X2_EQ: u32 = 0xd6;
 }
 
 /// Appends `value` as unsigned LEB128.
@@ -242,6 +251,13 @@ impl Code {
     pub fn simd(&mut self, opcode: u32) -> &mut Self {
         self.bytes.push(op::SIMD_PREFIX);
         leb_u32(&mut self.bytes, opcode);
+        self
+    }
+
+    /// `v128.const`, little-endian like the lanes of a guest vector register.
+    pub fn v128_const(&mut self, value: u128) -> &mut Self {
+        self.simd(simd::V128_CONST);
+        self.bytes.extend_from_slice(&value.to_le_bytes());
         self
     }
 

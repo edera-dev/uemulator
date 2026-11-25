@@ -163,6 +163,8 @@ mod diff_smc;
 #[cfg(test)]
 mod diff_tests;
 #[cfg(test)]
+mod diff_vex;
+#[cfg(test)]
 mod diff_whole_vector;
 
 #[cfg(not(all(
