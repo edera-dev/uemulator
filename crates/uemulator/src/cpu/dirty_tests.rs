@@ -43,18 +43,21 @@ fn rerun(h: &mut Harness) {
 /// same stores (the JIT's inline ones, the interpreter's fast path) must take the slow path.
 fn stores_mark_after_arming(jit: bool) {
     let mut h = Harness::new(&STORE_TWICE);
-    if jit && !h.enable_jit() {
-        // Only where there is no backend: on the three that exist this test must run them.
-        assert!(
-            !cfg!(feature = "jit")
-                || !cfg!(any(
-                    target_arch = "aarch64",
-                    target_arch = "x86_64",
-                    target_arch = "wasm32"
-                )),
-            "no JIT on a host that has one"
-        );
-        return;
+    if jit {
+        let has_jit = h.enable_jit();
+        // On the three hosts with a backend this test must run it.
+        #[cfg(all(
+            feature = "jit",
+            any(
+                target_arch = "aarch64",
+                target_arch = "x86_64",
+                target_arch = "wasm32"
+            )
+        ))]
+        assert!(has_jit, "no JIT on a host that has one");
+        if !has_jit {
+            return;
+        }
     }
     h.cpu.gpr[RDI] = FIRST;
     h.cpu.gpr[RSI] = SECOND;
