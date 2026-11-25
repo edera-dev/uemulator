@@ -368,7 +368,13 @@ fn the_evex_lane_shortcut_matches_the_legacy_kernel() {
                 }
                 for masks in mask_sets {
                     for osxmmexcpt in [false, true] {
-                        let mxcsr = masks | RC_SHIFTED[rng.below(4) as usize];
+                        // Flags already set (sticky from earlier instructions) half the time.
+                        let sticky = if rng.below(2) == 0 {
+                            0
+                        } else {
+                            rng.next() as u32 & MXCSR_EXCEPTION_FLAGS
+                        };
+                        let mxcsr = masks | RC_SHIFTED[rng.below(4) as usize] | sticky;
                         if osxmmexcpt {
                             cpu.cr4 |= CR4_OSXMMEXCPT;
                         } else {
@@ -518,7 +524,13 @@ fn the_register_form_shortcut_matches_the_legacy_kernel() {
                 }
                 for masks in mask_sets {
                     for osxmmexcpt in [false, true] {
-                        let mxcsr = masks | RC_SHIFTED[rng.below(4) as usize];
+                        // Flags already set (sticky from earlier instructions) half the time.
+                        let sticky = if rng.below(2) == 0 {
+                            0
+                        } else {
+                            rng.next() as u32 & MXCSR_EXCEPTION_FLAGS
+                        };
+                        let mxcsr = masks | RC_SHIFTED[rng.below(4) as usize] | sticky;
                         if osxmmexcpt {
                             cpu.cr4 |= CR4_OSXMMEXCPT;
                         } else {
