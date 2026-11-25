@@ -409,7 +409,7 @@ pub struct RuntimeArgs {
     pub viewer_allow_host: Vec<String>,
     /// Let gdb (`target remote HOST:PORT`) or lldb (`gdb-remote HOST:PORT`) debug the guest,
     /// listening on HOST:PORT [default: 127.0.0.1:1234]. Anyone who can reach it controls the
-    /// machine
+    /// machine. Put a bare --gdb after a machine name, or it takes the name as its address
     #[arg(
         long,
         value_name = "HOST:PORT",

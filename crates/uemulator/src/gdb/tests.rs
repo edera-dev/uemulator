@@ -5,6 +5,7 @@ use super::packet::{Decoder, Incoming, frame, from_hex, to_hex};
 use super::*;
 use crate::cpu::gdb::{OneVcpu, SharedVcpus};
 use crate::testkit::{CODE_BASE, Harness, RAX, RBX, RCX, SCRATCH};
+use std::sync::Mutex;
 
 fn framed(payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -109,6 +110,7 @@ impl Session {
             stop: StopEvent {
                 vcpu: 0,
                 kind: StopKind::Quiet,
+                resumes: 0,
             },
         };
         // Acknowledgments are covered on their own; everywhere else they would be noise.
@@ -199,6 +201,7 @@ fn q_supported_offers_the_target_description_and_learns_the_stop_reasons() {
     session.stop = StopEvent {
         vcpu: 0,
         kind: StopKind::Breakpoint(0x1000),
+        resumes: 0,
     };
     assert_eq!(session.ask("?"), "T05thread:1;swbreak:;");
 }
@@ -208,8 +211,17 @@ fn stop_replies_name_the_thread_and_the_reason() {
     let mut session = Session::new(&[0xf4]);
     let engine = Engine::new();
     let config = DebugConfig::default();
-    let reply =
-        |kind| String::from_utf8(engine.stop_reply(&StopEvent { vcpu: 2, kind }, &config)).unwrap();
+    let reply = |kind| {
+        String::from_utf8(engine.stop_reply(
+            &StopEvent {
+                vcpu: 2,
+                kind,
+                resumes: 0,
+            },
+            &config,
+        ))
+        .unwrap()
+    };
     assert_eq!(reply(StopKind::Quiet), "T05thread:3;");
     assert_eq!(reply(StopKind::Interrupted), "T02thread:3;");
     assert_eq!(reply(StopKind::Step), "T05thread:3;");
@@ -295,6 +307,7 @@ fn thread_queries_list_every_vcpu_from_one() {
     let stop = StopEvent {
         vcpu: 1,
         kind: StopKind::Quiet,
+        resumes: 0,
     };
     let mut ask = |payload: &str| {
         let mut out = Vec::new();
@@ -726,4 +739,145 @@ fn unknown_packets_get_the_empty_reply() {
     }
     assert_eq!(session.ask("qSymbol::"), "OK");
     assert_eq!(session.ask("qAttached"), "1");
+}
+
+/// A machine of one vCPU (a harness) with a stub, for `DebugLink::serve` itself.
+struct Served {
+    link: Arc<DebugLink>,
+    harness: Harness,
+    output: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Served {
+    fn new() -> Self {
+        let link = DebugLink::new(1, Arc::new(AtomicBool::new(false)), false);
+        let mut harness = Harness::new(&[0xf4]);
+        harness.cpu.attach_debugger(Some(link.clone()));
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let sink = output.clone();
+        GdbStub::new(link.clone())
+            .on_output(move |bytes| sink.lock().unwrap().extend_from_slice(bytes));
+        Served {
+            link,
+            harness,
+            output,
+        }
+    }
+
+    /// Serves a stop for `kind` with `client` already sent; it must resume the machine.
+    fn serve(&mut self, kind: StopKind, client: &[u8]) -> Option<crate::machine::ExitReason> {
+        self.link
+            .session
+            .lock()
+            .unwrap()
+            .inbox
+            .extend_from_slice(client);
+        let event = StopEvent {
+            vcpu: 0,
+            kind,
+            resumes: self.link.resumes(),
+        };
+        self.link.serve(&mut OneVcpu(&mut self.harness.cpu), event)
+    }
+}
+
+#[test]
+fn a_breakpoint_stop_answers_a_pause_asked_for_meanwhile() {
+    let mut served = Served::new();
+    served
+        .link
+        .session
+        .lock()
+        .unwrap()
+        .config
+        .breakpoints
+        .insert(0x1000, BreakpointKinds::default());
+    served.link.request_pause(PAUSE_INTERRUPT);
+    assert_eq!(
+        served.serve(StopKind::Breakpoint(0x1000), &framed(b"c")),
+        None
+    );
+    assert!(
+        !served.link.pause_pending(),
+        "a pause left over would stop the machine again"
+    );
+}
+
+#[test]
+fn a_ctrl_c_right_behind_a_resume_pauses_the_running_machine() {
+    let mut served = Served::new();
+    let client = [framed(b"c"), vec![packet::INTERRUPT]].concat();
+    assert_eq!(served.serve(StopKind::Quiet, &client), None);
+    assert!(served.link.pause_pending());
+    assert_eq!(served.link.pause.load(Ordering::SeqCst), PAUSE_INTERRUPT);
+}
+
+#[test]
+fn a_stale_step_is_not_reported() {
+    let mut served = Served::new();
+    let event = StopEvent {
+        vcpu: 0,
+        kind: StopKind::Step,
+        resumes: served.link.resumes(),
+    };
+    // Another stop is served and resumed in between.
+    assert_eq!(served.serve(StopKind::Quiet, &framed(b"c")), None);
+    // No client bytes: a stop that were reported would wait for them forever.
+    assert_eq!(
+        served
+            .link
+            .serve(&mut OneVcpu(&mut served.harness.cpu), event),
+        None
+    );
+    assert!(!served.link.is_stopped());
+}
+
+#[test]
+fn a_reply_owed_for_a_resume_comes_with_the_next_stop_and_can_be_asked_again() {
+    let mut served = Served::new();
+    served.serve(
+        StopKind::Quiet,
+        &[framed(b"QStartNoAckMode"), framed(b"c")].concat(),
+    );
+    served.output.lock().unwrap().clear();
+    served.serve(StopKind::Step, &[b"-".as_slice(), &framed(b"c")].concat());
+    let output = core::mem::take(&mut *served.output.lock().unwrap());
+    let packets: Vec<Incoming> = decode(&output);
+    assert_eq!(
+        packets,
+        vec![
+            Incoming::Packet(b"T05thread:1;".to_vec()),
+            Incoming::Packet(b"T05thread:1;".to_vec())
+        ],
+        "the stop reply, then again for the client's -"
+    );
+}
+
+#[test]
+fn kill_ends_the_run_and_raises_the_stop_flag() {
+    let mut served = Served::new();
+    assert_eq!(
+        served.serve(StopKind::Quiet, &framed(b"k")),
+        Some(crate::machine::ExitReason::Stopped)
+    );
+    assert!(served.link.machine_stop.load(Ordering::SeqCst));
+}
+
+#[test]
+fn a_new_client_does_not_inherit_breakpoints_from_one_that_left() {
+    let served = Served::new();
+    let stub = GdbStub::new(served.link.clone());
+    stub.connected();
+    served
+        .link
+        .session
+        .lock()
+        .unwrap()
+        .config
+        .breakpoints
+        .insert(0x1000, BreakpointKinds::default());
+    // The machine runs; the detach has not reached it when the next client connects.
+    stub.disconnected();
+    stub.connected();
+    assert!(served.link.config().breakpoints.is_empty());
 }

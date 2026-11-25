@@ -576,7 +576,9 @@ impl Cpu {
             if links.exiting() {
                 break Some(links.exit_reason());
             }
-            if !debugger.is_held(index) {
+            // A pause is answered by any vCPU that sees it, a held one too: the others may all be
+            // halted for good, or waiting for a start-up IPI that never comes.
+            if !debugger.is_held(index) || debugger.pause_pending() {
                 break None;
             }
             Waker::wait(MAX_SLEEP);
@@ -702,11 +704,15 @@ impl Cpu {
             // Everything that can end the wait comes with a wake-up, except a store to the line
             // `mwait` watches, which has to be polled for.
             // Nothing wakes a halted vCPU for a debugger pause: poll for it.
-            Waker::wait(if self.mwait_watch.is_some() || debugger.is_some() {
-                MAX_SLEEP
-            } else {
-                HALTED_SLEEP
-            });
+            Waker::wait(
+                if self.mwait_watch.is_some()
+                    || debugger.as_ref().is_some_and(|d| d.wants_polling())
+                {
+                    MAX_SLEEP
+                } else {
+                    HALTED_SLEEP
+                },
+            );
         };
         links.enter_running();
         link.halted.store(false, Ordering::SeqCst);

@@ -1242,6 +1242,9 @@ impl Vcpu {
         }
         // Before the secondaries are made from it: they copy the link.
         cpu.attach_debugger(self.debugger.clone());
+        if let Some(debugger) = &self.debugger {
+            debugger.release_all();
+        }
         // Cloned, not taken: a reboot builds a new CPU that needs the hook again.
         cpu.poll = self.poll.clone().map(|host_poll| {
             let poll: PollFn = Arc::new(move |idle| host_poll(&console, idle));

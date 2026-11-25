@@ -33,6 +33,8 @@ const ERROR_NO_THREAD: &[u8] = b"E02";
 const ERROR_REFUSED: &[u8] = b"E03";
 /// EFAULT, which gdb prints as "Cannot access memory".
 const ERROR_MEMORY: &[u8] = b"E14";
+/// A `qXfer` annex this target does not have.
+const ERROR_NO_ANNEX: &[u8] = b"E00";
 
 /// What a packet asks of the machine beyond its reply.
 #[derive(Debug, PartialEq, Eq)]
@@ -89,6 +91,21 @@ impl Engine {
 
     pub fn take_resume_pending(&mut self) -> bool {
         core::mem::take(&mut self.resume_pending)
+    }
+
+    /// Frames `payload` into `out`, kept for a `-` from the client.
+    pub fn send(&mut self, payload: &[u8], out: &mut Vec<u8>) {
+        self.last_reply.clear();
+        packet::frame(payload, &mut self.last_reply);
+        out.extend_from_slice(&self.last_reply);
+    }
+
+    /// Drops interrupts decoded behind a resume and says whether there were any: they arrived
+    /// while the machine was still stopped, but are meant for it running.
+    pub fn take_pending_interrupt(&mut self) -> bool {
+        let before = self.pending.len();
+        self.pending.retain(|item| *item != Incoming::Interrupt);
+        self.pending.len() != before
     }
 
     /// The `T` packet for a stop: signal, the vCPU, and why.
@@ -156,9 +173,7 @@ impl Engine {
                     };
                     let (reply, outcome) = self.handle(&data, &mut context);
                     if let Some(reply) = reply {
-                        self.last_reply.clear();
-                        packet::frame(&reply, &mut self.last_reply);
-                        out.extend_from_slice(&self.last_reply);
+                        self.send(&reply, out);
                     }
                     if let Some(outcome) = outcome {
                         if matches!(outcome, Outcome::Resume(_)) {
@@ -188,6 +203,7 @@ impl Engine {
                 let event = context.last_stop.unwrap_or(StopEvent {
                     vcpu: 0,
                     kind: StopKind::Quiet,
+                    resumes: 0,
                 });
                 (Some(self.stop_reply(&event, context.config)), None)
             }
@@ -533,7 +549,7 @@ fn features_read(request: &[u8]) -> Vec<u8> {
         return ERROR_BAD_PACKET.to_vec();
     };
     if annex != b"target.xml" {
-        return b"E00".to_vec();
+        return ERROR_NO_ANNEX.to_vec();
     }
     let Some((offset, length)) = parse_address_length(window) else {
         return ERROR_BAD_PACKET.to_vec();

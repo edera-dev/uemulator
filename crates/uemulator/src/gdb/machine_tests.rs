@@ -374,3 +374,60 @@ fn every_vcpu_is_a_thread_and_a_stop_stops_them_all() {
         finish(machine);
     }
 }
+
+#[test]
+fn a_vcpu_held_while_another_steps_still_answers_ctrl_c() {
+    // The second vCPU is never started: a step of it cannot end, and the first is held.
+    for engine in every_engine() {
+        let (machine, mut client) = machine(&[0xeb, 0xfe], 2, engine);
+        assert_eq!(client.ask("?"), "T05thread:1;");
+        client.send("vCont;s:2");
+        std::thread::sleep(Duration::from_millis(20));
+        client.interrupt();
+        assert_eq!(client.recv(), "T02thread:1;", "{engine:?}");
+        drop(client);
+        finish(machine);
+    }
+}
+
+#[test]
+fn ctrl_c_reaches_a_machine_whose_vcpus_are_all_halted() {
+    // sti; hlt; jmp back: an idle guest.
+    const IDLE: [u8; 4] = [0xfb, 0xf4, 0xeb, 0xfc];
+    for engine in every_engine() {
+        let (machine, mut client) = machine(&IDLE, 2, engine);
+        assert_eq!(client.ask("?"), "T05thread:1;");
+        client.send("c");
+        std::thread::sleep(Duration::from_millis(20));
+        client.interrupt();
+        assert_eq!(client.recv(), "T02thread:1;", "{engine:?}");
+        drop(client);
+        finish(machine);
+    }
+}
+
+#[test]
+fn memory_is_read_through_the_guests_page_tables() {
+    // The fake kernel's tables map low memory; read the code through a mapping of its own made
+    // by the client: the PML4 slot for the higher half points at the one for low memory.
+    for engine in every_engine() {
+        let (machine, mut client) = machine(&PROGRAM, 1, engine);
+        client.ask("?");
+        let entry = client.rip();
+        let cr3 = client.register(62) & !0xfff;
+        let low = client.ask(&format!("m{cr3:x},8"));
+        const HIGHER_HALF_SLOT: u64 = 256;
+        assert_eq!(
+            client.ask(&format!("M{:x},8:{low}", cr3 + 8 * HIGHER_HALF_SLOT)),
+            "OK"
+        );
+        const HIGHER_HALF: u64 = 0xffff_8000_0000_0000;
+        assert_eq!(
+            client.ask(&format!("m{:x},7", HIGHER_HALF + entry)),
+            "48c7c001000000",
+            "{engine:?}"
+        );
+        drop(client);
+        finish(machine);
+    }
+}

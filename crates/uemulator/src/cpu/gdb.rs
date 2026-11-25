@@ -54,6 +54,8 @@ const GDB_SEGMENT_ORDER: [usize; 6] = [SEG_CS, SEG_SS, SEG_DS, SEG_ES, SEG_FS, S
 
 const REG_RIP: usize = 16;
 const REG_EFLAGS: usize = 17;
+/// rax through r15: indices into `GDB_GPR_ORDER`.
+const REG_GPRS: core::ops::Range<usize> = 0..16;
 const REG_SEGMENTS: usize = 18;
 const REG_ST0: usize = 24;
 const REG_FCTRL: usize = 32;
@@ -83,6 +85,11 @@ const TAG_VALID: u16 = 0;
 const TAG_ZERO: u16 = 1;
 const TAG_SPECIAL: u16 = 2;
 const TAG_EMPTY: u16 = 3;
+const TAG_MASK: u16 = 3;
+const TAG_BITS: usize = 2;
+/// EFLAGS bits that exist: CF, PF, AF, ZF, SF, TF, IF, DF, OF, IOPL, NT, RF, VM, AC, VIF, VIP,
+/// ID. Bit 1 always reads 1; the rest are reserved, and a debugger may not set them.
+const EFLAGS_DEFINED: u64 = 0x003f_7fd5;
 const X87_EXPONENT_MASK: u16 = 0x7fff;
 const X87_INTEGER_BIT: u64 = 1 << 63;
 const FSW_TOP_SHIFT: u32 = 11;
@@ -117,8 +124,7 @@ const fn float(name: &'static str) -> Register {
 }
 
 /// gdb's amd64 register order (the `g` packet), then what QEMU adds for system debugging: the
-/// segment bases and the control registers. The first 57 are what gdb assumes without a target
-/// description, so a client that ignores `target.xml` still lines up.
+/// segment bases and the control registers. Clients take the layout from `target.xml`.
 pub(crate) const REGISTERS: [Register; REGISTER_COUNT] = [
     register("rax", 64, "int64"),
     register("rbx", 64, "int64"),
@@ -294,7 +300,14 @@ impl Cpu {
             }
             (pause, link.is_held(vcpu))
         };
-        let stop = |kind| Some(BeforeStep::Debug(StopEvent { vcpu, kind }));
+        let resumes = self.debugger.as_ref().map_or(0, |link| link.resumes());
+        let stop = |kind| {
+            Some(BeforeStep::Debug(StopEvent {
+                vcpu,
+                kind,
+                resumes,
+            }))
+        };
         if pause {
             return stop(StopKind::Paused);
         }
@@ -356,7 +369,7 @@ impl Cpu {
     fn register_bytes(&self, tpr: u8, register: usize) -> Option<Vec<u8>> {
         let width = (REGISTERS.get(register)?.bits / 8) as usize;
         let value: u128 = match register {
-            0..=15 => self.gpr[GDB_GPR_ORDER[register]] as u128,
+            _ if REG_GPRS.contains(&register) => self.gpr[GDB_GPR_ORDER[register]] as u128,
             REG_RIP => self.rip as u128,
             REG_EFLAGS => self.eflags_full() as u128,
             REG_SEGMENTS..REG_ST0 => {
@@ -402,11 +415,13 @@ impl Cpu {
         let value = u128::from_le_bytes(wide);
         let value64 = value as u64;
         match register {
-            0..=15 => self.gpr[GDB_GPR_ORDER[register]] = value64,
+            _ if REG_GPRS.contains(&register) => self.gpr[GDB_GPR_ORDER[register]] = value64,
             REG_RIP => self.rip = value64,
             REG_EFLAGS => {
                 // VM would switch to virtual-8086 mode without the mode change that goes with it.
-                if (value64 ^ self.eflags_full()) & flags::VM != 0 {
+                if (value64 ^ self.eflags_full()) & flags::VM != 0
+                    || value64 & !(EFLAGS_DEFINED | flags::RESERVED_ONE) != 0
+                {
                     return false;
                 }
                 self.eflags = value64 | flags::RESERVED_ONE;
@@ -421,10 +436,12 @@ impl Cpu {
             REG_FTAG => {
                 // The CPU keeps the abridged form: a register is in use unless its tag is empty.
                 self.ftw = (0..X87_REGISTERS)
-                    .filter(|&index| (value as u16 >> (2 * index)) & 3 != TAG_EMPTY)
+                    .filter(|&index| (value as u16 >> (TAG_BITS * index)) & TAG_MASK != TAG_EMPTY)
                     .fold(0, |tags, index| tags | (1 << index));
             }
             REG_XMM0..REG_MXCSR => self.xmm[register - REG_XMM0] = value,
+            // `ldmxcsr` would raise #GP for these; the debugger is refused instead.
+            REG_MXCSR if value as u32 & !fpu::MXCSR_VALID_BITS != 0 => return false,
             REG_MXCSR => self.mxcsr = value as u32,
             REG_FS_BASE => self.seg[SEG_FS].base = value64,
             REG_GS_BASE => self.seg[SEG_GS].base = value64,
@@ -456,7 +473,7 @@ impl Cpu {
                     _ => TAG_VALID,
                 }
             };
-            word | (tag << (2 * physical))
+            word | (tag << (TAG_BITS * physical))
         })
     }
 }
@@ -702,6 +719,78 @@ mod tests {
             Some((WatchKind::Write, SCRATCH)),
             "the debugger saw the store"
         );
+    }
+
+    const PRESENT_WRITABLE: u64 = 3;
+    const LARGE_PAGE: u64 = 1 << 7;
+
+    fn translate(h: &Harness, linear: u64) -> Option<u64> {
+        h.cpu.debug_translate(&h.cpu.debug_paging(), linear)
+    }
+
+    #[test]
+    fn the_debugger_walks_with_paging_off() {
+        let mut h = Harness::new(&[0xf4]);
+        h.cpu.cr0 &= !CR0_PG;
+        h.cpu.efer &= !EFER_LMA;
+        assert_eq!(translate(&h, 0x1234_5678_9abc), Some(0x5678_9abc));
+    }
+
+    #[test]
+    fn the_debugger_walks_32_bit_paging_with_4_mib_pages() {
+        let mut h = Harness::new(&[0xf4]);
+        let directory = SCRATCH;
+        let table = SCRATCH + 0x1000;
+        h.write(
+            directory + 4,
+            &(0x80_0000u32 | (LARGE_PAGE | PRESENT_WRITABLE) as u32).to_le_bytes(),
+        );
+        h.write(
+            directory + 8,
+            &((table | PRESENT_WRITABLE) as u32).to_le_bytes(),
+        );
+        h.write(
+            table + 4 * 5,
+            &(((SCRATCH + 0x2000) | PRESENT_WRITABLE) as u32).to_le_bytes(),
+        );
+        h.cpu.efer &= !EFER_LMA;
+        h.cpu.cr4 = (h.cpu.cr4 & !(CR4_PAE | sys::CR4_LA57)) | sys::CR4_PSE;
+        h.cpu.cr3 = directory;
+        assert_eq!(translate(&h, 0x40_1234), Some(0x80_1234));
+        assert_eq!(translate(&h, 0x80_5678), Some(SCRATCH + 0x2678));
+        assert_eq!(translate(&h, 0x80_6000), None);
+        assert_eq!(translate(&h, 0xc0_0000), None);
+    }
+
+    #[test]
+    fn the_debugger_walks_pae_paging_from_the_latched_pdptes() {
+        let mut h = Harness::new(&[0xf4]);
+        let directory = SCRATCH + 0x3000;
+        h.write_u64(directory + 8 * 3, 0xa0_0000 | LARGE_PAGE | PRESENT_WRITABLE);
+        h.cpu.efer &= !EFER_LMA;
+        h.cpu.cr4 = (h.cpu.cr4 & !sys::CR4_LA57) | CR4_PAE;
+        h.cpu.pdpte = [directory | 1, 0, 0, 0];
+        assert_eq!(translate(&h, 0x60_1234), Some(0xa0_1234));
+        assert_eq!(translate(&h, 0x4000_0000), None, "PDPTE 1 is not present");
+    }
+
+    #[test]
+    fn the_debugger_walks_five_levels_with_la57() {
+        let mut h = Harness::new(&[0xf4]);
+        const LINEAR: u64 = 1 << 48;
+        let tables: Vec<u64> = (0..5)
+            .map(|level| SCRATCH + 0x4000 + 0x1000 * level)
+            .collect();
+        // PML5 entry 1 (bit 48), then entry 0 at every level below.
+        h.write_u64(tables[0] + 8, tables[1] | PRESENT_WRITABLE);
+        for level in 1..4 {
+            h.write_u64(tables[level], tables[level + 1] | PRESENT_WRITABLE);
+        }
+        h.write_u64(tables[4], (SCRATCH + 0x9000) | PRESENT_WRITABLE);
+        h.cpu.cr4 |= sys::CR4_LA57;
+        h.cpu.cr3 = tables[0];
+        assert_eq!(translate(&h, LINEAR | 0x10), Some(SCRATCH + 0x9010));
+        assert_eq!(translate(&h, 0x10), None);
     }
 
     #[test]

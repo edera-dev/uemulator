@@ -21,7 +21,7 @@ use crate::cpu::gdb::{Vcpus, apply_resume};
 use crate::machine::ExitReason;
 use crate::sync::{Arc, Condvar, Mutex};
 use alloc::collections::BTreeMap;
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use core::time::Duration;
 use engine::{Engine, Outcome};
 
@@ -35,6 +35,9 @@ const PAUSE_NONE: u8 = 0;
 const PAUSE_QUIET: u8 = 1;
 /// The client's Ctrl-C, reported as SIGINT.
 const PAUSE_INTERRUPT: u8 = 2;
+
+/// The stop reply for a machine that ended: "exited with status 0".
+const EXITED_REPLY: &[u8] = b"W00";
 
 const SIGINT: u8 = 2;
 const SIGTRAP: u8 = 5;
@@ -99,6 +102,9 @@ pub(crate) enum StopKind {
 pub(crate) struct StopEvent {
     pub vcpu: usize,
     pub kind: StopKind,
+    /// `DebugLink::resumes` when the vCPU saw it. On threads a vCPU may wait out another's stop
+    /// with a step or watchpoint stop of its own that the resume in between made stale.
+    pub resumes: u64,
 }
 
 impl StopEvent {
@@ -147,6 +153,10 @@ pub(crate) struct DebugLink {
     stopped: AtomicBool,
     /// Per vCPU: held by the last resume (`ResumeAction::Hold`).
     held: Vec<AtomicBool>,
+    /// How many times the client resumed the machine (`StopEvent::resumes`).
+    resumes: AtomicU64,
+    /// A client is connected: halted vCPU threads poll for its pauses.
+    connected: AtomicBool,
     /// The machine's stop flag, for `k`.
     machine_stop: Arc<AtomicBool>,
     session: Mutex<Session>,
@@ -165,6 +175,8 @@ impl DebugLink {
             }),
             stopped: AtomicBool::new(false),
             held: (0..cpus).map(|_| AtomicBool::new(false)).collect(),
+            resumes: AtomicU64::new(0),
+            connected: AtomicBool::new(false),
             machine_stop,
             session: Mutex::new(Session {
                 inbox: Vec::new(),
@@ -199,6 +211,23 @@ impl DebugLink {
         if let Some(flag) = self.held.get(vcpu) {
             flag.store(held, Ordering::Release);
         }
+    }
+
+    /// A reboot builds new vCPUs; none starts out held.
+    pub fn release_all(&self) {
+        for flag in &self.held {
+            flag.store(false, Ordering::Release);
+        }
+    }
+
+    pub fn resumes(&self) -> u64 {
+        self.resumes.load(Ordering::Acquire)
+    }
+
+    /// Whether a halted vCPU thread should poll for pauses (`Cpu::wait_for_wake`): a client
+    /// that can send one is connected, or one is already waiting.
+    pub fn wants_polling(&self) -> bool {
+        self.connected.load(Ordering::Relaxed) || self.pause_pending()
     }
 
     pub fn config(&self) -> DebugConfig {
@@ -241,7 +270,8 @@ impl DebugLink {
         session.stopped = false;
         self.stopped.store(false, Ordering::Release);
         if session.engine.take_resume_pending() {
-            packet::frame(b"W00", &mut session.outbox);
+            let Session { engine, outbox, .. } = &mut *session;
+            engine.send(EXITED_REPLY, outbox);
         }
         drop(self.flush(session));
     }
@@ -265,7 +295,15 @@ impl DebugLink {
             StopKind::Breakpoint(address) if !session.config.breakpoints.contains_key(&address) => {
                 return None;
             }
-            _ => {}
+            StopKind::Step | StopKind::Watch(..) if event.resumes != self.resumes() => {
+                return None;
+            }
+            _ => {
+                // Whatever stops the machine answers a pause asked for meanwhile: left pending,
+                // it would stop the machine again right after the client resumes it, with no
+                // client to tell if it was a disconnect's.
+                self.pause.swap(PAUSE_NONE, Ordering::SeqCst);
+            }
         }
         if self.machine_stop.load(Ordering::SeqCst) || session.ended {
             return None;
@@ -276,7 +314,8 @@ impl DebugLink {
         // A client that went away is owed nothing, and the next one must not get its reply.
         if session.engine.take_resume_pending() && !session.detach_requested {
             let reply = session.engine.stop_reply(&event, &session.config);
-            packet::frame(&reply, &mut session.outbox);
+            let Session { engine, outbox, .. } = &mut *session;
+            engine.send(&reply, outbox);
         }
         let mut outcome = None;
         loop {
@@ -307,6 +346,11 @@ impl DebugLink {
                         vec![ResumeAction::Continue; vcpus.count()]
                     }
                 };
+                // A Ctrl-C the client sent right behind the resume is for the machine it resumed.
+                if session.engine.take_pending_interrupt() {
+                    self.request_pause(PAUSE_INTERRUPT);
+                }
+                self.resumes.fetch_add(1, Ordering::AcqRel);
                 apply_resume(vcpus, self, &session.config, &actions);
                 session.stopped = false;
                 self.stopped.store(false, Ordering::Release);
@@ -360,7 +404,11 @@ impl GdbStub {
         let mut session = self.link.session.lock().unwrap();
         session.engine = Engine::new();
         session.inbox.clear();
-        session.detach_requested = false;
+        // The last client's detach may not have reached the machine yet: its breakpoints go now.
+        if core::mem::take(&mut session.detach_requested) {
+            session.config = DebugConfig::default();
+        }
+        self.link.connected.store(true, Ordering::Relaxed);
         if !session.stopped && !session.ended {
             self.link.request_pause(PAUSE_QUIET);
         }
@@ -396,6 +444,7 @@ impl GdbStub {
     pub fn disconnected(&self) {
         let mut session = self.link.session.lock().unwrap();
         session.inbox.clear();
+        self.link.connected.store(false, Ordering::Relaxed);
         if session.ended {
             return;
         }

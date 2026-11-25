@@ -29,6 +29,7 @@ const UDP_MAX_DATAGRAM: usize = 65536;
 const UDP_RECV_TIMEOUT: Duration = Duration::from_millis(2);
 const GATEWAY_RECV_TIMEOUT: Duration = Duration::from_millis(5);
 const GDB_READ_CHUNK: usize = 4096;
+const GDB_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Splits `--network-link-udp LOCAL,REMOTE` at the first comma.
 fn parse_udp_spec(spec: &str) -> Result<(&str, &str), String> {
@@ -497,6 +498,9 @@ fn serve_gdb(stub: GdbStub, address: &str) -> Result<String, String> {
             };
             // Every packet waits for its answer: Nagle would hold each one back.
             let _ = stream.set_nodelay(true);
+            // Output is written from the stopped vCPU's thread: a client that stops reading must
+            // not keep the machine from noticing it is told to stop.
+            let _ = stream.set_write_timeout(Some(GDB_WRITE_TIMEOUT));
             let Ok(writer) = stream.try_clone() else {
                 continue;
             };
