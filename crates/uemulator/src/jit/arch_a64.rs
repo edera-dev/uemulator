@@ -6,8 +6,8 @@ use std::mem::offset_of;
 use super::a64::{self, Asm, NOP_WORD};
 use super::blocks::JUMP_CACHE_BITS;
 use super::emit::{
-    CALL_TARGET, CPU, Gen, PAGE_BASE, SAVED_ADDRESS, SAVED_INFO, SAVED_LR, SAVED_NZCV,
-    SAVED_OPERAND, SAVED_RESULT, TLB_BASE, VALUE,
+    CALL_TARGET, CPU, Gen, PAGE_BASE, PINNED_GUEST_COUNT, PINNED_HOST_FIRST, SAVED_ADDRESS,
+    SAVED_INFO, SAVED_LR, SAVED_NZCV, SAVED_OPERAND, SAVED_RESULT, TLB_BASE, VALUE,
 };
 use super::helpers::{self, EXIT_COUNT_SHIFT, STATUS_EXIT_REQUESTED};
 use super::native::{
@@ -24,6 +24,46 @@ pub(crate) use super::emit::Addrs;
 pub(crate) struct Prologue {
     pub code: Vec<u8>,
     addrs: Addrs,
+}
+
+/// A prologue stub or memory thunk a block may call (`Gen::call`). Only this file makes them, and
+/// every one stores the pinned guest registers to `Cpu::gpr` before its helper runs and loads
+/// them back after (`spill_pinned`, `reload_pinned`): a helper reads and writes guest registers
+/// through `Cpu`, and the Rust call clobbers x8..x15. A helper reached any other way would see
+/// stale registers and lose the guest's, which is why `Gen::call` takes this and not an address.
+#[derive(Clone, Copy)]
+pub(crate) struct Stub(u64);
+
+impl Stub {
+    /// For generator tests that never call a stub.
+    #[cfg(test)]
+    pub(super) const DUMMY: Stub = Stub(0);
+
+    pub(super) fn address(self) -> u64 {
+        self.0
+    }
+}
+
+/// `Cpu::gpr` is the first field, so `stp`/`ldp` (offsets up to 504) reach the pinned slots.
+const _: () = assert!(offset_of!(Cpu, gpr) + 8 * PINNED_GUEST_COUNT as usize <= 504);
+const GPR_PAIR_BYTES: i32 = 16;
+
+/// Stores the pinned guest registers (`emit::PINNED_HOST_FIRST`) to `Cpu::gpr`.
+fn spill_pinned(asm: &mut Asm) {
+    for pair in 0..PINNED_GUEST_COUNT as u32 / 2 {
+        let host = PINNED_HOST_FIRST + 2 * pair;
+        let offset = offset_of!(Cpu, gpr) as i32 + GPR_PAIR_BYTES * pair as i32;
+        asm.stp_off(host, host + 1, CPU, offset);
+    }
+}
+
+/// Loads the pinned guest registers from `Cpu::gpr`.
+fn reload_pinned(asm: &mut Asm) {
+    for pair in 0..PINNED_GUEST_COUNT as u32 / 2 {
+        let host = PINNED_HOST_FIRST + 2 * pair;
+        let offset = offset_of!(Cpu, gpr) as i32 + GPR_PAIR_BYTES * pair as i32;
+        asm.ldp_off(host, host + 1, CPU, offset);
+    }
 }
 
 fn bytes(words: &[u32]) -> Vec<u8> {
@@ -78,17 +118,24 @@ pub(crate) fn prologue(base: u64) -> Prologue {
     // The run loop enters at `Cpu::rip`, so that is the page the block runs from.
     asm.ldr(PAGE_BASE, CPU, offset_of!(Cpu, rip) as u32);
     assert!(asm.and_imm(PAGE_BASE, PAGE_BASE, !PAGE_OFFSET_MASK, true));
+    reload_pinned(&mut asm);
     asm.br(1);
     // Block exit with a helper status in x0 and the stopping instruction's index in x1: the
     // exit code is `status | retired << EXIT_COUNT_SHIFT`, where an instruction that
     // completed (`STATUS_EXIT_REQUESTED`) counts as retired and one that faulted does not.
+    // Both store the pinned guest registers back first: the run loop reads `Cpu`.
     let exit_fail = asm.here();
+    spill_pinned(&mut asm);
     asm.cmp_imm(0, STATUS_EXIT_REQUESTED as u32, true);
     asm.cinc_eq(1, 1);
     asm.lsl_imm(1, 1, EXIT_COUNT_SHIFT);
     asm.orr(0, 0, 1, true);
+    let restore = asm.label();
+    asm.b(restore);
     // Normal block exit: x0 already holds the finished exit code.
     let exit_ok = asm.here();
+    spill_pinned(&mut asm);
+    asm.bind(restore);
     asm.ldr(PAGE_BASE, a64::SP, SAVE_X21);
     asm.ldr(28, a64::SP, SAVE_X28 as u32);
     asm.ldp_off(26, 27, a64::SP, SAVE_X26_X27);
@@ -100,12 +147,12 @@ pub(crate) fn prologue(base: u64) -> Prologue {
     let chain = chain_stub(&mut asm, exit_ok);
     let addrs = Addrs {
         exec: exec_stub(&mut asm),
-        cond: tail_call_stub(&mut asm, helpers::helper_cond as *const () as usize as u64),
-        rotate_flags: tail_call_stub(
+        cond: helper_stub(&mut asm, helpers::helper_cond as *const () as usize as u64),
+        rotate_flags: helper_stub(
             &mut asm,
             helpers::helper_set_rotate_flags as *const () as usize as u64,
         ),
-        whole_vector: tail_call_stub(
+        whole_vector: helper_stub(
             &mut asm,
             helpers::helper_whole_vector as *const () as usize as u64,
         ),
@@ -140,27 +187,30 @@ pub(crate) fn prologue(base: u64) -> Prologue {
 /// Operand sizes of the memory thunks, indexed by `Gen::size_index`.
 const SIZES: [u8; 4] = [1, 2, 4, 8];
 
-/// A stub that tail-calls a Rust helper, so a block reaches it with a one-instruction `bl`
-/// instead of materializing a 64-bit address: the helper returns to the block.
-fn tail_call_stub(asm: &mut Asm, helper: u64) -> u64 {
+/// A stub that calls a Rust helper with the block's x0..x7 as arguments, so a block reaches it
+/// with a one-instruction `bl` instead of materializing a 64-bit address, and spills and reloads
+/// the pinned guest registers around it (see `Stub`). The return address waits in `SAVED_LR`,
+/// which only the memory thunks use otherwise, and stubs and thunks never nest.
+fn helper_stub(asm: &mut Asm, helper: u64) -> Stub {
     let start = asm.here();
+    asm.mov(SAVED_LR, LINK_REGISTER);
+    spill_pinned(asm);
     asm.mov_imm(CALL_TARGET, helper);
-    asm.br(CALL_TARGET);
-    start
+    asm.blr(CALL_TARGET);
+    reload_pinned(asm);
+    asm.ret_reg(SAVED_LR);
+    Stub(start)
 }
 
 /// `helper_exec_pair(cpu, pair, page_base)`: the pair holds the instruction's page offset, and the
 /// helper needs the page base to turn it into its `rip` (see `PAGE_BASE`).
-fn exec_stub(asm: &mut Asm) -> u64 {
+fn exec_stub(asm: &mut Asm) -> Stub {
     const PAGE_BASE_ARGUMENT: u32 = 2;
     let start = asm.here();
     asm.mov(PAGE_BASE_ARGUMENT, PAGE_BASE);
-    asm.mov_imm(
-        CALL_TARGET,
-        helpers::helper_exec_pair as *const () as usize as u64,
-    );
-    asm.br(CALL_TARGET);
-    start
+    let call = helper_stub(asm, helpers::helper_exec_pair as *const () as usize as u64);
+    debug_assert_eq!(call.address(), start + 4);
+    Stub(start)
 }
 
 #[derive(Clone, Copy)]
@@ -179,7 +229,7 @@ enum Access {
 /// returns to the block with the loaded value in x0. If the helper reports an exception the
 /// thunk leaves the block through `exit_fail` instead, with the status and the instruction's
 /// index. All of that used to be emitted per access, which made blocks several times bigger.
-fn thunk(asm: &mut Asm, access: Access, exit_fail: u64) -> u64 {
+fn thunk(asm: &mut Asm, access: Access, exit_fail: u64) -> Stub {
     const ADDRESS: u32 = 2;
     const INFO: u32 = 7;
     const LOAD_STATUS: u32 = 1;
@@ -231,8 +281,12 @@ fn thunk(asm: &mut Asm, access: Access, exit_fail: u64) -> u64 {
         asm.mov_imm(2, size as u64);
         asm.ldr(3, INFO, 0);
         asm.add(3, 3, PAGE_BASE, true);
+        spill_pinned(asm);
         asm.mov_imm(CALL_TARGET, helper);
         asm.blr(CALL_TARGET);
+        // Before the status check: the fail path's exit stub stores them again, and a nested
+        // page fault taken as a #VMEXIT inside the helper changed rsp and rax in `Cpu`.
+        reload_pinned(asm);
         asm.cbnz(LOAD_STATUS, fail, true);
         if let Access::Load { size, signed: true } = access {
             match size {
@@ -249,8 +303,10 @@ fn thunk(asm: &mut Asm, access: Access, exit_fail: u64) -> u64 {
         asm.ldr(4, INFO, 0);
         asm.add(4, 4, PAGE_BASE, true);
         asm.mov(0, CPU);
+        spill_pinned(asm);
         asm.mov_imm(CALL_TARGET, helper);
         asm.blr(CALL_TARGET);
+        reload_pinned(asm);
         asm.cbnz(0, fail, true);
     }
     asm.msr_nzcv(SAVED_NZCV);
@@ -267,7 +323,7 @@ fn thunk(asm: &mut Asm, access: Access, exit_fail: u64) -> u64 {
     }
     asm.ldr(1, SAVED_INFO, 8);
     asm.b_abs(exit_fail);
-    start
+    Stub(start)
 }
 
 /// Registers of the chain stub's calling convention (see `Gen::chain_exit`): the block

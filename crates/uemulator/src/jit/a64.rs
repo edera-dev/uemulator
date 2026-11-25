@@ -119,6 +119,22 @@ pub(crate) struct Asm {
     /// 64-bit constants to place after the code (see `literal`): the label bound to the first of
     /// a run (if any) and the value.
     pool: Vec<(Option<Label>, u64)>,
+    /// General registers no instruction of this code may write: the host registers that hold
+    /// guest registers in block code (`emit::PINNED_HOST_MASK`, set by `Gen::new`). Zero for the
+    /// prologue, which is where they are loaded and spilled. See `put`.
+    reserved: u32,
+    /// The one instruction `write_pinned` lets through.
+    pinned_write_allowed: bool,
+}
+
+/// The general registers an encoded instruction writes, which every encoder must declare when it
+/// hands its word to `Asm::put`: that is how `reserved` registers are kept from being used as
+/// scratch. An encoder added without thinking about it cannot compile without picking one.
+#[derive(Clone, Copy)]
+enum Writes {
+    Nothing,
+    Gp(u32),
+    GpPair(u32, u32),
 }
 
 /// Encodes `val` as a logical immediate (the 13-bit N:immr:imms field) for `and`/`orr`/`eor`/
@@ -188,6 +204,63 @@ impl Asm {
             labels: Vec::new(),
             fixes: Vec::new(),
             pool: Vec::new(),
+            reserved: 0,
+            pinned_write_allowed: false,
+        }
+    }
+
+    /// Makes writes to the registers in `mask` a bug (see `put`). Block code only.
+    pub fn reserve(&mut self, mask: u32) {
+        self.reserved = mask;
+    }
+
+    pub fn reserved(&self) -> u32 {
+        self.reserved
+    }
+
+    /// Emits one instruction that writes a reserved register on purpose: the generator's own
+    /// guest register accesses (`Gen::store_gpr`, `Gen::write_reg`).
+    pub fn write_pinned(&mut self, emit: impl FnOnce(&mut Asm)) {
+        self.pinned_write_allowed = true;
+        emit(self);
+        assert!(
+            !self.pinned_write_allowed,
+            "write_pinned emitted no instruction"
+        );
+    }
+
+    /// Appends one instruction. A write to a reserved register is a generator bug that would
+    /// silently corrupt a guest register held there, so tests panic on it (every differential
+    /// case compiles through here). Release builds do not check: the guest decides which
+    /// lowerings run, and the library never panics on guest behavior.
+    fn put(&mut self, word: u32, writes: Writes) {
+        let written = match writes {
+            Writes::Nothing => 0,
+            Writes::Gp(rd) => 1u64 << rd,
+            Writes::GpPair(rt, rt2) => 1u64 << rt | 1u64 << rt2,
+        };
+        let pinned = written & self.reserved as u64 != 0;
+        if cfg!(test) {
+            assert!(
+                !pinned || self.pinned_write_allowed,
+                "instruction {word:#010x} writes a host register reserved for a guest register \
+                 (mask {:#x}); see docs/plans/06-jit.md, \"Pinned guest registers\"",
+                self.reserved
+            );
+        }
+        self.pinned_write_allowed = false;
+        self.code.push(word);
+    }
+
+    /// Calling or jumping to Rust from block code would clobber the caller-saved registers that
+    /// hold guest registers and let the callee read stale ones from `Cpu`: block code reaches
+    /// Rust only through the prologue's spilling stubs (`Gen::call`).
+    fn check_leaves_through_stub(&self) {
+        if cfg!(test) {
+            assert!(
+                self.reserved == 0,
+                "block code may only call Rust through a spilling prologue stub (Gen::call)"
+            );
         }
     }
 
@@ -201,8 +274,8 @@ impl Asm {
         self.base + self.code.len() as u64 * 4
     }
 
-    pub fn emit(&mut self, word: u32) {
-        self.code.push(word);
+    pub fn nop(&mut self) {
+        self.put(NOP_WORD, Writes::Nothing);
     }
 
     pub fn label(&mut self) -> Label {
@@ -238,14 +311,14 @@ impl Asm {
             return;
         }
         if self.code.len() % 2 == 1 {
-            self.emit(NOP_WORD);
+            self.put(NOP_WORD, Writes::Nothing);
         }
         for (label, value) in std::mem::take(&mut self.pool) {
             if let Some(label) = label {
                 self.bind(label);
             }
-            self.emit(value as u32);
-            self.emit((value >> 32) as u32);
+            self.put(value as u32, Writes::Nothing);
+            self.put((value >> 32) as u32, Writes::Nothing);
         }
     }
 
@@ -268,33 +341,39 @@ impl Asm {
     /// `adr rd, label`: the address of a word-aligned label.
     pub fn adr(&mut self, rd: u32, label: Label) {
         self.fixes.push((self.code.len(), label, Fixup::Adr));
-        self.emit(0x1000_0000 | rd);
+        self.put(0x1000_0000 | rd, Writes::Gp(rd));
     }
 
     /// `ldr xt, label`: loads the 64-bit constant at a word-aligned label.
     pub fn ldr_literal(&mut self, rt: u32, label: Label) {
         self.fixes.push((self.code.len(), label, Fixup::Imm19));
-        self.emit(0x5800_0000 | rt);
+        self.put(0x5800_0000 | rt, Writes::Gp(rt));
     }
 
     pub fn b(&mut self, label: Label) {
         self.fixes.push((self.code.len(), label, Fixup::Imm26));
-        self.emit(0x1400_0000);
+        self.put(0x1400_0000, Writes::Nothing);
     }
 
     pub fn b_cond(&mut self, cond: u32, label: Label) {
         self.fixes.push((self.code.len(), label, Fixup::Imm19));
-        self.emit(0x5400_0000 | cond);
+        self.put(0x5400_0000 | cond, Writes::Nothing);
     }
 
     pub fn cbz(&mut self, rt: u32, label: Label, is64: bool) {
         self.fixes.push((self.code.len(), label, Fixup::Imm19));
-        self.emit(if is64 { 0xb400_0000 } else { 0x3400_0000 } | rt);
+        self.put(
+            if is64 { 0xb400_0000 } else { 0x3400_0000 } | rt,
+            Writes::Nothing,
+        );
     }
 
     pub fn cbnz(&mut self, rt: u32, label: Label, is64: bool) {
         self.fixes.push((self.code.len(), label, Fixup::Imm19));
-        self.emit(if is64 { 0xb500_0000 } else { 0x3500_0000 } | rt);
+        self.put(
+            if is64 { 0xb500_0000 } else { 0x3500_0000 } | rt,
+            Writes::Nothing,
+        );
     }
 
     /// Direct branch to an absolute address outside this `Asm` (the exit stubs in the prologue).
@@ -303,45 +382,62 @@ impl Asm {
     pub fn b_abs(&mut self, target: u64) {
         let offset = (target as i64 - self.here() as i64) / 4;
         assert!(offset.abs() < IMM26_SIGNED_LIMIT, "branch out of range");
-        self.emit(0x1400_0000 | (offset as u32 & IMM26_MASK));
+        self.put(0x1400_0000 | (offset as u32 & IMM26_MASK), Writes::Nothing);
     }
 
     pub fn ret(&mut self) {
-        self.emit(0xd65f_03c0);
+        self.put(0xd65f_03c0, Writes::Nothing);
     }
 
     /// `ret xn`: return through a register other than the link register.
     pub fn ret_reg(&mut self, rn: u32) {
-        self.emit(0xd65f_0000 | rn << RN_SHIFT);
+        self.put(0xd65f_0000 | rn << RN_SHIFT, Writes::Nothing);
     }
 
     /// Direct call to an absolute address outside this `Asm`, reach +-128 MiB like `b_abs`.
     pub fn bl_abs(&mut self, target: u64) {
+        self.check_leaves_through_stub();
+        self.bl_stub(target);
+    }
+
+    /// `bl_abs` to a stub that spills and reloads the pinned registers itself (`Gen::call`).
+    pub fn bl_stub(&mut self, target: u64) {
         let offset = (target as i64 - self.here() as i64) / 4;
         assert!(offset.abs() < IMM26_SIGNED_LIMIT, "branch out of range");
-        self.emit(0x9400_0000 | (offset as u32 & IMM26_MASK));
+        self.put(0x9400_0000 | (offset as u32 & IMM26_MASK), Writes::Nothing);
     }
 
     pub fn blr(&mut self, rn: u32) {
-        self.emit(0xd63f_0000 | rn << RN_SHIFT);
+        self.check_leaves_through_stub();
+        self.put(0xd63f_0000 | rn << RN_SHIFT, Writes::Nothing);
     }
 
     pub fn br(&mut self, rn: u32) {
-        self.emit(0xd61f_0000 | rn << RN_SHIFT);
+        self.check_leaves_through_stub();
+        self.put(0xd61f_0000 | rn << RN_SHIFT, Writes::Nothing);
     }
 
     /// `hw` is the halfword index 0..=3 the 16 bits land in.
     pub fn movz(&mut self, rd: u32, imm: u32, hw: u32) {
-        self.emit(0xd280_0000 | hw << HW_SHIFT | (imm & 0xffff) << IMM16_SHIFT | rd);
+        self.put(
+            0xd280_0000 | hw << HW_SHIFT | (imm & 0xffff) << IMM16_SHIFT | rd,
+            Writes::Gp(rd),
+        );
     }
 
     pub fn movk(&mut self, rd: u32, imm: u32, hw: u32) {
-        self.emit(0xf280_0000 | hw << HW_SHIFT | (imm & 0xffff) << IMM16_SHIFT | rd);
+        self.put(
+            0xf280_0000 | hw << HW_SHIFT | (imm & 0xffff) << IMM16_SHIFT | rd,
+            Writes::Gp(rd),
+        );
     }
 
     /// Writes the bitwise NOT of the shifted immediate.
     pub fn movn(&mut self, rd: u32, imm: u32, hw: u32) {
-        self.emit(0x9280_0000 | hw << HW_SHIFT | (imm & 0xffff) << IMM16_SHIFT | rd);
+        self.put(
+            0x9280_0000 | hw << HW_SHIFT | (imm & 0xffff) << IMM16_SHIFT | rd,
+            Writes::Gp(rd),
+        );
     }
 
     /// Loads any 64-bit constant: one `movn` when the top 48 bits are all ones, otherwise a
@@ -371,19 +467,22 @@ impl Asm {
 
     /// `orr rd, xzr, rm`. Register 31 here is `xzr`, so this cannot move from or to `sp`.
     pub fn mov(&mut self, rd: u32, rm: u32) {
-        self.emit(0xaa00_03e0 | rm << RM_SHIFT | rd);
+        self.put(0xaa00_03e0 | rm << RM_SHIFT | rd, Writes::Gp(rd));
     }
 
     /// `add rd, rn, #0`, the form that treats register 31 as `sp`.
     pub fn mov_sp(&mut self, rd: u32, rn: u32) {
-        self.emit(0x9100_0000 | rn << RN_SHIFT | rd);
+        self.put(0x9100_0000 | rn << RN_SHIFT | rd, Writes::Gp(rd));
     }
 
     /// Unshifted 12-bit immediate only; callers must range-check (see `Gen::effective_address`).
     fn addsub_imm(&mut self, op: u32, rd: u32, rn: u32, imm: u32, is64: bool) {
         let sf = if is64 { SF } else { 0 };
         assert!(imm < IMM12_LIMIT);
-        self.emit(sf | op | imm << IMM12_SHIFT | rn << RN_SHIFT | rd);
+        self.put(
+            sf | op | imm << IMM12_SHIFT | rn << RN_SHIFT | rd,
+            Writes::Gp(rd),
+        );
     }
 
     pub fn add_imm(&mut self, rd: u32, rn: u32, imm: u32, is64: bool) {
@@ -401,7 +500,10 @@ impl Asm {
 
     fn reg3(&mut self, op: u32, rd: u32, rn: u32, rm: u32, is64: bool) {
         let sf = if is64 { SF } else { 0 };
-        self.emit(sf | op | rm << RM_SHIFT | rn << RN_SHIFT | rd);
+        self.put(
+            sf | op | rm << RM_SHIFT | rn << RN_SHIFT | rd,
+            Writes::Gp(rd),
+        );
     }
 
     pub fn add(&mut self, rd: u32, rn: u32, rm: u32, is64: bool) {
@@ -447,12 +549,12 @@ impl Asm {
     /// Counts leading zero bits of the 32- or 64-bit operand (the width when it is zero).
     pub fn clz(&mut self, rd: u32, rn: u32, is64: bool) {
         let sf = if is64 { SF } else { 0 };
-        self.emit(sf | 0x5ac0_1000 | rn << RN_SHIFT | rd);
+        self.put(sf | 0x5ac0_1000 | rn << RN_SHIFT | rd, Writes::Gp(rd));
     }
     /// Reverses the bits of the 32- or 64-bit operand.
     pub fn rbit(&mut self, rd: u32, rn: u32, is64: bool) {
         let sf = if is64 { SF } else { 0 };
-        self.emit(sf | 0x5ac0_0000 | rn << RN_SHIFT | rd);
+        self.put(sf | 0x5ac0_0000 | rn << RN_SHIFT | rd, Writes::Gp(rd));
     }
     pub fn mul(&mut self, rd: u32, rn: u32, rm: u32, is64: bool) {
         self.reg3(0x1b00_7c00, rd, rn, rm, is64);
@@ -473,7 +575,10 @@ impl Asm {
     /// by `lsb`.
     pub fn extr(&mut self, rd: u32, rn: u32, rm: u32, lsb: u32, is64: bool) {
         let opcode = if is64 { 0x93c0_0000 } else { 0x1380_0000 };
-        self.emit(opcode | rm << RM_SHIFT | lsb << IMMS_SHIFT | rn << RN_SHIFT | rd);
+        self.put(
+            opcode | rm << RM_SHIFT | lsb << IMMS_SHIFT | rn << RN_SHIFT | rd,
+            Writes::Gp(rd),
+        );
     }
 
     /// `ror rd, rn, #amount`, the alias of `extr rd, rn, rn, #amount`.
@@ -483,7 +588,10 @@ impl Asm {
 
     /// 64-bit `add rd, rn, rm, lsl #shift`.
     pub fn add_lsl(&mut self, rd: u32, rn: u32, rm: u32, shift: u32) {
-        self.emit(0x8b00_0000 | rm << RM_SHIFT | shift << IMM6_SHIFT | rn << RN_SHIFT | rd);
+        self.put(
+            0x8b00_0000 | rm << RM_SHIFT | shift << IMM6_SHIFT | rn << RN_SHIFT | rd,
+            Writes::Gp(rd),
+        );
     }
 
     pub fn cmp(&mut self, rn: u32, rm: u32, is64: bool) {
@@ -503,7 +611,10 @@ impl Asm {
         match encode_bitmask(imm, is64) {
             Some(bitmask) => {
                 let sf = if is64 { SF } else { 0 };
-                self.emit(sf | op | bitmask << BITMASK_IMM_SHIFT | rn << RN_SHIFT | rd);
+                self.put(
+                    sf | op | bitmask << BITMASK_IMM_SHIFT | rn << RN_SHIFT | rd,
+                    Writes::Gp(rd),
+                );
                 true
             }
             None => false,
@@ -520,15 +631,24 @@ impl Asm {
     // `immr` the rotate amount and `imms` the index of the field's last bit.
     pub fn ubfm(&mut self, rd: u32, rn: u32, immr: u32, imms: u32, is64: bool) {
         let opcode = if is64 { 0xd340_0000 } else { 0x5300_0000 };
-        self.emit(opcode | immr << IMMR_SHIFT | imms << IMMS_SHIFT | rn << RN_SHIFT | rd);
+        self.put(
+            opcode | immr << IMMR_SHIFT | imms << IMMS_SHIFT | rn << RN_SHIFT | rd,
+            Writes::Gp(rd),
+        );
     }
     pub fn sbfm(&mut self, rd: u32, rn: u32, immr: u32, imms: u32, is64: bool) {
         let opcode = if is64 { 0x9340_0000 } else { 0x1300_0000 };
-        self.emit(opcode | immr << IMMR_SHIFT | imms << IMMS_SHIFT | rn << RN_SHIFT | rd);
+        self.put(
+            opcode | immr << IMMR_SHIFT | imms << IMMS_SHIFT | rn << RN_SHIFT | rd,
+            Writes::Gp(rd),
+        );
     }
     pub fn bfm(&mut self, rd: u32, rn: u32, immr: u32, imms: u32, is64: bool) {
         let opcode = if is64 { 0xb340_0000 } else { 0x3300_0000 };
-        self.emit(opcode | immr << IMMR_SHIFT | imms << IMMS_SHIFT | rn << RN_SHIFT | rd);
+        self.put(
+            opcode | immr << IMMR_SHIFT | imms << IMMS_SHIFT | rn << RN_SHIFT | rd,
+            Writes::Gp(rd),
+        );
     }
 
     /// 64-bit immediate shifts.
@@ -574,7 +694,7 @@ impl Asm {
     }
     /// 32-bit `mov`, which zeroes the upper half of the destination.
     pub fn uxtw(&mut self, rd: u32, rn: u32) {
-        self.emit(0x2a00_03e0 | rn << RM_SHIFT | rd);
+        self.put(0x2a00_03e0 | rn << RM_SHIFT | rd, Writes::Gp(rd));
     }
     pub fn sxtb(&mut self, rd: u32, rn: u32, is64: bool) {
         self.sbfm(rd, rn, 0, 7, is64);
@@ -594,51 +714,60 @@ impl Asm {
 
     /// `csinc rd, xzr, xzr, !cond`: rd = cond ? 1 : 0.
     pub fn cset(&mut self, rd: u32, cond: u32) {
-        self.emit(0x9a9f_07e0 | ((cond ^ 1) << COND_SHIFT) | rd);
+        self.put(
+            0x9a9f_07e0 | ((cond ^ 1) << COND_SHIFT) | rd,
+            Writes::Gp(rd),
+        );
     }
 
     pub fn csel(&mut self, rd: u32, rn: u32, rm: u32, cond: u32) {
-        self.emit(0x9a80_0000 | rm << RM_SHIFT | cond << COND_SHIFT | rn << RN_SHIFT | rd);
+        self.put(
+            0x9a80_0000 | rm << RM_SHIFT | cond << COND_SHIFT | rn << RN_SHIFT | rd,
+            Writes::Gp(rd),
+        );
     }
 
     /// Unsigned-offset load/store: the encoded immediate is `off >> scale`, so `off` must be a
     /// multiple of the access size (`1 << scale`) and below `4096 << scale`.
-    fn ldst_imm(&mut self, base: u32, scale: u32, rt: u32, rn: u32, off: u32) {
+    fn ldst_imm(&mut self, base: u32, scale: u32, rt: u32, rn: u32, off: u32, writes: Writes) {
         assert!(
             off.is_multiple_of(1 << scale) && (off >> scale) < IMM12_LIMIT,
             "bad ldst offset {off}"
         );
-        self.emit(base | (off >> scale) << IMM12_SHIFT | rn << RN_SHIFT | rt);
+        self.put(
+            base | (off >> scale) << IMM12_SHIFT | rn << RN_SHIFT | rt,
+            writes,
+        );
     }
 
     pub fn ldr(&mut self, rt: u32, rn: u32, off: u32) {
-        self.ldst_imm(0xf940_0000, 3, rt, rn, off);
+        self.ldst_imm(0xf940_0000, 3, rt, rn, off, Writes::Gp(rt));
     }
     pub fn str(&mut self, rt: u32, rn: u32, off: u32) {
-        self.ldst_imm(0xf900_0000, 3, rt, rn, off);
+        self.ldst_imm(0xf900_0000, 3, rt, rn, off, Writes::Nothing);
     }
     pub fn ldr_w(&mut self, rt: u32, rn: u32, off: u32) {
-        self.ldst_imm(0xb940_0000, 2, rt, rn, off);
+        self.ldst_imm(0xb940_0000, 2, rt, rn, off, Writes::Gp(rt));
     }
     pub fn str_w(&mut self, rt: u32, rn: u32, off: u32) {
-        self.ldst_imm(0xb900_0000, 2, rt, rn, off);
+        self.ldst_imm(0xb900_0000, 2, rt, rn, off, Writes::Nothing);
     }
     pub fn ldrh(&mut self, rt: u32, rn: u32, off: u32) {
-        self.ldst_imm(0x7940_0000, 1, rt, rn, off);
+        self.ldst_imm(0x7940_0000, 1, rt, rn, off, Writes::Gp(rt));
     }
     pub fn strh(&mut self, rt: u32, rn: u32, off: u32) {
-        self.ldst_imm(0x7900_0000, 1, rt, rn, off);
+        self.ldst_imm(0x7900_0000, 1, rt, rn, off, Writes::Nothing);
     }
     pub fn ldrb(&mut self, rt: u32, rn: u32, off: u32) {
-        self.ldst_imm(0x3940_0000, 0, rt, rn, off);
+        self.ldst_imm(0x3940_0000, 0, rt, rn, off, Writes::Gp(rt));
     }
     pub fn strb(&mut self, rt: u32, rn: u32, off: u32) {
-        self.ldst_imm(0x3900_0000, 0, rt, rn, off);
+        self.ldst_imm(0x3900_0000, 0, rt, rn, off, Writes::Nothing);
     }
 
     /// Register-offset form `[rn, rm]`: no shift, no extend.
-    fn ldst_reg(&mut self, base: u32, rt: u32, rn: u32, rm: u32) {
-        self.emit(base | rm << RM_SHIFT | rn << RN_SHIFT | rt);
+    fn ldst_reg(&mut self, base: u32, rt: u32, rn: u32, rm: u32, writes: Writes) {
+        self.put(base | rm << RM_SHIFT | rn << RN_SHIFT | rt, writes);
     }
 
     /// Loads `size` bytes from `[rn + rm]`. Unsigned loads zero-extend; signed ones sign-extend
@@ -654,7 +783,7 @@ impl Asm {
             (2, true) => 0x78a0_6800,
             _ => 0xb8a0_6800,
         };
-        self.ldst_reg(base, rt, rn, rm);
+        self.ldst_reg(base, rt, rn, rm, Writes::Gp(rt));
     }
 
     /// Stores the low `size` bytes of `rt` to `[rn + rm]`; any size other than 1, 2 or 4
@@ -666,7 +795,7 @@ impl Asm {
             4 => 0xb820_6800,
             _ => 0xf820_6800,
         };
-        self.ldst_reg(base, rt, rn, rm);
+        self.ldst_reg(base, rt, rn, rm, Writes::Nothing);
     }
 
     /// Load-acquire of `size` bytes from `[rn]`, zero-extended: `ldarb`/`ldarh`/`ldar`. The
@@ -679,7 +808,7 @@ impl Asm {
             4 => 0x88df_fc00,
             _ => 0xc8df_fc00,
         };
-        self.emit(base | rn << RN_SHIFT | rt);
+        self.put(base | rn << RN_SHIFT | rt, Writes::Gp(rt));
     }
 
     /// Store-release of the low `size` bytes of `rt` to `[rn]`; the counterpart of `ldar`.
@@ -690,7 +819,7 @@ impl Asm {
             4 => 0x889f_fc00,
             _ => 0xc89f_fc00,
         };
-        self.emit(base | rn << RN_SHIFT | rt);
+        self.put(base | rn << RN_SHIFT | rt, Writes::Nothing);
     }
 
     /// 64-bit `stp`/`ldp`. `imm` is a byte offset, a multiple of 8 in -512..=504.
@@ -700,37 +829,58 @@ impl Asm {
 
     /// Pre-indexed: the base register is updated before the store.
     pub fn stp_pre(&mut self, rt: u32, rt2: u32, rn: u32, imm: i32) {
-        self.emit(0xa980_0000 | Self::pair_imm7(imm) | rt2 << RT2_SHIFT | rn << RN_SHIFT | rt);
+        self.put(
+            0xa980_0000 | Self::pair_imm7(imm) | rt2 << RT2_SHIFT | rn << RN_SHIFT | rt,
+            Writes::Nothing,
+        );
     }
     pub fn stp_off(&mut self, rt: u32, rt2: u32, rn: u32, imm: i32) {
-        self.emit(0xa900_0000 | Self::pair_imm7(imm) | rt2 << RT2_SHIFT | rn << RN_SHIFT | rt);
+        self.put(
+            0xa900_0000 | Self::pair_imm7(imm) | rt2 << RT2_SHIFT | rn << RN_SHIFT | rt,
+            Writes::Nothing,
+        );
     }
     pub fn ldp_off(&mut self, rt: u32, rt2: u32, rn: u32, imm: i32) {
-        self.emit(0xa940_0000 | Self::pair_imm7(imm) | rt2 << RT2_SHIFT | rn << RN_SHIFT | rt);
+        self.put(
+            0xa940_0000 | Self::pair_imm7(imm) | rt2 << RT2_SHIFT | rn << RN_SHIFT | rt,
+            Writes::GpPair(rt, rt2),
+        );
     }
     /// `csinc rd, rn, rn, ne`: rd = eq ? rn + 1 : rn.
     pub fn cinc_eq(&mut self, rd: u32, rn: u32) {
-        self.emit(0x9a80_0400 | rn << RM_SHIFT | (NE << COND_SHIFT) | rn << RN_SHIFT | rd);
+        self.put(
+            0x9a80_0400 | rn << RM_SHIFT | (NE << COND_SHIFT) | rn << RN_SHIFT | rd,
+            Writes::Gp(rd),
+        );
     }
     /// Read/write the NZCV condition flags (system register S3_3_C4_C2_0).
     pub fn mrs_nzcv(&mut self, rt: u32) {
-        self.emit(0xd53b_4200 | rt);
+        self.put(0xd53b_4200 | rt, Writes::Gp(rt));
     }
     pub fn msr_nzcv(&mut self, rt: u32) {
-        self.emit(0xd51b_4200 | rt);
+        self.put(0xd51b_4200 | rt, Writes::Nothing);
     }
     /// Post-indexed: the base register is updated after the load.
     pub fn ldp_post(&mut self, rt: u32, rt2: u32, rn: u32, imm: i32) {
-        self.emit(0xa8c0_0000 | Self::pair_imm7(imm) | rt2 << RT2_SHIFT | rn << RN_SHIFT | rt);
+        self.put(
+            0xa8c0_0000 | Self::pair_imm7(imm) | rt2 << RT2_SHIFT | rn << RN_SHIFT | rt,
+            Writes::GpPair(rt, rt2),
+        );
     }
 
     /// 128-bit `ldr`/`str` of vector register `vt`; `off` is a byte offset, a multiple of 16 below
     /// 64 KiB.
     pub fn ldr_q(&mut self, vt: u32, rn: u32, off: u32) {
-        self.emit(0x3dc0_0000 | Self::q_offset(off) | rn << RN_SHIFT | vt);
+        self.put(
+            0x3dc0_0000 | Self::q_offset(off) | rn << RN_SHIFT | vt,
+            Writes::Nothing,
+        );
     }
     pub fn str_q(&mut self, vt: u32, rn: u32, off: u32) {
-        self.emit(0x3d80_0000 | Self::q_offset(off) | rn << RN_SHIFT | vt);
+        self.put(
+            0x3d80_0000 | Self::q_offset(off) | rn << RN_SHIFT | vt,
+            Writes::Nothing,
+        );
     }
     fn q_offset(off: u32) -> u32 {
         assert!(
@@ -744,7 +894,10 @@ impl Asm {
     /// the lane width as log2 of the byte count (0 = 16 x 8-bit .. 3 = 2 x 64-bit; the
     /// bitwise operations take 0). `vd = vn op vm`; `VEC_BIC` is `vn & !vm`.
     pub fn vec_op(&mut self, base: u32, size: u32, vd: u32, vn: u32, vm: u32) {
-        self.emit(base | size << VEC_SIZE_SHIFT | vm << RM_SHIFT | vn << RN_SHIFT | vd);
+        self.put(
+            base | size << VEC_SIZE_SHIFT | vm << RM_SHIFT | vn << RN_SHIFT | vd,
+            Writes::Nothing,
+        );
     }
 
     /// `ushr vd.16b, vn.16b, #shift` and the accumulating `usra`, per lane of `lane_bits` (8, 16,
@@ -759,51 +912,64 @@ impl Asm {
         assert!(lane_bits.is_power_of_two() && (1..=lane_bits).contains(&shift));
         // immh:immb is `2 * lane_bits - shift`; the position of its top set bit gives the lane size.
         let immediate = 2 * lane_bits - shift;
-        self.emit(base | immediate << VEC_SHIFT_IMMEDIATE_SHIFT | vn << RN_SHIFT | vd);
+        self.put(
+            base | immediate << VEC_SHIFT_IMMEDIATE_SHIFT | vn << RN_SHIFT | vd,
+            Writes::Nothing,
+        );
     }
 
     /// `umov wd, vn.b[index]`.
     /// `fmov dd, xn`: the low 64 bits of vector register `vd` from a general register, the rest
     /// zeroed.
     pub fn fmov_d_x(&mut self, vd: u32, xn: u32) {
-        self.emit(0x9e67_0000 | xn << RN_SHIFT | vd);
+        self.put(0x9e67_0000 | xn << RN_SHIFT | vd, Writes::Nothing);
     }
     /// `mov vd.d[1], xn`: the high 64 bits of `vd` from a general register.
     pub fn ins_d1(&mut self, vd: u32, xn: u32) {
-        self.emit(0x4e18_1c00 | xn << RN_SHIFT | vd);
+        self.put(0x4e18_1c00 | xn << RN_SHIFT | vd, Writes::Nothing);
     }
     pub fn umov_byte(&mut self, rd: u32, vn: u32, index: u32) {
         assert!(index < VECTOR_BYTES);
-        self.emit(
+        self.put(
             0x0e00_3c00 | (index << 1 | 1) << VEC_SHIFT_IMMEDIATE_SHIFT | vn << RN_SHIFT | rd,
+            Writes::Gp(rd),
         );
     }
 
     /// `sha256su0 vd.4s, vn.4s`: the first half of SHA-256's message schedule, which is exactly
     /// x86's sha256msg1 with the destination in `vd` and the source in `vn` (both lane 0 low).
     pub fn sha256su0(&mut self, vd: u32, vn: u32) {
-        self.emit(0x5e28_2800 | vn << RN_SHIFT | vd);
+        self.put(0x5e28_2800 | vn << RN_SHIFT | vd, Writes::Nothing);
     }
     /// `sha256su1 vd.4s, vn.4s, vm.4s`: `vd + sigma1(...)` like x86's sha256msg2, plus the
     /// `W[t-7]` words taken from `vn` and lane 0 of `vm`, which a caller wanting sha256msg2 zeroes.
     pub fn sha256su1(&mut self, vd: u32, vn: u32, vm: u32) {
-        self.emit(0x5e00_6000 | vm << RM_SHIFT | vn << RN_SHIFT | vd);
+        self.put(
+            0x5e00_6000 | vm << RM_SHIFT | vn << RN_SHIFT | vd,
+            Writes::Nothing,
+        );
     }
     /// `ext vd.16b, vn.16b, vm.16b, #index`: bytes `index..16` of `vn` followed by bytes
     /// `0..index` of `vm`, the 32-byte `vm:vn` shifted right by `index` bytes.
     pub fn ext_16b(&mut self, vd: u32, vn: u32, vm: u32, index: u32) {
         const EXT_INDEX_SHIFT: u32 = 11;
         assert!(index < VECTOR_BYTES);
-        self.emit(0x6e00_0000 | vm << RM_SHIFT | index << EXT_INDEX_SHIFT | vn << RN_SHIFT | vd);
+        self.put(
+            0x6e00_0000 | vm << RM_SHIFT | index << EXT_INDEX_SHIFT | vn << RN_SHIFT | vd,
+            Writes::Nothing,
+        );
     }
     /// `movi vd.2d, #0`.
     pub fn vec_zero(&mut self, vd: u32) {
-        self.emit(0x6f00_e400 | vd);
+        self.put(0x6f00_e400 | vd, Writes::Nothing);
     }
     /// `mov vd.s[0], wzr`: clears the low dword of `vd` and keeps the rest.
     pub fn clear_low_dword(&mut self, vd: u32) {
         const ZERO_REGISTER: u32 = 31;
-        self.emit(0x4e04_1c00 | ZERO_REGISTER << RN_SHIFT | vd);
+        self.put(
+            0x4e04_1c00 | ZERO_REGISTER << RN_SHIFT | vd,
+            Writes::Nothing,
+        );
     }
     /// `movi vd.16b, #imm`: `imm` in every byte.
     pub fn vec_splat_byte(&mut self, vd: u32, imm: u8) {
@@ -811,22 +977,26 @@ impl Asm {
         const DEFGH_SHIFT: u32 = 5;
         const DEFGH_BITS: u32 = 5;
         let imm = imm as u32;
-        self.emit(
+        self.put(
             0x4f00_e400
                 | (imm >> DEFGH_BITS) << ABC_SHIFT
                 | (imm & ((1 << DEFGH_BITS) - 1)) << DEFGH_SHIFT
                 | vd,
+            Writes::Nothing,
         );
     }
     /// `tbl vd.16b, {vn.16b}, vm.16b`: byte `k` of `vd` is byte `vm[k]` of `vn` (0 past 15).
     pub fn tbl(&mut self, vd: u32, vn: u32, vm: u32) {
-        self.emit(0x4e00_0000 | vm << RM_SHIFT | vn << RN_SHIFT | vd);
+        self.put(
+            0x4e00_0000 | vm << RM_SHIFT | vn << RN_SHIFT | vd,
+            Writes::Nothing,
+        );
     }
 
     /// `dmb ishld`: loads before it complete before any later load or store. A plain vector
     /// load plus this is an acquire, which `ldar` cannot give a 128-bit access.
     pub fn dmb_ishld(&mut self) {
-        self.emit(0xd503_39bf);
+        self.put(0xd503_39bf, Writes::Nothing);
     }
 }
 
@@ -1084,7 +1254,7 @@ mod encoding_tests {
     type EncodeCase = (&'static str, fn(&mut Asm), &'static [u32]);
 
     fn nop(a: &mut Asm) {
-        a.emit(NOP_WORD);
+        a.nop();
     }
 
     fn assemble(build: impl FnOnce(&mut Asm)) -> Vec<u32> {

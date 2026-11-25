@@ -14,6 +14,7 @@
 //! that one.
 
 use super::diff_tests::*;
+use crate::testkit::*;
 
 /// The non-canonical addresses below fault with #GP(0), or #SS(0) for a stack access.
 const GENERAL_PROTECTION: u8 = 13;
@@ -151,5 +152,94 @@ fn chained_blocks_read_what_their_predecessor_wrote() {
     check(&[
         0x48, 0xc7, 0xc3, 0x01, 0x00, 0x00, 0x00, 0xeb, 0x00, 0x48, 0x01, 0xdb, 0xe8, 0x04, 0x00,
         0x00, 0x00, 0x48, 0x01, 0xc3, 0xf4, 0x48, 0x8d, 0x43, 0x07, 0xc3,
+    ]);
+}
+
+/// The handler of a fault taken in the middle of a block runs on the pushed frame and reads the
+/// registers the block had written by then: the exit stub stored them to `Cpu` before the run loop
+/// delivered the exception through the IDT.
+#[test]
+fn a_fault_delivered_through_the_idt_shows_the_handler_the_registers_written_before_it() {
+    use crate::cpu::test_support::{Gate, install_idt, read_frame, set_gate};
+    const HANDLER_OFFSET: usize = 0x40;
+    const SAVED: u64 = SCRATCH + 0x500;
+    // mov rax, 0x1234; mov rbx, 0x5678; sub rsp, 0x40; mov rdx, 1 << 63; mov [rdx], rax; hlt
+    let mut code = vec![
+        0x48, 0xc7, 0xc0, 0x34, 0x12, 0x00, 0x00, 0x48, 0xc7, 0xc3, 0x78, 0x56, 0x00, 0x00, 0x48,
+        0x83, 0xec, 0x40, 0x48, 0xba, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x48, 0x89,
+        0x02, 0xf4,
+    ];
+    code.resize(HANDLER_OFFSET, 0x90);
+    // handler: mov [SAVED], rax; mov [SAVED + 8], rbx; mov [SAVED + 16], rsp; hlt
+    code.extend_from_slice(&[
+        0x48, 0x89, 0x04, 0x25, 0x00, 0x05, 0x40, 0x00, 0x48, 0x89, 0x1c, 0x25, 0x08, 0x05, 0x40,
+        0x00, 0x48, 0x89, 0x24, 0x25, 0x10, 0x05, 0x40, 0x00, 0xf4,
+    ]);
+    let run = |jit: bool| {
+        let mut harness = Harness::new(&code);
+        install_idt(&mut harness);
+        set_gate(
+            &mut harness,
+            GENERAL_PROTECTION,
+            Gate::interrupt(CODE_BASE + HANDLER_OFFSET as u64),
+        );
+        if jit && !harness.enable_jit() {
+            return None;
+        }
+        let stop = harness.run_delivering(1000);
+        assert_eq!(stop, Stop::Halted, "{}", harness.cpu.dump_regs());
+        Some(harness)
+    };
+    let oracle = run(false).unwrap();
+    let Some(jitted) = run(true) else {
+        return;
+    };
+    assert!(jitted.cpu.jit.as_ref().unwrap().stats().translated > 0);
+    for harness in [&oracle, &jitted] {
+        assert_eq!(harness.read_u64(SAVED), 0x1234, "rax in the handler");
+        assert_eq!(harness.read_u64(SAVED + 8), 0x5678, "rbx in the handler");
+        let handler_rsp = harness.read_u64(SAVED + 16);
+        let frame = read_frame(harness, handler_rsp, true);
+        assert_eq!(frame.rsp, STACK_TOP - 0x40, "the rsp the block had lowered");
+        assert_eq!(frame.error_code, Some(0));
+    }
+    assert_eq!(jitted.snapshot(), oracle.snapshot());
+    assert!(jitted.cpu.ram[0..] == oracle.cpu.ram[0..], "RAM differs");
+}
+
+/// `cpuid` always runs in the interpreter (`helper_exec`): it reads eax and ecx the block just
+/// wrote and writes all four, which the block's later inline instructions then read.
+#[test]
+fn an_interpreted_cpuid_reads_and_writes_the_pinned_registers() {
+    // mov eax, 7; xor ecx, ecx; mov rbx, -1; mov rdx, -1; cpuid; add rax, rbx; xor rsi, rdx;
+    // lea rdi, [rcx + rax]; hlt
+    check(&[
+        0xb8, 0x07, 0x00, 0x00, 0x00, 0x31, 0xc9, 0x48, 0xc7, 0xc3, 0xff, 0xff, 0xff, 0xff, 0x48,
+        0xc7, 0xc2, 0xff, 0xff, 0xff, 0xff, 0x0f, 0xa2, 0x48, 0x01, 0xd8, 0x48, 0x31, 0xd6, 0x48,
+        0x8d, 0x3c, 0x01, 0xf4,
+    ]);
+}
+
+/// Conditions the host flags cannot express call `helper_cond` (parity here), and rotates by an
+/// immediate merge CF/OF through `helper_set_rotate_flags`: both are Rust calls in the middle of a
+/// block, around which the pinned registers must survive.
+#[test]
+fn registers_survive_the_flag_helpers() {
+    // mov rax, 3; add rax, rbx; setp cl; mov rsi, rax; rol rdx, 5; jp 1f; inc rdi; 1: adc rdi,
+    // rsi; hlt
+    check(&[
+        0x48, 0xc7, 0xc0, 0x03, 0x00, 0x00, 0x00, 0x48, 0x01, 0xd8, 0x0f, 0x9a, 0xc1, 0x48, 0x89,
+        0xc6, 0x48, 0xc1, 0xc2, 0x05, 0x7a, 0x03, 0x48, 0xff, 0xc7, 0x48, 0x11, 0xf7, 0xf4,
+    ]);
+}
+
+/// The first access to a page goes through the slow path (the load or store thunk and its Rust
+/// helper) between inline register writes.
+#[test]
+fn registers_survive_a_slow_path_load_and_store() {
+    // mov rax, 9; mov rcx, [rbx]; add rcx, rax; mov [rsi], rcx; lea rdx, [rcx + rax]; hlt
+    check(&[
+        0x48, 0xc7, 0xc0, 0x09, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x0b, 0x48, 0x01, 0xc1, 0x48, 0x89,
+        0x0e, 0x48, 0x8d, 0x14, 0x01, 0xf4,
     ]);
 }
