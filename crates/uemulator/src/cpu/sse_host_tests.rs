@@ -479,11 +479,15 @@ fn fused_and_sums_at_the_range_edges_match_the_soft_engine() {
 
 /// `Cpu::exec`'s shortcut for the register forms (`exec_sse_float_register`) against the path it
 /// skips (`Cpu::sse`, then `rip` moved on): the same xmm registers, MXCSR, rip and exception, with
-/// exceptions unmasked, CR4.OSXMMEXCPT both ways and CR0.TS set; and no answer for memory forms.
+/// exceptions unmasked, CR4.OSXMMEXCPT both ways and CR0.TS set, on low and REX registers and with the
+/// destination as the source; and no answer for memory forms or a lock prefix.
 #[test]
 fn the_register_form_shortcut_matches_the_legacy_kernel() {
     use crate::cpu::sys::{CR0_TS, CR4_OSXMMEXCPT};
     const MODRM_XMM0_XMM1: u8 = 0xc1;
+    const MODRM_XMM0_XMM0: u8 = 0xc0;
+    const REX_R_B: u8 = 0x45;
+    const LOCK: u8 = 0xf0;
     const MODRM_XMM0_MEMORY: u8 = 0x06;
     let mut harness = crate::testkit::Harness::new(&[0xf4]);
     let cpu = &mut harness.cpu;
@@ -498,13 +502,27 @@ fn the_register_form_shortcut_matches_the_legacy_kernel() {
     let start = cpu.rip;
     for opcode in [0x51, 0x58, 0x59, 0x5c, 0x5d, 0x5e, 0x5f] {
         for prefix in [None, Some(0x66), Some(0xf3), Some(0xf2), Some(0x66f3)] {
-            let mut bytes: Vec<u8> = match prefix {
+            let prefixes: Vec<u8> = match prefix {
                 None => vec![],
                 Some(0x66f3) => vec![0x66, 0xf3],
                 Some(byte) => vec![byte as u8],
             };
-            bytes.extend([0x0f, opcode, MODRM_XMM0_XMM1]);
-            let insn = crate::cpu::decode::decode(&bytes).unwrap();
+            let encode = |rex: Option<u8>, modrm: u8| {
+                let mut bytes = prefixes.clone();
+                bytes.extend(rex);
+                bytes.extend([0x0f, opcode, modrm]);
+                bytes
+            };
+            let bytes = encode(None, MODRM_XMM0_XMM1);
+            let encodings = [
+                bytes.clone(),
+                encode(Some(REX_R_B), MODRM_XMM0_XMM1),
+                encode(None, MODRM_XMM0_XMM0),
+            ];
+            let mut locked = vec![LOCK];
+            locked.extend(&bytes);
+            let locked_insn = crate::cpu::decode::decode(&locked).unwrap();
+            assert!(cpu.exec_sse_float_register(&locked_insn).is_none());
             let mut memory_form = bytes.clone();
             *memory_form.last_mut().unwrap() = MODRM_XMM0_MEMORY;
             let memory_insn = crate::cpu::decode::decode(&memory_form).unwrap();
@@ -516,6 +534,8 @@ fn the_register_form_shortcut_matches_the_legacy_kernel() {
             };
             let edges = edge_values(format);
             for case in 0..CASES / 8 {
+                let encoding = &encodings[case % encodings.len()];
+                let insn = crate::cpu::decode::decode(encoding).unwrap();
                 let (mut a, mut b) = (0u128, 0u128);
                 for k in 0..format.lanes() {
                     let first = random_value(format, &mut rng, &edges);
@@ -543,24 +563,24 @@ fn the_register_form_shortcut_matches_the_legacy_kernel() {
                             cpu.cr0 &= !CR0_TS;
                         }
                         let reset = |cpu: &mut Cpu| {
-                            cpu.xmm[0] = a;
-                            cpu.xmm[1] = b;
+                            cpu.xmm[insn.reg as usize] = a;
+                            cpu.xmm[insn.rm as usize] = b;
                             cpu.mxcsr = mxcsr;
                             cpu.rip = start;
                         };
                         reset(cpu);
                         let fast = cpu.exec_sse_float_register(&insn).unwrap();
-                        let fast_state = (cpu.xmm[0], cpu.xmm[1], cpu.mxcsr, cpu.rip);
+                        let fast_state = (cpu.xmm, cpu.mxcsr, cpu.rip);
                         reset(cpu);
                         let legacy = cpu.sse(&insn, start + insn.len as u64).map(|handled| {
                             assert!(handled);
                             cpu.rip = start + insn.len as u64;
                         });
-                        let legacy_state = (cpu.xmm[0], cpu.xmm[1], cpu.mxcsr, cpu.rip);
+                        let legacy_state = (cpu.xmm, cpu.mxcsr, cpu.rip);
                         assert_eq!(
                             (format!("{fast:?}"), fast_state),
                             (format!("{legacy:?}"), legacy_state),
-                            "{bytes:x?} {a:#x} {b:#x} mxcsr {mxcsr:#x}"
+                            "{encoding:x?} {a:#x} {b:#x} mxcsr {mxcsr:#x}"
                         );
                     }
                 }
