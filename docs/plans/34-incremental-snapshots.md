@@ -47,9 +47,9 @@ u32 CRC-32 of everything before it
 
 ## Checkpoints
 
-`StopHandle::checkpoint(sink, done)`: the request goes in a queue and raises the stop flag. `Vcpu::run_once` now loops: when the vCPUs come back `Stopped` and the stop was not a real one (`HostRequests::ended`, set by `stop()` and `suspend()` before the flag), it writes each pending checkpoint and runs them again (`run_vcpus`: threaded, time-shared with the active vCPU kept, or the one).
+`StopHandle::checkpoint(sink, done)`: the request goes in a queue and raises the stop flag, both under the queue's lock. `Vcpu::run_once` now loops: when the vCPUs come back `Stopped` and the stop was not a real one (`HostRequests::ended`, set by `stop()` and `suspend()` before the flag), it writes the pending checkpoints, and lowers the stop under the same lock only once the queue is empty, so a request made while one is written (from its `done`, or the timer and a key at once) is taken too, as its child. Then it runs the vCPUs again (`run_vcpus`: threaded, time-shared with the active vCPU kept, or the one). A machine that ended, or runs `verify_jit` or a BIOS disk boot, answers requests at once with an error (`HostRequests::closed`).
 
-A checkpoint (`Vcpu::checkpoint`): refuse if a vCPU thread died; with the check on, compare RAM; `save(SaveKind::Checkpoint)`, a delta against the log's parent or full without one; undo `save`'s PMU parking (`unpark_after_save`: only what `save` parked; time-shared the inactive ones stay parked by the scheduler); put the wall clock back where the guest left it, so the pause is not guest time; and only on success arm the log against the new id. A failed checkpoint changes nothing, and the next delta is against the last one that was written. `done` gets the header or the error. Requests that meet a stop, a reset or a shutdown are answered with an error, and a stop raised only for them is cleared so it does not end the next boot.
+A checkpoint (`Vcpu::checkpoint`): refuse if a vCPU thread died; with the check on, compare RAM; `save(SaveKind::Checkpoint)`, a delta against the log's parent or full without one; undo `save`'s PMU parking (`unpark_after_save`: only what `save` parked, which it does first so that a save failing early is undone too; time-shared the inactive ones stay parked by the scheduler); take the pause out of guest time (`WallClock::skip_pause_since`); and only on success arm the log against the new id. A failed checkpoint changes nothing, and the next delta is against the last one that was written. `done` gets the header or the error. Requests that meet a stop, a reset or a shutdown are answered with an error, and a stop raised only for them is cleared so it does not end the next boot. A vCPU thread that died ends the run with `Internal`.
 
 Re-running the vCPUs: `run_threaded` builds new links and hands the host poll hook back to vCPU 0; every vCPU's decode cache generation is bumped first, because a vCPU that left on `ATTENTION_EXIT` may not have drained the invalidations published just before.
 
@@ -66,6 +66,9 @@ A checkpoint is only meaningful with the disks as they were (`29-snapshots.md`, 
 - `--checkpoint-dir DIR` (on `advanced boot` and `quick boot`): Ctrl-] then `c` takes a checkpoint; Ctrl-] then any other key stops (or suspends, with `--suspend-to`) as before. `--checkpoint-every SECS` takes them on a timer. Each is `DIR/NNNN.checkpoint` with `NNNN.disk-K` and `NNNN.nvram` beside it; the CLI prints its kind, size and time. Numbers only grow, so a branch taken after going back never overwrites another.
 - `--resume-from DIR/NNNN.checkpoint` finds the chain by the ids in the headers of the checkpoints in DIR, copies NNNN's disks and nvram back, resumes, and keeps every file; its checkpoints go on in DIR as deltas of NNNN. Any other `--resume-from FILE` is a suspend's snapshot and is deleted as before.
 - On APFS (and Linux file systems with reflinks) `fs::copy` clones, so a disk copy costs nothing until either side is written.
+- Going back replaces the machine's disks and nvram as they are with the checkpoint's copies (every copy is checked to exist first). That happens before the library reads the chain, so a chain that then fails its CRC has still put the old disks back; the checkpoint's own files are untouched either way.
+- The copies are by position among the writable disks (`disk-K`): give the same disks in the same order, as for any resume.
+- Refused: `--checkpoint-every 0`, checkpoints with `--verify`, and `--suspend-to` a `.checkpoint` name. Numbers are handed out by the process, so two checkpoints asked for at once get two numbers.
 
 ## Measured
 
@@ -95,3 +98,4 @@ The time is what the host sees from the request to `done`, so it includes the vC
 - Compression runs on the vCPU thread, one page at a time, single-threaded.
 - Restoring a chain reads every link's CPU and device state; only the last one's counts. Long chains (hundreds) are slow to resume; nothing merges them.
 - The CLI copies whole disk files; on a file system without clones that is a full copy per checkpoint. Read-only disks and http-backed bases are not copied (they cannot change).
+- `quick boot NAME --resume-from DIR/NNNN.checkpoint` decides between the installer and the disk before the disk is put back; the resume is right, but a guest reboot afterwards may boot the other one.

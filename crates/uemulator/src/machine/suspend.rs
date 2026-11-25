@@ -87,18 +87,7 @@ pub(super) fn save(
     sink: &mut dyn SnapshotSink,
     kind: SaveKind,
 ) -> Result<SnapshotInfo, SnapshotError> {
-    #[cfg(not(freestanding))]
-    if cpus.iter().any(|cpu| cpu.bios.is_some()) {
-        return Err(error("a BIOS disk boot keeps BIOS state on the host"));
-    }
-    {
-        let mut devices = cpus[active].dev.lock();
-        if let Some(reason) = devices.snapshot_blocker() {
-            return Err(error(reason));
-        }
-        devices.flush_storage().map_err(error)?;
-    }
-    let guest_ns = cpus[active].now_ns();
+    // First, before anything can fail: `unpark_after_save` undoes it whatever happens next.
     if threaded {
         for cpu in cpus.iter_mut() {
             cpu.pmu_park();
@@ -113,6 +102,18 @@ pub(super) fn save(
             }
         }
     }
+    #[cfg(not(freestanding))]
+    if cpus.iter().any(|cpu| cpu.bios.is_some()) {
+        return Err(error("a BIOS disk boot keeps BIOS state on the host"));
+    }
+    {
+        let mut devices = cpus[active].dev.lock();
+        if let Some(reason) = devices.snapshot_blocker() {
+            return Err(error(reason));
+        }
+        devices.flush_storage().map_err(error)?;
+    }
+    let guest_ns = cpus[active].now_ns();
     let log = cpus[active].page_has_code.dirty_log();
     let parent = match kind {
         SaveKind::Full => None,
@@ -168,7 +169,9 @@ pub(super) fn unpark_after_save(cpus: &mut [Cpu], active: usize, threaded: bool)
 /// the host's time where it has one. Two branches taken from one checkpoint on the virtual clock
 /// can reach the same guest state; the host time keeps their ids apart.
 fn new_id(cpus: &[Cpu], active: usize, guest_ns: u64, parent: Option<SnapshotId>) -> SnapshotId {
-    let mut state = 0x7565_6d75_736e_6170u64; // "uemusnap"
+    /// Any fixed start; these are the bytes of "uemusnap".
+    const ID_SEED: u64 = 0x7565_6d75_736e_6170;
+    let mut state = ID_SEED;
     let mut mix = |value: u64| {
         state = splitmix64(state ^ value);
     };
@@ -198,10 +201,15 @@ fn new_id(cpus: &[Cpu], active: usize, guest_ns: u64, parent: Option<SnapshotId>
     SnapshotId(id)
 }
 
+/// SplitMix64's output step (Steele, Lea and Flood, "Fast splittable pseudorandom number
+/// generators", 2014): its constants are the published ones.
 fn splitmix64(mut value: u64) -> u64 {
-    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    const GOLDEN_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
+    const MIX_1: u64 = 0xbf58_476d_1ce4_e5b9;
+    const MIX_2: u64 = 0x94d0_49bb_1331_11eb;
+    value = value.wrapping_add(GOLDEN_GAMMA);
+    value = (value ^ (value >> 30)).wrapping_mul(MIX_1);
+    value = (value ^ (value >> 27)).wrapping_mul(MIX_2);
     value ^ (value >> 31)
 }
 

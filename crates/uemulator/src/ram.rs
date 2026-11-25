@@ -579,7 +579,7 @@ impl DirtyLog {
     }
 
     /// No parent: the next snapshot is a full one.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn disarm(&self) {
         self.armed.store(false, Ordering::SeqCst);
     }

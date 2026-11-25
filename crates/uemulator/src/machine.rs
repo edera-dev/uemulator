@@ -703,7 +703,7 @@ pub struct StopHandle {
 }
 
 /// Called once a checkpoint is written (or could not be): its header, or why not.
-pub type CheckpointDone = Box<dyn FnOnce(Result<SnapshotInfo, SnapshotError>) + Send>;
+type CheckpointDone = Box<dyn FnOnce(Result<SnapshotInfo, SnapshotError>) + Send>;
 
 struct CheckpointRequest {
     sink: Box<dyn SnapshotSink>,
@@ -717,7 +717,12 @@ struct HostRequests {
     /// Raised with `stop` by `stop()` and `suspend()`; never cleared.
     ended: AtomicBool,
     suspend: AtomicBool,
+    /// Pending checkpoints. Pushed and drained under the lock together with raising and lowering
+    /// `stop`, so a request is never left waiting with the stop lowered.
     checkpoints: Mutex<Vec<CheckpointRequest>>,
+    /// No checkpoint can be taken: the machine ended, or it runs `verify_jit` or a BIOS disk
+    /// boot. Requests are answered at once.
+    closed: AtomicBool,
 }
 
 impl HostRequests {
@@ -733,6 +738,35 @@ impl HostRequests {
         for request in pending {
             (request.done)(Err(SnapshotError(why.into())));
         }
+    }
+
+    /// The pending checkpoints, or `None` once there are none, having lowered the stop they
+    /// raised (raised again if a real stop came in meanwhile: `ended` is set before it).
+    fn take_or_resume(&self, stop: &AtomicBool) -> Option<Vec<CheckpointRequest>> {
+        let mut pending = self.checkpoints.lock().unwrap();
+        if pending.is_empty() {
+            stop.store(false, Ordering::SeqCst);
+            if self.ended.load(Ordering::SeqCst) {
+                stop.store(true, Ordering::SeqCst);
+            }
+            return None;
+        }
+        Some(core::mem::take(&mut *pending))
+    }
+
+    /// After a run: a stop raised only for checkpoints must not end the next boot.
+    fn lower_stop_unless_ended(&self, stop: &AtomicBool) {
+        let _pending = self.checkpoints.lock().unwrap();
+        stop.store(false, Ordering::SeqCst);
+        if self.ended.load(Ordering::SeqCst) {
+            stop.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// The machine is gone: later requests are refused, pending ones answered.
+    fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.refuse_checkpoints("the machine has ended");
     }
 }
 
@@ -764,15 +798,22 @@ impl StopHandle {
         sink: impl SnapshotSink + 'static,
         done: impl FnOnce(Result<SnapshotInfo, SnapshotError>) + Send + 'static,
     ) {
-        self.requests
-            .checkpoints
-            .lock()
-            .unwrap()
-            .push(CheckpointRequest {
-                sink: Box::new(sink),
-                done: Box::new(done),
-            });
-        self.stop.store(true, Ordering::SeqCst);
+        {
+            let mut pending = self.requests.checkpoints.lock().unwrap();
+            if !self.requests.closed.load(Ordering::SeqCst) {
+                pending.push(CheckpointRequest {
+                    sink: Box::new(sink),
+                    done: Box::new(done),
+                });
+                self.stop.store(true, Ordering::SeqCst);
+                return;
+            }
+        }
+        done(Err(SnapshotError(
+            "this machine takes no checkpoints: it has ended, or runs verify_jit or a BIOS disk \
+             boot"
+                .into(),
+        )));
     }
 }
 
@@ -1156,7 +1197,14 @@ struct Finished {
 
 impl Vcpu {
     /// Boots, and boots again after every guest reset while `reboot` is set.
-    fn run(mut self) -> ExitReason {
+    fn run(self) -> ExitReason {
+        let requests = self.requests.clone();
+        let reason = self.run_boots();
+        requests.close();
+        reason
+    }
+
+    fn run_boots(mut self) -> ExitReason {
         loop {
             let (reason, finished) = self.run_once();
             let (ExitReason::Reset, Some(image)) = (&reason, &self.reboot) else {
@@ -1273,6 +1321,9 @@ impl Vcpu {
         }
     }
 
+    /// How many of the pages `check_dirty_tracking` found unmarked a failed checkpoint names.
+    const MISSED_PAGES_NAMED: usize = 16;
+
     /// Writes one checkpoint of the stopped machine to `sink`, and on success starts the dirty
     /// log's next generation against it (`StopHandle::checkpoint`).
     fn checkpoint(
@@ -1283,7 +1334,10 @@ impl Vcpu {
         sink: &mut dyn SnapshotSink,
         armed_copy: &mut Option<GuestRam>,
     ) -> Result<SnapshotInfo, SnapshotError> {
-        if cpus.len() != cpus[active].cpu_count as usize {
+        if cpus
+            .get(active)
+            .is_none_or(|cpu| cpus.len() != cpu.cpu_count as usize)
+        {
             return Err(SnapshotError("a vCPU thread ended abnormally".into()));
         }
         if let Some(copy) = armed_copy.as_ref() {
@@ -1292,7 +1346,7 @@ impl Vcpu {
             if !missed.is_empty() {
                 let pages: Vec<String> = missed
                     .iter()
-                    .take(16)
+                    .take(Self::MISSED_PAGES_NAMED)
                     .map(|page| format!("{:#x}", page << crate::cpu::PAGE_SHIFT))
                     .collect();
                 return Err(SnapshotError(format!(
@@ -1307,7 +1361,7 @@ impl Vcpu {
         let saved = suspend::save(cpus, active, threaded, sink, SaveKind::Checkpoint);
         suspend::unpark_after_save(cpus, active, threaded);
         if let Some(wall) = &cpus[active].wall_clock {
-            wall.resume_at(paused_at);
+            wall.skip_pause_since(paused_at);
         }
         let info = saved?;
         suspend::arm_dirty_log(cpus, info.id);
@@ -1427,10 +1481,17 @@ impl Vcpu {
                     uart_console,
                 );
                 twin.rng_state = cpu.rng_state;
-                cpu.run_verify(&mut twin)
+                let reason = cpu.run_verify(&mut twin);
+                // `verify_jit` refuses checkpoints (`HostRequests::closed`); one that slipped in
+                // before must not end the next boot.
+                self.requests
+                    .refuse_checkpoints("the machine stopped before the checkpoint");
+                self.requests.lower_stop_unless_ended(&self.stop);
+                reason
             }
             _ => {
                 let threaded = cpu.cpu_count > 1 && self.runs_on_threads(&cpu);
+                let cpu_count = cpu.cpu_count as usize;
                 // Every vCPU exists before anything runs, so a resume can load each one.
                 let mut cpus = if cpu.cpu_count > 1 {
                     crate::cpu::smp::secondary_cpus(cpu)
@@ -1469,39 +1530,40 @@ impl Vcpu {
                             reason
                         }
                     };
-                    if reason == ExitReason::Stopped && !self.requests.ended.load(Ordering::SeqCst)
-                    {
-                        let pending =
-                            core::mem::take(&mut *self.requests.checkpoints.lock().unwrap());
-                        if !pending.is_empty() {
-                            for request in pending {
-                                let mut sink = request.sink;
-                                let result = self.checkpoint(
+                    if reason != ExitReason::Stopped || self.requests.ended.load(Ordering::SeqCst) {
+                        break reason;
+                    }
+                    // Only `checkpoint` raises the stop without `ended`, and it does so with its
+                    // request queued under the same lock: so there is work here, and requests
+                    // that arrive while it is written are drained before the stop is lowered.
+                    let mut lost_a_vcpu = false;
+                    while let Some(batch) = self.requests.take_or_resume(&self.stop) {
+                        for request in batch {
+                            let mut sink = request.sink;
+                            let result = if lost_a_vcpu {
+                                Err(SnapshotError("a vCPU thread ended abnormally".into()))
+                            } else {
+                                self.checkpoint(
                                     &mut cpus,
                                     active,
                                     threaded,
                                     &mut *sink,
                                     &mut armed_copy,
-                                );
-                                (request.done)(result);
-                            }
-                            // A stop that came in meanwhile stays: `ended` is set first.
-                            self.stop.store(false, Ordering::SeqCst);
-                            if self.requests.ended.load(Ordering::SeqCst) {
-                                self.stop.store(true, Ordering::SeqCst);
-                            }
-                            continue;
+                                )
+                            };
+                            lost_a_vcpu |= cpus.len() != cpu_count;
+                            (request.done)(result);
                         }
                     }
-                    break reason;
+                    if lost_a_vcpu {
+                        break ExitReason::Internal("a vCPU thread ended abnormally".into());
+                    }
                 };
                 // Whatever ended the run, the checkpoints asked for meanwhile will not happen,
                 // and a stop raised only for them must not end the next boot.
                 self.requests
                     .refuse_checkpoints("the machine stopped before the checkpoint");
-                if !self.requests.ended.load(Ordering::SeqCst) {
-                    self.stop.store(false, Ordering::SeqCst);
-                }
+                self.requests.lower_stop_unless_ended(&self.stop);
                 let reason = match (&reason, self.suspend_to.as_deref_mut()) {
                     (ExitReason::Stopped, Some(sink))
                         if self.requests.suspend.load(Ordering::SeqCst) =>
@@ -1928,6 +1990,9 @@ impl EmulatedMachine {
             });
         let stop = Arc::new(AtomicBool::new(false));
         let requests = Arc::new(HostRequests::default());
+        if cfg.verify || cfg.boot_disk {
+            requests.closed.store(true, Ordering::SeqCst);
+        }
         Ok(Self {
             vcpu: Some(Vcpu {
                 ram,

@@ -14,6 +14,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use uemulator::{
@@ -59,6 +60,9 @@ impl MachineFiles {
 
     /// Puts the machine's files back as `checkpoint` had them, before anything opens them. A
     /// file without a copy is an error: the checkpoint was taken with other disks.
+    ///
+    /// Going back replaces the disks as they are now: that is what a revert is. Every copy is
+    /// checked first, so a checkpoint with a copy missing changes nothing.
     pub fn restore_from(&self, checkpoint: &Path) -> Result<(), String> {
         for (path, copy) in self.copies(checkpoint) {
             if !copy.is_file() {
@@ -69,6 +73,8 @@ impl MachineFiles {
                     copy.display()
                 ));
             }
+        }
+        for (path, copy) in self.copies(checkpoint) {
             copy_file(&copy, path)?;
         }
         Ok(())
@@ -144,6 +150,21 @@ pub fn sources(checkpoint: &Path) -> Result<Vec<Box<dyn SnapshotSource>>, String
         .collect()
 }
 
+/// The next number this process hands out, once a scan of the directory set it. A checkpoint
+/// asked for while another is still being written (the timer and Ctrl-] c) has no file yet for
+/// the scan to see, so the numbers come from here, not from the directory each time.
+static NEXT_NUMBER: Mutex<Option<u32>> = Mutex::new(None);
+
+fn reserve_number(directory: &Path) -> Result<u32, String> {
+    let mut next = NEXT_NUMBER.lock().unwrap();
+    let number = match *next {
+        Some(number) => number,
+        None => next_number(directory)?,
+    };
+    *next = Some(number + 1);
+    Ok(number)
+}
+
 /// The next unused number in `directory`.
 fn next_number(directory: &Path) -> Result<u32, String> {
     let mut highest = 0;
@@ -196,7 +217,7 @@ impl SnapshotSink for CheckpointSink {
 pub fn take(handle: &StopHandle, directory: &Path, files: &MachineFiles) {
     let number = match fs::create_dir_all(directory)
         .map_err(|e| e.to_string())
-        .and_then(|()| next_number(directory))
+        .and_then(|()| reserve_number(directory))
     {
         Ok(number) => number,
         Err(why) => {
@@ -222,7 +243,7 @@ pub fn take(handle: &StopHandle, directory: &Path, files: &MachineFiles) {
                 "\r\ncheckpoint {} ({kind}, id {}): {:.1} MB in {} ms\r\n",
                 path.display(),
                 short(info.id),
-                bytes as f64 / 1e6,
+                bytes as f64 / BYTES_PER_MB,
                 started.elapsed().as_millis()
             );
         }
@@ -230,8 +251,12 @@ pub fn take(handle: &StopHandle, directory: &Path, files: &MachineFiles) {
     });
 }
 
+/// Enough of an id to tell checkpoints apart in a message.
+const SHORT_ID_DIGITS: usize = 12;
+const BYTES_PER_MB: f64 = 1e6;
+
 fn short(id: SnapshotId) -> String {
-    id.to_string()[..12].to_string()
+    id.to_string()[..SHORT_ID_DIGITS].to_string()
 }
 
 #[cfg(test)]

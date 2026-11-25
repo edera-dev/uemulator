@@ -29,6 +29,14 @@ const HASH_MULTIPLIER: u32 = 2_654_435_761;
 /// After this many misses in a row the search steps faster through incompressible data (what
 /// LZ4 calls acceleration), so a page of random bytes costs little more than a copy.
 const SKIP_SHIFT: u32 = 5;
+/// A table entry is the generation it was written in, shifted up by this, or'd with the
+/// position: positions fit in 16 bits because a page is at most 64 KiB.
+const GENERATION_SHIFT: u32 = 16;
+const POSITION_MASK: u32 = (1 << GENERATION_SHIFT) - 1;
+/// Generations wrap here (then the table is cleared once).
+const GENERATION_MASK: u32 = u32::MAX >> GENERATION_SHIFT;
+/// Longer than any page by far: a run of 255 length bytes past it is damage.
+const MAX_DECODED_LENGTH: usize = 1 << 20;
 
 /// Reusable compressor state: the hash table of recent positions. Entries carry the generation
 /// they were written in, so a new page starts with an empty table without clearing it.
@@ -51,13 +59,13 @@ impl Compressor {
     pub fn compress(&mut self, input: &[u8], output: &mut Vec<u8>, limit: usize) -> bool {
         debug_assert!(input.len() <= u16::MAX as usize + 1);
         output.clear();
-        // Positions are stored as generation << 16 | position, so 65535 pages per clear.
-        self.generation = self.generation.wrapping_add(1) & 0xffff;
+        // 65535 pages per clear of the table.
+        self.generation = self.generation.wrapping_add(1) & GENERATION_MASK;
         if self.generation == 0 {
             self.table.fill(0);
             self.generation = 1;
         }
-        let tag = self.generation << 16;
+        let tag = self.generation << GENERATION_SHIFT;
         let length = input.len();
         let mut literal_start = 0;
         let mut position = 0;
@@ -68,8 +76,10 @@ impl Compressor {
             let slot = (word.wrapping_mul(HASH_MULTIPLIER) >> (32 - HASH_BITS)) as usize;
             let entry = self.table[slot];
             self.table[slot] = tag | position as u32;
-            let candidate = (entry & 0xffff) as usize;
-            if entry & !0xffff != tag || candidate >= position || read_u32(input, candidate) != word
+            let candidate = (entry & POSITION_MASK) as usize;
+            if entry & !POSITION_MASK != tag
+                || candidate >= position
+                || read_u32(input, candidate) != word
             {
                 misses += 1;
                 position += 1 + (misses >> SKIP_SHIFT) as usize;
@@ -187,10 +197,9 @@ fn read_length(input: &[u8], read: &mut usize) -> Result<usize, Corrupt> {
     loop {
         let byte = *input.get(*read).ok_or(Corrupt)? as usize;
         *read += 1;
-        // No page is anywhere near this long; a run of 255s is damage, not a length.
         total = total
             .checked_add(byte)
-            .filter(|&t| t <= 1 << 20)
+            .filter(|&total| total <= MAX_DECODED_LENGTH)
             .ok_or(Corrupt)?;
         if byte != LENGTH_BYTE_MORE {
             return Ok(total);

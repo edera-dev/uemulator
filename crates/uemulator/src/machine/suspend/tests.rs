@@ -596,6 +596,34 @@ fn a_failed_checkpoint_leaves_the_machine_running_and_the_chain_intact() {
     assert_eq!(running.output(), reference_output(JitMode::Off));
 }
 
+/// A checkpoint asked for from the callback of the one before (so while the machine is paused
+/// for it) is taken too, as its child, and the machine runs on to its result.
+#[test]
+fn a_checkpoint_asked_for_while_one_is_written_is_taken_too() {
+    let mut running = start(config(&CHECKSUM_GUEST, JitMode::Off));
+    running.wait_for(STARTED);
+    let (answer, answered) = std::sync::mpsc::channel();
+    let handle = running.handle.clone();
+    let second_answer = answer.clone();
+    running.handle.checkpoint(Shared::default(), move |first| {
+        handle.checkpoint(Shared::default(), move |second| {
+            second_answer.send(second).unwrap()
+        });
+        answer.send(first).unwrap();
+    });
+    let first = answered.recv_timeout(LIMIT).unwrap().unwrap();
+    let second = answered.recv_timeout(LIMIT).unwrap().unwrap();
+    assert_eq!(second.parent, Some(first.id));
+    assert_eq!(running.machine.wait(), ExitReason::Shutdown);
+    assert_eq!(running.output(), reference_output(JitMode::Off));
+    // And one asked for once the machine is gone is answered at once.
+    let (answer, answered) = std::sync::mpsc::channel();
+    running.handle.checkpoint(Shared::default(), move |result| {
+        answer.send(result).unwrap()
+    });
+    assert!(answered.recv_timeout(LIMIT).unwrap().is_err());
+}
+
 /// A checkpoint asked for while the machine stops is answered, with an error, and the stop is a
 /// stop.
 #[test]

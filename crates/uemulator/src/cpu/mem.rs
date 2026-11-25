@@ -1093,7 +1093,7 @@ impl Cpu {
         if self.ram.contains(pa, len as u64) {
             // Physical writers (the VMCB, AVIC backing pages, shadow stacks) come here without
             // `translate`; a store through it was marked there already.
-            self.page_has_code.dirty_log().mark(start >> PAGE_SHIFT);
+            self.page_has_code.dirty_log().mark_range(pa, len as u64);
             if self.ordered_memory {
                 // Store first, then look at the flag: a vCPU that flags the page and decodes it
                 // after our check must see these bytes, and one that flagged it before is seen

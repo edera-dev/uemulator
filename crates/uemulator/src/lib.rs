@@ -62,9 +62,9 @@ pub use gpu::{GpuBox, GpuCapset, GpuCommand, GpuLimits, GpuLink, GpuResource};
 pub use kv::FileKeyValueStore;
 pub use kv::{KeyValueError, KeyValueLog, KeyValueStore, LogKeyValueStore, MemoryKeyValueStore};
 pub use machine::{
-    CheckpointDone, ClockMode, ConsoleKind, DEFAULT_HYPERVISOR_CMDLINE, DisplayMode,
-    EmulatedMachine, Error, ExitReason, JitMode, MAX_MEMORY_MIB, MIN_MEMORY_MIB, MachineConfig,
-    SmpMode, StopHandle, read_snapshot_info,
+    ClockMode, ConsoleKind, DEFAULT_HYPERVISOR_CMDLINE, DisplayMode, EmulatedMachine, Error,
+    ExitReason, JitMode, MAX_MEMORY_MIB, MIN_MEMORY_MIB, MachineConfig, SmpMode, StopHandle,
+    read_snapshot_info,
 };
 pub use netdev::{NetHandle, NetOffloads};
 pub use platform::{DEFAULT_CMDLINE, DEFAULT_SERIAL_CMDLINE, Platform, load_linux};

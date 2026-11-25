@@ -230,6 +230,22 @@ fn build_config(
     if runtime.checkpoint_every.is_some() && checkpoint_directory(runtime).is_none() {
         return Err("--checkpoint-every needs --checkpoint-dir".into());
     }
+    if runtime.checkpoint_every == Some(0) {
+        return Err("--checkpoint-every needs at least 1 second".into());
+    }
+    if runtime.verify && checkpoint_directory(runtime).is_some() {
+        return Err("checkpoints cannot be combined with --verify (its twin is not saved)".into());
+    }
+    if runtime
+        .suspend_to
+        .as_deref()
+        .is_some_and(checkpoints::is_checkpoint)
+    {
+        return Err(format!(
+            "--suspend-to: a .{} file is resumed as a checkpoint; use another name",
+            checkpoints::EXTENSION
+        ));
+    }
     if runtime.debug {
         cfg = cfg.log(|line| eprintln!("{line}"));
     }
