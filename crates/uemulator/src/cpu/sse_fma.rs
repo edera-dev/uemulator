@@ -38,6 +38,36 @@ pub(super) fn fused_lane(
     negate_product: bool,
     sign: FmaSign,
 ) -> u64 {
+    let [op1, op2, op3] = sources;
+    let (x, y, z) = match form {
+        FmaForm::Form132 => (op1, op3, op2),
+        FmaForm::Form213 => (op2, op1, op3),
+        FmaForm::Form231 => (op2, op3, op1),
+    };
+    // Negating x negates the product; neither negation rounds.
+    let x = if negate_product {
+        x ^ format.sign_bit()
+    } else {
+        x
+    };
+    let z = if sign == FmaSign::Subtract {
+        z ^ format.sign_bit()
+    } else {
+        z
+    };
+    super::host::fused(env, format, x, y, z)
+        .unwrap_or_else(|| soft_fused_lane(env, format, sources, form, negate_product, sign))
+}
+
+/// `fused_lane` on the soft engine alone: the oracle.
+pub(super) fn soft_fused_lane(
+    env: &mut FpEnv,
+    format: Format,
+    sources: [u64; 3],
+    form: FmaForm,
+    negate_product: bool,
+    sign: FmaSign,
+) -> u64 {
     let unpacked = sources.map(|bits| unpack(env, format, bits));
     if unpacked.iter().any(Unpacked::is_nan) {
         if unpacked.iter().any(|u| u.kind == Kind::SignalingNan) {

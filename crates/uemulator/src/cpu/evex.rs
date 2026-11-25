@@ -530,6 +530,9 @@ impl Cpu {
     /// Runs the legacy 128-bit kernel for `i` on one lane. `old` is the kernel's destination
     /// operand (vvvv for binary operations).
     fn legacy_lane(&mut self, i: &Insn, old: u128, source: u128) -> ExecResult<u128> {
+        if let Some(outcome) = self.packed_float_lane(i, old, source) {
+            return outcome;
+        }
         self.run_legacy_registers(i, old, source)
     }
 

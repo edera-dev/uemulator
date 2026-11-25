@@ -440,7 +440,7 @@ fn propagate_nan(
     Some(chosen.bits | format.quiet_bit())
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Arithmetic {
     Add,
     Subtract,
@@ -450,8 +450,21 @@ enum Arithmetic {
 }
 
 /// One lane of add/sub/mul/div/sqrt, `dest` being the destination operand and `source` the
-/// ModRM.rm one (sqrt only reads `source`).
+/// ModRM.rm one (sqrt only reads `source`): on the host FPU when `host` can prove the result, else
+/// on the soft engine.
 fn arithmetic(
+    env: &mut FpEnv,
+    format: Format,
+    operation: Arithmetic,
+    dest: u64,
+    source: u64,
+) -> u64 {
+    host::arithmetic(env, format, operation, dest, source)
+        .unwrap_or_else(|| soft_arithmetic(env, format, operation, dest, source))
+}
+
+/// `arithmetic` on the soft engine alone: the oracle.
+fn soft_arithmetic(
     env: &mut FpEnv,
     format: Format,
     operation: Arithmetic,
@@ -674,6 +687,17 @@ fn order(a: &Unpacked, b: &Unpacked) -> core::cmp::Ordering {
 /// minps/maxps and the scalar forms: when either operand is a NaN (any kind, which raises invalid)
 /// or both are zero, the second (source) operand is returned unchanged.
 fn minimum_maximum(env: &mut FpEnv, format: Format, maximum: bool, dest: u64, source: u64) -> u64 {
+    host::minimum_maximum(format, maximum, dest, source)
+        .unwrap_or_else(|| soft_minimum_maximum(env, format, maximum, dest, source))
+}
+
+fn soft_minimum_maximum(
+    env: &mut FpEnv,
+    format: Format,
+    maximum: bool,
+    dest: u64,
+    source: u64,
+) -> u64 {
     let a = unpack(env, format, dest);
     let b = unpack(env, format, source);
     if a.is_nan() || b.is_nan() {
@@ -695,6 +719,19 @@ fn minimum_maximum(env: &mut FpEnv, format: Format, maximum: bool, dest: u64, so
 /// Orders two operands for the compare instructions, `None` when unordered. `signal_quiet_nan`
 /// selects whether a QNaN (not just an SNaN) raises invalid.
 fn compare(
+    env: &mut FpEnv,
+    format: Format,
+    dest: u64,
+    source: u64,
+    signal_quiet_nan: bool,
+) -> Option<core::cmp::Ordering> {
+    match host::compare(format, dest, source) {
+        Some(ordering) => Some(ordering),
+        None => soft_compare(env, format, dest, source, signal_quiet_nan),
+    }
+}
+
+fn soft_compare(
     env: &mut FpEnv,
     format: Format,
     dest: u64,
@@ -756,6 +793,10 @@ fn compare_eflags(ordering: Option<core::cmp::Ordering>) -> u64 {
 
 /// Signed integer to float (cvtsi2ss/sd, cvtdq2ps/pd), rounded once under the current mode.
 fn int_to_float(env: &mut FpEnv, format: Format, value: i64) -> u64 {
+    host::int_to_float(env, format, value).unwrap_or_else(|| soft_int_to_float(env, format, value))
+}
+
+fn soft_int_to_float(env: &mut FpEnv, format: Format, value: i64) -> u64 {
     if value == 0 {
         return 0;
     }
@@ -775,6 +816,17 @@ fn int_to_float(env: &mut FpEnv, format: Format, value: i64) -> u64 {
 /// MXCSR.RC. NaN, infinity and out-of-range values give the "integer indefinite" (the minimum)
 /// and raise invalid; an inexact conversion raises precision.
 fn float_to_int(env: &mut FpEnv, format: Format, bits: u64, width: u32, truncate: bool) -> u64 {
+    host::float_to_int(env, format, bits, width, truncate)
+        .unwrap_or_else(|| soft_float_to_int(env, format, bits, width, truncate))
+}
+
+fn soft_float_to_int(
+    env: &mut FpEnv,
+    format: Format,
+    bits: u64,
+    width: u32,
+    truncate: bool,
+) -> u64 {
     let indefinite = 1u64 << (width - 1);
     let value = unpack(env, format, bits);
     match value.kind {
@@ -830,6 +882,10 @@ fn float_to_int(env: &mut FpEnv, format: Format, bits: u64, width: u32, truncate
 /// cvtss2sd, cvtsd2ss, cvtps2pd, cvtpd2ps for one lane. NaNs keep their payload (shifted to the
 /// new width) and are quieted.
 fn convert_float(env: &mut FpEnv, from: Format, to: Format, bits: u64) -> u64 {
+    host::convert_float(env, from, bits).unwrap_or_else(|| soft_convert_float(env, from, to, bits))
+}
+
+fn soft_convert_float(env: &mut FpEnv, from: Format, to: Format, bits: u64) -> u64 {
     let value = unpack(env, from, bits);
     match value.kind {
         Kind::QuietNan | Kind::SignalingNan => {
@@ -1457,18 +1513,7 @@ impl Cpu {
                 };
                 if matches!(prefix, Prefix::Np | Prefix::P66) {
                     let s = src!(16);
-                    let mut r = 0;
-                    for k in 0..format.lanes() {
-                        let lane = binary_operation(
-                            &mut fp,
-                            format,
-                            opcode,
-                            lane_get(dst, format, k),
-                            lane_get(s, format, k),
-                        );
-                        lane_put(&mut r, format, k, lane);
-                    }
-                    Some(r)
+                    Some(host::packed_binary(&mut fp, format, opcode, dst, s))
                 } else {
                     let s = lane_get(src!(format.bytes()), format, 0);
                     let lane =
@@ -2057,6 +2102,11 @@ pub(in crate::cpu) mod evex;
 pub(in crate::cpu) mod ext;
 #[path = "sse_fma.rs"]
 pub(in crate::cpu) mod fma;
+#[path = "sse_host.rs"]
+mod host;
+#[cfg(test)]
+#[path = "sse_host_tests.rs"]
+mod host_tests;
 
 #[cfg(test)]
 mod tests {

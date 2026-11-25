@@ -1,5 +1,6 @@
 //! Microbenchmarks of the JIT, one guest loop per cost the generators pay: register ALU, loads
-//! and stores, branches inside a block, call/ret, indirect jumps, `rep stos`. All `#[ignore]`;
+//! and stores, branches inside a block, call/ret, indirect jumps, `rep stos`, and SSE/AVX-512
+//! floating point (packed multiply-add, square root and divide, conversions, FMA). All `#[ignore]`;
 //! run them on each backend with
 //!
 //!   cargo test --release -p uemulator --lib jit::bench -- --ignored --nocapture --test-threads=1
@@ -87,6 +88,72 @@ const REP_STOS_LOOP: &[u8] = &[
     0x48, 0x83, 0xc3, 0x01, 0x48, 0xff, 0xc9, 0x75, 0xe7, 0xf4,
 ];
 
+// 1: movaps xmm0, xmm6; mulps xmm0, xmm1; addps xmm0, xmm2; movapd xmm3, xmm7; mulpd xmm3, xmm4;
+// addpd xmm3, xmm5; dec rcx; jnz 1b; hlt   (1.1 * 0.3 + 0.7, inexact every time)
+const PACKED_FP_LOOP: &[u8] = &[
+    0x0f, 0x28, 0xc6, 0x0f, 0x59, 0xc1, 0x0f, 0x58, 0xc2, 0x66, 0x0f, 0x28, 0xdf, 0x66, 0x0f, 0x59,
+    0xdc, 0x66, 0x0f, 0x58, 0xdd, 0x48, 0xff, 0xc9, 0x75, 0xe6, 0xf4,
+];
+
+// 1: minps xmm0, xmm1; maxps xmm0, xmm2; minpd xmm3, xmm4; maxpd xmm3, xmm5; dec rcx; jnz 1b; hlt
+// The same dispatch as the arithmetic with almost no work per lane: the floor the lane math sits
+// on.
+const MIN_MAX_LOOP: &[u8] = &[
+    0x0f, 0x5d, 0xc1, 0x0f, 0x5f, 0xc2, 0x66, 0x0f, 0x5d, 0xdc, 0x66, 0x0f, 0x5f, 0xdd, 0x48, 0xff,
+    0xc9, 0x75, 0xed, 0xf4,
+];
+
+// 1: sqrtps xmm0, xmm1; movaps xmm2, xmm6; divps xmm2, xmm0; sqrtpd xmm3, xmm4;
+// movapd xmm5, xmm7; divpd xmm5, xmm3; dec rcx; jnz 1b; hlt
+const SQRT_DIV_LOOP: &[u8] = &[
+    0x0f, 0x51, 0xc1, 0x0f, 0x28, 0xd6, 0x0f, 0x5e, 0xd0, 0x66, 0x0f, 0x51, 0xdc, 0x66, 0x0f, 0x28,
+    0xef, 0x66, 0x0f, 0x5e, 0xeb, 0x48, 0xff, 0xc9, 0x75, 0xe6, 0xf4,
+];
+
+// 1: cvtdq2ps xmm0, xmm1; cvtps2dq xmm2, xmm0; cvtsi2sd xmm3, rcx; cvttsd2si rax, xmm3;
+// cvtss2sd xmm4, xmm0; cvtsd2ss xmm5, xmm3; dec rcx; jnz 1b; hlt
+const CONVERT_LOOP: &[u8] = &[
+    0x0f, 0x5b, 0xc1, 0x66, 0x0f, 0x5b, 0xd0, 0xf2, 0x48, 0x0f, 0x2a, 0xd9, 0xf2, 0x48, 0x0f, 0x2c,
+    0xc3, 0xf3, 0x0f, 0x5a, 0xe0, 0xf2, 0x0f, 0x5a, 0xeb, 0x48, 0xff, 0xc9, 0x75, 0xe2, 0xf4,
+];
+
+// 1: vfmadd231ps zmm0, zmm1, zmm2; vmulps zmm3, zmm0, zmm1; vaddps zmm3, zmm3, zmm2;
+// vfmadd231sd xmm4, xmm5, xmm6; dec rcx; jnz 1b; hlt
+const FMA_LOOP: &[u8] = &[
+    0x62, 0xf2, 0x75, 0x48, 0xb8, 0xc2, 0x62, 0xf1, 0x7c, 0x48, 0x59, 0xd9, 0x62, 0xf1, 0x64, 0x48,
+    0x58, 0xda, 0xc4, 0xe2, 0xd1, 0xb9, 0xe6, 0x48, 0xff, 0xc9, 0x75, 0xe4, 0xf4,
+];
+
+/// Every 32-bit lane of a 128-bit register set to `bits`.
+fn singles(bits: u32) -> u128 {
+    u128::from(bits) * 0x0000_0001_0000_0001_0000_0001_0000_0001
+}
+
+/// Both 64-bit lanes set to `bits`.
+fn doubles(bits: u64) -> u128 {
+    u128::from(bits) << 64 | u128::from(bits)
+}
+
+/// Normal operands for the floating-point loops, chosen so that every product and sum is inexact:
+/// singles in xmm0-2 and 6, doubles in xmm3-5 and 7 (xmm1 doubles as the integers the conversions
+/// start from), AVX-512 enabled with zmm0-2 filled.
+fn setup_floating_point(harness: &mut Harness) {
+    let cpu = &mut harness.cpu;
+    cpu.cr4 |= crate::cpu::CR4_OSFXSR | crate::cpu::CR4_OSXSAVE;
+    cpu.xcr0 = crate::cpu::xsave::XCR0_SUPPORTED;
+    cpu.xmm[0] = singles(1.5f32.to_bits());
+    cpu.xmm[1] = singles(0.3f32.to_bits());
+    cpu.xmm[2] = singles(0.7f32.to_bits());
+    cpu.xmm[3] = doubles(1.5f64.to_bits());
+    cpu.xmm[4] = doubles(0.3f64.to_bits());
+    cpu.xmm[5] = doubles(0.7f64.to_bits());
+    cpu.xmm[6] = singles(1.1f32.to_bits());
+    cpu.xmm[7] = doubles(1.1f64.to_bits());
+    for register in 0..3 {
+        cpu.zmm_hi[register] = [cpu.xmm[register]; 2];
+    }
+}
+
 fn backend() -> &'static str {
     if cfg!(target_arch = "aarch64") {
         "aarch64"
@@ -127,8 +194,19 @@ fn bench(name: &str, code: &[u8], iterations: u64) {
 }
 
 fn bench_with_data(name: &str, code: &[u8], iterations: u64, data: u64) {
+    bench_with_setup(name, code, iterations, data, |_| {});
+}
+
+fn bench_with_setup(
+    name: &str,
+    code: &[u8],
+    iterations: u64,
+    data: u64,
+    extra_setup: impl Fn(&mut Harness),
+) {
     let mut interpreted = Harness::new(code);
     setup(&mut interpreted, CHECK_ITERATIONS, data);
+    extra_setup(&mut interpreted);
     run_sliced(&mut interpreted);
     let mut compiled = Harness::new(code);
     if !compiled.enable_jit() {
@@ -136,10 +214,20 @@ fn bench_with_data(name: &str, code: &[u8], iterations: u64, data: u64) {
         return;
     }
     setup(&mut compiled, CHECK_ITERATIONS, data);
+    extra_setup(&mut compiled);
     run_sliced(&mut compiled);
     assert_eq!(
         compiled.cpu.gpr, interpreted.cpu.gpr,
         "{name}: JIT differs from the interpreter"
+    );
+    assert_eq!(
+        (compiled.cpu.xmm, compiled.cpu.zmm_hi, compiled.cpu.mxcsr),
+        (
+            interpreted.cpu.xmm,
+            interpreted.cpu.zmm_hi,
+            interpreted.cpu.mxcsr
+        ),
+        "{name}: JIT vector state differs from the interpreter"
     );
     assert_eq!(
         compiled.cpu.icount, interpreted.cpu.icount,
@@ -149,6 +237,7 @@ fn bench_with_data(name: &str, code: &[u8], iterations: u64, data: u64) {
     let mut timed = Harness::new(code);
     timed.enable_jit();
     setup(&mut timed, iterations, data);
+    extra_setup(&mut timed);
     let started = Instant::now();
     run_sliced(&mut timed);
     let elapsed = started.elapsed();
@@ -218,4 +307,64 @@ fn rep_stos_loop() {
 #[ignore]
 fn aliased_indirect_loop() {
     bench_with_data("tlb-alias", INDIRECT_LOOP, TIMED_ITERATIONS, ALIAS_DATA);
+}
+
+#[test]
+#[ignore]
+fn packed_fp_loop() {
+    bench_with_setup(
+        "packed-fp",
+        PACKED_FP_LOOP,
+        TIMED_ITERATIONS / 4,
+        DATA,
+        setup_floating_point,
+    );
+}
+
+#[test]
+#[ignore]
+fn min_max_loop() {
+    bench_with_setup(
+        "min-max",
+        MIN_MAX_LOOP,
+        TIMED_ITERATIONS / 4,
+        DATA,
+        setup_floating_point,
+    );
+}
+
+#[test]
+#[ignore]
+fn sqrt_div_loop() {
+    bench_with_setup(
+        "sqrt-div",
+        SQRT_DIV_LOOP,
+        TIMED_ITERATIONS / 8,
+        DATA,
+        setup_floating_point,
+    );
+}
+
+#[test]
+#[ignore]
+fn convert_loop() {
+    bench_with_setup(
+        "convert",
+        CONVERT_LOOP,
+        TIMED_ITERATIONS / 4,
+        DATA,
+        setup_floating_point,
+    );
+}
+
+#[test]
+#[ignore]
+fn fma_loop() {
+    bench_with_setup(
+        "fma",
+        FMA_LOOP,
+        TIMED_ITERATIONS / 8,
+        DATA,
+        setup_floating_point,
+    );
 }

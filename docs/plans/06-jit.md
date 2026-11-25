@@ -78,7 +78,7 @@ With one host thread per vCPU (`docs/plans/22-smp-threads.md`) the code cache is
 
 ## Future perf (post-milestone-4, from the fork)
 
-jump-cache lookup inline in generated code (`x-tblookup`), cold-path separation (`x-tblayout`), inline MMIO fast paths (`x-iofast`), exit-request checks on cycle edges only (`x-edgesys`), slow-path thunks (`x-slowthunk`), SSE FP on the host FPU instead of softfloat (`x-ssefp`; aarch64 host FPU semantics differ in NaN/denormal handling, verify), guest-register caching, NEON for SSE2 integer ops.
+jump-cache lookup inline in generated code (`x-tblookup`), cold-path separation (`x-tblayout`), inline MMIO fast paths (`x-iofast`), exit-request checks on cycle edges only (`x-edgesys`), slow-path thunks (`x-slowthunk`), SSE FP on the host FPU instead of softfloat (`x-ssefp`: done in the interpreter's lane functions, which the JITs reach through `helper_exec`, for normal operands and results under nearest-even, the soft engine as oracle and fallback; no inline lowering yet, see `31-host-fpu.md`), guest-register caching, NEON for SSE2 integer ops.
 
 ## CET shadow stacks
 
