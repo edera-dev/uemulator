@@ -14,9 +14,12 @@
 //!   guest rip they use is `PAGE_BASE` plus an offset known when the block is translated (see
 //!   `Gen::rip_to`), and the `rip`s in `compile` and below are such offsets, not addresses.
 //! - `SAVED_ADDRESS` (x22) and `SAVED_NZCV` (x23): hold the access address and the host flags
-//!   across a slow-path helper call. Together with x19/x20 these are the only callee-saved
-//!   registers the code touches, so they are the only ones the prologue saves.
-//! - x0..x6 and x16 are caller-saved scratch: x0/x1 are the ALU operands and the helper
+//!   across a slow-path helper call. x24..x28 are the other callee-saved ones (see their
+//!   constants); the prologue saves all of them.
+//! - x8..x15 hold guest rax..rdi (`PINNED_HOST_FIRST`) and are never scratch: block code may
+//!   write them only through `store_gpr`/`write_reg`, and reaches Rust only through a `Stub`,
+//!   which stores them to `Cpu::gpr` and loads them back around the helper.
+//! - x0..x7 and x16 are caller-saved scratch: x0/x1 are the ALU operands and the helper
 //!   argument/return registers, `ADDRESS` (x2) the guest linear address being accessed,
 //!   `SCRATCH_A..C` (x3..x5) temporaries of address arithmetic and the TLB probe, `VALUE` (x6)
 //!   the value moved by mov-style instructions, x16 the helper call target.
@@ -44,8 +47,9 @@
 use std::mem::{offset_of, size_of};
 
 use super::a64::*;
+pub(super) use super::arch::Stub;
 use super::helpers::*;
-use super::native::LinkSite;
+use super::native::{LinkSite, ResolveTarget};
 use crate::cpu::cet::Cet;
 use crate::cpu::decode::{Insn, NO_REG, VEX_OP_FLAG};
 use crate::cpu::flags::{AC, CF, IF, LazyFlagsOp, SZP_CF_OF_SRC_CF_BIT};
@@ -111,7 +115,7 @@ const VECTOR_DST: u32 = 0;
 const VECTOR_SRC: u32 = 1;
 /// A third host vector register for the sequences that need a zero or an index vector.
 const VECTOR_TEMPORARY: u32 = 2;
-const RCX_INDEX: u32 = 1;
+const RCX_INDEX: u8 = 1;
 const SEG_BASE_OFFSET: u32 = (offset_of!(Cpu, seg) + offset_of!(Seg, base)) as u32;
 const SEG_STRIDE: u32 = size_of::<Seg>() as u32;
 const GS_BASE_OFFSET: u32 = SEG_BASE_OFFSET + SEG_STRIDE * SEG_GS as u32;
@@ -137,14 +141,34 @@ const PAGE_MASK: u64 = (1 << PAGE_SHIFT) - 1;
 pub(super) const CPU: u32 = 19;
 pub(super) const TLB_BASE: u32 = 20;
 /// Guest virtual address of the page the block runs from (`rip & !0xfff`), latched on entry like
-/// `TLB_BASE`: the trampoline sets it from `Cpu::rip`, the chain stub from its target, and a direct
-/// link keeps it because links stay within a page. Blocks are keyed by physical address alone
+/// `TLB_BASE`: the trampoline sets it from `Cpu::rip`, the chain stub from its target, the check of
+/// a cross-page link (`arch_a64::cross_page_check`) from the page it checked, and a same-page link
+/// keeps it. Blocks are keyed by physical address alone
 /// (`Jit::translate`), so the same translation runs at whatever virtual address the page is
 /// mapped at (ASLR gives every process its own address for the same libc page), and every guest
 /// address a block needs is this plus a translation-time offset. Callee-saved, so helper calls
 /// keep it.
 pub(super) const PAGE_BASE: u32 = 21;
 pub(super) const SAVED_ADDRESS: u32 = 22;
+/// Guest rax..rdi (`Cpu::gpr[0..8]`) live in host x8..x15 for as long as generated code runs,
+/// across chained and linked blocks: the trampoline loads them, and every way out of generated
+/// code (the exit stubs, every helper stub and memory thunk, see `Stub`) stores them back to
+/// `Cpu::gpr` first, and the stubs that return reload them, since the helper may have changed
+/// them (the interpreter; `Cpu::vmexit` inside a slow-path access rewrites rsp and rax). Caller-
+/// saved registers, which no other role used; every callee-saved one already has a role. The
+/// assembler refuses to let block code write them except through `load_gpr`/`store_gpr`/
+/// `write_reg` (`Asm::reserve`), and refuses `blr`/`br`/`bl_abs` there, so a lowering that
+/// hard-codes one as scratch fails every test that compiles it. `docs/plans/06-jit.md`,
+/// "Pinned guest registers".
+pub(super) const PINNED_HOST_FIRST: u32 = 8;
+pub(super) const PINNED_GUEST_COUNT: u8 = 8;
+pub(super) const PINNED_HOST_MASK: u32 = ((1 << PINNED_GUEST_COUNT) - 1) << PINNED_HOST_FIRST;
+
+/// The host register guest register `reg` lives in, if it is pinned.
+pub(super) fn pinned_host(reg: u8) -> Option<u32> {
+    (reg < PINNED_GUEST_COUNT).then_some(PINNED_HOST_FIRST + reg as u32)
+}
+
 pub(super) const SAVED_NZCV: u32 = 23;
 /// Callee-saved homes for values that must outlive a slow-path helper call: the result and
 /// second operand of a read-modify-write instruction whose store takes the slow path (its flags
@@ -432,28 +456,31 @@ fn has_segment_base(insn: &Insn) -> bool {
 /// block (`CODE_SIZE`).
 #[derive(Clone)]
 pub(crate) struct Addrs {
-    /// Tail-call stubs for `helper_exec_pair` and `helper_cond`.
-    pub exec: u64,
-    pub cond: u64,
-    /// Tail-call stub for `helper_set_rotate_flags(cpu, packed CF/OF)`.
-    pub rotate_flags: u64,
-    /// Tail-call stub for `helper_whole_vector(cpu, packed, source low, source high)`.
-    pub whole_vector: u64,
+    /// Stubs that call `helper_exec_pair` and `helper_cond`, storing and reloading the pinned
+    /// guest registers around the call (`arch_a64::helper_stub`).
+    pub exec: Stub,
+    pub cond: Stub,
+    /// The same for `helper_set_rotate_flags(cpu, packed CF/OF)`.
+    pub rotate_flags: Stub,
+    /// The same for `helper_whole_vector(cpu, packed, source low, source high)`.
+    pub whole_vector: Stub,
     pub exit_ok: u64,
     pub exit_fail: u64,
     /// The block-to-block transfer stub (see `arch_a64::chain_stub`), or 0 when chaining is off
     /// and every block returns to the run loop.
     pub chain: u64,
+    /// The mapping check in front of a cross-page link slot (`arch_a64::cross_page_check`).
+    pub cross_page_check: u64,
     /// Memory-access thunks, indexed by `size_index` (1, 2, 4, 8 bytes), for the slow path of
     /// the inline TLB probe: zero-extending loads, stores, and stores that keep x0 and x1.
     /// Sign-extending loads exist for 1, 2 and 4 bytes. The stack variants (push/pop/call/ret)
     /// differ only in the fault they raise for a non-canonical address.
-    pub load: [u64; 4],
-    pub load_signed: [u64; 3],
-    pub load_stack: u64,
-    pub store: [u64; 4],
-    pub store_keep: [u64; 4],
-    pub store_stack: u64,
+    pub load: [Stub; 4],
+    pub load_signed: [Stub; 3],
+    pub load_stack: Stub,
+    pub store: [Stub; 4],
+    pub store_keep: [Stub; 4],
+    pub store_stack: Stub,
 }
 
 /// Index of an operand size of 1, 2, 4 or 8 bytes in the `Addrs` thunk tables.
@@ -497,8 +524,15 @@ pub(crate) struct Gen<'a> {
     pub body_offset: u32,
     /// Label of the link entry's out-of-line exit, bound by `emit_slows`.
     link_entry_miss: Option<Label>,
-    /// Patchable slots of exits to fixed addresses in the block's own page.
+    /// Patchable slots of exits to fixed addresses in the block's own page, and of cross-page
+    /// ones `resolve` found a page for.
     pub links: Vec<LinkSite>,
+    /// Where the targets of cross-page exits are mapped as the block is translated (none in
+    /// tests that compile without a CPU).
+    pub resolve: ResolveTarget<'a>,
+    /// Cross-page links (index into `links`) and the literal holding their expected host page,
+    /// whose offset is known once the literal pool is placed (`emit_slows`).
+    cross_page_words: Vec<(usize, Label)>,
     /// Per instruction: must the lazy flags it sets be recorded (`helpers::flag_record_needed`).
     flag_record_needed: Vec<bool>,
     /// The instruction being lowered has a dead flag record, which `store_lazy_op` leaves out.
@@ -513,8 +547,14 @@ pub(crate) struct Gen<'a> {
 
 impl<'a> Gen<'a> {
     pub fn new(base: u64, addrs: &'a Addrs, insns: &'a [Insn]) -> Self {
+        let mut asm = Asm::new(base);
+        asm.reserve(PINNED_HOST_MASK);
+        asm.reserve_slots(
+            CPU,
+            GPR_OFFSET..GPR_OFFSET + GPR_SIZE * PINNED_GUEST_COUNT as u32,
+        );
         Gen {
-            asm: Asm::new(base),
+            asm,
             addrs,
             insns,
             slow_paths: Vec::new(),
@@ -530,6 +570,8 @@ impl<'a> Gen<'a> {
             body_offset: 0,
             link_entry_miss: None,
             links: Vec::new(),
+            resolve: &|_| None,
+            cross_page_words: Vec::new(),
             flag_record_needed: flag_record_needed(insns),
             skip_flag_record: false,
             flag_records_skipped: 0,
@@ -538,16 +580,27 @@ impl<'a> Gen<'a> {
     }
 
     fn load_gpr(&mut self, rd: u32, reg: u8) {
-        self.asm.ldr(rd, CPU, GPR_OFFSET + GPR_SIZE * reg as u32);
+        match pinned_host(reg) {
+            Some(host) => {
+                if rd != host {
+                    self.asm.mov(rd, host);
+                }
+            }
+            None => self.asm.ldr(rd, CPU, GPR_OFFSET + GPR_SIZE * reg as u32),
+        }
     }
 
     fn store_gpr(&mut self, reg: u8, rs: u32) {
-        self.asm.str(rs, CPU, GPR_OFFSET + GPR_SIZE * reg as u32);
+        match pinned_host(reg) {
+            Some(host) => self.asm.write_pinned(|asm| asm.mov(host, rs)),
+            None => self.asm.str(rs, CPU, GPR_OFFSET + GPR_SIZE * reg as u32),
+        }
     }
 
-    /// Calls a stub or thunk in the prologue.
-    fn call(&mut self, stub: u64) {
-        self.asm.bl_abs(stub);
+    /// Calls a stub or thunk in the prologue. The only way block code reaches Rust: every `Stub`
+    /// spills the pinned guest registers to `Cpu` before its helper runs and reloads them after.
+    fn call(&mut self, stub: Stub) {
+        self.asm.bl_stub(stub.address());
     }
 
     /// `rd = PAGE_BASE + rip`, where `rip` is the page-relative offset a block carries around
@@ -607,30 +660,64 @@ impl<'a> Gen<'a> {
 
     /// `chain_exit` to a fixed guest address.
     fn chain_to(&mut self, rip: u64, retired: u32) {
-        self.rip_to(1, rip);
         if self.addrs.chain == 0 {
+            self.rip_to(1, rip);
             self.chain_exit(retired);
             return;
         }
         self.pay_icount(retired);
-        self.link_slot(rip);
+        self.fixed_exit(rip);
+    }
+
+    /// The end of a chained exit to the fixed guest address `target`, `icount` already paid: x1 =
+    /// `target`, then the chain stub, with a link slot in front of it where one can go.
+    ///
+    /// Within the block's page the slot comes first (a linked jump skips the rest). For another
+    /// page it comes after a check that the target's page still maps to the host page `resolve`
+    /// found at translation (`arch_a64::cross_page_check`, which also sets `PAGE_BASE` for the
+    /// successor): the block runs in every address space its page is mapped in, and the target
+    /// page may map elsewhere in another, or after a remap, which the stub then handles.
+    fn fixed_exit(&mut self, target: u64) {
+        if target >> PAGE_SHIFT == self.entry_rip >> PAGE_SHIFT {
+            self.link_slot(target, None);
+            self.rip_to(1, target);
+            self.asm.b_abs(self.addrs.chain);
+            return;
+        }
+        self.rip_to(1, target);
+        if self.addrs.chain != 0 {
+            const EXPECTED_HOST_PAGE: u32 = 2;
+            let resolved = (self.resolve)(target);
+            let word = self
+                .asm
+                .literal(resolved.map_or(0, |resolved| resolved.host_page));
+            self.asm.ldr_literal(EXPECTED_HOST_PAGE, word);
+            self.asm.bl_stub(self.addrs.cross_page_check);
+            let elsewhere = self.asm.label();
+            self.asm.b_cond(NE, elsewhere);
+            self.link_slot(target, resolved.map(|resolved| resolved.phys_page));
+            self.cross_page_words.push((self.links.len() - 1, word));
+            self.asm.bind(elsewhere);
+        }
         self.asm.b_abs(self.addrs.chain);
     }
 
     /// Emits the nop that `Jit::translate` turns into a direct jump to the block at `target_rip`
-    /// once it exists, when `target_rip` is in this block's page (see `LinkSite`). It sits right
-    /// before the `mov x1, rip; b chain` exit, which therefore still runs while the slot is a nop.
-    /// The jump skips the stub and its probes, so it lands on the successor's link entry, which
-    /// repeats the stub's checks; icount must already be paid, as for the stub.
-    fn link_slot(&mut self, target_rip: u64) {
-        if self.addrs.chain == 0 || target_rip >> PAGE_SHIFT != self.entry_rip >> PAGE_SHIFT {
+    /// once it exists (see `LinkSite`; `phys_page` for a target in another page). It sits right
+    /// before the `b chain` exit, which therefore still runs while the slot is a nop. The jump
+    /// skips the stub and its probes, so it lands on the successor's link entry, which repeats
+    /// the stub's checks; icount must already be paid, as for the stub.
+    fn link_slot(&mut self, target_rip: u64, phys_page: Option<u64>) {
+        if self.addrs.chain == 0 {
             return;
         }
         self.links.push(LinkSite {
             code_offset: (self.asm.here() - self.asm.base()) as u32,
             target_rip,
+            word_offset: None,
+            phys_page,
         });
-        self.asm.emit(NOP_WORD);
+        self.asm.nop();
     }
 
     /// The checks `chain_stub` does before it jumps into a block, for a block reached by a
@@ -1084,6 +1171,9 @@ impl<'a> Gen<'a> {
             self.asm.b(slow.resume);
         }
         self.asm.finish();
+        for (link, word) in std::mem::take(&mut self.cross_page_words) {
+            self.links[link].word_offset = self.asm.label_offset(word);
+        }
     }
 
     /// Records the flags of the instruction just emitted: the result is in x0, the second
@@ -1209,9 +1299,16 @@ impl<'a> Gen<'a> {
             (_, true) => (HIGH_BYTE_SHIFT, 8),
             (_, false) => (0, 8),
         };
-        self.load_gpr(SCRATCH_C, reg);
-        self.asm.bfi(SCRATCH_C, rs, lsb, width, true);
-        self.store_gpr(reg, SCRATCH_C);
+        match pinned_host(reg) {
+            Some(host) => self
+                .asm
+                .write_pinned(|asm| asm.bfi(host, rs, lsb, width, true)),
+            None => {
+                self.load_gpr(SCRATCH_C, reg);
+                self.asm.bfi(SCRATCH_C, rs, lsb, width, true);
+                self.store_gpr(reg, SCRATCH_C);
+            }
+        }
     }
 
     /// Loads the `size`-byte operand `dst` names into `rd` (zero-extended for memory, raw for
@@ -1270,7 +1367,7 @@ impl<'a> Gen<'a> {
     /// if it stored to memory (the caller follows with `smc_check`).
     ///
     /// Operand order matters: the memory operand is loaded first because its slow path calls a
-    /// helper that clobbers x0..x15, and only then is the register/immediate operand loaded.
+    /// helper that clobbers x0..x7, and only then is the register/immediate operand loaded.
     ///
     /// Byte and word operations run in W registers on operands shifted up to the top of the
     /// word, so the host NZCV flags describe the narrow operation exactly and `jcc` can use
@@ -1627,7 +1724,7 @@ impl<'a> Gen<'a> {
                 self.asm.mov(0, result);
             }
             None => {
-                self.asm.ldr(flags, CPU, GPR_OFFSET + GPR_SIZE * RCX_INDEX);
+                self.load_gpr(flags, RCX_INDEX);
                 let count_mask = if is64 { 63 } else { 31 };
                 assert!(self.asm.and_imm(flags, flags, count_mask, true));
                 self.asm.mov(SAVED_EXTRA, flags);
@@ -2001,7 +2098,7 @@ impl<'a> Gen<'a> {
                 self.asm.ror_imm(result, 0, amount, is64);
             }
             None => {
-                self.asm.ldr(flags, CPU, GPR_OFFSET + GPR_SIZE * RCX_INDEX);
+                self.load_gpr(flags, RCX_INDEX);
                 assert!(self.asm.and_imm(flags, flags, bits as u64 - 1, true));
                 self.asm.mov(SAVED_EXTRA, flags);
                 self.asm.cbz(SAVED_EXTRA, skip, true);
@@ -2133,13 +2230,9 @@ impl<'a> Gen<'a> {
             return;
         }
         if chaining {
-            self.link_slot(next_rip);
-            self.rip_to(1, next_rip);
-            self.asm.b_abs(self.addrs.chain);
+            self.fixed_exit(next_rip);
             self.asm.bind(taken);
-            self.link_slot(target);
-            self.rip_to(1, target);
-            self.asm.b_abs(self.addrs.chain);
+            self.fixed_exit(target);
         } else {
             self.chain_to(next_rip, retired);
             self.asm.bind(taken);
@@ -4007,20 +4100,92 @@ mod tests {
     }
 
     const DUMMY_ADDRESSES: Addrs = Addrs {
-        exec: 0,
-        cond: 0,
-        rotate_flags: 0,
-        whole_vector: 0,
+        exec: Stub::DUMMY,
+        cond: Stub::DUMMY,
+        rotate_flags: Stub::DUMMY,
+        whole_vector: Stub::DUMMY,
         exit_ok: 0,
         exit_fail: 0,
         chain: 0,
-        load: [0; 4],
-        load_signed: [0; 3],
-        load_stack: 0,
-        store: [0; 4],
-        store_keep: [0; 4],
-        store_stack: 0,
+        cross_page_check: 0,
+        load: [Stub::DUMMY; 4],
+        load_signed: [Stub::DUMMY; 3],
+        load_stack: Stub::DUMMY,
+        store: [Stub::DUMMY; 4],
+        store_keep: [Stub::DUMMY; 4],
+        store_stack: Stub::DUMMY,
     };
+
+    /// What another branch's lowering would do by mistake: use a pinned host register as scratch.
+    #[test]
+    #[should_panic(expected = "reserved for a guest register")]
+    fn block_code_cannot_use_a_pinned_register_as_scratch() {
+        let insns: [Insn; 0] = [];
+        let mut generator = Gen::new(0, &DUMMY_ADDRESSES, &insns);
+        generator.asm.mov_imm(PINNED_HOST_FIRST + 1, 5);
+    }
+
+    #[test]
+    #[should_panic(expected = "reserved for a guest register")]
+    fn block_code_cannot_load_into_a_pinned_register() {
+        let insns: [Insn; 0] = [];
+        let mut generator = Gen::new(0, &DUMMY_ADDRESSES, &insns);
+        generator
+            .asm
+            .ldp_off(0, PINNED_HOST_FIRST + 7, SCRATCH_A, 0);
+    }
+
+    /// The pinned registers' slots in `Cpu` are stale while a block runs.
+    #[test]
+    #[should_panic(expected = "guest register held in a host register")]
+    fn block_code_cannot_read_a_pinned_register_from_cpu() {
+        let insns: [Insn; 0] = [];
+        let mut generator = Gen::new(0, &DUMMY_ADDRESSES, &insns);
+        generator.asm.ldr(0, CPU, GPR_OFFSET + GPR_SIZE * 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "guest register held in a host register")]
+    fn block_code_cannot_store_a_pinned_register_to_cpu() {
+        let insns: [Insn; 0] = [];
+        let mut generator = Gen::new(0, &DUMMY_ADDRESSES, &insns);
+        generator.asm.strb(0, CPU, GPR_OFFSET + GPR_SIZE * 7 + 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "spilling prologue stub")]
+    fn block_code_cannot_call_rust_directly() {
+        let insns: [Insn; 0] = [];
+        let mut generator = Gen::new(0, &DUMMY_ADDRESSES, &insns);
+        generator.asm.mov_imm(CALL_TARGET, 0x1000);
+        generator.asm.blr(CALL_TARGET);
+    }
+
+    #[test]
+    #[should_panic(expected = "spilling prologue stub")]
+    fn block_code_cannot_branch_and_link_to_an_arbitrary_address() {
+        let insns: [Insn; 0] = [];
+        let mut generator = Gen::new(0, &DUMMY_ADDRESSES, &insns);
+        generator.asm.bl_abs(0x1000);
+    }
+
+    #[test]
+    fn guest_register_accesses_reach_the_pinned_registers_and_the_rest_of_cpu() {
+        let insns: [Insn; 0] = [];
+        let mut generator = Gen::new(0, &DUMMY_ADDRESSES, &insns);
+        // A pinned register: a move in and out, and a byte write in place.
+        generator.load_gpr(0, 3);
+        generator.store_gpr(3, 1);
+        generator.write_reg(3, true, 1, 1);
+        assert_eq!(generator.asm.code.len(), 3, "no memory access for rbx");
+        // r8 is not pinned and stays in `Cpu`.
+        generator.store_gpr(8, 1);
+        generator.load_gpr(0, 8);
+        assert_eq!(generator.asm.code.len(), 5);
+        assert_eq!(pinned_host(7), Some(PINNED_HOST_FIRST + 7));
+        assert_eq!(pinned_host(8), None);
+        assert_eq!(PINNED_HOST_MASK, 0xff00);
+    }
 
     fn and_constant_result(constant: u64, input: u64) -> (u64, usize) {
         let _guard = crate::jit::serialize_jit_tests();

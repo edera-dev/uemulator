@@ -44,6 +44,10 @@ const FAR_TARGET: u64 = SCRATCH + 0x8_0000;
 /// without the `jit` feature.
 const CR4_OSFXSR: u64 = 1 << 9;
 const CR4_OSXSAVE: u64 = 1 << 18;
+/// The second half of the far-jump loop, in another page again.
+const FAR_JUMP_TARGET: u64 = SCRATCH + 0x9_0000;
+const JMP_REL32_LENGTH: u64 = 5;
+const JNZ_REL32_LENGTH: u64 = 6;
 
 // 1: add rax, rbx; xor rdx, rax; add rbx, 3; dec rcx; jnz 1b; hlt
 const REGISTER_LOOP: &[u8] = &[
@@ -204,6 +208,25 @@ fn setup_floating_point(harness: &mut Harness) {
     }
 }
 
+/// `1: jmp 2f; hlt` at `CODE_BASE` and `2: add rax, 1; dec rcx; jnz 1b; hlt` at
+/// `FAR_JUMP_TARGET`: direct jumps between pages both ways (cross-page links).
+fn far_jump_loop() -> Vec<u8> {
+    let jump = (FAR_JUMP_TARGET.wrapping_sub(CODE_BASE + JMP_REL32_LENGTH) as i32).to_le_bytes();
+    [&[0xe9][..], &jump, &[0xf4]].concat()
+}
+
+fn far_jump_body() -> Vec<u8> {
+    const BEFORE_JNZ: u64 = 7;
+    let back = (CODE_BASE.wrapping_sub(FAR_JUMP_TARGET + BEFORE_JNZ + JNZ_REL32_LENGTH) as i32)
+        .to_le_bytes();
+    [
+        &[0x48, 0x83, 0xc0, 0x01, 0x48, 0xff, 0xc9, 0x0f, 0x85][..],
+        &back,
+        &[0xf4],
+    ]
+    .concat()
+}
+
 fn backend() -> &'static str {
     if cfg!(target_arch = "aarch64") {
         "aarch64"
@@ -228,6 +251,7 @@ fn setup(harness: &mut Harness, iterations: u64, data: u64) {
     if data == DATA {
         harness.write(DATA, &[STRING_FILL; STRING_BYTES]);
     }
+    harness.write(FAR_JUMP_TARGET, &far_jump_body());
     if data == ALIAS_DATA {
         let directory_entry =
             harness.cpu.cr3 + FIRST_PAGE_DIRECTORY_OFFSET + (ALIAS_DATA >> LARGE_PAGE_SHIFT) * 8;
@@ -345,6 +369,12 @@ fn call_ret_loop() {
 #[ignore]
 fn far_call_loop() {
     bench("far-call", FAR_CALL_LOOP, TIMED_ITERATIONS);
+}
+
+#[test]
+#[ignore]
+fn far_jump_loop_bench() {
+    bench("far-jump", &far_jump_loop(), TIMED_ITERATIONS);
 }
 
 #[test]

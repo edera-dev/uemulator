@@ -56,6 +56,27 @@ impl ExecMem {
         }
     }
 
+    /// Replaces one aligned 64-bit data word inside generated code (a cross-page link's expected
+    /// host page) with a single atomic store, as `write_word` does for an instruction.
+    pub fn write_u64(&self, offset: usize, value: u64) {
+        assert!(
+            offset.is_multiple_of(std::mem::size_of::<u64>())
+                && offset
+                    .checked_add(std::mem::size_of::<u64>())
+                    .is_some_and(|end| end <= self.len),
+            "u64 write at offset {offset:#x} is misaligned or outside the {}-byte mapping",
+            self.len
+        );
+        unsafe {
+            let target = self.ptr.add(offset) as *mut u64;
+            imp::set_write_protect(false);
+            std::sync::atomic::AtomicU64::from_ptr(target)
+                .store(value, std::sync::atomic::Ordering::Release);
+            imp::set_write_protect(true);
+            imp::flush(target as *mut u8, std::mem::size_of::<u64>());
+        }
+    }
+
     /// Makes the region writable for this thread only, copies, restores execute permission and
     /// flushes the instruction cache (see `imp`).
     pub fn write_bytes(&self, offset: usize, bytes: &[u8]) {

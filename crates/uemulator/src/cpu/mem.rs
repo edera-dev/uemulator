@@ -150,6 +150,18 @@ fn tlb_slot(linear: u64, user: bool) -> usize {
         | ((linear >> PAGE_SHIFT) as usize & (TLB_ENTRIES_PER_MODE - 1))
 }
 
+impl Cpu {
+    /// The host address of `linear`'s page as the exec TLB half of the current privilege has it,
+    /// without a walk or any other side effect: what the JIT's chain stub would find there. The
+    /// JIT resolves a cross-page link with it when it translates the block making the jump.
+    #[cfg(all(feature = "jit", any(target_arch = "aarch64", target_arch = "x86_64")))]
+    pub(crate) fn exec_tlb_host_page(&self, linear: u64) -> Option<u64> {
+        let page = linear & !((1u64 << PAGE_SHIFT) - 1);
+        let entry = &self.tlb[tlb_slot(linear, self.cpl == USER_CPL)];
+        (entry.tag_x == page).then(|| entry.addend.wrapping_add(page))
+    }
+}
+
 /// See `Cpu::read_stack`.
 fn stack_fault_for_non_canonical(exception: Exception) -> Exception {
     match exception {

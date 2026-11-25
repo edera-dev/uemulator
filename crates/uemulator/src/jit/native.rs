@@ -62,14 +62,36 @@ pub(crate) const JUMP_ENTRY_PHYS_OFFSET: u32 = std::mem::offset_of!(JumpEntry, p
 pub(crate) const JUMP_ENTRY_CODE_OFFSET: u32 = std::mem::offset_of!(JumpEntry, code_addr) as u32;
 pub(crate) const JUMP_ENTRY_BLOCK_OFFSET: u32 = std::mem::offset_of!(JumpEntry, block) as u32;
 
-/// A patchable slot in a compiled block: the exit to the fixed guest address `target_rip` (in the
-/// block's own page) is preceded by a nop of `arch::link_bytes` size that becomes a direct jump to
-/// the successor's `link_addr` once it exists.
+/// A patchable slot in a compiled block: the exit to the fixed guest address `target_rip` (an
+/// offset from the block's page, see `Gen::rip_to`) is preceded by a nop of `arch::link_bytes`
+/// size that becomes a direct jump to the successor's `link_addr` once it exists.
 pub(crate) struct LinkSite {
     /// Offset of the slot inside the block's code.
     pub code_offset: u32,
     pub target_rip: u64,
+    /// For a target in another page: where the exit keeps the host address of the page it may
+    /// be linked to (a 64-bit word inside the block, offset from its start), which it compares
+    /// with the exec TLB before it reaches the slot. `None` within the block's page.
+    pub word_offset: Option<u32>,
+    /// For a target in another page that was in the exec TLB at translation
+    /// (`CrossPageTarget`): its physical page, which the word already names. Otherwise the word
+    /// is 0, which never matches, until `Jit::link_unresolved` fills it in.
+    pub phys_page: Option<u64>,
 }
+
+/// Where the page of a cross-page exit's target was mapped when the block was translated, from the
+/// translating vCPU's exec TLB (`Cpu::exec_tlb_host_page`): the host address of the page, which
+/// the generated check compares with what the TLB says when the exit runs, and its physical
+/// address, which names the destination block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CrossPageTarget {
+    pub host_page: u64,
+    pub phys_page: u64,
+}
+
+/// Resolves a cross-page exit target (a page offset, as in `LinkSite::target_rip`) for
+/// `arch::compile_block`, or `None` when it cannot be linked (not in the exec TLB).
+pub(crate) type ResolveTarget<'a> = &'a dyn Fn(u64) -> Option<CrossPageTarget>;
 
 /// What `arch::compile_block` produces.
 pub(crate) struct CompiledBlock {
@@ -86,12 +108,21 @@ pub(crate) struct CompiledBlock {
 }
 
 /// A slot in the code buffer and the block it should jump to: the physical address of the
-/// destination, which is its `BlockKey` (links stay within a page, so never a straddling block).
+/// destination, which is its `BlockKey` (never a straddling block, see `Jit::install`).
 #[derive(Clone)]
 struct LinkedSite {
     /// Offset into `ExecMem` of the slot (the instruction or jump `arch::LinkSite` describes).
     exec_offset: usize,
     destination: u64,
+    /// Behind a cross-page mapping check (`LinkSite::phys_page`), for the statistics.
+    cross_page: bool,
+}
+
+/// A cross-page exit waiting in `State::unresolved`: offsets into `ExecMem` of its slot and of
+/// its expected-host-page word.
+struct UnresolvedSite {
+    slot_offset: usize,
+    word_offset: usize,
 }
 
 /// One translated block. Blocks are only ever added; an invalidated block keeps its slot (cleared
@@ -185,6 +216,18 @@ struct State {
     /// Unpatched slots by the physical address of the block they want: the destination was not
     /// translated yet, or was invalidated since.
     pending: HashMap<u64, Vec<LinkedSite>>,
+    /// Cross-page exits whose target page was not in the exec TLB when their block was
+    /// translated, by the guest virtual address of the target as the translating vCPU saw it.
+    /// The first time a block is found or made for that address (`Jit::link_unresolved`), the
+    /// exit is linked to it: its word gets the block's host page and its slot the jump. Another
+    /// address space may map the address elsewhere; the exit's check then fails and it takes the
+    /// chain stub, as it would have anyway.
+    unresolved: HashMap<u64, Vec<UnresolvedSite>>,
+    /// `Cpu::ram_base` (the same for every vCPU of the machine), set by `install` before it adds
+    /// to `unresolved`: a block's physical address plus this is the host page a cross-page exit
+    /// checks for. Kept here and not per handle, because a vCPU's first act may be a block-map
+    /// hit in `lookup` that links a site another vCPU's translation left waiting.
+    ram_base: u64,
     /// Counts writes to generated code that a core other than the writer's could have fetched
     /// stale: blocks, link patches and unlinks. A handle runs an instruction barrier before code
     /// it found in the block map only when this moved past its own `Jit::synced_writes`, so a
@@ -210,6 +253,8 @@ pub(crate) struct JitStats {
     pub resets: u64,
     /// Block-exit slots patched into a direct jump, including relinks after an invalidation.
     pub linked: u64,
+    /// The part of `linked` that leads to another page.
+    pub cross_page_linked: u64,
     /// Slots put back to the chain stub because their destination was invalidated.
     pub unlinked: u64,
     /// Lazy-flag records left out of compiled blocks as dead.
@@ -234,6 +279,14 @@ thread_local! {
 
 pub(crate) const fn jump_cache_mask() -> u64 {
     (1 << JUMP_CACHE_BITS) - 1
+}
+
+/// What `Jit::install` needs from the translating vCPU besides the decoded block: the code page
+/// flags, where cross-page targets map (`ResolveTarget`) and `Cpu::ram_base`.
+struct InstallContext<'a> {
+    flags: &'a CodePages,
+    resolve: ResolveTarget<'a>,
+    ram_base: u64,
 }
 
 /// What `Jit::install` found.
@@ -292,6 +345,7 @@ impl State {
             .or_default()
             .push(site.clone());
         self.stats.linked += 1;
+        self.stats.cross_page_linked += site.cross_page as u64;
         true
     }
 
@@ -302,6 +356,7 @@ impl State {
         self.page_blocks.clear();
         self.incoming.clear();
         self.pending.clear();
+        self.unresolved.clear();
         for flag in &shared.valid[..self.blocks.len()] {
             flag.store(0, Ordering::Release);
         }
@@ -357,6 +412,8 @@ impl Jit {
                 page_blocks: HashMap::new(),
                 incoming: HashMap::new(),
                 pending: HashMap::new(),
+                unresolved: HashMap::new(),
+                ram_base: 0,
                 code_writes: 0,
                 stats: JitStats::default(),
             }),
@@ -503,6 +560,13 @@ impl Jit {
         }
     }
 
+    /// Empties this vCPU's jump cache, so a test can tell a direct link (which needs none) from the
+    /// chain stub (which then misses and returns to the run loop).
+    #[cfg(test)]
+    pub fn clear_jump_cache(&mut self) {
+        self.jump_cache.fill(JumpEntry::default());
+    }
+
     /// Drops every block of the whole cache, for tests that need a known state. Nothing may be
     /// running generated code.
     #[cfg(test)]
@@ -526,7 +590,8 @@ impl Jit {
         let mut state = self.shared.lock();
         let index = *state.block_map.get(&(phys_addr, NO_SECOND_PAGE))?;
         let code_addr = state.blocks[index as usize].code_addr;
-        // Another vCPU may have written this block.
+        self.link_unresolved(&mut state, rip, phys_addr, index);
+        // Another vCPU may have written this block (or this handle just linked into it).
         Self::barrier_if_foreign(&mut self.synced_writes, &mut state);
         drop(state);
         self.jump_cache[jump_cache_hash(rip)] = JumpEntry {
@@ -536,6 +601,27 @@ impl Jit {
             block: index as u64,
         };
         Some(code_addr)
+    }
+
+    /// Links the cross-page exits waiting for a block at virtual address `rip` (`State::unresolved`)
+    /// to block `index`, found or made for it at physical `phys_addr`: the word first, then the
+    /// slot, so a vCPU running past them sees the slot taken only with the word that goes with it
+    /// (the word is written once, and a `0` word never matches). Not for straddling blocks.
+    fn link_unresolved(&self, state: &mut State, rip: u64, phys_addr: u64, index: u32) {
+        let Some(sites) = state.unresolved.remove(&rip) else {
+            return;
+        };
+        let host_page = state.ram_base + (phys_addr & !PAGE_MASK);
+        for site in sites {
+            self.shared.exec_mem.write_u64(site.word_offset, host_page);
+            state.code_writes += 1;
+            let linked = LinkedSite {
+                exec_offset: site.slot_offset,
+                destination: phys_addr,
+                cross_page: true,
+            };
+            state.patch_link(&self.shared, &linked, index);
+        }
     }
 
     /// Runs an instruction barrier if another handle wrote code since this one last ran one or
@@ -612,7 +698,32 @@ impl Jit {
                 0 => {}
                 micros => std::thread::sleep(std::time::Duration::from_micros(micros)),
             }
-            match self.install(decoded, rip, phys_addr, generation, &cpu.page_has_code) {
+            // A cross-page exit is linked to the block its target maps to now, and only runs the
+            // link while it still does (see `LinkSite::phys_page`).
+            let page = rip & !PAGE_MASK;
+            let cpu_view: &Cpu = cpu;
+            let resolve = |target: u64| {
+                let host_page = cpu_view.exec_tlb_host_page(page.wrapping_add(target))?;
+                let phys_page = host_page.wrapping_sub(cpu_view.ram_base);
+                cpu_view
+                    .ram
+                    .contains(phys_page, PAGE_SIZE)
+                    .then_some(CrossPageTarget {
+                        host_page,
+                        phys_page,
+                    })
+            };
+            match self.install(
+                decoded,
+                rip,
+                phys_addr,
+                generation,
+                InstallContext {
+                    flags: &cpu.page_has_code,
+                    resolve: &resolve,
+                    ram_base: cpu.ram_base,
+                },
+            ) {
                 Install::Ready(code_addr) => return Ok(code_addr),
                 Install::Stale => {}
                 Install::Full => self.flush(cpu),
@@ -628,10 +739,16 @@ impl Jit {
         rip: u64,
         phys_addr: u64,
         generation: u64,
-        flags: &CodePages,
+        machine: InstallContext,
     ) -> Install {
+        let InstallContext {
+            flags,
+            resolve,
+            ram_base,
+        } = machine;
         let shared = self.shared.clone();
         let mut state = shared.lock();
+        state.ram_base = ram_base;
         // A write to the page since the bytes were read: its `invalidate_page` may have run
         // before this block existed (so dropped nothing), and the block would outlive it.
         if shared.invalidations.load(Ordering::Acquire) != generation {
@@ -658,6 +775,9 @@ impl Jit {
         Self::barrier_if_foreign(&mut self.synced_writes, &mut state);
         if let Some(&index) = state.block_map.get(&key) {
             let code_addr = state.blocks[index as usize].code_addr;
+            if decoded.second_page == NO_SECOND_PAGE {
+                self.link_unresolved(&mut state, rip, phys_addr, index);
+            }
             self.fill_jump_cache(rip, phys_addr, decoded.second_page, code_addr, index);
             return Install::Ready(code_addr);
         }
@@ -683,6 +803,7 @@ impl Jit {
             &insn_rips,
             end_rip,
             shared.ordered_memory.load(Ordering::Acquire),
+            resolve,
         );
         state.stats.inlined += compiled.inlined as u64;
         state.stats.flag_records_skipped += compiled.flag_records_skipped as u64;
@@ -702,20 +823,37 @@ impl Jit {
             _insns: insns,
         });
         shared.valid[index as usize].store(1, Ordering::Release);
-        // Only same-page blocks are linked, in either direction. A direct jump skips the chain
-        // stub's TLB probe and key check, which is sound when the destination is in the page the
-        // jumping block was entered through; a block that straddles a page is keyed by a second
-        // page that only the translating address space is known to map there.
+        // A direct jump skips the chain stub's TLB probe and key check. That is sound within a
+        // page: the destination is in the page the jumping block was entered through. A cross-page
+        // exit probes the TLB itself and takes its slot only when the target page maps to the
+        // physical page it was linked for (`LinkSite::phys_page`). A block that straddles a page
+        // is never linked, in either direction: it is keyed by a second page that only the
+        // translating address space is known to map there.
         if !crosses_page {
             for site in state.pending.remove(&phys_addr).unwrap_or_default() {
                 state.patch_link(&shared, &site, index);
             }
+            self.link_unresolved(&mut state, rip, phys_addr, index);
             let page_base = phys_addr & !PAGE_MASK;
             for link in compiled.links {
-                let destination = page_base | (link.target_rip & PAGE_MASK);
+                if let (Some(word_offset), None) = (link.word_offset, link.phys_page) {
+                    let target = (rip & !PAGE_MASK).wrapping_add(link.target_rip);
+                    state
+                        .unresolved
+                        .entry(target)
+                        .or_default()
+                        .push(UnresolvedSite {
+                            slot_offset: block_offset + link.code_offset as usize,
+                            word_offset: block_offset + word_offset as usize,
+                        });
+                    continue;
+                }
+                let target_page = link.phys_page.unwrap_or(page_base);
+                let destination = target_page | (link.target_rip & PAGE_MASK);
                 let site = LinkedSite {
                     exec_offset: block_offset + link.code_offset as usize,
                     destination,
+                    cross_page: link.word_offset.is_some(),
                 };
                 match state.block_map.get(&(destination, NO_SECOND_PAGE)).copied() {
                     Some(target) => {
@@ -1323,6 +1461,7 @@ mod tests {
             &rips,
             start + 4,
             false,
+            &|_| None,
         );
         let written =
             unsafe { std::slice::from_raw_parts(code_addr as *const u8, expected.code.len()) };
