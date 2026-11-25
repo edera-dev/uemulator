@@ -23,7 +23,7 @@
 use std::mem::{offset_of, size_of};
 
 use super::helpers::*;
-use super::native::LinkSite;
+use super::native::{LinkSite, ResolveTarget};
 use super::x64::*;
 use crate::cpu::cet::Cet;
 use crate::cpu::decode::{Insn, NO_REG, VEX_OP_FLAG};
@@ -117,6 +117,7 @@ const _: () = assert!(offset_of!(Cpu, lazy_size) == offset_of!(Cpu, lazy_op) + 1
 const TLB_TAG_READ: i32 = offset_of!(TlbEntry, tag_r) as i32;
 const TLB_TAG_WRITE: i32 = offset_of!(TlbEntry, tag_w) as i32;
 const TLB_ADDEND: i32 = offset_of!(TlbEntry, addend) as i32;
+const TLB_TAG_EXEC: i32 = offset_of!(TlbEntry, tag_x) as i32;
 const TLB_ENTRY_SHIFT: u8 = size_of::<TlbEntry>().trailing_zeros() as u8;
 const _: () = assert!(size_of::<TlbEntry>().is_power_of_two());
 
@@ -180,6 +181,10 @@ const PUSH_POP_SIZE: i32 = 8;
 const CONDITION_BELOW: u64 = 2;
 
 const NOP: u8 = 0x90;
+/// `mov rdi, imm64` (REX.W B8+7), the expected host page of a cross-page link (`fixed_exit`).
+const MOVABS_RDI: [u8; 2] = [0x48, 0xbf];
+const MOVABS_IMMEDIATE_OFFSET: u64 = MOVABS_RDI.len() as u64;
+const CROSS_PAGE_WORD_ALIGN: u64 = 8;
 
 /// Stack frame the prologue reserves below its saved registers. The eight pushes leave rsp at
 /// 8 mod 16, so the frame must be 8 mod 16 for calls from blocks to see rsp 16-byte aligned (both
@@ -189,7 +194,8 @@ pub(crate) const FRAME: i32 = 72;
 /// Offset from rsp of the 8-byte slot holding the guest address of the page the running block
 /// belongs to (`rip & !0xfff`), where aarch64 keeps it in a register (`PAGE_BASE` in `emit.rs`;
 /// every host register here has a role). The trampoline sets it from `Cpu::rip`, the chain stub
-/// from its target; a direct link keeps it because links stay within a page. Above `OUT`, in the
+/// from its target, a cross-page link's check (`Gen::fixed_exit`) from the page it checked, and a
+/// same-page link keeps it. Above `OUT`, in the
 /// frame's spare bytes, which no callee touches.
 pub(crate) const PAGE_BASE_SLOT: i32 = 40;
 /// Where the trampoline keeps the jump cache of the vCPU running the block (the code and the chain
@@ -367,6 +373,9 @@ pub(crate) struct Gen<'a> {
     link_entry_miss: Option<Label>,
     /// Patchable slots of exits to fixed addresses in the block's own page.
     pub links: Vec<LinkSite>,
+    /// Where the targets of cross-page exits are mapped as the block is translated (see
+    /// `emit.rs`).
+    pub resolve: ResolveTarget<'a>,
     /// Per instruction: must the lazy flags it sets be recorded (`helpers::flag_record_needed`).
     flag_record_needed: Vec<bool>,
     /// The instruction being lowered has a dead flag record, which `store_lazy_op` leaves out.
@@ -410,6 +419,7 @@ impl<'a> Gen<'a> {
             body_offset: 0,
             link_entry_miss: None,
             links: Vec::new(),
+            resolve: &|_| None,
             flag_record_needed: flag_record_needed(insns),
             skip_flag_record: false,
             flag_records_skipped: 0,
@@ -482,17 +492,69 @@ impl<'a> Gen<'a> {
             self.a.st(mem(CPU, PREPAID_ICOUNT), SCRATCH_D, 8);
         }
         if let Some(target) = target {
-            self.link_slot(target);
+            self.fixed_exit(target);
         }
         self.a.jmp_abs(self.addrs.chain);
+    }
+
+    /// The slot in front of the `jmp chain` of an exit to the fixed guest address `target` (in
+    /// rcx, `icount` paid). Within the block's page it is the slot alone. For another page it sits
+    /// behind an inline check that the target's page still maps to the host page `resolve` found
+    /// at translation, which also sets the page base for the successor; see `emit.rs`
+    /// (`Gen::fixed_exit`) and `arch_a64::cross_page_check` for why. Inline here: x86 code is
+    /// compact, and a call that does not return would unbalance the return predictor. rdx, rsi
+    /// and rdi are free at an exit, as for the chain stub.
+    fn fixed_exit(&mut self, target: u64) {
+        if target >> PAGE_SHIFT == self.entry_rip >> PAGE_SHIFT {
+            self.link_slot(target, None);
+            return;
+        }
+        if self.addrs.chain == 0 {
+            return;
+        }
+        let resolved = (self.resolve)(target);
+        let (entry, page, expected) = (RDX, RSI, RDI);
+        let elsewhere = self.a.label();
+        // `mov rdi, imm64` with the immediate 8-byte aligned, so `Jit::link_unresolved` can
+        // replace it with one atomic store while another vCPU runs past it.
+        while !(self.a.here() + MOVABS_IMMEDIATE_OFFSET).is_multiple_of(CROSS_PAGE_WORD_ALIGN) {
+            self.a.code.push(NOP);
+        }
+        let word_offset = (self.a.here() - self.a.base()) as u32 + MOVABS_IMMEDIATE_OFFSET as u32;
+        self.a.code.extend_from_slice(&MOVABS_RDI);
+        self.a.code.extend_from_slice(
+            &resolved
+                .map_or(0, |resolved| resolved.host_page)
+                .to_le_bytes(),
+        );
+        self.a.mov_rr(entry, OPERAND, true);
+        self.a.shift_ri(SHR, entry, PAGE_SHIFT, true);
+        self.a
+            .alu_ri(AND, entry, (TLB_ENTRIES_PER_MODE - 1) as i32, true);
+        self.a.shift_ri(SHL, entry, TLB_ENTRY_SHIFT, true);
+        self.a.alu_rr(ADD, entry, TLB_BASE, true);
+        self.a.mov_rr(page, OPERAND, true);
+        self.a.alu_ri(AND, page, PAGE_MASK, true);
+        self.a.cmp_mr(mem(entry, TLB_TAG_EXEC), page);
+        self.a.jcc(NE, elsewhere);
+        self.a.ld(entry, mem(entry, TLB_ADDEND));
+        self.a.alu_rr(ADD, entry, page, true);
+        self.a.alu_rr(CMP, entry, expected, true);
+        self.a.jcc(NE, elsewhere);
+        self.a.st(mem(RSP, PAGE_BASE_SLOT), page, 8);
+        self.link_slot(target, resolved.map(|resolved| resolved.phys_page));
+        if let Some(link) = self.links.last_mut() {
+            link.word_offset = Some(word_offset);
+        }
+        self.a.bind(elsewhere);
     }
 
     /// Emits the `jmp rel32` that `Jit::translate` points at the block for `target_rip` once it
     /// exists, when `target_rip` is in this block's page; see `emit.rs`. It sits right before the
     /// `jmp chain`, so while it is unpatched (a jump to the next instruction) the stub path runs.
     /// The displacement is padded to a 4-byte boundary so one store replaces it.
-    fn link_slot(&mut self, target_rip: u64) {
-        if self.addrs.chain == 0 || target_rip >> PAGE_SHIFT != self.entry_rip >> PAGE_SHIFT {
+    fn link_slot(&mut self, target_rip: u64, phys_page: Option<u64>) {
+        if self.addrs.chain == 0 {
             return;
         }
         while !(self.a.here() + LINK_JMP_OPCODE_BYTES).is_multiple_of(LINK_WORD_ALIGN) {
@@ -501,6 +563,8 @@ impl<'a> Gen<'a> {
         self.links.push(LinkSite {
             code_offset: (self.a.here() - self.a.base()) as u32,
             target_rip,
+            word_offset: None,
+            phys_page,
         });
         self.a.code.extend_from_slice(&LINK_JMP);
     }
@@ -2957,7 +3021,7 @@ mod tests {
             for _ in 0..padding {
                 generator.a.code.push(0x90);
             }
-            generator.link_slot(0x10);
+            generator.link_slot(0x10, None);
             let site = generator.links[0].code_offset as u64;
             assert_eq!(
                 (memory.base() + padding + site + 1) % 4,

@@ -12,7 +12,7 @@ use super::emit::{
 use super::helpers::{self, EXIT_COUNT_SHIFT, STATUS_EXIT_REQUESTED};
 use super::native::{
     CompiledBlock, JUMP_ENTRY_BLOCK_OFFSET, JUMP_ENTRY_CODE_OFFSET, JUMP_ENTRY_PHYS_OFFSET,
-    JUMP_ENTRY_SHIFT, jump_cache_mask,
+    JUMP_ENTRY_SHIFT, ResolveTarget, jump_cache_mask,
 };
 use crate::cpu::decode::Insn;
 use crate::cpu::{Cpu, TLB_ENTRIES_PER_MODE, TlbEntry};
@@ -145,6 +145,7 @@ pub(crate) fn prologue(base: u64) -> Prologue {
     asm.ldp_post(FRAME_POINTER, LINK_REGISTER, a64::SP, FRAME_SIZE);
     asm.ret();
     let chain = chain_stub(&mut asm, exit_ok);
+    let cross_page_check = cross_page_check(&mut asm);
     let addrs = Addrs {
         exec: exec_stub(&mut asm),
         cond: helper_stub(&mut asm, helpers::helper_cond as *const () as usize as u64),
@@ -159,6 +160,7 @@ pub(crate) fn prologue(base: u64) -> Prologue {
         exit_ok,
         exit_fail,
         chain,
+        cross_page_check,
         load: SIZES.map(|size| {
             thunk(
                 &mut asm,
@@ -404,6 +406,44 @@ fn chain_stub(asm: &mut Asm, exit_ok: u64) -> u64 {
     start
 }
 
+/// The mapping check of a cross-page link (`Gen::fixed_exit`), called with `bl` and x1 = the
+/// target rip, x2 = the host address its page had when the block was translated. Returns with the
+/// host flags EQ when the exec TLB half the block runs in (the one the chain stub would probe)
+/// maps the target's page to that host page, having set `PAGE_BASE` to the target's page for the
+/// successor, and NE otherwise, when the block goes through the chain stub instead. A plain
+/// subroutine that returns either way, so the return predictor stays balanced; it calls no Rust
+/// and touches only x2..x5, so the pinned guest registers stay live across it.
+///
+/// Comparing host addresses is the same test as the chain stub's physical one (`ram_base` is
+/// fixed), one load shorter. The tag check covers everything a TLB fill checked (present,
+/// executable at this privilege); a remap or flush of the target page changes or empties the
+/// entry, so a link made for another mapping is never taken.
+fn cross_page_check(asm: &mut Asm) -> u64 {
+    const TLB_SLOT_MASK: u64 = (TLB_ENTRIES_PER_MODE - 1) as u64;
+    const TLB_ENTRY_SHIFT: u32 = std::mem::size_of::<TlbEntry>().trailing_zeros();
+    const TARGET: u32 = 1;
+    const EXPECTED_HOST_PAGE: u32 = 2;
+    let (entry, page, value) = (3, 4, 5);
+    let start = asm.here();
+    let done = asm.label();
+    asm.lsr_imm(entry, TARGET, PAGE_SHIFT);
+    assert!(asm.and_imm(entry, entry, TLB_SLOT_MASK, true));
+    asm.add_lsl(entry, TLB_BASE, entry, TLB_ENTRY_SHIFT);
+    assert!(asm.and_imm(page, TARGET, !PAGE_OFFSET_MASK, true));
+    asm.ldr(value, entry, offset_of!(TlbEntry, tag_x) as u32);
+    asm.cmp(page, value, true);
+    asm.b_cond(a64::NE, done);
+    asm.ldr(value, entry, offset_of!(TlbEntry, addend) as u32);
+    asm.add(value, value, page, true);
+    asm.cmp(value, EXPECTED_HOST_PAGE, true);
+    asm.b_cond(a64::NE, done);
+    // `mov` leaves NZCV alone, so the caller still sees EQ.
+    asm.mov(PAGE_BASE, page);
+    asm.bind(done);
+    asm.ret();
+    start
+}
+
 /// The addresses blocks are compiled against. Without `chaining` the chain address is 0 and
 /// every control transfer returns to the run loop.
 pub(crate) fn addrs(prologue: &Prologue, chaining: bool) -> Addrs {
@@ -423,9 +463,11 @@ pub(crate) fn compile_block(
     rips: &[u64],
     end_rip: u64,
     ordered: bool,
+    resolve: ResolveTarget,
 ) -> CompiledBlock {
     let mut generator = Gen::new(addr, addrs, insns);
     generator.ordered_memory = ordered;
+    generator.resolve = resolve;
     generator.compile(rips, end_rip);
     CompiledBlock {
         code: bytes(&generator.asm.code),

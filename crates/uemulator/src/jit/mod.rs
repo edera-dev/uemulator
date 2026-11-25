@@ -138,6 +138,12 @@ mod diff_alias_cases;
 mod diff_alu;
 #[cfg(test)]
 mod diff_bmi;
+#[cfg(all(
+    test,
+    feature = "jit",
+    any(target_arch = "aarch64", target_arch = "x86_64")
+))]
+mod diff_cross_page;
 #[cfg(test)]
 mod diff_evex;
 #[cfg(test)]

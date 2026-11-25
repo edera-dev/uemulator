@@ -4,7 +4,7 @@ use super::emit_x64::{CPU, FRAME, Gen, JUMP_CACHE_SLOT, PAGE_BASE_SLOT, TLB_BASE
 use super::helpers::{self, EXIT_COUNT_SHIFT, STATUS_EXIT_REQUESTED};
 use super::native::{
     CompiledBlock, JUMP_ENTRY_BLOCK_OFFSET, JUMP_ENTRY_CODE_OFFSET, JUMP_ENTRY_PHYS_OFFSET,
-    JUMP_ENTRY_SHIFT, jump_cache_mask,
+    JUMP_ENTRY_SHIFT, ResolveTarget, jump_cache_mask,
 };
 use super::x64::*;
 use crate::cpu::decode::Insn;
@@ -189,9 +189,11 @@ pub(crate) fn compile_block(
     rips: &[u64],
     end_rip: u64,
     ordered: bool,
+    resolve: ResolveTarget,
 ) -> CompiledBlock {
     let mut generator = Gen::new(addr, addrs, insns);
     let _ = ordered;
+    generator.resolve = resolve;
     generator.compile(rips, end_rip);
     CompiledBlock {
         code: generator.a.code,

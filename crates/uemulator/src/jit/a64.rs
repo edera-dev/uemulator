@@ -287,6 +287,11 @@ impl Asm {
         self.labels[label] = Some(self.code.len());
     }
 
+    /// Byte offset from `base` a label was bound to (after `finish` for literals).
+    pub fn label_offset(&self, label: Label) -> Option<u32> {
+        self.labels[label].map(|word| word as u32 * 4)
+    }
+
     /// Patches every branch to a label. The offsets are not range-checked: `b.cond`/`cbz` reach
     /// only +-1 MiB and `b` +-128 MiB, far more than one block (at most `MAX_INSNS` instructions
     /// plus their out-of-line slow paths) ever spans. Panics on a label that was never bound.

@@ -38,6 +38,10 @@ const LARGE_PAGE_SHIFT: u32 = 21;
 const PDE_PRESENT_WRITABLE_LARGE: u64 = 1 | 2 | 1 << 7;
 /// A page of its own for the far call target, so call and ret cross pages.
 const FAR_TARGET: u64 = SCRATCH + 0x8_0000;
+/// The second half of the far-jump loop, in another page again.
+const FAR_JUMP_TARGET: u64 = SCRATCH + 0x9_0000;
+const JMP_REL32_LENGTH: u64 = 5;
+const JNZ_REL32_LENGTH: u64 = 6;
 
 // 1: add rax, rbx; xor rdx, rax; add rbx, 3; dec rcx; jnz 1b; hlt
 const REGISTER_LOOP: &[u8] = &[
@@ -87,6 +91,25 @@ const REP_STOS_LOOP: &[u8] = &[
     0x48, 0x83, 0xc3, 0x01, 0x48, 0xff, 0xc9, 0x75, 0xe7, 0xf4,
 ];
 
+/// `1: jmp 2f; hlt` at `CODE_BASE` and `2: add rax, 1; dec rcx; jnz 1b; hlt` at
+/// `FAR_JUMP_TARGET`: direct jumps between pages both ways (cross-page links).
+fn far_jump_loop() -> Vec<u8> {
+    let jump = (FAR_JUMP_TARGET.wrapping_sub(CODE_BASE + JMP_REL32_LENGTH) as i32).to_le_bytes();
+    [&[0xe9][..], &jump, &[0xf4]].concat()
+}
+
+fn far_jump_body() -> Vec<u8> {
+    const BEFORE_JNZ: u64 = 7;
+    let back = (CODE_BASE.wrapping_sub(FAR_JUMP_TARGET + BEFORE_JNZ + JNZ_REL32_LENGTH) as i32)
+        .to_le_bytes();
+    [
+        &[0x48, 0x83, 0xc0, 0x01, 0x48, 0xff, 0xc9, 0x0f, 0x85][..],
+        &back,
+        &[0xf4],
+    ]
+    .concat()
+}
+
 fn backend() -> &'static str {
     if cfg!(target_arch = "aarch64") {
         "aarch64"
@@ -104,6 +127,7 @@ fn setup(harness: &mut Harness, iterations: u64, data: u64) {
     harness.cpu.gpr[RDI] = SCRATCH + 0x1_0000;
     harness.cpu.gpr[R10] = FAR_TARGET;
     harness.write(FAR_TARGET, FAR_FUNCTION);
+    harness.write(FAR_JUMP_TARGET, &far_jump_body());
     if data == ALIAS_DATA {
         let directory_entry =
             harness.cpu.cr3 + FIRST_PAGE_DIRECTORY_OFFSET + (ALIAS_DATA >> LARGE_PAGE_SHIFT) * 8;
@@ -199,6 +223,12 @@ fn call_ret_loop() {
 #[ignore]
 fn far_call_loop() {
     bench("far-call", FAR_CALL_LOOP, TIMED_ITERATIONS);
+}
+
+#[test]
+#[ignore]
+fn far_jump_loop_bench() {
+    bench("far-jump", &far_jump_loop(), TIMED_ITERATIONS);
 }
 
 #[test]

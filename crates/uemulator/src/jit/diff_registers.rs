@@ -1,17 +1,19 @@
-//! Where a backend that keeps guest registers in host registers or locals for the life of a block
-//! would have to write them back to `Cpu` or reload them: a fault after earlier instructions of
-//! the block wrote registers, an interpreted instruction between inline ones (it reads the written
-//! registers from `Cpu` and writes its own there), byte and word writes to registers the block has
-//! not touched yet, `push rsp`/`pop rsp`, a rotate by CL, a store that ends the block because it
-//! hit translated code, and successors that read what their predecessor wrote (linked exits and
-//! the chain stub). No backend caches registers today; these pin the behavior one would have to
-//! keep.
+//! Where a backend that keeps guest registers in host registers (the aarch64 one keeps rax..rdi in
+//! x8..x15 across blocks, `docs/plans/06-jit.md`, "Pinned guest registers") or in locals has to
+//! write them back to `Cpu` or reload them: a fault after earlier instructions of the block wrote
+//! registers (also delivered through the IDT, to a handler that reads them), an interpreted
+//! instruction between inline ones (it reads the written registers from `Cpu` and writes its own
+//! there), the flag helpers and slow-path memory helpers in the middle of a block, byte and word
+//! writes to registers the block has not touched yet, `push rsp`/`pop rsp`, a rotate by CL, a
+//! store that ends the block because it hit translated code, and successors that read what their
+//! predecessor wrote (linked exits and the chain stub).
 //!
 //! Such a backend must also write registers back before the slow-path load and store helpers,
-//! not only before `helper_exec`, and must not write them back after one fails: a nested page
-//! fault in an SVM guest is a #VMEXIT taken inside the helper (`Cpu::vmexit`), which saves the
-//! guest's rsp and rax to the VMCB and loads the host's into `Cpu::gpr`. No case here covers
-//! that one.
+//! not only before `helper_exec`, and reload them after even when the helper failed: a nested
+//! page fault in an SVM guest is a #VMEXIT taken inside the helper (`Cpu::vmexit`), which saves
+//! the guest's rsp and rax to the VMCB and loads the host's into `Cpu::gpr`. That case is
+//! `cpu/svm.rs`'s `a_nested_fault_in_the_middle_of_a_block_saves_the_guest_and_restores_the_host`,
+//! which runs on the JIT too.
 
 use super::diff_tests::*;
 use crate::testkit::*;

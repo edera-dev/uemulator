@@ -49,7 +49,7 @@ use std::mem::{offset_of, size_of};
 use super::a64::*;
 pub(super) use super::arch::Stub;
 use super::helpers::*;
-use super::native::LinkSite;
+use super::native::{LinkSite, ResolveTarget};
 use crate::cpu::cet::Cet;
 use crate::cpu::decode::{Insn, NO_REG, VEX_OP_FLAG};
 use crate::cpu::flags::{AC, CF, IF, LazyFlagsOp, SZP_CF_OF_SRC_CF_BIT};
@@ -140,8 +140,9 @@ const PAGE_MASK: u64 = (1 << PAGE_SHIFT) - 1;
 pub(super) const CPU: u32 = 19;
 pub(super) const TLB_BASE: u32 = 20;
 /// Guest virtual address of the page the block runs from (`rip & !0xfff`), latched on entry like
-/// `TLB_BASE`: the trampoline sets it from `Cpu::rip`, the chain stub from its target, and a direct
-/// link keeps it because links stay within a page. Blocks are keyed by physical address alone
+/// `TLB_BASE`: the trampoline sets it from `Cpu::rip`, the chain stub from its target, the check of
+/// a cross-page link (`arch_a64::cross_page_check`) from the page it checked, and a same-page link
+/// keeps it. Blocks are keyed by physical address alone
 /// (`Jit::translate`), so the same translation runs at whatever virtual address the page is
 /// mapped at (ASLR gives every process its own address for the same libc page), and every guest
 /// address a block needs is this plus a translation-time offset. Callee-saved, so helper calls
@@ -466,6 +467,8 @@ pub(crate) struct Addrs {
     /// The block-to-block transfer stub (see `arch_a64::chain_stub`), or 0 when chaining is off
     /// and every block returns to the run loop.
     pub chain: u64,
+    /// The mapping check in front of a cross-page link slot (`arch_a64::cross_page_check`).
+    pub cross_page_check: u64,
     /// Memory-access thunks, indexed by `size_index` (1, 2, 4, 8 bytes), for the slow path of
     /// the inline TLB probe: zero-extending loads, stores, and stores that keep x0 and x1.
     /// Sign-extending loads exist for 1, 2 and 4 bytes. The stack variants (push/pop/call/ret)
@@ -516,8 +519,15 @@ pub(crate) struct Gen<'a> {
     pub body_offset: u32,
     /// Label of the link entry's out-of-line exit, bound by `emit_slows`.
     link_entry_miss: Option<Label>,
-    /// Patchable slots of exits to fixed addresses in the block's own page.
+    /// Patchable slots of exits to fixed addresses in the block's own page, and of cross-page
+    /// ones `resolve` found a page for.
     pub links: Vec<LinkSite>,
+    /// Where the targets of cross-page exits are mapped as the block is translated (none in
+    /// tests that compile without a CPU).
+    pub resolve: ResolveTarget<'a>,
+    /// Cross-page links (index into `links`) and the literal holding their expected host page,
+    /// whose offset is known once the literal pool is placed (`emit_slows`).
+    cross_page_words: Vec<(usize, Label)>,
     /// Per instruction: must the lazy flags it sets be recorded (`helpers::flag_record_needed`).
     flag_record_needed: Vec<bool>,
     /// The instruction being lowered has a dead flag record, which `store_lazy_op` leaves out.
@@ -550,6 +560,8 @@ impl<'a> Gen<'a> {
             body_offset: 0,
             link_entry_miss: None,
             links: Vec::new(),
+            resolve: &|_| None,
+            cross_page_words: Vec::new(),
             flag_record_needed: flag_record_needed(insns),
             skip_flag_record: false,
             flag_records_skipped: 0,
@@ -638,28 +650,62 @@ impl<'a> Gen<'a> {
 
     /// `chain_exit` to a fixed guest address.
     fn chain_to(&mut self, rip: u64, retired: u32) {
-        self.rip_to(1, rip);
         if self.addrs.chain == 0 {
+            self.rip_to(1, rip);
             self.chain_exit(retired);
             return;
         }
         self.pay_icount(retired);
-        self.link_slot(rip);
+        self.fixed_exit(rip);
+    }
+
+    /// The end of a chained exit to the fixed guest address `target`, `icount` already paid: x1 =
+    /// `target`, then the chain stub, with a link slot in front of it where one can go.
+    ///
+    /// Within the block's page the slot comes first (a linked jump skips the rest). For another
+    /// page it comes after a check that the target's page still maps to the host page `resolve`
+    /// found at translation (`arch_a64::cross_page_check`, which also sets `PAGE_BASE` for the
+    /// successor): the block runs in every address space its page is mapped in, and the target
+    /// page may map elsewhere in another, or after a remap, which the stub then handles.
+    fn fixed_exit(&mut self, target: u64) {
+        if target >> PAGE_SHIFT == self.entry_rip >> PAGE_SHIFT {
+            self.link_slot(target, None);
+            self.rip_to(1, target);
+            self.asm.b_abs(self.addrs.chain);
+            return;
+        }
+        self.rip_to(1, target);
+        if self.addrs.chain != 0 {
+            const EXPECTED_HOST_PAGE: u32 = 2;
+            let resolved = (self.resolve)(target);
+            let word = self
+                .asm
+                .literal(resolved.map_or(0, |resolved| resolved.host_page));
+            self.asm.ldr_literal(EXPECTED_HOST_PAGE, word);
+            self.asm.bl_stub(self.addrs.cross_page_check);
+            let elsewhere = self.asm.label();
+            self.asm.b_cond(NE, elsewhere);
+            self.link_slot(target, resolved.map(|resolved| resolved.phys_page));
+            self.cross_page_words.push((self.links.len() - 1, word));
+            self.asm.bind(elsewhere);
+        }
         self.asm.b_abs(self.addrs.chain);
     }
 
     /// Emits the nop that `Jit::translate` turns into a direct jump to the block at `target_rip`
-    /// once it exists, when `target_rip` is in this block's page (see `LinkSite`). It sits right
-    /// before the `mov x1, rip; b chain` exit, which therefore still runs while the slot is a nop.
-    /// The jump skips the stub and its probes, so it lands on the successor's link entry, which
-    /// repeats the stub's checks; icount must already be paid, as for the stub.
-    fn link_slot(&mut self, target_rip: u64) {
-        if self.addrs.chain == 0 || target_rip >> PAGE_SHIFT != self.entry_rip >> PAGE_SHIFT {
+    /// once it exists (see `LinkSite`; `phys_page` for a target in another page). It sits right
+    /// before the `b chain` exit, which therefore still runs while the slot is a nop. The jump
+    /// skips the stub and its probes, so it lands on the successor's link entry, which repeats
+    /// the stub's checks; icount must already be paid, as for the stub.
+    fn link_slot(&mut self, target_rip: u64, phys_page: Option<u64>) {
+        if self.addrs.chain == 0 {
             return;
         }
         self.links.push(LinkSite {
             code_offset: (self.asm.here() - self.asm.base()) as u32,
             target_rip,
+            word_offset: None,
+            phys_page,
         });
         self.asm.nop();
     }
@@ -1115,6 +1161,9 @@ impl<'a> Gen<'a> {
             self.asm.b(slow.resume);
         }
         self.asm.finish();
+        for (link, word) in std::mem::take(&mut self.cross_page_words) {
+            self.links[link].word_offset = self.asm.label_offset(word);
+        }
     }
 
     /// Records the flags of the instruction just emitted: the result is in x0, the second
@@ -2171,13 +2220,9 @@ impl<'a> Gen<'a> {
             return;
         }
         if chaining {
-            self.link_slot(next_rip);
-            self.rip_to(1, next_rip);
-            self.asm.b_abs(self.addrs.chain);
+            self.fixed_exit(next_rip);
             self.asm.bind(taken);
-            self.link_slot(target);
-            self.rip_to(1, target);
-            self.asm.b_abs(self.addrs.chain);
+            self.fixed_exit(target);
         } else {
             self.chain_to(next_rip, retired);
             self.asm.bind(taken);
@@ -3905,6 +3950,7 @@ mod tests {
         exit_ok: 0,
         exit_fail: 0,
         chain: 0,
+        cross_page_check: 0,
         load: [Stub::DUMMY; 4],
         load_signed: [Stub::DUMMY; 3],
         load_stack: Stub::DUMMY,
