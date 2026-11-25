@@ -352,3 +352,40 @@ Round 6 left the page walks unexplained. Counting the misses of a Debian boot (1
 Native aarch64, wall seconds, medians of 5 interleaved runs at a load of 4 to 7 (main is 17b3a29): Debian installer 7.19 -> 6.94 (1.036x), Alpine demo 1.51 -> 1.43 (1.056x), Xen PV 4.97 -> 4.90 (1.014x), Xen PVH 3.36 -> 3.24 (1.037x). Earlier A/B runs at a load near 17 put the steps apart: flushing only filled slots alone changed nothing, 4096 entries took Debian from 7.49 to 7.31, global pages on top to 7.13 and Alpine from 1.56 to 1.45. Under Node (3 runs): Alpine 4.20 -> 4.02 (1.045x), Xen PVH 7.73 -> 7.47 (1.035x), Xen PV 12.07 -> 12.06. Why a PV dom0 gains least was not looked into.
 
 Left: code and data still share a slot (`jit::bench`'s `tlb-alias`, now a page 1 GiB above the code mapped in by a 2 MiB entry: 39.6 ns an iteration against 5.8 for the same loop without the alias); a separate exec TLB for the run loop's lookups would end that without touching the inline probes, which read only `tag_r` and `tag_w`. PCIDs are not kept apart, so a CR3 write drops every non-global entry whatever its no-flush bit says.
+
+## Round 8: AVX, AVX2 and the rest of the AVX-512 string forms inline (2026-11-25)
+
+Round 5 found glibc's AVX-512 string functions and bignum code at the top of what a desktop userspace sends through the interpreter under wasm. Measured again on this branch's base (c5f2add), natively (aarch64) with `--debug`'s histogram:
+
+- Debian 13 netboot to the installer (25 s): 29.6M instructions through the interpreter, of them vpbroadcastb from a general register 1.6M, VEX vmovdqu loads 1.2M and stores 1.1M, kortestd 1.0M, VEX vpcmpeqb 0.5M.
+- Fedora 44 KDE live (`boot/x86_64/loader/linux` and `initrd` from the ISO, the ISO as a read-only virtio disk, `root=live:CDLABEL=Fedora-KDE-Live-44 rd.live.image`, 4 GiB), the first 240 s, to the login prompt: 455M. `leave` 115M; the legacy SSE integer forms psrldq imm 45M, movq m64, xmm 43M, psrlq imm 31M, pshuflw 11M, movlpd/movhpd 8M, punpckhqdq 7M; EVEX vpbroadcastb r32 22M; cmpxchg 19M; then the AVX tail: VEX vmovdqu 4M, kmov k, r 2.7M, kortest 1.4M, masked EVEX stores 0.9M. The same boot under Node (2047 MiB) gave the same list (445M by the login prompt). Neither boot runs adcx/adox: round 5's bignum load was key generation in the Debian live image, which this one does not do.
+
+So the AVX family was about 35M of the 455M, and the two biggest SIMD items were legacy SSE: those were done too.
+
+What is now inline on all three backends (`helpers::evex_form`, `vex_form`, `vector_shift`, `is_movq_store`):
+
+- VEX.128/256 vmovdqu/vmovdqa/vmovups/vmovaps/vmovupd/vmovapd, vpand/vpandn/vpor/vpxor, vpminub/vpmaxub, vpadd*/vpsub*, vpcmpeqb/w/d (into a vector) and vpmovmskb, on the EVEX lane machinery with no mask. They have their own gate, `Cpu::vex_gate` (CR4.OSXSAVE, XCR0 SSE and AVX, CR0.TS), checked once per block like the others (`vex_gated`); a passed AVX-512 check covers it, the SSE gate does not (it checks CR0.EM and CR4.OSFXSR, which VEX ignores).
+- EVEX vpbroadcastb/w/d/q from a general register with merge or zero masking (aarch64 `dup`; x86-64 a multiply by 0x0101... and `punpcklqdq`, SSE2 only; wasm `splat`), and kmov between opmask and general registers at 8, 16, 32 and 64 bits.
+- On wasm, EVEX write masks: `push_write_mask` turns a lane's opmask bits into a vector (splat, a swizzle for bytes, AND with each element's bit, compare) for `v128.bitselect`, so masked loads, register moves and arithmetic no longer leave the block. Masked loads read the whole vector inside the TLB-vouched page, as natively; masked stores to memory stay in the interpreter everywhere (fault suppression on the elements a mask drops).
+- Legacy psrlq/psllq/psrldq/pslldq by an immediate (aarch64 `ushr`/`shl`/`ext` against zero, x86-64 the guest's own SSE2 instruction, wasm i64x2 shifts and `i8x16.shuffle` against zero; counts of 0 and past the width are decided at translation) and movq xmm/m64, xmm.
+
+`jit/diff_vex.rs` runs every form against the interpreter over `diff_evex`'s register fillings (masks of none, all and random bits, bits above the element count), page-end and unmapped operands, misaligned aligned moves (32 bytes for VEX.256), each gate failure, every order of a legacy, a VEX, an EVEX and an opmask instruction in one block under each state that fails some of them, and the encodings the interpreter raises #UD for; `the_lowered_forms_run_without_the_interpreter` counts what reaches the interpreter after a TLB warm-up, so a fast path that is never taken fails (checked by adding a masked store to its list).
+
+`jit::bench` has four glibc-shaped loops over 4 KiB (ns per iteration, base -> this branch, a load of 6 to 30 from other sessions):
+
+| loop | aarch64 | x86-64 (Rosetta) | wasm (Node 26) |
+|---|---:|---:|---:|
+| avx2-strlen (vpcmpeqb, vpmovmskb) | 30428 -> 639 | 20911 -> 471 | 42347 -> 394 |
+| avx2-memcpy (vmovdqu load and store) | 51735 -> 450 | 26552 -> 381 | 56700 -> 490 |
+| evex-strlen (vpcmpeqb k, kmovq) | 257 -> 245 | 368 -> 317 | 331 -> 300 |
+| evex-memchr (vpbroadcastb, kmovq k, r, masked vmovdqu8 tail) | 435 -> 250 | 525 -> 308 | 844 -> 302 |
+
+A VEX instruction in the interpreter cost 250 ns or more: `exec_vex_vector` copies the whole vector register file for its snapshot and runs each 128-bit lane through the legacy kernel.
+
+Boots (native aarch64, interleaved, medians):
+
+- Debian installer, 7 pairs at a load of 5 to 10: 6.45 -> 6.07 s (1.06x).
+- Fedora KDE live, the emulator's CPU seconds when `Permit User Sessions` finishes (wall time to the login prompt is not usable: some boots wait minutes in plymouth or a 2-minute firewalld job, guest timeouts on the wall clock): 3 interleaved pairs, base against this branch, 157.5/143.0, 120.7/114.1 and 110.0/106.1 s as the load fell from 21 to 6 (medians 120.7 and 114.1, 1.06x; the pairs say 1.04 to 1.10x). Instructions through the interpreter in the first 240 s: 455M -> 304M.
+- Fedora KDE live under Node (wasm), to `Permit User Sessions`: 282.1 and 260.4 s for the base against 263.5 and 243.0 s (two interleaved pairs at a load of 4 to 6, the order swapped between them; 1.07x on the means, and the guest's own waits are in these).
+
+Left, in order of size (Fedora, natively, after this round): `leave` (115M; not a vector instruction, but the largest single item, and cheap to lower), cmpxchg (19M), pshuflw (11M), movzx r32, r/m8 (12M, a form the generators refuse), bt (9M), div (9M), punpckhqdq (7M), movlpd/movhpd (8M), kortest (1.4M; it writes ZF and CF and clears the other arithmetic flags, which needs an eflags store the lazy-flag model has no inline path for, and the register-pinning work touches the same state), masked EVEX stores (0.9M; a per-element store with fault suppression), adcx/adox (not in these boots). `Cpu::dump` panics with `ram::out_of_range` on the wasm build with 3072 MiB of RAM (seen at the end of a `--debug` run; 2047 MiB works); not looked into.
