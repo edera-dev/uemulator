@@ -1816,12 +1816,58 @@ mod tests {
             (&[0x62, 0xf3, 0x75, 0x48, 0x3e, 0xca, 0x04], 1),
             // vmovdqu8 [rbx]{k1}, zmm2: a masked store to memory
             (&[0x62, 0xf1, 0x7f, 0x49, 0x7f, 0x13], 0),
-            // broadcast, other element sizes, kmovw
+            // a memory broadcast, other element sizes
             (&[0x62, 0xf1, 0x6d, 0x58, 0xef, 0x0b], 0),
             (&[0x62, 0xf1, 0x75, 0x48, 0x75, 0xca], 0),
-            (&[0xc5, 0xf8, 0x93, 0xc1], 0),
+            // kmovw eax, k1 | kmov eax, k1 with F3 (#UD)
+            (&[0xc5, 0xf8, 0x93, 0xc1], 1),
+            (&[0xc5, 0xfa, 0x93, 0xc1], 0),
         ] {
             assert_eq!(inlined_in(&[code, &[0xf4]].concat()), inlined, "{code:x?}");
+        }
+    }
+
+    /// The AVX forms and the broadcasts and kmovs `diff_vex` checks run inline: a memory form
+    /// once the TLB is warm (the first access is the interpreter's), a register form always.
+    #[test]
+    fn avx_forms_broadcasts_and_kmov_run_inline() {
+        use crate::cpu::CR4_OSXSAVE;
+        use crate::cpu::xsave::XCR0_SUPPORTED;
+        let _guard = serialize_jit_tests();
+        for (instruction, interpreted_once) in [
+            // vmovdqu ymm1, [rsi] | vmovdqu [rsi+32], ymm1 | vpcmpeqb ymm2, ymm1, [rsi]
+            (&[0xc5, 0xfe, 0x6f, 0x0e][..], true),
+            (&[0xc5, 0xfe, 0x7f, 0x4e, 0x20], true),
+            (&[0xc5, 0xf5, 0x74, 0x16], true),
+            // vpxor ymm1, ymm2, ymm3 | vpcmpeqb ymm1, ymm2, ymm3 | vpmovmskb eax, ymm1
+            (&[0xc5, 0xed, 0xef, 0xcb], false),
+            (&[0xc5, 0xed, 0x74, 0xcb], false),
+            (&[0xc5, 0xfd, 0xd7, 0xc1], false),
+            // vmovdqa ymm14, ymm15 | vpbroadcastb zmm1 {k1}, eax | vpbroadcastq zmm5, rax
+            (&[0xc4, 0x41, 0x7d, 0x6f, 0xf7], false),
+            (&[0x62, 0xf2, 0x7d, 0x49, 0x7a, 0xc8], false),
+            (&[0x62, 0xf2, 0xfd, 0x48, 0x7c, 0xe8], false),
+            // kmovd k1, eax | kmovb eax, k1 | kmovw k4, r10d
+            (&[0xc5, 0xfb, 0x92, 0xc8], false),
+            (&[0xc5, 0xf9, 0x93, 0xc1], false),
+            (&[0xc4, 0xc1, 0x78, 0x92, 0xe2], false),
+        ] {
+            let code = [instruction, instruction, instruction, &[0xf4]].concat();
+            let mut cpu = cpu_running(&code);
+            cpu.cr4 |= CR4_OSXSAVE;
+            cpu.xcr0 = XCR0_SUPPORTED;
+            cpu.gpr[RSI] = SCRATCH;
+            cpu.jit = Some(Box::new(new_jit()));
+            cpu.helper_histogram = Some(Default::default());
+            cpu.next_event = u64::MAX;
+            steps_to_halt(&mut cpu);
+            let key = decode::decode(instruction).unwrap().histogram_key();
+            let interpreted = cpu.helper_histogram.as_ref().unwrap().get(&key).copied();
+            assert_eq!(
+                interpreted,
+                interpreted_once.then_some(1),
+                "{instruction:x?}"
+            );
         }
     }
 

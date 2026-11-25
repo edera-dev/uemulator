@@ -95,6 +95,7 @@ const VPCMP_NOT_LESS_EQUAL: u8 = 6;
 const XCR0_OFFSET: u32 = offset_of!(Cpu, xcr0) as u32;
 /// What `Cpu::evex_gate` requires of XCR0: the SSE, AVX and AVX-512 state components.
 const XCR0_EVEX_STATE: u64 = XCR0_SSE | XCR0_AVX | XCR0_AVX512;
+const XCR0_VEX_STATE: u64 = XCR0_SSE | XCR0_AVX;
 /// Every 128-bit lane `ldr_q`/`str_q` of a vector register reaches must be within the 12-bit
 /// scaled offset of the instruction (the highest lane of zmm31).
 const _: () =
@@ -478,6 +479,9 @@ pub(crate) struct Gen<'a> {
     sse_gated: bool,
     /// The block already checked the AVX-512 state gate (CR4.OSXSAVE, XCR0, CR0.TS).
     evex_gated: bool,
+    /// The block already checked the AVX state gate (`VectorGate::Avx`), or the AVX-512 one,
+    /// which implies it. Not implied by `sse_gated`: the SSE gate checks other bits.
+    vex_gated: bool,
     /// Instructions of this block already added to `Cpu::icount` ahead of an interpreter helper
     /// (the block index of the last one). Exact at translation time because a block is
     /// straight-line code: every instruction before a reachable one has executed.
@@ -519,6 +523,7 @@ impl<'a> Gen<'a> {
             live: None,
             sse_gated: false,
             evex_gated: false,
+            vex_gated: false,
             prepaid_insns: 0,
             inlined: 0,
             entry_rip: 0,
@@ -2732,6 +2737,17 @@ impl<'a> Gen<'a> {
                 }
                 is_store = self.vector_alu(&insn, form, next_rip, insn_index, rip);
             }
+            // psrlq/psllq/psrldq/pslldq xmm, imm8 (66 0f 73 /2 /6 /3 /7)
+            PSHIFT_QUADWORD_IMMEDIATE if plain => {
+                let Some((shift, count)) = vector_shift(&insn) else {
+                    return false;
+                };
+                self.vector_shift(&insn, shift, count, insn_index, rip);
+            }
+            // movq xmm/m64, xmm (66 0f d6)
+            MOVQ_STORE if plain && is_movq_store(&insn) => {
+                is_store = self.movq_store(&insn, next_rip, insn_index, rip);
+            }
             // The SHA extensions (no prefix), pshufd, palignr and pshufb (66 prefix): see
             // `whole_vector`
             0x170 | 0x200 | 0x30f | 0x2c8..=0x2cd | 0x3cc if plain => {
@@ -2740,8 +2756,9 @@ impl<'a> Gen<'a> {
                 };
                 is_store = self.whole_vector(&insn, form, next_rip, insn_index, rip);
             }
-            // AVX-512 data movement, integer logic and arithmetic, byte compares into an opmask
-            // register, and kmov of an opmask register (see `evex_form`)
+            // AVX and AVX-512 data movement, integer logic, arithmetic and compares, byte compares
+            // into an opmask register, vpmovmskb, broadcasts from a general register and kmov
+            // (see `evex_form`)
             _ if insn.evex || insn.vex => {
                 let Some(form) = evex_form(&insn) else {
                     return false;
@@ -2824,12 +2841,13 @@ impl<'a> Gen<'a> {
         (entry, resume)
     }
 
-    /// Starts an inline AVX-512 instruction: registers its out-of-line interpreter fallback and,
-    /// for the first one of the block, checks `Cpu::evex_gate` (#UD without CR4.OSXSAVE or the
-    /// SSE, AVX and AVX-512 state in XCR0, #NM under CR0.TS), jumping to the fallback so the
-    /// interpreter raises the exception. Like the SSE gate it holds for the whole block: whatever
-    /// changes CR0, CR4 or XCR0 ends it.
-    fn evex_entry(&mut self, insn_index: u32, rip: u64) -> (Label, Label) {
+    /// Starts an inline AVX or AVX-512 instruction: registers its out-of-line interpreter fallback
+    /// and, for the first one of the block that needs `gate`, checks `Cpu::vex_gate` (`Avx`) or
+    /// `Cpu::evex_gate` (`Avx512`): #UD without CR4.OSXSAVE or the state in XCR0, #NM under
+    /// CR0.TS, jumping to the fallback so the interpreter raises the exception. A passed AVX-512
+    /// check covers later AVX ones, not the reverse. Like the SSE gate it holds for the whole
+    /// block: whatever changes CR0, CR4 or XCR0 ends it.
+    fn evex_entry(&mut self, gate: VectorGate, insn_index: u32, rip: u64) -> (Label, Label) {
         let entry = self.asm.label();
         let resume = self.asm.label();
         self.slow_paths.push(SlowPath {
@@ -2839,15 +2857,19 @@ impl<'a> Gen<'a> {
             insn_index,
             rip,
         });
-        if !self.evex_gated {
-            self.evex_gated = true;
+        let (gated, state) = match gate {
+            VectorGate::Avx512 => (self.evex_gated, XCR0_EVEX_STATE),
+            VectorGate::Avx => (self.vex_gated || self.evex_gated, XCR0_VEX_STATE),
+        };
+        if !gated {
+            self.vex_gated = true;
+            self.evex_gated |= gate == VectorGate::Avx512;
             self.asm.ldr(SCRATCH_A, CPU, CR4_OFFSET);
             self.and_constant(SCRATCH_A, SCRATCH_A, CR4_OSXSAVE);
             self.asm.cbz(SCRATCH_A, entry, true);
             self.asm.ldr(SCRATCH_A, CPU, XCR0_OFFSET);
-            self.and_constant(SCRATCH_A, SCRATCH_A, XCR0_EVEX_STATE);
-            self.asm
-                .sub_imm(SCRATCH_A, SCRATCH_A, XCR0_EVEX_STATE as u32, true);
+            self.and_constant(SCRATCH_A, SCRATCH_A, state);
+            self.asm.sub_imm(SCRATCH_A, SCRATCH_A, state as u32, true);
             self.asm.cbnz(SCRATCH_A, entry, true);
             self.asm.ldr(SCRATCH_A, CPU, CR0_OFFSET);
             self.and_constant(SCRATCH_A, SCRATCH_A, CR0_TS);
@@ -2965,7 +2987,7 @@ impl<'a> Gen<'a> {
         }
     }
 
-    /// An inline AVX-512 instruction (`EvexForm`): whole 128, 256 or 512-bit vectors processed
+    /// An inline AVX or AVX-512 instruction (`EvexForm`): whole 128, 256 or 512-bit vectors processed
     /// one 128-bit lane at a time through v0 and v1, loaded from and stored to `Cpu` per lane, so
     /// nothing lives in host vector registers across instructions. A memory operand that is
     /// misaligned (for the aligned moves), misses the TLB or crosses a page, and a failing gate,
@@ -2981,27 +3003,78 @@ impl<'a> Gen<'a> {
         insn_index: u32,
         rip: u64,
     ) -> bool {
-        let (slow, resume) = self.evex_entry(insn_index, rip);
+        let (slow, resume) = self.evex_entry(form.gate, insn_index, rip);
         let lanes = form.bytes / XMM_SIZE;
         let lane_offset = |register: u8, lane: u32| vector_lane_offset(register, lane) as u32;
         let mut is_store = false;
-        let writes_vector = matches!(form.kind, EvexKind::Alu { .. } | EvexKind::Move { .. });
+        let writes_vector = matches!(
+            form.kind,
+            EvexKind::Alu { .. } | EvexKind::Move { .. } | EvexKind::BroadcastGeneral
+        );
         let memory_store = matches!(form.kind, EvexKind::Move { load: false, .. })
             && insn.md != MODRM_MOD_REGISTER;
         if writes_vector && !memory_store && insn.evex_mask != 0 {
             self.begin_masked_write(insn, form.element_log2);
         }
         match form.kind {
-            EvexKind::MaskToGeneral { wide } => {
+            EvexKind::MaskToGeneral { bits } => {
                 self.asm.ldr(
                     VALUE,
                     CPU,
                     OPMASK_OFFSET + OPMASK_SIZE * (insn.rm & OPMASK_REGISTER_MASK) as u32,
                 );
-                if !wide {
-                    self.asm.uxtw(VALUE, VALUE);
+                if bits < u64::BITS {
+                    self.and_constant(VALUE, VALUE, (1 << bits) - 1);
                 }
-                self.write_reg(insn.reg, false, if wide { 8 } else { 4 }, VALUE);
+                self.write_reg(
+                    insn.reg,
+                    false,
+                    if bits == u64::BITS { 8 } else { 4 },
+                    VALUE,
+                );
+            }
+            EvexKind::GeneralToMask { bits } => {
+                self.read_reg(VALUE, insn.rm & GENERAL_REGISTER_MASK, false);
+                if bits < u64::BITS {
+                    self.and_constant(VALUE, VALUE, (1 << bits) - 1);
+                }
+                self.asm.str(
+                    VALUE,
+                    CPU,
+                    OPMASK_OFFSET + OPMASK_SIZE * (insn.reg & OPMASK_REGISTER_MASK) as u32,
+                );
+            }
+            EvexKind::BroadcastGeneral => {
+                // The element in every element of v1, copied to v0 for each commit (a zeroing
+                // commit ANDs v0 in place). `dup` ignores the register bits above the element.
+                self.read_reg(VALUE, insn.rm & GENERAL_REGISTER_MASK, false);
+                self.asm
+                    .vec_dup_general(VECTOR_SRC, VALUE, form.element_log2);
+                for lane in 0..lanes {
+                    self.asm
+                        .vec_op(VEC_ORR, 0, VECTOR_DST, VECTOR_SRC, VECTOR_SRC);
+                    self.commit_vector_lane(insn, form.element_log2, insn.reg, lane);
+                }
+                self.zero_vector_lanes(insn.reg, lanes);
+            }
+            EvexKind::MoveMaskBytes => {
+                // As for `vector_alu`'s pmovmskb, 16 bits per lane, gathered in x0.
+                for lane in 0..lanes {
+                    self.asm.ldr_q(VECTOR_SRC, CPU, lane_offset(insn.rm, lane));
+                    self.asm.vec_ushr(VECTOR_SRC, VECTOR_SRC, 8, 7);
+                    self.asm.vec_usra(VECTOR_SRC, VECTOR_SRC, 16, 7);
+                    self.asm.vec_usra(VECTOR_SRC, VECTOR_SRC, 32, 14);
+                    self.asm.vec_usra(VECTOR_SRC, VECTOR_SRC, 64, 28);
+                    self.asm.umov_byte(VALUE, VECTOR_SRC, 0);
+                    self.asm.umov_byte(SCRATCH_A, VECTOR_SRC, XMM_HALF);
+                    self.asm.add_lsl(VALUE, VALUE, SCRATCH_A, u8::BITS);
+                    if lane == 0 {
+                        self.asm.mov(0, VALUE);
+                    } else {
+                        self.asm.add_lsl(0, 0, VALUE, LANE_BYTE_MASK_BITS * lane);
+                    }
+                }
+                self.write_reg(insn.reg, false, 4, 0);
             }
             EvexKind::Move { load, aligned } => {
                 if insn.md == MODRM_MOD_REGISTER {
@@ -3075,7 +3148,10 @@ impl<'a> Gen<'a> {
                                 VectorOp::MaxUnsigned8 => (VEC_UMAX, 0, VECTOR_DST, VECTOR_SRC),
                                 VectorOp::Add => (VEC_ADD, lane_log2, VECTOR_DST, VECTOR_SRC),
                                 VectorOp::Subtract => (VEC_SUB, lane_log2, VECTOR_DST, VECTOR_SRC),
-                                VectorOp::CompareEqual | VectorOp::MoveMask => {
+                                VectorOp::CompareEqual => {
+                                    (VEC_CMEQ, lane_log2, VECTOR_DST, VECTOR_SRC)
+                                }
+                                VectorOp::MoveMask => {
                                     unreachable!("not an EvexKind::Alu operation")
                                 }
                             };
@@ -3111,7 +3187,7 @@ impl<'a> Gen<'a> {
                             if lane == 0 {
                                 self.asm.mov(0, VALUE);
                             } else {
-                                self.asm.add_lsl(0, 0, VALUE, 16 * lane);
+                                self.asm.add_lsl(0, 0, VALUE, LANE_BYTE_MASK_BITS * lane);
                             }
                         }
                     }
@@ -3283,6 +3359,82 @@ impl<'a> Gen<'a> {
         self.asm.bind(resume);
         self.live = None;
         false
+    }
+
+    /// psrlq/psllq (`ushr`/`shl` of the two quadwords) and psrldq/pslldq (`ext` against a zero
+    /// vector) of xmm `rm` by an immediate. A count of 0 leaves the register as it is, one past
+    /// the width clears it; neither is encodable as a NEON shift, so both are decided here.
+    fn vector_shift(
+        &mut self,
+        insn: &Insn,
+        shift: VectorShift,
+        count: u8,
+        insn_index: u32,
+        rip: u64,
+    ) {
+        const QUADWORD_BITS: u32 = 64;
+        let (_, resume) = self.sse_entry(insn_index, rip);
+        let xmm = XMM_OFFSET + XMM_SIZE * insn.rm as u32;
+        let count = count as u32;
+        if shift.clears(count as u8) {
+            self.asm.str(XZR, CPU, xmm);
+            self.asm.str(XZR, CPU, xmm + XMM_HALF);
+        } else if count != 0 {
+            self.asm.ldr_q(VECTOR_SRC, CPU, xmm);
+            match shift {
+                VectorShift::RightQuadwords => {
+                    self.asm
+                        .vec_ushr(VECTOR_DST, VECTOR_SRC, QUADWORD_BITS, count)
+                }
+                VectorShift::LeftQuadwords => {
+                    self.asm
+                        .vec_shl(VECTOR_DST, VECTOR_SRC, QUADWORD_BITS, count)
+                }
+                // bytes count..16 of the source, then zeros
+                VectorShift::RightBytes => {
+                    self.asm.vec_zero(VECTOR_DST);
+                    self.asm.ext_16b(VECTOR_DST, VECTOR_SRC, VECTOR_DST, count);
+                }
+                // `count` zero bytes, then bytes 0..16 - count of the source
+                VectorShift::LeftBytes => {
+                    self.asm.vec_zero(VECTOR_DST);
+                    self.asm
+                        .ext_16b(VECTOR_DST, VECTOR_DST, VECTOR_SRC, XMM_SIZE - count);
+                }
+            }
+            self.asm.str_q(VECTOR_DST, CPU, xmm);
+        }
+        self.asm.bind(resume);
+        self.live = None;
+    }
+
+    /// movq xmm/m64, xmm (`is_movq_store`): the low quadword of xmm `reg` to memory inside one
+    /// page (no alignment rule; a miss or a page crossing runs in the interpreter), or to xmm `rm`
+    /// with its high quadword cleared. Returns whether it stores to memory.
+    fn movq_store(&mut self, insn: &Insn, next_rip: u64, insn_index: u32, rip: u64) -> bool {
+        const QUADWORD_BYTES: u8 = 8;
+        let (slow, resume) = self.sse_entry(insn_index, rip);
+        let xmm = |reg: u8| XMM_OFFSET + XMM_SIZE * reg as u32;
+        let memory = insn.md != MODRM_MOD_REGISTER;
+        if memory {
+            self.effective_address(insn, next_rip, ADDRESS);
+            self.tlb_probe(QUADWORD_BYTES, TLB_TAG_WRITE_OFFSET, slow);
+            self.asm.ldr(SCRATCH_B, SCRATCH_A, TLB_ADDEND_OFFSET);
+            self.asm.add(SCRATCH_B, ADDRESS, SCRATCH_B, true);
+            self.asm.ldr(VALUE, CPU, xmm(insn.reg));
+            if self.ordered_memory {
+                self.asm.stlr(VALUE, SCRATCH_B, QUADWORD_BYTES);
+            } else {
+                self.asm.str(VALUE, SCRATCH_B, 0);
+            }
+        } else {
+            self.asm.ldr(VALUE, CPU, xmm(insn.reg));
+            self.asm.str(VALUE, CPU, xmm(insn.rm));
+            self.asm.str(XZR, CPU, xmm(insn.rm) + XMM_HALF);
+        }
+        self.asm.bind(resume);
+        self.live = None;
+        memory
     }
 
     /// A `WholeVector` instruction (the SHA extensions, pshufd, palignr, pshufb), the source being

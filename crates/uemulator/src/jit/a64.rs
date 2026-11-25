@@ -755,6 +755,13 @@ impl Asm {
     pub fn vec_usra(&mut self, vd: u32, vn: u32, lane_bits: u32, shift: u32) {
         self.vec_shift_right(0x6f00_1400, vd, vn, lane_bits, shift);
     }
+    /// `shl vd.<T>, vn.<T>, #shift` per lane of `lane_bits` bits, shift 0..lane_bits.
+    pub fn vec_shl(&mut self, vd: u32, vn: u32, lane_bits: u32, shift: u32) {
+        assert!(lane_bits.is_power_of_two() && shift < lane_bits);
+        // immh:immb is `lane_bits + shift`; its top set bit gives the lane size.
+        let immediate = lane_bits + shift;
+        self.emit(0x4f00_5400 | immediate << VEC_SHIFT_IMMEDIATE_SHIFT | vn << RN_SHIFT | vd);
+    }
     fn vec_shift_right(&mut self, base: u32, vd: u32, vn: u32, lane_bits: u32, shift: u32) {
         assert!(lane_bits.is_power_of_two() && (1..=lane_bits).contains(&shift));
         // immh:immb is `2 * lane_bits - shift`; the position of its top set bit gives the lane size.
@@ -817,6 +824,13 @@ impl Asm {
                 | (imm & ((1 << DEFGH_BITS) - 1)) << DEFGH_SHIFT
                 | vd,
         );
+    }
+    /// `dup vd.<T>, wn/xn`: the low element of general register `rn` in every element of `vd`,
+    /// elements of `1 << size` bytes (0 = 16 x 8-bit .. 3 = 2 x 64-bit).
+    pub fn vec_dup_general(&mut self, vd: u32, rn: u32, size: u32) {
+        const IMM5_SHIFT: u32 = 16;
+        assert!(size <= 3);
+        self.emit(0x4e00_0c00 | (1 << size) << IMM5_SHIFT | rn << RN_SHIFT | vd);
     }
     /// `tbl vd.16b, {vn.16b}, vm.16b`: byte `k` of `vd` is byte `vm[k]` of `vn` (0 past 15).
     pub fn tbl(&mut self, vd: u32, vn: u32, vm: u32) {
@@ -931,6 +945,12 @@ mod tests {
                 a.umov_byte(9, 1, 0);
                 a.umov_byte(10, 1, 8);
                 a.dmb_ishld();
+                a.vec_dup_general(1, 6, 0); // dup v1.16b, w6
+                a.vec_dup_general(1, 6, 1);
+                a.vec_dup_general(1, 6, 2);
+                a.vec_dup_general(1, 6, 3); // dup v1.2d, x6
+                a.vec_shl(0, 0, 64, 1); // shl v0.2d, v0.2d, #1
+                a.vec_shl(1, 2, 64, 63);
             }),
             [
                 0x6f09_0421,
@@ -940,6 +960,12 @@ mod tests {
                 0x0e01_3c29,
                 0x0e11_3c2a,
                 0xd503_39bf,
+                0x4e01_0cc1,
+                0x4e02_0cc1,
+                0x4e04_0cc1,
+                0x4e08_0cc1,
+                0x4f41_5400,
+                0x4f7f_5441,
             ]
         );
     }
