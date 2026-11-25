@@ -51,15 +51,18 @@ The design plans in [`plans/`](plans/README.md) are the source of truth for how 
 - [28-apple.md](plans/28-apple.md): the SwiftUI app for macOS and iOS (proposal): native engine, and the WebAssembly JIT run in a hidden WebKit view on iOS.
 - [12-uefi.md](plans/12-uefi.md): uemulator as a UEFI application, including the hardware-virtualization path.
 - [29-snapshots.md](plans/29-snapshots.md): suspending a machine to a snapshot and resuming it, on any host, keeping its disks consistent: how the app survives iOS ending it and moves a machine between engines.
+- [34-incremental-snapshots.md](plans/34-incremental-snapshots.md): dirty-page tracking, delta snapshots with page compression, and checkpoints of a running machine to go back to.
 
 ## Performance
 
 - [20-jit-perf.md](plans/20-jit-perf.md): JIT performance work, covering direct chaining, inline lowering and SIMD fast paths, with measurements.
 - [23-guest-io-perf.md](plans/23-guest-io-perf.md): performance as the guest sees it (syscalls, memory, disk and network), with in-guest benchmarks.
+- [31-host-fpu.md](plans/31-host-fpu.md): SSE, AVX and AVX-512 floating point on the host FPU where the result is provably the soft-float engine's, and the differential tests that show it.
 
 ## Testing
 
 - [08-testing.md](plans/08-testing.md): unit, instruction and differential (JIT against interpreter) tests.
+- [30-gdb-stub.md](plans/30-gdb-stub.md): the GDB remote stub, a sans-I/O protocol engine in the library that gdb and lldb attach to.
 - [`CLAUDE.md`](../CLAUDE.md): the project's test rules and the real-guest checks to run after touching particular subsystems.
 
 ## Specifications

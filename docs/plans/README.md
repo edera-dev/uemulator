@@ -34,5 +34,8 @@ Index of the design plans, in reading order. Each file starts with a status line
 | 27-wisp.md | internet for web guests through a Wisp relay over WebSocket; the user-mode gateway moved into the library and shared with the CLI (implemented) |
 | 28-apple.md | SwiftUI app for macOS, iOS and iPadOS (proposal): a native engine (JIT on macOS, interpreter on iOS) and a WebKit engine that runs the WebAssembly build and its JIT in a hidden `WKWebView`, the Xcode project, the bridge, milestones |
 | 29-snapshots.md | machine snapshots: suspend and resume through a host sink, the same on every host, so a machine moves between the native and WebAssembly builds; `#[derive(Snapshot)]`, I/O consistency, the iOS background flow (implemented) |
+| 30-gdb-stub.md | GDB remote stub: the RSP engine in the library (sans-I/O), breakpoints, watchpoints and single-step through the interpreter's debug path, a thread per vCPU, `--gdb` on the CLI (implemented) |
+| 31-host-fpu.md | SSE/AVX/AVX-512 floating point on the host FPU (`x-ssefp`): when the host's result is exactly soft-float's, the exactness checks and the fallbacks, per host (implemented) |
+| 34-incremental-snapshots.md | dirty-page tracking, snapshot format 2 (deltas, LZ page compression), checkpoints of a running machine and resuming a chain (implemented) |
 
 Rules for implementers: `../ext/qemu-uplink` is read-only reference. Behaviour and algorithms are studied there; code is written fresh in Rust, not transliterated. The library has zero crate dependencies when built with `--no-default-features`.
