@@ -481,7 +481,7 @@ fn the_register_form_shortcut_matches_the_legacy_kernel() {
     const MODRM_XMM0_MEMORY: u8 = 0x06;
     let mut harness = crate::testkit::Harness::new(&[0xf4]);
     let cpu = &mut harness.cpu;
-    cpu.cr4 |= crate::cpu::CR4_OSFXSR;
+    cpu.cr4 |= crate::cpu::sys::CR4_OSFXSR;
     let mut rng = XorShift(0x3c6e_f372_fe94_f82b);
     let mask_sets = [
         ALL_MASKED,

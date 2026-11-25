@@ -39,6 +39,10 @@ const LARGE_PAGE_SHIFT: u32 = 21;
 const PDE_PRESENT_WRITABLE_LARGE: u64 = 1 | 2 | 1 << 7;
 /// A page of its own for the far call target, so call and ret cross pages.
 const FAR_TARGET: u64 = SCRATCH + 0x8_0000;
+/// `cpu::sys`'s CR4 bits, which `cpu` re-exports only to the JIT builds; this module also builds
+/// without the `jit` feature.
+const CR4_OSFXSR: u64 = 1 << 9;
+const CR4_OSXSAVE: u64 = 1 << 18;
 
 // 1: add rax, rbx; xor rdx, rax; add rbx, 3; dec rcx; jnz 1b; hlt
 const REGISTER_LOOP: &[u8] = &[
@@ -139,7 +143,7 @@ fn doubles(bits: u64) -> u128 {
 /// start from), AVX-512 enabled with zmm0-2 filled.
 fn setup_floating_point(harness: &mut Harness) {
     let cpu = &mut harness.cpu;
-    cpu.cr4 |= crate::cpu::CR4_OSFXSR | crate::cpu::CR4_OSXSAVE;
+    cpu.cr4 |= CR4_OSFXSR | CR4_OSXSAVE;
     cpu.xcr0 = crate::cpu::xsave::XCR0_SUPPORTED;
     cpu.xmm[0] = singles(1.5f32.to_bits());
     cpu.xmm[1] = singles(0.3f32.to_bits());
