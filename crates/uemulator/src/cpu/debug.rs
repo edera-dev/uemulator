@@ -129,6 +129,7 @@ impl Cpu {
         self.eflags & (TF | RF) != 0
             || self.dr[7] & DR7_ENABLES != 0
             || self.debug.needs_attention()
+            || self.gdb.armed
     }
 
     /// One step of the run loop: a JIT block where one may run (`Cpu::uses_jit`), else one
@@ -213,6 +214,10 @@ impl Cpu {
                 self.debug.trap_bits |= 1 << index;
             }
         }
+        // The debugger's watchpoints, apart from the guest's: `cpu/gdb.rs`.
+        if !self.gdb.watchpoints.is_empty() {
+            self.gdb_watch(linear, size, write);
+        }
     }
 
     /// Called for every port access while `watch_accesses` is on.
@@ -235,7 +240,8 @@ impl Cpu {
     /// every iteration while single-stepping, with RIP still on it (SDM 18.3.1.2): the trap is
     /// taken between iterations.
     pub(crate) fn rep_must_pause(&self) -> bool {
-        self.debug.watch_accesses && (self.debug.trap_bits != 0 || self.eflags & TF != 0)
+        self.debug.watch_accesses
+            && (self.debug.trap_bits != 0 || self.eflags & TF != 0 || self.gdb.watch_hit.is_some())
     }
 
     /// A task switch loaded a TSS with its T bit set.
@@ -247,6 +253,7 @@ impl Cpu {
     /// breakpoints, general detect) come before the instruction runs; traps (data and I/O
     /// breakpoints, single-step, bus lock) after it completes, with RIP at the next instruction.
     pub(crate) fn step_debug(&mut self) -> ExecResult<()> {
+        self.gdb_note_step();
         if core::mem::take(&mut self.debug.task_switch_trap) {
             return Err(self.debug_exception(DR6_TASK_SWITCH));
         }
@@ -271,7 +278,8 @@ impl Cpu {
         self.debug.mov_ss_shadow = false;
         self.debug.watch_accesses = self.access_breakpoints_armed()
             || self.debug.debugctl & DEBUGCTL_BUS_LOCK_DETECT != 0
-            || flags_before & TF != 0;
+            || flags_before & TF != 0
+            || !self.gdb.watchpoints.is_empty();
         let result = self.fetch_decode().and_then(|insn| {
             self.trace_step();
             self.exec_interpreted(&insn).map(|()| insn)
@@ -281,6 +289,8 @@ impl Cpu {
             Ok(insn) => insn,
             Err(error) => {
                 self.debug.trap_bits = 0;
+                // A faulting instruction did not complete; its accesses are not reported.
+                self.gdb.watch_hit = None;
                 if self.debug.deferred_bits != 0 {
                     self.debug.deferred_ready = true;
                 }

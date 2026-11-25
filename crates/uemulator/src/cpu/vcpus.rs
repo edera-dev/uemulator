@@ -47,6 +47,9 @@ const HALTED_SLEEP: Duration = Duration::from_millis(100);
 const INVALIDATION_LOG_CAPACITY: usize = 4096;
 /// Waiting iterations before a thread offers its time slice to others instead of just spinning.
 const SPINS_BEFORE_YIELD: u32 = 64;
+/// Waiting iterations before a thread waiting out a debugger stop sleeps between looks: the
+/// stop lasts as long as the person at the debugger takes, and every other vCPU waits it out.
+const SPINS_BEFORE_SLEEP: u32 = 1024;
 
 /// Lets one thread wake another that sleeps with a timeout. Hosted: `park`/`unpark`. A
 /// freestanding host has no scheduler, so a wait is a spin and a wake is a no-op.
@@ -135,6 +138,9 @@ pub(crate) struct VcpuLinks {
     /// completion therefore sees the count or the invalidation. Raising it for every tick instead
     /// would stall every vCPU at every block boundary for the length of every tick.
     pub(super) dma_in_flight: AtomicUsize,
+    /// The exclusive section in progress is a debugger stop (`run_thread`): those waiting for it
+    /// sleep instead of spinning.
+    debugger_stop: AtomicBool,
     #[cfg(test)]
     dma_wait_observed: AtomicBool,
 }
@@ -164,6 +170,7 @@ impl VcpuLinks {
             device_waker: Waker::default(),
             device_sleeping: AtomicBool::new(false),
             dma_in_flight: AtomicUsize::new(0),
+            debugger_stop: AtomicBool::new(false),
             #[cfg(test)]
             dma_wait_observed: AtomicBool::new(false),
         })
@@ -306,7 +313,7 @@ impl VcpuLinks {
             self.running.fetch_sub(1, Ordering::SeqCst);
             let mut spins = 0u32;
             while self.exclusive_requested.load(Ordering::SeqCst) {
-                spin_or_yield(&mut spins);
+                self.spin_or_yield(&mut spins);
             }
         }
     }
@@ -314,13 +321,21 @@ impl VcpuLinks {
     fn wait_while_exclusive(&self) {
         let mut spins = 0u32;
         while self.exclusive_requested.load(Ordering::SeqCst) {
-            spin_or_yield(&mut spins);
+            self.spin_or_yield(&mut spins);
         }
+    }
+
+    fn spin_or_yield(&self, spins: &mut u32) {
+        if *spins >= SPINS_BEFORE_SLEEP && self.debugger_stop.load(Ordering::Relaxed) {
+            Waker::wait(MAX_SLEEP);
+            return;
+        }
+        spin_or_yield(spins);
     }
 }
 
 fn spin_or_yield(spins: &mut u32) {
-    *spins += 1;
+    *spins = spins.saturating_add(1);
     if *spins < SPINS_BEFORE_YIELD {
         core::hint::spin_loop();
     } else {
@@ -391,10 +406,29 @@ impl Cpu {
         link.cpu.store(self as *mut Cpu, Ordering::SeqCst);
         // Everyone is counted as running from the start, so an exclusive request waits for the
         // threads that have not got here yet; being here means being a parked-or-running vCPU.
-        let reason = match self.run_slice() {
-            Slice::Exit(reason) => reason,
-            Slice::Yield | Slice::Halted => {
-                ExitReason::Internal("a threaded vCPU asked for a scheduler".into())
+        if let Some(debugger) = self.debugger.clone() {
+            // Breakpoints set before this thread published its `Cpu` did not reach it.
+            self.attach_debugger(Some(debugger));
+        }
+        let reason = loop {
+            match self.run_slice() {
+                Slice::Exit(reason) => break reason,
+                Slice::Debug(event) => {
+                    let debugger = self.debugger.clone().expect("a debugger stop");
+                    let stopped = self.with_exclusive(|cpu| {
+                        let links = cpu.links();
+                        links.debugger_stop.store(true, Ordering::SeqCst);
+                        let reason = debugger.serve(&mut super::gdb::ThreadVcpus(cpu), event);
+                        links.debugger_stop.store(false, Ordering::SeqCst);
+                        reason
+                    });
+                    if let Some(reason) = stopped {
+                        break reason;
+                    }
+                }
+                Slice::Yield | Slice::Halted => {
+                    break ExitReason::Internal("a threaded vCPU asked for a scheduler".into());
+                }
             }
         };
         link.cpu.store(core::ptr::null_mut(), Ordering::SeqCst);
@@ -494,7 +528,7 @@ impl Cpu {
             if links.exclusive_requested.load(Ordering::SeqCst) {
                 self.park_for_exclusive(&links);
             }
-            spin_or_yield(&mut spins);
+            links.spin_or_yield(&mut spins);
         }
         links.exclusive_requested.store(true, Ordering::SeqCst);
         links.leave_running();
@@ -515,6 +549,43 @@ impl Cpu {
         links.enter_running();
         links.exclusive_owner.store(false, Ordering::Release);
         result
+    }
+
+    /// vCPU `index`'s `Cpu`, if its thread has published it. Only valid inside `with_exclusive`,
+    /// and only `index != self.cpu_index`.
+    pub(super) fn other_cpu(&mut self, index: usize) -> Option<&mut Cpu> {
+        let links = self.links();
+        let link = links.links.get(index)?;
+        // The exclusive section stops that thread (parked, halted, or held by the debugger) for
+        // as long as `self` is borrowed.
+        unsafe { link.cpu.load(Ordering::SeqCst).as_mut() }
+    }
+
+    /// A vCPU the debugger holds while the others run (`gdb.rs`): out of the running count, so
+    /// exclusive sections (the next debugger stop among them) need not wait for it, until the
+    /// next resume releases it or the machine ends.
+    pub(super) fn wait_while_held(&mut self) -> BeforeStep {
+        let links = self.links();
+        let debugger = self.debugger.clone().expect("held by a debugger");
+        let index = self.cpu_index as usize;
+        links.leave_running();
+        let exit = loop {
+            if self.stop.load(Ordering::Relaxed) {
+                break Some(ExitReason::Stopped);
+            }
+            if links.exiting() {
+                break Some(links.exit_reason());
+            }
+            if !debugger.is_held(index) {
+                break None;
+            }
+            Waker::wait(MAX_SLEEP);
+        };
+        links.enter_running();
+        match exit {
+            Some(reason) => BeforeStep::Exit(reason),
+            None => BeforeStep::Idled,
+        }
     }
 
     /// Every vCPU's `Cpu` but this one. Only valid inside `with_exclusive`.
@@ -605,9 +676,24 @@ impl Cpu {
         );
         link.halted.store(true, Ordering::SeqCst);
         links.leave_running();
+        let debugger = self.debugger.clone();
+        let mut debugger_pause = false;
         let exit = loop {
             if self.stop.load(Ordering::Relaxed) {
                 break Some(ExitReason::Stopped);
+            }
+            if let Some(debugger) = &debugger {
+                // The debugger may be writing this `Cpu` while the machine is stopped: read
+                // nothing of it until the stop ends.
+                if debugger.is_stopped() {
+                    Waker::wait(MAX_SLEEP);
+                    continue;
+                }
+                // A pause for the debugger: `before_step` stops (or finds another vCPU did).
+                if debugger.pause_pending() && !self.wait_for_sipi {
+                    debugger_pause = true;
+                    break None;
+                }
             }
             let attention = link.attention.load(Ordering::SeqCst);
             if self.wake_condition(attention) {
@@ -615,7 +701,8 @@ impl Cpu {
             }
             // Everything that can end the wait comes with a wake-up, except a store to the line
             // `mwait` watches, which has to be polled for.
-            Waker::wait(if self.mwait_watch.is_some() {
+            // Nothing wakes a halted vCPU for a debugger pause: poll for it.
+            Waker::wait(if self.mwait_watch.is_some() || debugger.is_some() {
                 MAX_SLEEP
             } else {
                 HALTED_SLEEP
@@ -623,7 +710,7 @@ impl Cpu {
         };
         links.enter_running();
         link.halted.store(false, Ordering::SeqCst);
-        if exit.is_none() && self.mwait_watch.take().is_some() {
+        if exit.is_none() && !debugger_pause && self.mwait_watch.take().is_some() {
             self.halted = false;
         }
         exit
@@ -773,6 +860,7 @@ pub(crate) fn run_threaded(
     let mut ram = cpus[0].ram.clone();
     let flags = cpus[0].page_has_code.clone();
     let wall = cpus[0].wall_clock.clone();
+    let debugger = cpus[0].debugger.clone();
     device_handle.lock().attach_links(links.clone());
     device_handle.set_locking(true);
     let base_seed = cpus[0].rng_state;
@@ -812,6 +900,16 @@ pub(crate) fn run_threaded(
         }
         if let Some(poll) = &poll {
             poll(false);
+        }
+        // While the debugger has the machine stopped, devices and guest time stand still: no
+        // tick and no clock read, so the clock cuts the whole stop out (`MAX_HOST_GAP_NS`)
+        // instead of firing every timer that came due during it.
+        if debugger
+            .as_ref()
+            .is_some_and(|debugger| debugger.is_stopped())
+        {
+            Waker::wait(MAX_SLEEP);
+            continue;
         }
         let now = wall.as_ref().map_or(0, WallClock::elapsed_ns);
         // A device can write code and then publish a used-ring entry in this tick. The barrier

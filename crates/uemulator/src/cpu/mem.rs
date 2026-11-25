@@ -26,6 +26,18 @@ pub(crate) enum PagingMode {
     Long,
 }
 
+/// One vCPU's paging state, copied out so the debugger can walk it against the RAM another `Cpu`
+/// holds (`Cpu::debug_translate`).
+#[derive(Clone, Copy)]
+pub(crate) struct DebugPaging {
+    mode: PagingMode,
+    cr3: u64,
+    la57: bool,
+    pse: bool,
+    pdpte: [u64; 4],
+    nested: bool,
+}
+
 const PTE_PRESENT: u64 = 1 << 0;
 const PTE_WRITABLE: u64 = 1 << 1;
 const PTE_USER: u64 = 1 << 2;
@@ -751,6 +763,96 @@ impl Cpu {
             *entry = value;
         }
         Ok(entries)
+    }
+
+    /// What the debugger's page walk needs from a vCPU (`debug_translate`).
+    pub(crate) fn debug_paging(&self) -> DebugPaging {
+        DebugPaging {
+            mode: self.paging_mode(),
+            cr3: self.cr3,
+            la57: self.cr4 & CR4_LA57 != 0,
+            pse: self.cr4 & CR4_PSE != 0,
+            pdpte: self.pdpte,
+            nested: self
+                .svm
+                .guest
+                .as_ref()
+                .is_some_and(|guest| guest.nested_cr3.is_some()),
+        }
+    }
+
+    /// Linear to physical for the debugger: the walk `walk` does, with another vCPU's paging
+    /// state when time-sharing keeps RAM in this one, and with no side effects at all: no
+    /// Accessed or Dirty bits, no CR2, no TLB or large-page fill, no permission check (a
+    /// debugger reads what the page tables map, whoever may access it). `None` when nothing is
+    /// mapped, a table lies outside RAM, or the vCPU runs an SVM guest with nested paging: its
+    /// tables are guest-physical, and walking them as physical would read the wrong memory.
+    pub(crate) fn debug_translate(&self, paging: &DebugPaging, linear: u64) -> Option<u64> {
+        if paging.nested {
+            return None;
+        }
+        let offset = |leaf_shift: u32| linear & ((1u64 << leaf_shift) - 1);
+        match paging.mode {
+            PagingMode::Off => Some(linear & LINEAR_32BIT_MASK),
+            PagingMode::Legacy => {
+                let linear = linear & LINEAR_32BIT_MASK;
+                let directory_index = (linear >> LEGACY_LARGE_PAGE_SHIFT) & LEGACY_INDEX_MASK;
+                let pde = self.read_ram_u32(
+                    (paging.cr3 & LEGACY_TABLE_MASK) + directory_index * LEGACY_PTE_BYTES,
+                )?;
+                if pde & PTE_PRESENT == 0 {
+                    return None;
+                }
+                if paging.pse && pde & PTE_PAGE_SIZE != 0 {
+                    let high =
+                        (pde >> LEGACY_LARGE_ADDRESS_HIGH_SHIFT) & LEGACY_LARGE_ADDRESS_HIGH_MASK;
+                    let base = (pde & LEGACY_LARGE_ADDRESS_LOW_MASK)
+                        | (high << LEGACY_LARGE_ADDRESS_HIGH_POSITION);
+                    return Some(base | offset(LEGACY_LARGE_PAGE_SHIFT));
+                }
+                let table_index = (linear >> PAGE_SHIFT) & LEGACY_INDEX_MASK;
+                let pte =
+                    self.read_ram_u32((pde & LEGACY_TABLE_MASK) + table_index * LEGACY_PTE_BYTES)?;
+                (pte & PTE_PRESENT != 0).then(|| (pte & LEGACY_TABLE_MASK) | offset(PAGE_SHIFT))
+            }
+            mode => {
+                let pae = mode == PagingMode::Pae;
+                let linear = if pae {
+                    linear & LINEAR_32BIT_MASK
+                } else {
+                    linear
+                };
+                let mut level = if pae {
+                    PAE_TOP_LEVEL
+                } else if paging.la57 {
+                    LA57_TOP_LEVEL
+                } else {
+                    TOP_LEVEL
+                };
+                let mut table = paging.cr3 & PTE_ADDRESS_MASK;
+                loop {
+                    let index =
+                        (linear >> (PAGE_SHIFT + LEVEL_INDEX_BITS * level)) & LEVEL_INDEX_MASK;
+                    let entry = if pae && level == PAE_TOP_LEVEL {
+                        paging.pdpte[index as usize & (PDPT_ENTRIES - 1)]
+                    } else {
+                        self.read_ram_u64(table + index * PTE_BYTES)?
+                    };
+                    if entry & PTE_PRESENT == 0 {
+                        return None;
+                    }
+                    let large_leaf =
+                        entry & PTE_PAGE_SIZE != 0 && (level == 1 || (!pae && level == PDPT_LEVEL));
+                    if level == 0 || large_leaf {
+                        let leaf_shift = PAGE_SHIFT + LEVEL_INDEX_BITS * level;
+                        let base = entry & PTE_ADDRESS_MASK & !((1u64 << leaf_shift) - 1);
+                        return Some(base | offset(leaf_shift));
+                    }
+                    table = entry & PTE_ADDRESS_MASK;
+                    level -= 1;
+                }
+            }
+        }
     }
 
     /// Linear to physical address for one access, refilling the TLB on a miss.

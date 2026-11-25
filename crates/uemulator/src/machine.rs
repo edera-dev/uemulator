@@ -20,6 +20,7 @@ use crate::dev::{
 };
 use crate::disk::Disk;
 use crate::display::{self, DisplayHandle, InputHandle};
+use crate::gdb::GdbStub;
 use crate::gpu::{self, GpuLink};
 use crate::kv::{KeyValueStore, MemoryKeyValueStore};
 use crate::netdev::NetHandle;
@@ -239,6 +240,8 @@ pub struct MachineConfig {
     reboot: bool,
     suspend_to: Option<Box<dyn SnapshotSink>>,
     resume_from: Option<Box<dyn SnapshotSource>>,
+    /// `Some(halt_at_start)` gives the machine a GDB stub.
+    gdb_stub: Option<bool>,
 }
 
 impl Default for MachineConfig {
@@ -285,6 +288,7 @@ impl Default for MachineConfig {
             reboot: true,
             suspend_to: None,
             resume_from: None,
+            gdb_stub: None,
         }
     }
 }
@@ -571,6 +575,14 @@ impl MachineConfig {
         self
     }
 
+    /// Gives the machine a GDB stub (`EmulatedMachine::gdb_stub`, `docs/plans/30-gdb-stub.md`).
+    /// With `halt_at_start` the first vCPU stops before its first instruction and waits for a
+    /// client to resume it.
+    pub fn gdb_stub(mut self, halt_at_start: bool) -> Self {
+        self.gdb_stub = Some(halt_at_start);
+        self
+    }
+
     /// Where `StopHandle::suspend` writes the machine's snapshot (`docs/plans/29-snapshots.md`).
     pub fn suspend_to(mut self, sink: impl SnapshotSink + 'static) -> Self {
         self.suspend_to = Some(Box::new(sink));
@@ -725,6 +737,8 @@ struct Vcpu {
     suspend_to: Option<Box<dyn SnapshotSink>>,
     /// Taken by the first run: a reboot after resuming boots afresh.
     resume_from: Option<Box<dyn SnapshotSource>>,
+    /// The GDB stub's side of the vCPUs; every `Cpu` of every boot gets it.
+    debugger: Option<Arc<crate::gdb::DebugLink>>,
 }
 
 /// The display devices for one boot: the embedder's handle, and the boot framebuffer only
@@ -1073,6 +1087,14 @@ struct Finished {
 impl Vcpu {
     /// Boots, and boots again after every guest reset while `reboot` is set.
     fn run(mut self) -> ExitReason {
+        let reason = self.run_until_off();
+        if let Some(debugger) = &self.debugger {
+            debugger.machine_ended();
+        }
+        reason
+    }
+
+    fn run_until_off(&mut self) -> ExitReason {
         loop {
             let (reason, finished) = self.run_once();
             let (ExitReason::Reset, Some(image)) = (&reason, &self.reboot) else {
@@ -1218,6 +1240,8 @@ impl Vcpu {
         if let Some(seed) = self.random_seed {
             cpu.rng_state = seed;
         }
+        // Before the secondaries are made from it: they copy the link.
+        cpu.attach_debugger(self.debugger.clone());
         // Cloned, not taken: a reboot builds a new CPU that needs the hook again.
         cpu.poll = self.poll.clone().map(|host_poll| {
             let poll: PollFn = Arc::new(move |idle| host_poll(&console, idle));
@@ -1377,6 +1401,7 @@ pub struct EmulatedMachine {
     input: Option<InputHandle>,
     stop: Arc<AtomicBool>,
     suspend: Arc<AtomicBool>,
+    debugger: Option<Arc<crate::gdb::DebugLink>>,
 }
 
 impl EmulatedMachine {
@@ -1395,6 +1420,11 @@ impl EmulatedMachine {
             return Err(Error::BadConfig(format!(
                 "cpus must be between {MIN_CPUS} and {MAX_CPUS}"
             )));
+        }
+        if cfg.gdb_stub.is_some() && cfg.verify {
+            return Err(Error::BadConfig(
+                "a GDB stub cannot be combined with verify_jit".into(),
+            ));
         }
         let snapshots = cfg.suspend_to.is_some() || cfg.resume_from.is_some();
         if snapshots && (cfg.verify || cfg.boot_disk) {
@@ -1728,6 +1758,9 @@ impl EmulatedMachine {
             });
         let stop = Arc::new(AtomicBool::new(false));
         let suspend = Arc::new(AtomicBool::new(false));
+        let debugger = cfg
+            .gdb_stub
+            .map(|halt_at_start| crate::gdb::DebugLink::new(cfg.cpus, stop.clone(), halt_at_start));
         Ok(Self {
             vcpu: Some(Vcpu {
                 ram,
@@ -1752,6 +1785,7 @@ impl EmulatedMachine {
                 suspend_requested: suspend.clone(),
                 suspend_to: cfg.suspend_to,
                 resume_from: cfg.resume_from,
+                debugger: debugger.clone(),
             }),
             #[cfg(not(freestanding))]
             thread: None,
@@ -1763,7 +1797,13 @@ impl EmulatedMachine {
             input,
             stop,
             suspend,
+            debugger,
         })
+    }
+
+    /// The GDB stub, with `MachineConfig::gdb_stub`.
+    pub fn gdb_stub(&self) -> Option<GdbStub> {
+        self.debugger.clone().map(GdbStub::new)
     }
 
     /// The screen, with `DisplayMode::Framebuffer`.

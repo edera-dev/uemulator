@@ -103,6 +103,21 @@ impl Smp {
             let progressed = self.cpus[self.active].icount != icount_before;
             match slice {
                 Slice::Exit(reason) => return reason,
+                Slice::Debug(event) => {
+                    let link = self.cpus[self.active]
+                        .debugger
+                        .clone()
+                        .expect("a debugger stop");
+                    let mut vcpus = super::gdb::SharedVcpus {
+                        cpus: &mut self.cpus,
+                        active: self.active,
+                    };
+                    if let Some(reason) = link.serve(&mut vcpus, event) {
+                        return reason;
+                    }
+                    self.stalled_slices = 0;
+                    continue;
+                }
                 Slice::Halted if !progressed => self.stalled_slices += 1,
                 Slice::Halted | Slice::Yield => self.stalled_slices = 0,
             }
@@ -133,6 +148,10 @@ impl Smp {
 
     fn runnable(&mut self, index: usize) -> bool {
         let cpu = &self.cpus[index];
+        // A vCPU the debugger holds waits for the next resume, whatever wakes it.
+        if self.held(index) {
+            return false;
+        }
         if !cpu.halted {
             return true;
         }
@@ -162,12 +181,21 @@ impl Smp {
     /// Everyone is halted: advance time to the next device event, or end the run if nothing can
     /// ever wake a vCPU.
     fn idle_all(&mut self) -> Option<ExitReason> {
+        // A vCPU the debugger holds runs again at the next resume: the machine is not dead.
         let may_wake = self
             .cpus
             .iter()
             .any(|cpu| !cpu.wait_for_sipi && cpu.eflags & flags::IF != 0)
+            || (0..self.cpus.len()).any(|index| self.held(index))
             || self.cpus[self.active].dev.lock().any_nmi_pending();
         self.cpus[self.active].idle(may_wake)
+    }
+
+    fn held(&self, index: usize) -> bool {
+        self.cpus[0]
+            .debugger
+            .as_ref()
+            .is_some_and(|link| link.is_held(index))
     }
 
     fn switch_to(&mut self, target: usize) {

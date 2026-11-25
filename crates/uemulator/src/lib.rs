@@ -19,6 +19,7 @@ mod dev;
 mod disk;
 mod display;
 mod gateway;
+mod gdb;
 mod gpu;
 mod jit;
 mod kv;
@@ -57,6 +58,7 @@ pub use gateway::{
     Endpoint, Gateway, GatewayConfig, GatewayPolicy, GatewayRequest, GuestFrame, StreamId,
     StreamInterest, StreamKind,
 };
+pub use gdb::GdbStub;
 pub use gpu::{GpuBox, GpuCapset, GpuCommand, GpuLimits, GpuLink, GpuResource};
 #[cfg(not(freestanding))]
 pub use kv::FileKeyValueStore;
@@ -333,6 +335,18 @@ mod api_tests {
         ];
         assert_eq!(commands.len(), 13);
         let _ = (capset, limits);
+    }
+
+    #[test]
+    fn the_gdb_stub_has_the_documented_signatures() {
+        let _: fn(MachineConfig, bool) -> MachineConfig = MachineConfig::gdb_stub;
+        let _: fn(&EmulatedMachine) -> Option<GdbStub> = EmulatedMachine::gdb_stub;
+        let _: fn(&GdbStub) = GdbStub::connected;
+        let _: fn(&GdbStub, &[u8]) = GdbStub::from_client;
+        let _: fn(&GdbStub) = GdbStub::disconnected;
+        let _ = |stub: &GdbStub| stub.on_output(|_bytes: &[u8]| {});
+        is_send_sync::<GdbStub>();
+        is_clone::<GdbStub>();
     }
 
     #[test]

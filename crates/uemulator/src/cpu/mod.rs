@@ -22,6 +22,7 @@ pub(crate) mod exception;
 mod exec;
 pub(crate) mod flags;
 mod fpu;
+pub(crate) mod gdb;
 mod invlpgb;
 pub(crate) mod legacy;
 mod legacy_flow;
@@ -118,6 +119,8 @@ enum BeforeStep {
     /// Several vCPUs: this one is halted with nothing to wake it. The scheduler idles the whole
     /// machine once every vCPU is in this state.
     Halted,
+    /// Stop the machine for the debugger (`gdb.rs`).
+    Debug(crate::gdb::StopEvent),
 }
 
 /// Why `Cpu::run_slice` returned.
@@ -125,6 +128,9 @@ pub(crate) enum Slice {
     Exit(ExitReason),
     Yield,
     Halted,
+    /// The debugger stops the machine; whoever runs the vCPUs serves it (`DebugLink::serve`)
+    /// with all of them stopped, then runs on.
+    Debug(crate::gdb::StopEvent),
 }
 
 /// `Instant` as a host clock.
@@ -728,6 +734,13 @@ pub(crate) struct Cpu {
     pub large_pages: [LargePage; LARGE_PAGE_CACHE_ENTRIES],
     #[snapshot(skip)]
     pub large_page_next: usize,
+    /// The machine's debugger, when it has one (`MachineConfig::gdb_stub`). Host-side.
+    #[snapshot(skip)]
+    pub debugger: Option<Arc<crate::gdb::DebugLink>>,
+    /// What the debugger watches for on this vCPU (`gdb.rs`). Host-side: a resumed machine
+    /// gets it again from `attach_debugger`.
+    #[snapshot(skip)]
+    pub gdb: gdb::GdbVcpu,
 }
 
 /// The state of a locked read-modify-write while `Cpu::exec_locked` runs it on a vCPU that shares
@@ -835,6 +848,7 @@ impl Cpu {
         cpu.wall_clock = bsp.wall_clock.clone();
         cpu.halted = true;
         cpu.wait_for_sipi = true;
+        cpu.attach_debugger(bsp.debugger.clone());
         cpu
     }
 
@@ -1032,6 +1046,8 @@ impl Cpu {
             tlb_active_base: 0,
             large_pages: [LARGE_PAGE_EMPTY; LARGE_PAGE_CACHE_ENTRIES],
             large_page_next: 0,
+            debugger: None,
+            gdb: Default::default(),
             ordered_memory: false,
             rmw: Rmw::Off,
             threads: None,
@@ -1247,10 +1263,17 @@ impl Cpu {
                 return BeforeStep::Yield;
             }
         }
+        // Before anything is delivered: a step must not land in an interrupt handler, and a
+        // held vCPU must not take one.
+        if self.debugger.is_some()
+            && let Some(step) = self.debugger_check()
+        {
+            return step;
+        }
         // has_pending() is a cheap pre-check; pending_interrupt() does the acknowledge.
         // A guest may intercept physical interrupts (and takes its virtual ones) before the host does.
         self.svm_before_step();
-        if self.svm.gif && self.take_pending_nmi() {
+        if self.svm.gif && !self.gdb_holds_interrupts() && self.take_pending_nmi() {
             self.halted = false;
             if let Some(reason) = self.deliver_event(NMI_VECTOR, None, false) {
                 return BeforeStep::Exit(reason);
@@ -1259,6 +1282,7 @@ impl Cpu {
         if self.eflags & flags::IF != 0
             && self.svm.gif
             && !self.interrupt_shadow
+            && !self.gdb_holds_interrupts()
             && (self.threads.is_none() || self.attention() & vcpus::ATTENTION_IRQ != 0)
             && self.dev.lock().interrupt_pending()
             && let Some(vector) = self.pending_interrupt()
@@ -1318,10 +1342,18 @@ impl Cpu {
 
     /// Single vCPU: runs until the machine exits.
     pub fn run(&mut self) -> ExitReason {
-        match self.run_slice() {
-            Slice::Exit(reason) => reason,
-            Slice::Yield | Slice::Halted => {
-                ExitReason::Internal("a lone vCPU asked for a scheduler".into())
+        loop {
+            match self.run_slice() {
+                Slice::Exit(reason) => return reason,
+                Slice::Debug(event) => {
+                    let link = self.debugger.clone().expect("a debugger stop");
+                    if let Some(reason) = link.serve(&mut gdb::OneVcpu(self), event) {
+                        return reason;
+                    }
+                }
+                Slice::Yield | Slice::Halted => {
+                    return ExitReason::Internal("a lone vCPU asked for a scheduler".into());
+                }
             }
         }
     }
@@ -1334,6 +1366,7 @@ impl Cpu {
                 BeforeStep::Idled => continue,
                 BeforeStep::Yield => return Slice::Yield,
                 BeforeStep::Halted => return Slice::Halted,
+                BeforeStep::Debug(event) => return Slice::Debug(event),
                 BeforeStep::Execute => {}
             }
             self.interrupt_shadow = false;
@@ -1357,6 +1390,10 @@ impl Cpu {
             let (main_gate, shadow_gate) = (self.before_step(), shadow.before_step());
             match (main_gate, shadow_gate) {
                 (BeforeStep::Exit(reason), _) => return reason,
+                // `EmulatedMachine::new` refuses a debugger together with verification.
+                (BeforeStep::Debug(_), _) | (_, BeforeStep::Debug(_)) => {
+                    return ExitReason::Internal("verify: a debugger stop".into());
+                }
                 (BeforeStep::Idled, BeforeStep::Idled) => continue,
                 (BeforeStep::Execute, BeforeStep::Execute) => {}
                 _ => return ExitReason::Internal("verify: pre-step divergence".into()),

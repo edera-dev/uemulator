@@ -88,6 +88,8 @@ impl DisplayArg {
 /// Where the web viewer listens unless `--viewer-address` says otherwise: loopback only, on the
 /// port VNC's HTTP viewers have used (5800).
 pub const DEFAULT_VIEWER_ADDRESS: &str = "127.0.0.1:5800";
+/// Where `--gdb` listens without an address: gdb's conventional port, as QEMU's `-s`.
+pub const DEFAULT_GDB_ADDRESS: &str = "127.0.0.1:1234";
 
 /// `--smp MODE`: how the vCPUs of a multi-processor guest run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
@@ -405,6 +407,19 @@ pub struct RuntimeArgs {
     /// keeps other web sites from driving the machine through DNS rebinding
     #[arg(long, value_name = "NAME")]
     pub viewer_allow_host: Vec<String>,
+    /// Let gdb (`target remote HOST:PORT`) or lldb (`gdb-remote HOST:PORT`) debug the guest,
+    /// listening on HOST:PORT [default: 127.0.0.1:1234]. Anyone who can reach it controls the
+    /// machine
+    #[arg(
+        long,
+        value_name = "HOST:PORT",
+        num_args = 0..=1,
+        default_missing_value = DEFAULT_GDB_ADDRESS
+    )]
+    pub gdb: Option<String>,
+    /// With --gdb: stop before the first instruction until the debugger continues
+    #[arg(long, requires = "gdb")]
+    pub gdb_wait: bool,
 }
 
 /// Everything about a machine that outlives one run, and what `run` needs to build it. `None` and
