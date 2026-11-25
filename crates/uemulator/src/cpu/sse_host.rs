@@ -658,6 +658,59 @@ fn fused_double(x: u64, y: u64, z: u64) -> Option<(u64, bool)> {
 }
 
 impl Cpu {
+    /// The register forms of legacy-SSE sqrt/add/mul/sub/min/div/max (`0F 51`, `58`-`5F`, every
+    /// prefix), called by `Cpu::exec` before its opcode match so the commonest float
+    /// instructions skip `exec_two_byte` and `Cpu::sse`'s prologue (prefix, `allowed`,
+    /// `form_valid`, MMX forms, the memory operand). `None` for anything else, which takes the
+    /// usual path; `Cpu::sse` still handles these opcodes for the memory forms and for VEX/EVEX
+    /// through the legacy kernels. Called after the lock, SVM-intercept and legacy-mode
+    /// handling in `exec`, which these instructions need nothing from.
+    pub(in crate::cpu) fn exec_sse_float_register(&mut self, i: &Insn) -> Option<ExecResult<()>> {
+        let opcode = (i.op & 0xff) as u8;
+        if i.op >> 8 != OPCODE_MAP_0F
+            || i.vex
+            || i.evex
+            || i.lock
+            || i.md != MODRM_MOD_REGISTER
+            || !matches!(opcode, 0x51 | 0x58 | 0x59 | 0x5c..=0x5f)
+        {
+            return None;
+        }
+        Some(self.sse_float_register(i, opcode))
+    }
+
+    fn sse_float_register(&mut self, i: &Insn, opcode: u8) -> ExecResult<()> {
+        self.sse_gate()?;
+        // F3 and F2 win over 66, as in `Cpu::sse`.
+        let (scalar, single) = match (i.rep, i.p66) {
+            (1, _) => (true, true),
+            (2, _) => (true, false),
+            (_, p66) => (false, !p66),
+        };
+        let format = if single { SINGLE } else { DOUBLE };
+        let destination = self.xmm[i.reg as usize];
+        let source = self.xmm[i.rm as usize];
+        let mut env = FpEnv::new(self.mxcsr);
+        let result = if scalar {
+            let lane = binary_operation(
+                &mut env,
+                format,
+                opcode,
+                lane_get(destination, format, 0),
+                lane_get(source, format, 0),
+            );
+            (destination & !format.lane_mask()) | lane as u128
+        } else {
+            packed_binary(&mut env, format, opcode, destination, source)
+        };
+        if env.flags != 0 {
+            self.fp_commit(&env)?;
+        }
+        self.xmm[i.reg as usize] = result;
+        self.rip = self.rip.wrapping_add(i.len as u64);
+        Ok(())
+    }
+
     /// The 128-bit kernel of packed sqrt/add/mul/sub/min/div/max (`0F 51`, `58`-`5F` with no
     /// prefix or 66) for the EVEX lane loop, without re-entering the legacy decoder through
     /// `run_legacy_registers`. `None` for any other instruction. Flags are committed per call, as

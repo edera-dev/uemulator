@@ -1357,6 +1357,9 @@ impl Cpu {
         if i.evex {
             return self.exec_evex(i, next);
         }
+        if let Some(outcome) = self.exec_sse_float_register(i) {
+            return outcome;
+        }
         match op {
             // The eight ALU ops (add/or/adc/sbb/and/sub/xor/cmp), forms 0..=5: r/m,r (byte, full),
             // r,r/m (byte, full), al,imm and eax,imm.

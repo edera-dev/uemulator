@@ -262,35 +262,300 @@ fn packed_binary_matches_the_soft_engine_lane_by_lane() {
                         mxcsr,
                         || format!("{} {opcode:#x} {dest:#x} {source:#x}", format_name(format)),
                         |env| host::packed_binary(env, format, opcode, dest, source),
-                        |env| {
-                            let mut result = 0;
-                            for k in 0..format.lanes() {
-                                let (a, b) =
-                                    (lane_get(dest, format, k), lane_get(source, format, k));
-                                let lane = match opcode {
-                                    0x5d | 0x5f => {
-                                        soft_minimum_maximum(env, format, opcode == 0x5f, a, b)
-                                    }
-                                    _ => {
-                                        let operation = match opcode {
-                                            0x51 => Arithmetic::SquareRoot,
-                                            0x58 => Arithmetic::Add,
-                                            0x59 => Arithmetic::Multiply,
-                                            0x5c => Arithmetic::Subtract,
-                                            _ => Arithmetic::Divide,
-                                        };
-                                        soft_arithmetic(env, format, operation, a, b)
-                                    }
-                                };
-                                lane_put(&mut result, format, k, lane);
-                            }
-                            result
-                        },
+                        |env| soft_packed_binary(env, format, opcode, dest, source),
                     );
                 }
             }
         }
     }
+}
+
+/// `packed_binary` with every lane on the soft engine.
+fn soft_packed_binary(
+    env: &mut FpEnv,
+    format: Format,
+    opcode: u8,
+    dest: u128,
+    source: u128,
+) -> u128 {
+    let mut result = 0;
+    for k in 0..format.lanes() {
+        let (a, b) = (lane_get(dest, format, k), lane_get(source, format, k));
+        let lane = match opcode {
+            0x5d | 0x5f => soft_minimum_maximum(env, format, opcode == 0x5f, a, b),
+            _ => {
+                let operation = match opcode {
+                    0x51 => Arithmetic::SquareRoot,
+                    0x58 => Arithmetic::Add,
+                    0x59 => Arithmetic::Multiply,
+                    0x5c => Arithmetic::Subtract,
+                    _ => Arithmetic::Divide,
+                };
+                soft_arithmetic(env, format, operation, a, b)
+            }
+        };
+        lane_put(&mut result, format, k, lane);
+    }
+    result
+}
+
+/// Lanes of every kind in one vector, so one instruction mixes host and soft lanes: a NaN, a
+/// denormal, a zero and normals, in both operand orders (sqrt reads only the source).
+#[test]
+fn packed_binary_mixes_host_and_soft_lanes() {
+    let lanes = |values: [u32; 4]| -> u128 {
+        let mut vector = 0;
+        for (k, value) in values.into_iter().enumerate() {
+            lane_put(&mut vector, SINGLE, k, value as u64);
+        }
+        vector
+    };
+    let first = lanes([0x7fc0_1234, 0x0000_0003, 0x8000_0000, 0x3fa0_0000]);
+    let second = lanes([0x3f80_0000, 0x3f80_0000, 0x4040_0000, 0xbfc0_0001]);
+    for mxcsr in environments() {
+        for opcode in [0x51, 0x58, 0x59, 0x5c, 0x5d, 0x5e, 0x5f] {
+            for (a, b) in [(first, second), (second, first)] {
+                check(
+                    mxcsr,
+                    || format!("{opcode:#x} {a:#x} {b:#x}"),
+                    |env| host::packed_binary(env, SINGLE, opcode, a, b),
+                    |env| soft_packed_binary(env, SINGLE, opcode, a, b),
+                );
+            }
+        }
+    }
+}
+
+/// `vXXXps/pd/ss/sd zmm0, zmm1, zmm2` (`zmm0, zmm2` for sqrt): EVEX P1 is W, inverted vvvv, a
+/// fixed 1 and pp.
+fn evex_encoding(opcode: u8, wide: bool, pp: u8) -> [u8; 6] {
+    const EVEX: u8 = 0x62;
+    const P0_MAP_0F: u8 = 0xf1;
+    const P1_FIXED: u8 = 1 << 2;
+    const P2_512_BITS: u8 = 0x48;
+    const MODRM_ZMM0_ZMM2: u8 = 0xc2;
+    let vvvv: u8 = if opcode == 0x51 { 0 } else { 1 };
+    let p1 = (wide as u8) << 7 | (!vvvv & 0xf) << 3 | P1_FIXED | pp;
+    [EVEX, P0_MAP_0F, p1, P2_512_BITS, opcode, MODRM_ZMM0_ZMM2]
+}
+
+/// The EVEX lane loop's direct call (`Cpu::packed_float_lane`) against the legacy kernel it
+/// replaced (`run_legacy_registers`): the same result, MXCSR and exception, with exceptions
+/// unmasked and CR4.OSXMMEXCPT both ways; and no answer for the scalar forms.
+#[test]
+fn the_evex_lane_shortcut_matches_the_legacy_kernel() {
+    use crate::cpu::sys::CR4_OSXMMEXCPT;
+    let mut harness = crate::testkit::Harness::new(&[0xf4]);
+    let cpu = &mut harness.cpu;
+    let mut rng = XorShift(0x2545_f491_4f6c_dd1d);
+    let mask_sets = [
+        ALL_MASKED,
+        ALL_MASKED & !(FLAG_PRECISION << MXCSR_MASK_SHIFT),
+        ALL_MASKED & !((FLAG_INVALID | FLAG_DIVIDE_BY_ZERO) << MXCSR_MASK_SHIFT),
+        0,
+    ];
+    for opcode in [0x51, 0x58, 0x59, 0x5c, 0x5d, 0x5e, 0x5f] {
+        for (pp, wide) in [(0, false), (1, true), (2, false), (3, true)] {
+            let insn = crate::cpu::decode::decode(&evex_encoding(opcode, wide, pp)).unwrap();
+            let format = if wide { DOUBLE } else { SINGLE };
+            let edges = edge_values(format);
+            for _ in 0..CASES / 8 {
+                let (mut a, mut b) = (0u128, 0u128);
+                for k in 0..format.lanes() {
+                    let first = random_value(format, &mut rng, &edges);
+                    lane_put(&mut a, format, k, first);
+                    lane_put(&mut b, format, k, partner(format, &mut rng, first, &edges));
+                }
+                for masks in mask_sets {
+                    for osxmmexcpt in [false, true] {
+                        let mxcsr = masks | RC_SHIFTED[rng.below(4) as usize];
+                        if osxmmexcpt {
+                            cpu.cr4 |= CR4_OSXMMEXCPT;
+                        } else {
+                            cpu.cr4 &= !CR4_OSXMMEXCPT;
+                        }
+                        cpu.mxcsr = mxcsr;
+                        let fast = cpu.packed_float_lane(&insn, a, b);
+                        let fast_mxcsr = cpu.mxcsr;
+                        cpu.mxcsr = mxcsr;
+                        let legacy = cpu.run_legacy_registers(&insn, a, b);
+                        let Some(fast) = fast else {
+                            assert!(pp >= 2, "{opcode:#x} pp={pp} has no shortcut");
+                            continue;
+                        };
+                        assert!(
+                            pp < 2,
+                            "{opcode:#x} pp={pp}: a scalar form took the shortcut"
+                        );
+                        assert_eq!(
+                            (format!("{fast:?}"), fast_mxcsr),
+                            (format!("{legacy:?}"), cpu.mxcsr),
+                            "{opcode:#x} pp={pp} {a:#x} {b:#x} mxcsr {mxcsr:#x}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Double FMAs around the bottom of `fused_double`'s exponent band, where its error terms start
+/// to underflow, with addends that nearly cancel the product; and sums of the largest finite
+/// number with values carrying an odd multiple of its half-ulp, where TwoSum's intermediate terms
+/// are largest.
+#[test]
+fn fused_and_sums_at_the_range_edges_match_the_soft_engine() {
+    let mut rng = XorShift(0x6a09_e667_f3bc_c909);
+    let biased = |exponent: i64| exponent + DOUBLE.bias() as i64;
+    for _ in 0..CASES * 4 {
+        let product_exponent = -1060 + rng.below(200) as i64;
+        let x_exponent = -(rng.below(520) as i64);
+        let y_exponent = product_exponent - x_exponent;
+        if !(1..DOUBLE.exponent_mask() as i64).contains(&biased(y_exponent)) {
+            continue;
+        }
+        let x = (biased(x_exponent) as u64) << 52 | (rng.next() & DOUBLE.fraction_mask());
+        let y = (biased(y_exponent) as u64) << 52 | (rng.next() & DOUBLE.fraction_mask());
+        let mut env = FpEnv::new(ALL_MASKED);
+        let product = soft_arithmetic(&mut env, DOUBLE, Arithmetic::Multiply, x, y);
+        let z = (product ^ DOUBLE.sign_bit())
+            .wrapping_add(rng.below(9))
+            .wrapping_sub(4);
+        for mxcsr in [ALL_MASKED, ALL_MASKED | MXCSR_FTZ] {
+            check(
+                mxcsr,
+                || format!("fma {x:#x} {y:#x} {z:#x}"),
+                |env| {
+                    fused_lane(
+                        env,
+                        DOUBLE,
+                        [x, y, z],
+                        FmaForm::Form213,
+                        false,
+                        FmaSign::Add,
+                    )
+                },
+                |env| {
+                    soft_fused_lane(
+                        env,
+                        DOUBLE,
+                        [x, y, z],
+                        FmaForm::Form213,
+                        false,
+                        FmaSign::Add,
+                    )
+                },
+            );
+        }
+    }
+    for format in FORMATS {
+        let max = format.max_finite(false);
+        let fraction_bits = format.fraction_bits as u64;
+        for _ in 0..CASES {
+            let exponent = format.exponent_mask() - 2 - fraction_bits - rng.below(3);
+            let small = exponent << fraction_bits | (rng.next() & format.fraction_mask()) | 1;
+            for (a, b) in [
+                (max, small | format.sign_bit()),
+                (max | format.sign_bit(), small),
+            ] {
+                for operation in [Arithmetic::Add, Arithmetic::Subtract] {
+                    check(
+                        ALL_MASKED,
+                        || format!("{} {operation:?} {a:#x} {b:#x}", format_name(format)),
+                        |env| arithmetic(env, format, operation, a, b),
+                        |env| soft_arithmetic(env, format, operation, a, b),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `Cpu::exec`'s shortcut for the register forms (`exec_sse_float_register`) against the path it
+/// skips (`Cpu::sse`, then `rip` moved on): the same xmm registers, MXCSR, rip and exception, with
+/// exceptions unmasked, CR4.OSXMMEXCPT both ways and CR0.TS set; and no answer for memory forms.
+#[test]
+fn the_register_form_shortcut_matches_the_legacy_kernel() {
+    use crate::cpu::sys::{CR0_TS, CR4_OSXMMEXCPT};
+    const MODRM_XMM0_XMM1: u8 = 0xc1;
+    const MODRM_XMM0_MEMORY: u8 = 0x06;
+    let mut harness = crate::testkit::Harness::new(&[0xf4]);
+    let cpu = &mut harness.cpu;
+    cpu.cr4 |= crate::cpu::CR4_OSFXSR;
+    let mut rng = XorShift(0x3c6e_f372_fe94_f82b);
+    let mask_sets = [
+        ALL_MASKED,
+        ALL_MASKED & !(FLAG_PRECISION << MXCSR_MASK_SHIFT),
+        ALL_MASKED & !((FLAG_INVALID | FLAG_DIVIDE_BY_ZERO) << MXCSR_MASK_SHIFT),
+        0,
+    ];
+    let start = cpu.rip;
+    for opcode in [0x51, 0x58, 0x59, 0x5c, 0x5d, 0x5e, 0x5f] {
+        for prefix in [None, Some(0x66), Some(0xf3), Some(0xf2), Some(0x66f3)] {
+            let mut bytes: Vec<u8> = match prefix {
+                None => vec![],
+                Some(0x66f3) => vec![0x66, 0xf3],
+                Some(byte) => vec![byte as u8],
+            };
+            bytes.extend([0x0f, opcode, MODRM_XMM0_XMM1]);
+            let insn = crate::cpu::decode::decode(&bytes).unwrap();
+            let mut memory_form = bytes.clone();
+            *memory_form.last_mut().unwrap() = MODRM_XMM0_MEMORY;
+            let memory_insn = crate::cpu::decode::decode(&memory_form).unwrap();
+            assert!(cpu.exec_sse_float_register(&memory_insn).is_none());
+            let format = if matches!(prefix, None | Some(0xf3)) {
+                SINGLE
+            } else {
+                DOUBLE
+            };
+            let edges = edge_values(format);
+            for case in 0..CASES / 8 {
+                let (mut a, mut b) = (0u128, 0u128);
+                for k in 0..format.lanes() {
+                    let first = random_value(format, &mut rng, &edges);
+                    lane_put(&mut a, format, k, first);
+                    lane_put(&mut b, format, k, partner(format, &mut rng, first, &edges));
+                }
+                for masks in mask_sets {
+                    for osxmmexcpt in [false, true] {
+                        let mxcsr = masks | RC_SHIFTED[rng.below(4) as usize];
+                        if osxmmexcpt {
+                            cpu.cr4 |= CR4_OSXMMEXCPT;
+                        } else {
+                            cpu.cr4 &= !CR4_OSXMMEXCPT;
+                        }
+                        // Now and then with the task-switched bit set: #NM either way.
+                        if case % 64 == 0 {
+                            cpu.cr0 |= CR0_TS;
+                        } else {
+                            cpu.cr0 &= !CR0_TS;
+                        }
+                        let reset = |cpu: &mut Cpu| {
+                            cpu.xmm[0] = a;
+                            cpu.xmm[1] = b;
+                            cpu.mxcsr = mxcsr;
+                            cpu.rip = start;
+                        };
+                        reset(cpu);
+                        let fast = cpu.exec_sse_float_register(&insn).unwrap();
+                        let fast_state = (cpu.xmm[0], cpu.xmm[1], cpu.mxcsr, cpu.rip);
+                        reset(cpu);
+                        let legacy = cpu.sse(&insn, start + insn.len as u64).map(|handled| {
+                            assert!(handled);
+                            cpu.rip = start + insn.len as u64;
+                        });
+                        let legacy_state = (cpu.xmm[0], cpu.xmm[1], cpu.mxcsr, cpu.rip);
+                        assert_eq!(
+                            (format!("{fast:?}"), fast_state),
+                            (format!("{legacy:?}"), legacy_state),
+                            "{bytes:x?} {a:#x} {b:#x} mxcsr {mxcsr:#x}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    cpu.cr0 &= !CR0_TS;
 }
 
 #[test]
