@@ -81,6 +81,10 @@ Host: Apple Silicon Mac, native aarch64 JIT, with other agents building in paral
 
 Checkpoints every 6 s, 2 vCPUs on threads, `--check-dirty-tracking` on, two runs: the first (full) 50.5-51.5 MB in 462-503 ms; idle deltas 0.1-0.4 MB in 66-475 ms; the deltas across the text write 5.3-7.9 MB in 121-194 ms, across the random write 29.7-30.5 MB in 172-608 ms (the spread is the host's load). Every delta passed the dirty-log check. The chains of 6 and 12 resumed (2 vCPUs) to a shell whose files had the right checksums (the text's matched the host's `seq`). A format-2 suspend moved native to WebAssembly (`boot.mjs`, wasm JIT, time-shared) and back, and a format-1 snapshot from the previous build resumed in this one, both with the checksums intact.
 
+Disks and the network: the same kernel, 512 MiB, 2 vCPUs on threads, a 64 MiB udisk and a virtio NIC on the loop gateway, checkpoints every 5 s with the dirty-log check. The guest read the whole disk, wrote `AAAA` to sector 100, pinged the gateway five times, then overwrote it with `BBBB`: every delta passed the check (virtio-blk and virtio-net DMA). Resuming the checkpoint between the two writes, the one after, and the first again, each time dropping the guest's caches and reading the sector through virtio, gave `AAAA`, `BBBB`, `AAAA`: the disk copies went back with the RAM.
+
+Not measured: the suspend's time on the WebAssembly engine, where the POSTs dominate; the gain there is the bytes (1.76x fewer in the run above). Natively the compression costs about what the smaller CRC and write save.
+
 The time is what the host sees from the request to `done`, so it includes the vCPUs reaching an event check and the disk copies; under the load above it is noisy.
 
 ## Tests

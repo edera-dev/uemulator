@@ -44,6 +44,16 @@ fn rerun(h: &mut Harness) {
 fn stores_mark_after_arming(jit: bool) {
     let mut h = Harness::new(&STORE_TWICE);
     if jit && !h.enable_jit() {
+        // Only where there is no backend: on the three that exist this test must run them.
+        assert!(
+            !cfg!(feature = "jit")
+                || !cfg!(any(
+                    target_arch = "aarch64",
+                    target_arch = "x86_64",
+                    target_arch = "wasm32"
+                )),
+            "no JIT on a host that has one"
+        );
         return;
     }
     h.cpu.gpr[RDI] = FIRST;
@@ -54,6 +64,9 @@ fn stores_mark_after_arming(jit: bool) {
     arm(&mut h.cpu);
     h.cpu.gpr[RAX] = 2;
     rerun(&mut h);
+    if let Some(jit) = &h.cpu.jit {
+        assert!(jit.stats().translated > 0, "the stores ran interpreted");
+    }
     assert_eq!(h.read_u64(FIRST), 2);
     assert!(dirty(&h.cpu, FIRST) && dirty(&h.cpu, SECOND));
     assert!(!dirty(&h.cpu, UNTOUCHED));
