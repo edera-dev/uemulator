@@ -1,4 +1,5 @@
 mod args;
+mod checkpoints;
 mod firmware;
 mod frontend;
 mod images;
@@ -191,8 +192,9 @@ enum QuickCmd {
         source: BootSourceArgs,
         #[command(flatten)]
         uefi: UefiBootArgs,
+        /// Boxed: with the GDB and checkpoint options this variant is far larger than the rest.
         #[command(flatten)]
-        runtime: RuntimeArgs,
+        runtime: Box<RuntimeArgs>,
     },
     /// Throw away a machine's kernel and initramfs and download fresh ones; the disk and the
     /// configuration are kept

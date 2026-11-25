@@ -1,7 +1,7 @@
 use super::iommu::{Access, Iommu, PhysRead, PhysWrite};
 #[cfg(freestanding)]
 use crate::prelude::*;
-use crate::ram::{RamSpan, is_ram_range};
+use crate::ram::{CodePages, DirtyLog, RamSpan, is_ram_range};
 use core::cell::RefCell;
 use core::sync::atomic::{AtomicUsize, Ordering, fence};
 
@@ -24,6 +24,9 @@ pub(crate) struct GuestMem<'a> {
     ram: RamSpan<'a>,
     /// `Cpu::page_has_code`: one byte per guest page, nonzero if a translated block covers it.
     code: &'a [u8],
+    /// The machine's dirty log (`CodePages::dirty_log`): every byte written here is a page the
+    /// next delta snapshot must carry. `None` only for host buffers and tests.
+    dirty: Option<&'a DirtyLog>,
     /// Page numbers written while flagged in `code`, each listed once.
     pub code_pages_written: Vec<usize>,
     /// `VcpuLinks::dma_in_flight` of a threaded machine: raised once, at the first write that
@@ -74,13 +77,24 @@ fn chunk_len(remaining: usize, bytes_left: u64) -> usize {
 }
 
 impl<'a> GuestMem<'a> {
+    /// Over a host buffer or in a test: writes reach no dirty log. A machine's RAM goes through
+    /// `for_pages`, or device writes go missing from delta snapshots.
     pub fn new(ram: impl Into<RamSpan<'a>>, code: &'a [u8]) -> Self {
         GuestMem {
             ram: ram.into(),
             code,
+            dirty: None,
             code_pages_written: Vec::new(),
             code_write_barrier: None,
             dma: None,
+        }
+    }
+
+    /// A machine's RAM with its code flags and dirty log.
+    pub fn for_pages(ram: impl Into<RamSpan<'a>>, pages: &'a CodePages) -> Self {
+        GuestMem {
+            dirty: Some(pages.dirty_log()),
+            ..GuestMem::new(ram, pages.as_bytes())
         }
     }
 
@@ -246,6 +260,9 @@ impl<'a> GuestMem<'a> {
         if data.is_empty() {
             return true;
         }
+        if let Some(dirty) = self.dirty {
+            dirty.mark_range(phys_addr, data.len() as u64);
+        }
         self.ram[start..end].copy_from_slice(data);
         // Store first, then look at the flags: a vCPU that flags a page and decodes it after
         // this check sees the new bytes, and one that flagged it before is seen here (the other
@@ -335,6 +352,9 @@ impl PhysWrite for GuestMem<'_> {
         let Some(word) = self.ram.get_mut(start..start + WORD) else {
             return false;
         };
+        if let Some(dirty) = self.dirty {
+            dirty.mark(start >> PAGE_SHIFT);
+        }
         // SAFETY: four aligned bytes of guest RAM, which vCPU threads also reach only through
         // atomics (or plain accesses the guest itself must order).
         let word = unsafe { core::sync::atomic::AtomicU32::from_ptr(word.as_mut_ptr().cast()) };

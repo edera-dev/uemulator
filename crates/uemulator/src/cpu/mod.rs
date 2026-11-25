@@ -18,6 +18,8 @@ pub(crate) mod debug;
 #[cfg(test)]
 mod debug_tests;
 pub(crate) mod decode;
+#[cfg(test)]
+mod dirty_tests;
 pub(crate) mod exception;
 mod exec;
 pub(crate) mod flags;
@@ -1151,7 +1153,7 @@ impl Cpu {
         }
         let written_code_pages = {
             let barrier = self.threads.as_ref().map(|t| &t.links.dma_in_flight);
-            let mut mem = GuestMem::new(&mut self.ram, self.page_has_code.as_bytes())
+            let mut mem = GuestMem::for_pages(&mut self.ram, &self.page_has_code)
                 .with_code_write_barrier(barrier);
             self.dev.lock().tick(now, &mut mem);
             mem.code_pages_written

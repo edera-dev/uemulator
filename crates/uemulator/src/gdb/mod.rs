@@ -159,6 +159,9 @@ pub(crate) struct DebugLink {
     connected: AtomicBool,
     /// The machine's stop flag, for `k`.
     machine_stop: Arc<AtomicBool>,
+    /// Set before `machine_stop` when the machine is really ending. `machine_stop` alone is
+    /// also how a checkpoint pauses the run, which must neither end the session nor the machine.
+    machine_ended: Arc<AtomicBool>,
     session: Mutex<Session>,
     wake: Condvar,
     output: Mutex<Option<OutputFn>>,
@@ -166,7 +169,12 @@ pub(crate) struct DebugLink {
 
 impl DebugLink {
     /// `halt_at_start` makes the first vCPU stop before the first instruction.
-    pub fn new(cpus: usize, machine_stop: Arc<AtomicBool>, halt_at_start: bool) -> Arc<Self> {
+    pub fn new(
+        cpus: usize,
+        machine_stop: Arc<AtomicBool>,
+        machine_ended: Arc<AtomicBool>,
+        halt_at_start: bool,
+    ) -> Arc<Self> {
         Arc::new(DebugLink {
             pause: AtomicU8::new(if halt_at_start {
                 PAUSE_QUIET
@@ -178,6 +186,7 @@ impl DebugLink {
             resumes: AtomicU64::new(0),
             connected: AtomicBool::new(false),
             machine_stop,
+            machine_ended,
             session: Mutex::new(Session {
                 inbox: Vec::new(),
                 engine: Engine::new(),
@@ -305,7 +314,7 @@ impl DebugLink {
                 self.pause.swap(PAUSE_NONE, Ordering::SeqCst);
             }
         }
-        if self.machine_stop.load(Ordering::SeqCst) || session.ended {
+        if self.machine_ended.load(Ordering::SeqCst) || session.ended {
             return None;
         }
         session.stopped = true;
@@ -336,7 +345,7 @@ impl DebugLink {
                 outcome = engine.process(&inbox, vcpus, config, *last_stop, outbox);
             }
             session = self.flush(session);
-            let stopping = self.machine_stop.load(Ordering::SeqCst);
+            let stopping = self.machine_ended.load(Ordering::SeqCst);
             if let Some(outcome) = outcome.take().or(stopping.then_some(Outcome::Kill)) {
                 let kill = matches!(outcome, Outcome::Kill);
                 let actions = match outcome {
@@ -355,6 +364,9 @@ impl DebugLink {
                 session.stopped = false;
                 self.stopped.store(false, Ordering::Release);
                 if kill {
+                    // `ended` first, as `StopHandle::stop` does: the run reads a stop without it
+                    // as a checkpoint's pause and lowers it again.
+                    self.machine_ended.store(true, Ordering::SeqCst);
                     self.machine_stop.store(true, Ordering::SeqCst);
                     return Some(ExitReason::Stopped);
                 }

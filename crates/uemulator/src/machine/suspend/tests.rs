@@ -1,5 +1,5 @@
 use super::*;
-use crate::snapshot::MemorySnapshot;
+use crate::snapshot::{MemorySnapshot, SnapshotId};
 use crate::testkit::fake_bzimage;
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
@@ -261,7 +261,8 @@ fn resuming_and_suspending_again_without_running_gives_the_same_snapshot() {
     machine.suspend();
     machine.start().unwrap();
     assert_eq!(machine.wait(), ExitReason::Suspended);
-    let second = second.bytes.lock().unwrap().clone();
+    let second = without_ids(second.bytes.lock().unwrap().clone());
+    let first = without_ids(first);
     assert_eq!(first.len(), second.len());
     let differs = first.iter().zip(&second).position(|(a, b)| a != b);
     assert_eq!(
@@ -327,4 +328,458 @@ fn suspend_and_resume_refuse_verify_jit() {
         EmulatedMachine::new(config),
         Err(Error::BadConfig(_))
     ));
+}
+
+/// Where a format-2 header keeps the snapshot's id, then its parent's.
+const ID_AT: usize = MAGIC.len() + 4 + 1;
+const IDS_END: usize = ID_AT + 32;
+
+/// `bytes` with the id and parent fields blanked and without the checksum, which covers them:
+/// two snapshots of one state differ only there.
+fn without_ids(mut bytes: Vec<u8>) -> Vec<u8> {
+    bytes[ID_AT..IDS_END].fill(0);
+    bytes.truncate(bytes.len() - 4);
+    bytes
+}
+
+/// Fills 32 pages at 4 MiB with 0x11 and prints '1'; spins long enough for a checkpoint; then
+/// rewrites four of them with a pattern, zeroes one, stores one byte into another and adds to a
+/// fifth with a locked instruction, prints '2', and halts for good with nothing pending.
+///
+/// ```text
+/// mov dx, 0x3f8; mov edi, 0x400000; mov ecx, 16384; movabs rax, 0x1111111111111111; rep stosq
+/// mov al, '1'; out dx, al; mov ecx, 30000000; 2: dec ecx; jnz 2b
+/// mov edi, 0x410000; mov ecx, 2048; movabs rbx, 0x9e3779b97f4a7c15; mov rax, rbx
+/// 3: mov [rdi], rax; add rax, rbx; add rdi, 8; dec ecx; jnz 3b
+/// mov edi, 0x404000; mov ecx, 512; xor eax, eax; rep stosq
+/// mov edi, 0x40c123; mov byte ptr [rdi], 0x5a; mov edi, 0x40d008; lock add qword ptr [rdi], 7
+/// mov al, '2'; out dx, al; sti; hlt
+/// ```
+const DELTA_GUEST: [u8; 114] = [
+    0x66, 0xba, 0xf8, 0x03, 0xbf, 0x00, 0x00, 0x40, 0x00, 0xb9, 0x00, 0x40, 0x00, 0x00, 0x48, 0xb8,
+    0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0xf3, 0x48, 0xab, 0xb0, 0x31, 0xee, 0xb9, 0x80,
+    0xc3, 0xc9, 0x01, 0xff, 0xc9, 0x75, 0xfc, 0xbf, 0x00, 0x00, 0x41, 0x00, 0xb9, 0x00, 0x08, 0x00,
+    0x00, 0x48, 0xbb, 0x15, 0x7c, 0x4a, 0x7f, 0xb9, 0x79, 0x37, 0x9e, 0x48, 0x89, 0xd8, 0x48, 0x89,
+    0x07, 0x48, 0x01, 0xd8, 0x48, 0x83, 0xc7, 0x08, 0xff, 0xc9, 0x75, 0xf2, 0xbf, 0x00, 0x40, 0x40,
+    0x00, 0xb9, 0x00, 0x02, 0x00, 0x00, 0x31, 0xc0, 0xf3, 0x48, 0xab, 0xbf, 0x23, 0xc1, 0x40, 0x00,
+    0xc6, 0x07, 0x5a, 0xbf, 0x08, 0xd0, 0x40, 0x00, 0xf0, 0x48, 0x83, 0x07, 0x07, 0xb0, 0x32, 0xee,
+    0xfb, 0xf4,
+];
+
+/// A machine that is running, and what its console printed so far.
+struct Running {
+    machine: EmulatedMachine,
+    output: Arc<StdMutex<Vec<u8>>>,
+    handle: StopHandle,
+}
+
+fn start(config: MachineConfig) -> Running {
+    let mut machine = EmulatedMachine::new(config).expect("valid config");
+    let output = Arc::new(StdMutex::new(Vec::new()));
+    let sink = output.clone();
+    machine
+        .console()
+        .on_output(move |bytes| sink.lock().unwrap().extend_from_slice(bytes));
+    let handle = machine.stop_handle();
+    machine.start().expect("starts");
+    Running {
+        machine,
+        output,
+        handle,
+    }
+}
+
+impl Running {
+    fn wait_for(&self, marker: u8) {
+        let deadline = Instant::now() + LIMIT;
+        while !self.output.lock().unwrap().contains(&marker) {
+            assert!(
+                Instant::now() < deadline,
+                "the guest never printed {marker}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn output(&self) -> Vec<u8> {
+        self.output.lock().unwrap().clone()
+    }
+
+    /// Takes a checkpoint and waits for it.
+    fn checkpoint(&self) -> Result<(SnapshotInfo, Vec<u8>), SnapshotError> {
+        let sink = Shared::default();
+        let (answer, answered) = std::sync::mpsc::channel();
+        self.handle
+            .checkpoint(sink.clone(), move |result| answer.send(result).unwrap());
+        let info = answered
+            .recv_timeout(LIMIT)
+            .expect("the checkpoint was answered")?;
+        assert!(sink.finished.load(Ordering::SeqCst));
+        let bytes = sink.bytes.lock().unwrap().clone();
+        Ok((info, bytes))
+    }
+}
+
+fn chain(snapshots: &[&Vec<u8>]) -> Vec<Box<dyn SnapshotSource>> {
+    snapshots
+        .iter()
+        .map(|bytes| Box::new(MemorySnapshot::new((*bytes).clone())) as Box<dyn SnapshotSource>)
+        .collect()
+}
+
+/// A checkpoint, a delta after the guest rewrote some pages, and a suspend of the same moment:
+/// the chain of the two checkpoints, resumed and suspended again before anything runs, gives the
+/// suspend's bytes. Every write the delta missed, or a page it restored wrongly, shows up. The
+/// dirty-log check runs too, so a store path that skips the log fails the second checkpoint.
+#[test]
+fn a_delta_chain_restores_exactly_the_machine_it_was_taken_from() {
+    for (jit, cpus) in [(JitMode::Off, 1), (JitMode::Auto, 1), (JitMode::Off, 2)] {
+        let _turn = (jit != JitMode::Off).then(crate::jit::serialize_jit_tests);
+        let machine = || {
+            config(&DELTA_GUEST, jit)
+                .cpus(cpus)
+                .smp(SmpMode::Timeshare)
+                .check_dirty_tracking(true)
+        };
+        let suspended = Shared::default();
+        let running = start(machine().suspend_to(suspended.clone()));
+        running.wait_for(b'1');
+        let (base, base_bytes) = running.checkpoint().expect("the first checkpoint");
+        assert_eq!(base.parent, None, "the first checkpoint is full");
+        assert!(
+            !running.output().contains(&b'2'),
+            "the guest finished before the checkpoint; lengthen its loop"
+        );
+        running.wait_for(b'2');
+        let (delta, delta_bytes) = running.checkpoint().expect("the delta");
+        assert_eq!(delta.parent, Some(base.id), "{jit:?} {cpus}");
+        running.handle.suspend();
+        let mut running = running;
+        assert_eq!(running.machine.wait(), ExitReason::Suspended);
+        let suspended = suspended.bytes.lock().unwrap().clone();
+
+        // Resumed and suspended at once: through the same `settle` both ways, which re-anchors
+        // the inactive vCPUs' counters, so the two are compared after it.
+        let resume_then_suspend = |sources: Vec<Box<dyn SnapshotSource>>| {
+            let again = Shared::default();
+            let mut resumed = EmulatedMachine::new(
+                machine()
+                    .resume_from_chain(sources)
+                    .suspend_to(again.clone()),
+            )
+            .unwrap();
+            resumed.suspend();
+            resumed.start().unwrap();
+            assert_eq!(resumed.wait(), ExitReason::Suspended);
+            again.bytes.lock().unwrap().clone()
+        };
+        let again = resume_then_suspend(chain(&[&base_bytes, &delta_bytes]));
+        let expected = resume_then_suspend(chain(&[&suspended]));
+        if cpus == 1 {
+            assert_eq!(without_ids(expected.clone()), without_ids(suspended));
+        }
+        assert_eq!(again.len(), expected.len(), "{jit:?} {cpus}");
+        let (again, expected) = (without_ids(again), without_ids(expected));
+        let differs = again.iter().zip(&expected).position(|(a, b)| a != b);
+        assert_eq!(
+            differs, None,
+            "{jit:?} {cpus}: differs from byte {differs:?} on"
+        );
+    }
+}
+
+/// Checkpoints taken during the computation change nothing the guest computes, and the chain of
+/// them resumes to the same result, on threads and time-shared, with the interpreter and the JIT.
+#[test]
+fn checkpoints_leave_a_computation_alone_and_its_chain_resumes_it() {
+    let expected = reference_output(JitMode::Off);
+    for (jit, cpus, smp) in [
+        (JitMode::Off, 1, SmpMode::Auto),
+        (JitMode::Auto, 1, SmpMode::Auto),
+        (JitMode::Off, 2, SmpMode::Timeshare),
+        (JitMode::Off, 2, SmpMode::Threads),
+        (JitMode::Auto, 2, SmpMode::Threads),
+    ] {
+        let _turn = (jit != JitMode::Off).then(crate::jit::serialize_jit_tests);
+        let machine = || {
+            config(&CHECKSUM_GUEST, jit)
+                .cpus(cpus)
+                .smp(smp)
+                .clock(if smp == SmpMode::Threads {
+                    ClockMode::Realtime
+                } else {
+                    ClockMode::Virtual
+                })
+                .check_dirty_tracking(true)
+        };
+        let mut running = start(machine());
+        running.wait_for(STARTED);
+        let mut taken = Vec::new();
+        for _ in 0..3 {
+            taken.push(running.checkpoint().expect("a checkpoint"));
+        }
+        assert_eq!(
+            running.output(),
+            [STARTED],
+            "the guest finished before the checkpoints; lengthen its loop"
+        );
+        for pair in taken.windows(2) {
+            assert_eq!(pair[1].0.parent, Some(pair[0].0.id));
+        }
+        assert_eq!(running.machine.wait(), ExitReason::Shutdown);
+        assert_eq!(running.output(), expected, "{jit:?} {cpus} {smp:?}");
+
+        let snapshots: Vec<&Vec<u8>> = taken.iter().map(|(_, bytes)| bytes).collect();
+        let resumed = run(machine().resume_from_chain(chain(&snapshots)), None);
+        assert_eq!(resumed.exit, ExitReason::Shutdown, "{jit:?} {cpus} {smp:?}");
+        let mut whole = vec![STARTED];
+        whole.extend_from_slice(&resumed.output);
+        assert_eq!(whole, expected, "{jit:?} {cpus} {smp:?}");
+    }
+}
+
+/// A chain whose pieces do not fit together is refused before anything runs.
+#[test]
+fn a_chain_that_does_not_fit_together_is_refused() {
+    let running = start(config(&DELTA_GUEST, JitMode::Off));
+    running.wait_for(b'1');
+    let (_, first) = running.checkpoint().unwrap();
+    let (_, second) = running.checkpoint().unwrap();
+    let (_, third) = running.checkpoint().unwrap();
+    running.handle.stop();
+    for (pieces, why) in [
+        (vec![&second], "must be restored before it"),
+        (vec![&first, &first], "not a delta"),
+        (vec![&first, &third], "is a delta of"),
+    ] {
+        let resumed = run(
+            config(&DELTA_GUEST, JitMode::Off).resume_from_chain(chain(&pieces)),
+            None,
+        );
+        let ExitReason::ResumeFailed(message) = &resumed.exit else {
+            panic!("resumed: {:?}", resumed.exit);
+        };
+        assert!(message.contains(why), "{message}");
+        assert!(resumed.output.is_empty());
+    }
+}
+
+/// A sink that refuses every write.
+struct Refusing;
+
+impl SnapshotSink for Refusing {
+    fn write(&mut self, _: &[u8]) -> Result<(), SnapshotError> {
+        Err(SnapshotError("disk full".into()))
+    }
+
+    fn finish(&mut self) -> Result<(), SnapshotError> {
+        Err(SnapshotError("disk full".into()))
+    }
+}
+
+/// A checkpoint that fails changes nothing: the machine runs on, and the next delta is against
+/// the last checkpoint that was written.
+#[test]
+fn a_failed_checkpoint_leaves_the_machine_running_and_the_chain_intact() {
+    let mut running = start(config(&CHECKSUM_GUEST, JitMode::Off));
+    running.wait_for(STARTED);
+    let (first, _) = running.checkpoint().unwrap();
+    let (answer, answered) = std::sync::mpsc::channel();
+    running
+        .handle
+        .checkpoint(Refusing, move |result| answer.send(result).unwrap());
+    let refused = answered.recv_timeout(LIMIT).unwrap();
+    assert!(refused.unwrap_err().0.contains("disk full"));
+    let (second, _) = running.checkpoint().unwrap();
+    assert_eq!(second.parent, Some(first.id));
+    assert_eq!(running.machine.wait(), ExitReason::Shutdown);
+    assert_eq!(running.output(), reference_output(JitMode::Off));
+}
+
+/// A checkpoint asked for from the callback of the one before (so while the machine is paused
+/// for it) is taken too, as its child, and the machine runs on to its result.
+#[test]
+fn a_checkpoint_asked_for_while_one_is_written_is_taken_too() {
+    let mut running = start(config(&CHECKSUM_GUEST, JitMode::Off));
+    running.wait_for(STARTED);
+    let (answer, answered) = std::sync::mpsc::channel();
+    let handle = running.handle.clone();
+    let second_answer = answer.clone();
+    running.handle.checkpoint(Shared::default(), move |first| {
+        handle.checkpoint(Shared::default(), move |second| {
+            second_answer.send(second).unwrap()
+        });
+        answer.send(first).unwrap();
+    });
+    let first = answered.recv_timeout(LIMIT).unwrap().unwrap();
+    let second = answered.recv_timeout(LIMIT).unwrap().unwrap();
+    assert_eq!(second.parent, Some(first.id));
+    assert_eq!(running.machine.wait(), ExitReason::Shutdown);
+    assert_eq!(running.output(), reference_output(JitMode::Off));
+    // And one asked for once the machine is gone is answered at once.
+    let (answer, answered) = std::sync::mpsc::channel();
+    running.handle.checkpoint(Shared::default(), move |result| {
+        answer.send(result).unwrap()
+    });
+    assert!(answered.recv_timeout(LIMIT).unwrap().is_err());
+}
+
+/// A checkpoint asked for while the machine stops is answered, with an error, and the stop is a
+/// stop.
+#[test]
+fn a_checkpoint_that_meets_a_stop_is_refused() {
+    let mut machine = EmulatedMachine::new(config(&CHECKSUM_GUEST, JitMode::Off)).unwrap();
+    let (answer, answered) = std::sync::mpsc::channel();
+    machine
+        .stop_handle()
+        .checkpoint(Shared::default(), move |result| {
+            answer.send(result).unwrap()
+        });
+    machine.stop();
+    machine.start().unwrap();
+    assert_eq!(machine.wait(), ExitReason::Stopped);
+    assert!(answered.recv_timeout(LIMIT).unwrap().is_err());
+}
+
+/// What the builds before delta snapshots wrote (format 1: no id, every non-zero page raw), from
+/// the stopped vCPUs of a harness.
+fn save_format_1(cpus: &mut [Cpu], sink: &mut dyn SnapshotSink) {
+    let guest_ns = cpus[0].now_ns();
+    cpus[0].pmu_park();
+    let shape = shape(cpus);
+    let mut w = Writer::new(sink);
+    w.bytes(MAGIC).unwrap();
+    w.u32(FORMAT_VERSION_RAW_PAGES).unwrap();
+    shape.save(&mut w).unwrap();
+    w.u64(guest_ns).unwrap();
+    w.len(cpus.len()).unwrap();
+    for cpu in cpus.iter() {
+        cpu.save(&mut w).unwrap();
+    }
+    w.u64(cpus[0].rng_state).unwrap();
+    cpus[0].dev.lock().save(&mut w).unwrap();
+    let ram = &cpus[0].ram;
+    w.len(ram.len()).unwrap();
+    let pages = ram.len() / PAGE_BYTES;
+    for group in (0..pages).step_by(PAGES_PER_GROUP) {
+        let end = (group + PAGES_PER_GROUP).min(pages);
+        let present = (group..end)
+            .filter(|&page| !is_filled_with(page_bytes(ram, page), 0))
+            .fold(0u64, |bits, page| bits | 1 << (page - group));
+        w.u64(present).unwrap();
+        for page in group..end {
+            if present & 1 << (page - group) != 0 {
+                w.bytes(page_bytes(ram, page)).unwrap();
+            }
+        }
+    }
+    w.finish().unwrap();
+}
+
+/// mov rax, 0x1234; hlt
+const SET_RAX_THEN_HALT: [u8; 8] = [0x48, 0xc7, 0xc0, 0x34, 0x12, 0x00, 0x00, 0xf4];
+
+fn harness_ram(cpu: &Cpu) -> Vec<u8> {
+    cpu.ram[0..cpu.ram.len()].to_vec()
+}
+
+/// Snapshots written before format 2 still resume.
+#[test]
+fn a_format_1_snapshot_still_loads() {
+    let mut taken = crate::testkit::Harness::new(&SET_RAX_THEN_HALT);
+    taken.run_to_halt();
+    taken.write(0x40_0000, b"written before the upgrade");
+    let mut bytes = MemorySnapshot::default();
+    save_format_1(core::slice::from_mut(&mut taken.cpu), &mut bytes);
+    let mut source = MemorySnapshot::new(bytes.bytes.clone());
+    assert_eq!(
+        read_snapshot_info(&mut source).unwrap(),
+        SnapshotInfo {
+            version: 1,
+            id: SnapshotId::default(),
+            parent: None
+        }
+    );
+    let mut into = crate::testkit::Harness::new(&[crate::testkit::HLT]);
+    let mut sources: Vec<Box<dyn SnapshotSource>> =
+        vec![Box::new(MemorySnapshot::new(bytes.bytes))];
+    let (info, parent_capable) =
+        restore(core::slice::from_mut(&mut into.cpu), false, &mut sources).unwrap();
+    assert_eq!(info.version, 1);
+    assert!(
+        !parent_capable,
+        "a format-1 snapshot has no id to be a parent by"
+    );
+    assert_eq!(into.cpu.gpr[crate::testkit::RAX], 0x1234);
+    assert_eq!(harness_ram(&into.cpu), harness_ram(&taken.cpu));
+}
+
+/// xorshift64*: deterministic noise for the page contents below.
+fn noise(state: &mut u64) -> u64 {
+    *state ^= *state >> 12;
+    *state ^= *state << 25;
+    *state ^= *state >> 27;
+    state.wrapping_mul(0x2545_f491_4f6c_dd1d)
+}
+
+/// Rounds of device-style writes of every kind of page (zero, one byte repeated, compressible,
+/// random, a few bytes), each followed by a delta; the chain restores the same RAM every time.
+#[test]
+fn random_page_writes_survive_a_long_delta_chain() {
+    let mut machine = crate::testkit::Harness::new(&[crate::testkit::HLT]);
+    let mut state = 0x5eed_u64;
+    let mut snapshots: Vec<Vec<u8>> = Vec::new();
+    let pages_in_ram = machine.cpu.ram.len() / PAGE_BYTES;
+    for round in 0..8 {
+        if round > 0 {
+            let pages = machine.cpu.page_has_code.clone();
+            let mut mem = crate::dev::guestmem::GuestMem::for_pages(&mut machine.cpu.ram, &pages);
+            for _ in 0..40 {
+                let page = (noise(&mut state) as usize % pages_in_ram) as u64;
+                let mut bytes = vec![0u8; PAGE_BYTES];
+                match noise(&mut state) % 5 {
+                    0 => {}
+                    1 => bytes.fill(noise(&mut state) as u8),
+                    2 => {
+                        for (index, byte) in bytes.iter_mut().enumerate() {
+                            *byte = (index / 13) as u8;
+                        }
+                    }
+                    3 => bytes
+                        .iter_mut()
+                        .for_each(|byte| *byte = noise(&mut state) as u8),
+                    _ => {
+                        let at = noise(&mut state) as usize % (PAGE_BYTES - 4);
+                        let mut current = vec![0; 4];
+                        mem.read(page * PAGE_BYTES as u64 + at as u64, &mut current);
+                        current[0] ^= 0xff;
+                        assert!(mem.write(page * PAGE_BYTES as u64 + at as u64, &current));
+                        continue;
+                    }
+                }
+                assert!(mem.write(page * PAGE_BYTES as u64, &bytes));
+            }
+        }
+        let log = machine.cpu.page_has_code.dirty_log();
+        let marked: u32 = (0..pages_in_ram.div_ceil(PAGES_PER_GROUP))
+            .map(|word| log.word(word).count_ones())
+            .sum();
+        // Only what the forty writes touched (the in-place edits may land on a written page).
+        assert!(marked <= 40, "round {round}: {marked} pages marked");
+        let mut sink = MemorySnapshot::default();
+        let cpus = core::slice::from_mut(&mut machine.cpu);
+        let info = save(cpus, 0, false, &mut sink, SaveKind::Checkpoint).unwrap();
+        unpark_after_save(cpus, 0, false);
+        assert_eq!(info.parent.is_some(), round > 0);
+        arm_dirty_log(cpus, info.id);
+        snapshots.push(sink.bytes);
+
+        let mut into = crate::testkit::Harness::new(&[crate::testkit::HLT]);
+        let mut sources = chain(&snapshots.iter().collect::<Vec<_>>());
+        restore(core::slice::from_mut(&mut into.cpu), false, &mut sources).unwrap();
+        assert!(
+            harness_ram(&into.cpu) == harness_ram(&machine.cpu),
+            "round {round}: the restored RAM differs"
+        );
+    }
 }

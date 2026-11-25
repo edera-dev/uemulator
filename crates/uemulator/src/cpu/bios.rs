@@ -309,6 +309,9 @@ impl Cpu {
                 self.code_written(page);
             }
         }
+        self.page_has_code
+            .dirty_log()
+            .mark_range(linear, data.len() as u64);
         self.ram[start..end].copy_from_slice(data);
         true
     }

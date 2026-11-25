@@ -69,6 +69,26 @@ impl WallClock {
             .store(guest_ns.saturating_sub(now), Ordering::SeqCst);
     }
 
+    /// Takes the host time since guest time was `guest_ns` out of guest time, here and in every
+    /// clone: a checkpoint's pause, which the guest must not see. Only while nothing runs.
+    pub(crate) fn skip_pause_since(&self, guest_ns: u64) {
+        let timeline = &*self.timeline;
+        let now = self.elapsed_ns();
+        let pause = now.saturating_sub(guest_ns);
+        if pause == 0 {
+            return;
+        }
+        let _writer = timeline.writer.lock().unwrap();
+        let sequence = timeline.sequence.load(Ordering::Relaxed);
+        timeline.sequence.store(sequence + 1, Ordering::Relaxed);
+        fence(Ordering::Release);
+        let skipped = timeline.skipped_ns.load(Ordering::Relaxed);
+        timeline
+            .skipped_ns
+            .store(skipped + pause, Ordering::Relaxed);
+        timeline.sequence.store(sequence + 2, Ordering::Release);
+    }
+
     pub(crate) fn elapsed_ns(&self) -> u64 {
         let timeline = &*self.timeline;
         loop {
@@ -146,6 +166,18 @@ mod tests {
         assert_eq!(clock.elapsed_ns(), 3_600 * 1_000 * MS);
         host.fetch_add(5 * MS, Ordering::SeqCst);
         assert_eq!(clone.elapsed_ns(), 3_600 * 1_000 * MS + 5 * MS);
+    }
+
+    #[test]
+    fn a_checkpoints_pause_is_not_guest_time() {
+        let (host, clock) = manual_clock();
+        host.fetch_add(40 * MS, Ordering::SeqCst);
+        let paused_at = clock.elapsed_ns();
+        host.fetch_add(30 * MS, Ordering::SeqCst);
+        clock.clone().skip_pause_since(paused_at);
+        assert_eq!(clock.elapsed_ns(), paused_at);
+        host.fetch_add(MS, Ordering::SeqCst);
+        assert_eq!(clock.elapsed_ns(), paused_at + MS);
     }
 
     #[test]

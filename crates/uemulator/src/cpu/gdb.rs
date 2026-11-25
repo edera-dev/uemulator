@@ -631,6 +631,11 @@ pub(crate) fn write_memory(vcpus: &mut dyn Vcpus, index: usize, address: u64, da
         done += chunk;
     }
     for (physical, offset, chunk) in pieces {
+        // No `translate` on this path, so nothing else tells a delta snapshot about the page.
+        machine
+            .page_has_code
+            .dirty_log()
+            .mark_range(physical as u64, chunk as u64);
         let target = &mut machine.ram[physical..physical + chunk];
         if machine.ordered_memory {
             for (byte, &value) in target.iter_mut().zip(&data[offset..offset + chunk]) {

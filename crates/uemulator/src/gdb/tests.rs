@@ -548,6 +548,19 @@ fn a_memory_write_to_translated_code_drops_it() {
     assert_eq!(session.harness.cpu.gpr[RAX], 2);
 }
 
+/// A debugger's write is a write to guest RAM like any other: a checkpoint taken after it must
+/// carry the page, so it has to reach the dirty log behind delta snapshots.
+#[test]
+fn a_memory_write_marks_the_dirty_log() {
+    let mut session = Session::new(&[0xf4]);
+    let page = (CODE_BASE >> 12) as usize;
+    let log = session.harness.cpu.page_has_code.dirty_log();
+    log.arm([7; 16]);
+    assert!(!log.is_dirty(page));
+    assert_eq!(session.ask(&format!("M{:x},1:90", CODE_BASE + 1)), "OK");
+    assert!(session.harness.cpu.page_has_code.dirty_log().is_dirty(page));
+}
+
 #[test]
 fn breakpoint_and_watchpoint_packets_edit_the_configuration() {
     let mut session = Session::new(&[0xf4]);
@@ -750,7 +763,12 @@ struct Served {
 
 impl Served {
     fn new() -> Self {
-        let link = DebugLink::new(1, Arc::new(AtomicBool::new(false)), false);
+        let link = DebugLink::new(
+            1,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            false,
+        );
         let mut harness = Harness::new(&[0xf4]);
         harness.cpu.attach_debugger(Some(link.clone()));
         let output = Arc::new(Mutex::new(Vec::new()));
@@ -861,6 +879,10 @@ fn kill_ends_the_run_and_raises_the_stop_flag() {
         Some(crate::machine::ExitReason::Stopped)
     );
     assert!(served.link.machine_stop.load(Ordering::SeqCst));
+    assert!(
+        served.link.machine_ended.load(Ordering::SeqCst),
+        "a stop without `ended` is a checkpoint's pause, which the run lowers and runs on"
+    );
 }
 
 #[test]

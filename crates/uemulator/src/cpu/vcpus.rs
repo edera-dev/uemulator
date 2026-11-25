@@ -922,7 +922,7 @@ pub(crate) fn run_threaded(
         // stays up until the JIT and decode invalidations are visible, even though the device
         // lock is released before the JIT cache lock is taken.
         let written_code_pages = {
-            let mut mem = GuestMem::new(&mut ram, flags.as_bytes())
+            let mut mem = GuestMem::for_pages(&mut ram, &flags)
                 .with_code_write_barrier(Some(&links.dma_in_flight));
             device_handle.lock().tick(now, &mut mem);
             mem.code_pages_written
@@ -963,7 +963,11 @@ pub(crate) fn run_threaded(
     let reason = links.exit_reason();
     device_handle.lock().detach_links();
     let mut results = results.lock().unwrap();
-    let finished: Vec<Cpu> = results.drain(..).flatten().map(|cpu| *cpu).collect();
+    let mut finished: Vec<Cpu> = results.drain(..).flatten().map(|cpu| *cpu).collect();
+    // Back where it came from: a checkpoint runs the vCPUs again (`Vcpu::run_vcpus`).
+    if let Some(first) = finished.iter_mut().find(|cpu| cpu.cpu_index == 0) {
+        first.poll = poll;
+    }
     let summary = finished
         .iter()
         .map(|cpu| {

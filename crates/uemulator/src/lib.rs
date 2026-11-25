@@ -66,13 +66,16 @@ pub use kv::{KeyValueError, KeyValueLog, KeyValueStore, LogKeyValueStore, Memory
 pub use machine::{
     ClockMode, ConsoleKind, DEFAULT_HYPERVISOR_CMDLINE, DisplayMode, EmulatedMachine, Error,
     ExitReason, JitMode, MAX_MEMORY_MIB, MIN_MEMORY_MIB, MachineConfig, SmpMode, StopHandle,
+    read_snapshot_info,
 };
 pub use netdev::{NetHandle, NetOffloads};
 pub use platform::{DEFAULT_CMDLINE, DEFAULT_SERIAL_CMDLINE, Platform, load_linux};
 pub use segment::{SegmentAgent, SegmentDestination, SegmentStatus};
 #[cfg(not(freestanding))]
 pub use snapshot::{FileSnapshotSink, FileSnapshotSource};
-pub use snapshot::{MemorySnapshot, SnapshotError, SnapshotSink, SnapshotSource};
+pub use snapshot::{
+    MemorySnapshot, SnapshotError, SnapshotId, SnapshotInfo, SnapshotSink, SnapshotSource,
+};
 pub use wisp::{WispClient, WispState, WispStatus};
 
 #[cfg(test)]
@@ -103,6 +106,11 @@ mod api_tests {
         let _: fn(Vec<u8>, &UdiskOptions, Base) -> disk_io::Result<Udisk> = Udisk::create;
         let _: fn(&mut dyn ImageStorage) -> disk_io::Result<Option<UdiskInfo>> = Udisk::probe;
         let _: fn(&mut EmulatedMachine) -> ExitReason = EmulatedMachine::wait;
+        let _: fn(&mut dyn SnapshotSource) -> Result<SnapshotInfo, SnapshotError> =
+            read_snapshot_info;
+        let _: fn(MachineConfig, Vec<Box<dyn SnapshotSource>>) -> MachineConfig =
+            MachineConfig::resume_from_chain;
+        let _ = |handle: &StopHandle| handle.checkpoint(MemorySnapshot::default(), |_| {});
         let _: fn(&EmulatedMachine) = EmulatedMachine::stop;
         let _: fn(&EmulatedMachine) -> StopHandle = EmulatedMachine::stop_handle;
         let _: fn(&EmulatedMachine) -> ConsoleHandle = EmulatedMachine::console;

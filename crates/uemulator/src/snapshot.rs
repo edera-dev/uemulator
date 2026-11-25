@@ -24,6 +24,8 @@ use core::fmt;
 
 pub(crate) use uemulator_snapshot_derive::Snapshot;
 
+pub(crate) mod compress;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotError(pub String);
 
@@ -34,6 +36,32 @@ impl fmt::Display for SnapshotError {
 }
 
 impl core::error::Error for SnapshotError {}
+
+/// Names one snapshot. A delta carries its parent's id, so a host can line a chain up from the
+/// files' headers (`read_snapshot_info`) and a restore can refuse a chain that does not fit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SnapshotId(pub [u8; 16]);
+
+impl fmt::Display for SnapshotId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// What a snapshot's header says (`read_snapshot_info`), or what a checkpoint wrote.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnapshotInfo {
+    /// The format version: 1 wrote every page as is and has no id (it reads as all zeros); 2
+    /// compresses pages and may be a delta.
+    pub version: u32,
+    pub id: SnapshotId,
+    /// For a delta, the snapshot its pages apply to: restore that one (and its own parents)
+    /// first. `None` for a full snapshot.
+    pub parent: Option<SnapshotId>,
+}
 
 /// Where a suspended machine's snapshot goes (`MachineConfig::suspend_to`). Writes arrive in
 /// order, in pieces of up to `Writer::BUFFER_BYTES`. `finish` comes after the last one, and the
@@ -52,6 +80,12 @@ pub trait SnapshotSink: Send {
 pub trait SnapshotSource: Send {
     fn read(&mut self, buffer: &mut [u8]) -> Result<usize, SnapshotError>;
     fn finish(&mut self) -> Result<(), SnapshotError>;
+    /// Whether the snapshot stays where it is after `finish`. Only then may the machine's next
+    /// checkpoint be a delta against it; otherwise that checkpoint is a full snapshot. A
+    /// checkpoint is kept (its disks are copied beside it), a suspend's snapshot is not.
+    fn retained(&self) -> bool {
+        false
+    }
 }
 
 /// A snapshot in memory, for tests and for hosts that keep it themselves.
@@ -89,6 +123,10 @@ impl SnapshotSource for MemorySnapshot {
 
     fn finish(&mut self) -> Result<(), SnapshotError> {
         Ok(())
+    }
+
+    fn retained(&self) -> bool {
+        true
     }
 }
 
@@ -171,13 +209,27 @@ mod file {
     pub struct FileSnapshotSource {
         path: PathBuf,
         file: File,
+        keep: bool,
     }
 
     impl FileSnapshotSource {
         pub fn open(path: impl Into<PathBuf>) -> Result<Self, SnapshotError> {
             let path = path.into();
             let file = File::open(&path).map_err(|e| io_error("opening", &path, e))?;
-            Ok(FileSnapshotSource { path, file })
+            Ok(FileSnapshotSource {
+                path,
+                file,
+                keep: false,
+            })
+        }
+
+        /// A checkpoint: `finish` leaves the file, so it can be resumed again (with the disks
+        /// as they were when it was taken) and later checkpoints can be deltas against it.
+        pub fn open_kept(path: impl Into<PathBuf>) -> Result<Self, SnapshotError> {
+            Ok(FileSnapshotSource {
+                keep: true,
+                ..Self::open(path)?
+            })
         }
     }
 
@@ -189,7 +241,14 @@ mod file {
         }
 
         fn finish(&mut self) -> Result<(), SnapshotError> {
+            if self.keep {
+                return Ok(());
+            }
             fs::remove_file(&self.path).map_err(|e| io_error("removing", &self.path, e))
+        }
+
+        fn retained(&self) -> bool {
+            self.keep
         }
     }
 
@@ -302,6 +361,10 @@ impl<'a> Writer<'a> {
         self.bytes(&[value])
     }
 
+    pub(crate) fn u16(&mut self, value: u16) -> Result<(), SnapshotError> {
+        self.bytes(&value.to_le_bytes())
+    }
+
     pub(crate) fn u32(&mut self, value: u32) -> Result<(), SnapshotError> {
         self.bytes(&value.to_le_bytes())
     }
@@ -384,6 +447,12 @@ impl<'a> Reader<'a> {
         let mut byte = [0];
         self.bytes(&mut byte)?;
         Ok(byte[0])
+    }
+
+    pub(crate) fn u16(&mut self) -> Result<u16, SnapshotError> {
+        let mut bytes = [0; 2];
+        self.bytes(&mut bytes)?;
+        Ok(u16::from_le_bytes(bytes))
     }
 
     pub(crate) fn u32(&mut self) -> Result<u32, SnapshotError> {
