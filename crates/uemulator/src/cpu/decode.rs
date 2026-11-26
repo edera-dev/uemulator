@@ -512,9 +512,13 @@ pub(crate) fn decode_in_mode(bytes: &[u8], mode: CodeMode) -> Result<Insn, Decod
     let mut map = MAP_ONE_BYTE;
     let mut opb = op;
     // Outside 64-bit mode c4/c5 are les/lds unless ModRM.mod would be 3, which those cannot
-    // encode (they need memory): that is VEX.
+    // encode (they need memory): that is VEX. The byte to look at is the one after the opcode,
+    // `r.pos`, not the instruction's second byte: behind a prefix that would be the opcode.
     let is_vex = (op == VEX_THREE_BYTE || op == VEX_TWO_BYTE)
-        && (long || bytes.get(1).is_some_and(|&b| b >> 6 == MODRM_MOD_REGISTER));
+        && (long
+            || bytes
+                .get(r.pos)
+                .is_some_and(|&b| b >> 6 == MODRM_MOD_REGISTER));
     // Registers 16-31 (EVEX.R', V' and X on a register operand); added once ModRM is known.
     let (mut high_reg, mut high_rm, mut high_vvvv) = (0u8, 0u8, 0u8);
     // Outside 64-bit mode 62 is `bound`.

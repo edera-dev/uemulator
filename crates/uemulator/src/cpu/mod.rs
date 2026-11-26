@@ -380,6 +380,13 @@ pub(crate) const TLB_FLAG_PROTECTION_KEY_MASK: TlbFlags = 0xf;
 pub(crate) const TLB_FLAG_SHADOW_STACK: TlbFlags = 1 << 8;
 /// The leaf is global (PTE bit 8 with CR4.PGE): a CR3 write keeps it (`flush_tlb_non_global`).
 pub(crate) const TLB_FLAG_GLOBAL: TlbFlags = 1 << 9;
+/// The page is one 4 KiB piece of a 2 MiB, 4 MiB or 1 GiB leaf: INVLPG of any address in the
+/// leaf must drop it (`Cpu::invlpg`, `Cpu::tlb_large`).
+pub(crate) const TLB_FLAG_LARGE: TlbFlags = 1 << 10;
+/// What `Cpu::invlpg` treats as "the same large leaf" for the slots in `Cpu::tlb_large`: the
+/// biggest leaf there is, 1 GiB. The slots keep no leaf size, so an INVLPG also drops the other
+/// large-leaf pages of its GiB; dropping more than asked is always allowed.
+pub(crate) const TLB_LARGE_REGION_SHIFT: u32 = 30;
 pub(crate) const TLB_INDEX_BITS: usize = 12;
 /// `Cpu::tlb` holds two halves of this many entries: supervisor first, then user. They are
 /// separate because the same page can be accessible to one privilege and not the other, and a
@@ -595,6 +602,12 @@ pub(crate) struct Cpu {
     /// set without the slot's `tlb_filled` bit.
     #[snapshot(skip)]
     pub tlb_global: Vec<u64>,
+    /// The slots of `tlb_filled` whose entry came from a large leaf (`TLB_FLAG_LARGE`). The soft
+    /// TLB holds such a leaf as one entry per 4 KiB page touched, in unrelated slots, so an
+    /// INVLPG of the leaf's base would otherwise leave the others behind (Linux flushes a
+    /// transparent huge page with one INVLPG at its base). Never set without the `tlb_filled` bit.
+    #[snapshot(skip)]
+    pub tlb_large: Vec<u64>,
     #[snapshot(skip)]
     pub decode_cache: Vec<DecodeCacheEntry>,
     /// Bumping it invalidates the whole decode cache at once. Starts at 1 so the zeroed
@@ -1009,6 +1022,7 @@ impl Cpu {
             tlb: vec![TLB_EMPTY; 2 * TLB_ENTRIES_PER_MODE],
             tlb_filled: vec![0; TLB_FILLED_WORDS],
             tlb_global: vec![0; TLB_FILLED_WORDS],
+            tlb_large: vec![0; TLB_FILLED_WORDS],
             ram_base: 0,
             decode_cache: if has_machine_state {
                 vec![

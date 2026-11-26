@@ -625,9 +625,10 @@ impl Svm {
 /// store to a page that became code while it was out skips `code_written`.
 pub(crate) struct ParkedTlb {
     pub(crate) entries: Vec<TlbEntry>,
-    /// `Cpu::tlb_filled` and `Cpu::tlb_global` for `entries`.
+    /// `Cpu::tlb_filled`, `Cpu::tlb_global` and `Cpu::tlb_large` for `entries`.
     filled: Vec<u64>,
     global: Vec<u64>,
+    large: Vec<u64>,
     pub(crate) large_pages: [LargePage; LARGE_PAGE_CACHE_ENTRIES],
     owner: TlbOwner,
 }
@@ -817,6 +818,7 @@ impl ParkedTlb {
             entries: vec![TLB_EMPTY; 2 * TLB_ENTRIES_PER_MODE],
             filled: vec![0; TLB_FILLED_WORDS],
             global: vec![0; TLB_FILLED_WORDS],
+            large: vec![0; TLB_FILLED_WORDS],
             large_pages: [LARGE_PAGE_EMPTY; LARGE_PAGE_CACHE_ENTRIES],
             owner: TlbOwner::Nobody,
         })
@@ -1084,6 +1086,7 @@ impl Cpu {
         core::mem::swap(&mut self.tlb, &mut parked.entries);
         core::mem::swap(&mut self.tlb_filled, &mut parked.filled);
         core::mem::swap(&mut self.tlb_global, &mut parked.global);
+        core::mem::swap(&mut self.tlb_large, &mut parked.large);
         core::mem::swap(&mut self.large_pages, &mut parked.large_pages);
         self.set_cpl(self.cpl);
     }

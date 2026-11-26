@@ -486,7 +486,7 @@ impl Cpu {
         if cached.shadow_stack {
             flags |= TLB_FLAG_SHADOW_STACK;
         }
-        Some((page, flags))
+        Some((page, flags | TLB_FLAG_LARGE))
     }
 
     /// Remembers a large leaf `walk_wide` just resolved. With nested paging the host-physical
@@ -654,7 +654,7 @@ impl Cpu {
                             upper_levels_writable,
                         ),
                         nested,
-                    ),
+                    ) | if level > 0 { TLB_FLAG_LARGE } else { 0 },
                 ));
             }
             if pte & PTE_ACCESSED == 0 {
@@ -747,7 +747,7 @@ impl Cpu {
                             upper_levels_writable,
                         ),
                         nested,
-                    ),
+                    ) | if large { TLB_FLAG_LARGE } else { 0 },
                 ));
             }
             if pte & PTE_ACCESSED == 0 {
@@ -976,7 +976,7 @@ impl Cpu {
             {
                 refilled.tag_w = page;
             }
-            self.fill_tlb(slot, refilled, walk_flags & TLB_FLAG_GLOBAL != 0);
+            self.fill_tlb(slot, refilled, walk_flags);
         }
         Ok(page_pa | (linear & PAGE_OFFSET_MASK))
     }
@@ -1082,7 +1082,7 @@ impl Cpu {
             };
             refilled.addend = (self.ram_base + page).wrapping_sub(linear_page);
             refilled.tag_w = linear_page | TLB_TAG_SHADOW_STACK;
-            self.fill_tlb(slot, refilled, flags & TLB_FLAG_GLOBAL != 0);
+            self.fill_tlb(slot, refilled, flags);
         }
         Ok(page | (linear & PAGE_OFFSET_MASK))
     }
@@ -1100,16 +1100,18 @@ impl Cpu {
     }
 
     fn empty_tlb_slots(&mut self, including_global: bool) {
-        for (word_index, (filled_word, global_word)) in self
+        for (word_index, ((filled_word, global_word), large_word)) in self
             .tlb_filled
             .iter_mut()
             .zip(self.tlb_global.iter_mut())
+            .zip(self.tlb_large.iter_mut())
             .enumerate()
         {
             let kept = if including_global { 0 } else { *global_word };
             let mut emptied = *filled_word & !kept;
             *filled_word = kept;
             *global_word = kept;
+            *large_word &= kept;
             while emptied != 0 {
                 let slot = word_index * u64::BITS as usize + emptied.trailing_zeros() as usize;
                 self.tlb[slot] = TLB_EMPTY;
@@ -1120,21 +1122,32 @@ impl Cpu {
         self.large_pages = [LARGE_PAGE_EMPTY; LARGE_PAGE_CACHE_ENTRIES];
     }
 
-    /// Stores a TLB entry and records the slot for the flushes.
+    /// Stores a TLB entry and records the slot for the flushes; `flags` are the walk's
+    /// (`TLB_FLAG_GLOBAL`, `TLB_FLAG_LARGE`).
     #[inline]
-    fn fill_tlb(&mut self, slot: usize, entry: TlbEntry, global: bool) {
+    fn fill_tlb(&mut self, slot: usize, entry: TlbEntry, flags: TlbFlags) {
         self.tlb[slot] = entry;
         let word = slot / u64::BITS as usize;
         let bit = 1 << (slot % u64::BITS as usize);
         self.tlb_filled[word] |= bit;
-        if global {
+        if flags & TLB_FLAG_GLOBAL != 0 {
             self.tlb_global[word] |= bit;
         } else {
             self.tlb_global[word] &= !bit;
         }
+        if flags & TLB_FLAG_LARGE != 0 {
+            self.tlb_large[word] |= bit;
+        } else {
+            self.tlb_large[word] &= !bit;
+        }
     }
 
     /// Empties the page's slot in both halves; whatever other page shares the slot goes too.
+    /// A large leaf is cached as many 4 KiB entries in other slots, and INVLPG of any address in
+    /// it must drop them all (SDM 4.10.4.1): so every large-leaf entry of the same
+    /// `TLB_LARGE_REGION_SHIFT` region goes as well. The large-page cache cannot say which leaf
+    /// `linear` was in (it may have evicted it, it skips nested paging and 32-bit paging), and
+    /// the guest has usually rewritten the PDE already, so a walk cannot either.
     pub fn invlpg(&mut self, linear: u64) {
         for leaf in self.large_pages.iter_mut() {
             if leaf.shift != 0 && linear >> leaf.shift == leaf.linear_base >> leaf.shift {
@@ -1144,6 +1157,24 @@ impl Cpu {
         let slot = tlb_slot(linear, false);
         self.tlb[slot] = TLB_EMPTY;
         self.tlb[TLB_ENTRIES_PER_MODE + slot] = TLB_EMPTY;
+        let region = linear >> TLB_LARGE_REGION_SHIFT;
+        let in_region = |tag: u64| {
+            tag != TLB_TAG_INVALID
+                && (tag & !TLB_TAG_SHADOW_STACK) >> TLB_LARGE_REGION_SHIFT == region
+        };
+        for (word_index, large_word) in self.tlb_large.iter_mut().enumerate() {
+            let mut bits = *large_word;
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let slot = word_index * u64::BITS as usize + bit;
+                let entry = &self.tlb[slot];
+                if in_region(entry.tag_r) || in_region(entry.tag_w) || in_region(entry.tag_x) {
+                    self.tlb[slot] = TLB_EMPTY;
+                    *large_word &= !(1 << bit);
+                }
+            }
+        }
     }
 
     /// Reads `size` bytes (at most 8, all inside one page) at a physical address: RAM, else
@@ -2930,6 +2961,91 @@ mod tests {
             assert_eq!(
                 translate(&mut h, LARGE_VA + 0x3000, AccessKind::Read),
                 OTHER_LARGE_PA + 0x3000
+            );
+        }
+
+        #[test]
+        fn invlpg_at_the_base_drops_the_leafs_other_filled_pages() {
+            // Linux flushes a transparent huge page with one INVLPG at its base, but the soft TLB
+            // holds every 4 KiB page of it touched so far, each in its own slot.
+            let (mut h, mut tables) = paged();
+            let leaf = map_2m(&mut h, &mut tables, FULL | PTE_A | PTE_D);
+            translate(&mut h, LARGE_VA + 0x5000, AccessKind::Read);
+            write_pte(
+                &mut h.cpu,
+                leaf,
+                OTHER_LARGE_PA | FULL | PTE_PS | PTE_A | PTE_D,
+            );
+            h.cpu.invlpg(LARGE_VA);
+            assert_eq!(
+                translate(&mut h, LARGE_VA + 0x5000, AccessKind::Read),
+                OTHER_LARGE_PA + 0x5000
+            );
+        }
+
+        #[test]
+        fn invlpg_drops_the_leafs_pages_after_the_large_page_cache_lost_it() {
+            let (mut h, mut tables) = paged();
+            let leaf = map_2m(&mut h, &mut tables, FULL | PTE_A | PTE_D);
+            translate(&mut h, LARGE_VA + 0x5000, AccessKind::Read);
+            h.cpu.large_pages = [LARGE_PAGE_EMPTY; LARGE_PAGE_CACHE_ENTRIES];
+            write_pte(
+                &mut h.cpu,
+                leaf,
+                OTHER_LARGE_PA | FULL | PTE_PS | PTE_A | PTE_D,
+            );
+            h.cpu.invlpg(LARGE_VA + 0x1f_f000);
+            assert_eq!(
+                translate(&mut h, LARGE_VA + 0x5000, AccessKind::Read),
+                OTHER_LARGE_PA + 0x5000
+            );
+        }
+
+        #[test]
+        fn invlpg_at_the_base_revokes_a_write_the_leaf_no_longer_allows() {
+            let (mut h, mut tables) = paged();
+            let leaf = map_2m(&mut h, &mut tables, FULL | PTE_A | PTE_D);
+            h.cpu.set_cpl(3);
+            translate(&mut h, LARGE_VA + 0x5000, AccessKind::Write);
+            write_pte(
+                &mut h.cpu,
+                leaf,
+                LARGE_PA | READ_ONLY_USER | PTE_PS | PTE_A | PTE_D,
+            );
+            h.cpu.invlpg(LARGE_VA);
+            assert!(
+                h.cpu
+                    .translate(LARGE_VA + 0x5000, AccessKind::Write, false)
+                    .is_err()
+            );
+        }
+
+        #[test]
+        fn invlpg_at_the_base_makes_the_next_store_set_dirty_again() {
+            let (mut h, mut tables) = paged();
+            let leaf = map_2m(&mut h, &mut tables, FULL | PTE_A | PTE_D);
+            translate(&mut h, LARGE_VA + 0x5000, AccessKind::Write);
+            write_pte(&mut h.cpu, leaf, LARGE_PA | FULL | PTE_PS | PTE_A);
+            h.cpu.invlpg(LARGE_VA);
+            translate(&mut h, LARGE_VA + 0x5000, AccessKind::Write);
+            assert_ne!(read_pte(&h.cpu, leaf) & PTE_D, 0);
+        }
+
+        #[test]
+        fn invlpg_anywhere_in_a_1gib_leaf_drops_its_filled_pages() {
+            let (mut h, mut tables) = paged();
+            let leaf = tables.map(&mut h.cpu, GIGA_VA, 0, &[FULL, FULL | PTE_A | PTE_D]);
+            let far = 0x3000_0000;
+            translate(&mut h, GIGA_VA + far, AccessKind::Read);
+            write_pte(
+                &mut h.cpu,
+                leaf,
+                0x4000_0000 | FULL | PTE_PS | PTE_A | PTE_D,
+            );
+            h.cpu.invlpg(GIGA_VA + 0x1000);
+            assert_eq!(
+                translate(&mut h, GIGA_VA + far, AccessKind::Read),
+                0x4000_0000 + far
             );
         }
 

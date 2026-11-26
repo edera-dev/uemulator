@@ -306,6 +306,33 @@ fn les_and_lds_load_a_far_pointer() {
 }
 
 #[test]
+fn les_and_lds_behind_a_prefix_are_not_vex() {
+    // cs les bx, [0x400]; ds lds si, [0x404]; hlt
+    let code = [
+        0x2e, 0xc4, 0x1e, 0x00, 0x04, 0x3e, 0xc5, 0x36, 0x04, 0x04, 0xf4,
+    ];
+    let mut h = Harness::real(&code);
+    h.write(0x400, &[0x34, 0x12, 0x00, 0x20, 0x78, 0x56, 0x00, 0x30]);
+    h.run_to_halt();
+    assert_eq!(reg16(&h, RBX), 0x1234);
+    assert_eq!(h.cpu.seg[SEG_ES].sel, 0x2000);
+    assert_eq!(reg16(&h, RSI), 0x5678);
+    assert_eq!(h.cpu.seg[SEG_DS].sel, 0x3000);
+}
+
+#[test]
+fn prefixed_c4_and_c5_decode_by_the_byte_after_the_opcode() {
+    use super::decode::decode_in_mode;
+    // 66 les ebx, [0x1234] in 16-bit code.
+    let les = decode_in_mode(&[0x66, 0xc4, 0x1e, 0x34, 0x12, 0, 0, 0], CodeMode::Bits16).unwrap();
+    assert_eq!((les.op, les.len), (0xc4, 5));
+    // cs es vzeroupper in 32-bit code: VEX behind two prefixes.
+    let vex = decode_in_mode(&[0x2e, 0x26, 0xc5, 0xf8, 0x77, 0, 0, 0], CodeMode::Bits32).unwrap();
+    assert_eq!(vex.len, 5);
+    assert_ne!(vex.op, 0xc5);
+}
+
+#[test]
 fn flat_thirty_two_bit_code_uses_dword_stack_slots() {
     let code = [
         0x40, 0x4b, 0x50, 0xe8, 0x07, 0x00, 0x00, 0x00, 0x59, 0xba, 0x09, 0x00, 0x00, 0x00, 0xf4,

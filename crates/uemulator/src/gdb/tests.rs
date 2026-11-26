@@ -436,6 +436,29 @@ fn register_writes_change_state_and_refuse_what_needs_the_cpu_to_react() {
     );
 }
 
+#[test]
+fn a_g_packet_refuses_the_eflags_and_mxcsr_values_p_refuses() {
+    let eflags_offset = 16 * 8 + 8;
+    let mxcsr_offset = 16 * 8 + 8 + 4 + 6 * 4 + 8 * 10 + 8 * 4 + 16 * 16;
+    for (name, offset, refused, single) in [
+        ("eflags", eflags_offset, 0x8000_0202u32, "P11=02020080"),
+        ("mxcsr", mxcsr_offset, 0xffff_ffff, "P38=ffffffff"),
+    ] {
+        let mut session = Session::new(&[0xf4]);
+        assert_eq!(session.ask(single), "E03", "{name}");
+        let before = session.ask("g");
+        let mut bytes = from_hex(before.as_bytes()).unwrap();
+        bytes[0..8].copy_from_slice(&0x99u64.to_le_bytes());
+        bytes[offset..offset + 4].copy_from_slice(&refused.to_le_bytes());
+        assert_eq!(
+            session.ask(&format!("G{}", String::from_utf8(to_hex(&bytes)).unwrap())),
+            "E03",
+            "{name}"
+        );
+        assert_eq!(session.ask("g"), before, "{name}: nothing was written");
+    }
+}
+
 fn hex64(value: u64) -> String {
     String::from_utf8(to_hex(&value.to_le_bytes())).unwrap()
 }

@@ -399,6 +399,22 @@ impl Cpu {
         Some(value.to_le_bytes()[..width].to_vec())
     }
 
+    /// Values of registers gdb may otherwise write that are refused: EFLAGS.VM would switch to
+    /// virtual-8086 mode without the mode change that goes with it, and the undefined EFLAGS and
+    /// MXCSR bits would raise #GP through `popf`/`ldmxcsr`. The `G` packet checks this for every
+    /// register before writing any, so it must stay the only place these rules live.
+    fn refuses_register_value(&self, register: usize, value: u128) -> bool {
+        match register {
+            REG_EFLAGS => {
+                let value = value as u64;
+                (value ^ self.eflags_full()) & flags::VM != 0
+                    || value & !(EFLAGS_DEFINED | flags::RESERVED_ONE) != 0
+            }
+            REG_MXCSR => value as u32 & !fpu::MXCSR_VALID_BITS != 0,
+            _ => false,
+        }
+    }
+
     /// Writes what gdb may change without the CPU having to react: the general registers, RIP,
     /// the flags, x87 and SSE state, the segment bases and CR2. The others (selectors, which
     /// would need a descriptor load, and the control registers, which change paging) are
@@ -417,13 +433,8 @@ impl Cpu {
         match register {
             _ if REG_GPRS.contains(&register) => self.gpr[GDB_GPR_ORDER[register]] = value64,
             REG_RIP => self.rip = value64,
+            _ if self.refuses_register_value(register, value) => return false,
             REG_EFLAGS => {
-                // VM would switch to virtual-8086 mode without the mode change that goes with it.
-                if (value64 ^ self.eflags_full()) & flags::VM != 0
-                    || value64 & !(EFLAGS_DEFINED | flags::RESERVED_ONE) != 0
-                {
-                    return false;
-                }
                 self.eflags = value64 | flags::RESERVED_ONE;
                 self.lazy_op = LazyFlagsOp::Eflags;
             }
@@ -440,8 +451,6 @@ impl Cpu {
                     .fold(0, |tags, index| tags | (1 << index));
             }
             REG_XMM0..REG_MXCSR => self.xmm[register - REG_XMM0] = value,
-            // `ldmxcsr` would raise #GP for these; the debugger is refused instead.
-            REG_MXCSR if value as u32 & !fpu::MXCSR_VALID_BITS != 0 => return false,
             REG_MXCSR => self.mxcsr = value as u32,
             REG_FS_BASE => self.seg[SEG_FS].base = value64,
             REG_GS_BASE => self.seg[SEG_GS].base = value64,
@@ -542,15 +551,12 @@ pub(crate) fn write_registers(vcpus: &mut dyn Vcpus, index: usize, bytes: &[u8])
         writes.push((register, &bytes[offset..offset + width]));
         offset += width;
     }
-    let flags_before = cpu.eflags_full();
-    let ok = writes.iter().all(|&(register, value)| match register {
-        REG_EFLAGS => {
-            (u32::from_le_bytes(value.try_into().unwrap()) as u64 ^ flags_before) & flags::VM == 0
-        }
-        _ => {
-            register_is_writable(register)
-                || cpu.register_bytes(tpr, register).as_deref() == Some(value)
-        }
+    let ok = writes.iter().all(|&(register, value)| {
+        let mut wide = [0u8; 16];
+        wide[..value.len()].copy_from_slice(value);
+        (register_is_writable(register)
+            && !cpu.refuses_register_value(register, u128::from_le_bytes(wide)))
+            || cpu.register_bytes(tpr, register).as_deref() == Some(value)
     });
     if !ok {
         return false;
@@ -561,7 +567,7 @@ pub(crate) fn write_registers(vcpus: &mut dyn Vcpus, index: usize, bytes: &[u8])
     true
 }
 
-/// What `write_register_bytes` changes to any value (EFLAGS aside, which keeps VM).
+/// What `write_register_bytes` changes, to any value `Cpu::refuses_register_value` allows.
 fn register_is_writable(register: usize) -> bool {
     matches!(
         register,
