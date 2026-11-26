@@ -165,13 +165,14 @@ mod header {
                 )
                 .0,
             );
-            assert!(message.contains("2.15"), "{version:#x}: {message}");
+            assert!(message.contains("2.12"), "{version:#x}: {message}");
         }
     }
 
     #[test]
-    fn protocol_2_15_and_newer_are_accepted() {
-        for version in [MIN_PROTOCOL_VERSION, 0x0210, 0x0212, 0xffff] {
+    fn protocol_2_12_and_newer_are_accepted() {
+        // 2.12 is memtest86+'s.
+        for version in [MIN_PROTOCOL_VERSION, 0x020f, 0x0210, 0x0212, 0xffff] {
             let (result, _) = load_with(
                 &FakeKernel {
                     version,

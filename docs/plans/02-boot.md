@@ -15,6 +15,8 @@
 
 Re-run the header parse in `boot.rs` tests so the numbers in this file stay verified.
 
+The loader accepts protocol 2.12 and newer (2.12 added `xloadflags`, the newest field it reads), so memtest86+ (`mt86+x64`, protocol 2.12, XLF_KERNEL_64) boots directly too, and through the UEFI firmware by its EFI stub: `advanced boot --kernel mt86+x64 --cmdline console=ttyS0,115200 --console serial` (add `--cpus N` for its SMP tests). Its startup reloads CS with `ljmp *m16:32` in 64-bit mode.
+
 ## Direct 64-bit entry (no firmware)
 
 Follow the kernel's 64-bit boot protocol (Documentation/arch/x86/boot.rst, "64-bit Boot Protocol") and QEMU's `x86_load_linux` for the boot_params layout:

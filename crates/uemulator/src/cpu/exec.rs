@@ -100,6 +100,7 @@ const GROUP5_INC: u8 = 0;
 const GROUP5_DEC: u8 = 1;
 const GROUP5_CALL_NEAR: u8 = 2;
 const GROUP5_JMP_NEAR: u8 = 4;
+const GROUP5_JMP_FAR: u8 = 5;
 const GROUP5_PUSH: u8 = 6;
 
 // Bit-test family: bt, bts, btr, btc.
@@ -1867,7 +1868,7 @@ impl Cpu {
             // cld / std
             0xfc => self.eflags &= !DF,
             0xfd => self.eflags |= DF,
-            // group 4/5: inc, dec, call, jmp, push (far forms are not implemented)
+            // group 4/5: inc, dec, call, jmp, push (far call is not implemented in 64-bit mode)
             0xfe | 0xff => {
                 let size = if op == 0xfe { 1 } else { osz };
                 let loc = self.modrm_location(i, next)?;
@@ -1895,6 +1896,14 @@ impl Cpu {
                     GROUP5_JMP_NEAR if op == 0xff => {
                         self.rip = self.load_operand(loc, 8, i)?;
                         return Ok(());
+                    }
+                    GROUP5_JMP_FAR if op == 0xff => {
+                        // m16:32 even with REX.W: AMD has no m16:64 form of the far jump
+                        // (APM 3, JMP (Far)), and the modeled CPU is AMD. A 16-bit operand
+                        // size stays m16:16.
+                        let mut far = *i;
+                        far.opsize = osz.min(4);
+                        return self.far_branch_indirect(&far, next);
                     }
                     GROUP5_PUSH if op == 0xff => {
                         let sz = stack_operand_size(i);
@@ -7935,9 +7944,9 @@ mod exec_tests {
     }
 
     #[test]
-    fn far_indirect_jump_and_call_and_odd_group_5_and_4_forms_are_undefined() {
+    fn far_indirect_call_and_odd_group_5_and_4_forms_are_undefined() {
+        // The far indirect jump is implemented (`far_jump_through_memory_*`).
         for snippet in [
-            code::JMP_FAR_IND,
             code::CALL_FAR_IND,
             code::GROUP5_REG7,
             code::GROUP4_CALL,
@@ -11091,6 +11100,59 @@ mod exec_tests {
             SEL_DATA_NOT_PRESENT,
             ss_fault(selector_code(SEL_DATA_NOT_PRESENT)),
         );
+    }
+
+    /// Runs `code`, a far jump through the m16:32 pointer at DATA, and returns the CPU after it.
+    #[track_caller]
+    fn run_far_jump(code: &[u8], selector: u16, landing: u64) -> Pair {
+        let mut pair = Pair::new(code);
+        let stop = pair.run_for(1, |h| {
+            enter_cpl(h, 0);
+            h.cpu.gpr[RSI] = DATA;
+            put_words(h, DATA, &[landing | ((selector as u64) << 32)]);
+        });
+        assert_eq!(stop, Stop::Limit, "{}", pair.cpu().dump_regs());
+        pair
+    }
+
+    #[test]
+    fn far_jump_through_memory_in_64_bit_mode_loads_cs_and_rip() {
+        // memtest86+ reloads CS with `ljmp *-6(%rsp)` after its lgdt.
+        let pair = run_far_jump(code::LJMP_INDIRECT, SEL_CONFORMING_DPL0, CODE_BASE + 2);
+        let cpu = pair.cpu();
+        assert_eq!(cpu.rip, CODE_BASE + 2);
+        assert_eq!(cpu.seg[SEG_CS].sel, SEL_CONFORMING_DPL0);
+        assert_eq!(cpu.code_mode(), CodeMode::Long64);
+    }
+
+    #[test]
+    fn far_jump_through_memory_can_enter_compatibility_mode() {
+        let pair = run_far_jump(code::LJMP_INDIRECT, SEL_CODE32, CODE_BASE + 2);
+        let cpu = pair.cpu();
+        assert_eq!(cpu.seg[SEG_CS].sel, SEL_CODE32);
+        assert_eq!(cpu.code_mode(), CodeMode::Bits32);
+    }
+
+    #[test]
+    fn far_jump_with_rex_w_still_reads_m16_32_as_amd_does() {
+        let pair = run_far_jump(code::LJMP_INDIRECT_REX_W, SEL_KCODE, CODE_BASE + 3);
+        assert_eq!(pair.cpu().rip, CODE_BASE + 3);
+        assert_eq!(pair.cpu().seg[SEG_CS].sel, SEL_KCODE);
+    }
+
+    #[test]
+    fn far_jump_through_memory_checks_the_target_like_any_far_transfer() {
+        assert_fault_changes_nothing(
+            code::LJMP_INDIRECT,
+            |h| {
+                enter_cpl(h, 0);
+                h.cpu.gpr[RSI] = DATA;
+                put_words(h, DATA, &[CODE_BASE | ((SEL_KDATA as u64) << 32)]);
+            },
+            gp(selector_code(SEL_KDATA)),
+        );
+        let (_, stop) = run_regs_stop(code::LJMP_REGISTER, &[]);
+        assert_eq!(stop, ud());
     }
 
     #[test]
@@ -17658,6 +17720,15 @@ mod code {
     // retfq
     // hlt
     pub(super) const RETFQ: &[u8] = &[0x48, 0xcb, 0xf4];
+    // ljmp *(%rsi)
+    // hlt
+    pub(super) const LJMP_INDIRECT: &[u8] = &[0xff, 0x2e, 0xf4];
+    // rex64 ljmp *(%rsi)
+    // hlt
+    pub(super) const LJMP_INDIRECT_REX_W: &[u8] = &[0x48, 0xff, 0x2e, 0xf4];
+    // ljmp *%rax (register form, which does not exist)
+    // hlt
+    pub(super) const LJMP_REGISTER: &[u8] = &[0xff, 0xe8, 0xf4];
     // rex64 retf 16
     // hlt
     pub(super) const RETFQ_IMM: &[u8] = &[0x48, 0xca, 0x10, 0x00, 0xf4];
@@ -18360,9 +18431,6 @@ mod code {
     // .byte 0xf3, 0xc3
     // hlt
     pub(super) const REP_RET: &[u8] = &[0xf3, 0xc3, 0xf4];
-    // .byte 0xff, 0x2a
-    // hlt
-    pub(super) const JMP_FAR_IND: &[u8] = &[0xff, 0x2a, 0xf4];
     // .byte 0xff, 0x1a
     // hlt
     pub(super) const CALL_FAR_IND: &[u8] = &[0xff, 0x1a, 0xf4];
