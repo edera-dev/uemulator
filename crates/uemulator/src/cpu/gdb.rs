@@ -571,7 +571,7 @@ pub(crate) fn write_registers(vcpus: &mut dyn Vcpus, index: usize, bytes: &[u8])
 fn register_is_writable(register: usize) -> bool {
     matches!(
         register,
-        0..=REG_RIP | REG_ST0..=REG_FTAG | REG_XMM0..=REG_KERNEL_GS_BASE | REG_CR2
+        0..=REG_EFLAGS | REG_ST0..=REG_FTAG | REG_XMM0..=REG_KERNEL_GS_BASE | REG_CR2
     )
 }
 
