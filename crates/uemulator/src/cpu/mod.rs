@@ -1429,9 +1429,13 @@ impl Cpu {
                 BeforeStep::Debug(event) => return Slice::Debug(event),
                 BeforeStep::Execute => {}
             }
-            self.interrupt_shadow = false;
+            let shadowed = core::mem::take(&mut self.interrupt_shadow);
             self.icount += 1;
-            let result = self.dispatch_step();
+            let result = if shadowed {
+                self.dispatch_shadowed_step()
+            } else {
+                self.dispatch_step()
+            };
             if let Some(reason) = self.after_step(result) {
                 return Slice::Exit(reason);
             }
@@ -1458,18 +1462,22 @@ impl Cpu {
                 (BeforeStep::Execute, BeforeStep::Execute) => {}
                 _ => return ExitReason::Internal("verify: pre-step divergence".into()),
             }
-            self.interrupt_shadow = false;
+            let shadowed = core::mem::take(&mut self.interrupt_shadow);
             shadow.interrupt_shadow = false;
             let main_before = (self.gpr, self.eflags_full(), self.rip);
             let shadow_before = (shadow.rip, shadow.icount, self.icount);
             let start = self.rip;
             self.icount += 1;
             shadow.icount += 1;
-            let main_result = if self.uses_jit() {
+            let main_result = if self.uses_jit() && !shadowed {
                 self.step_block()
             } else {
                 self.last_block_insns = 1;
-                self.dispatch_step()
+                if shadowed {
+                    self.dispatch_shadowed_step()
+                } else {
+                    self.dispatch_step()
+                }
             };
             let retired = self.last_block_insns;
             // A faulting block reports the instructions retired before the fault, so the

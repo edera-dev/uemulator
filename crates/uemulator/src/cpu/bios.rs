@@ -28,6 +28,7 @@ use super::flags::{CF, IF, ZF};
 use super::modes::real_mode_segment;
 use super::*;
 use crate::boot::e820_map;
+use crate::dev::pci::{CONFIG_ADDRESS_PORT, CONFIG_DATA_PORT};
 use crate::machine::ExitReason;
 
 /// Written by the stubs. 0xb2 is the APM control port, which nothing here decodes.
@@ -182,6 +183,27 @@ const STATUS_WRITE_FAULT: u8 = 0xcc;
 const STATUS_CONTROLLER_FAILURE: u8 = 0x20;
 const STATUS_NOT_SUPPORTED: u8 = 0x86;
 
+// PCI BIOS 2.1 (`int 1ah` AH=B1h), which BIOS-era network boot ROMs such as iPXE use to find
+// their NIC. Status codes in AH; the signature is "PCI " in EDX.
+const PCI_BIOS_FUNCTION: u8 = 0xb1;
+const PCI_BIOS_SIGNATURE: u32 = u32::from_le_bytes(*b"PCI ");
+/// BCD major.minor in BH.BL.
+const PCI_BIOS_VERSION: u16 = 0x0210;
+/// AL bit 0: configuration mechanism #1, the 0xCF8/0xCFC ports.
+const PCI_CONFIG_MECHANISM_ONE: u8 = 0x01;
+/// The root complex has bus 0 only: the virtio functions sit on it directly.
+const PCI_LAST_BUS: u8 = 0;
+const PCI_STATUS_FUNCTION_NOT_SUPPORTED: u8 = 0x81;
+const PCI_STATUS_BAD_VENDOR_ID: u8 = 0x83;
+const PCI_STATUS_DEVICE_NOT_FOUND: u8 = 0x86;
+const PCI_STATUS_BAD_REGISTER: u8 = 0x87;
+/// Mechanism #1 reaches the first 256 bytes of a function's config space.
+const PCI_CONFIG_SPACE_BYTES: u16 = 0x100;
+const PCI_REGISTER_VENDOR_DEVICE: u16 = 0x00;
+const PCI_REGISTER_CLASS_REVISION: u16 = 0x08;
+const PCI_VENDOR_ABSENT: u16 = 0xffff;
+const PCI_DEVFN_COUNT: u16 = 0x100;
+
 /// A fixed disk is reported as 255 heads of 63 sectors, which is what every BIOS translates to.
 const GEOMETRY_HEADS: u64 = 255;
 const GEOMETRY_SECTORS: u64 = 63;
@@ -219,6 +241,15 @@ const CARRIAGE_RETURN: u8 = 0x0d;
 const NO_BOOT_MESSAGE: &[u8] = b"No bootable device.\r\n";
 const LOG_KEY_BIOS_EXCEPTION: u64 = 0xb105_0000;
 const LOG_KEY_BIOS_UNSUPPORTED: u64 = 0xb105_1000;
+const LOG_KEY_BIOS_UNSUPPORTED_TIME: u64 = 0xb105_1a00;
+const LOG_KEY_BIOS_UNSUPPORTED_PCI: u64 = 0xb105_b100;
+
+/// The mechanism #1 address dword for BH = bus, BL = devfn and a dword-aligned register.
+fn pci_config_address(bus_devfn: u16, register: u16) -> u32 {
+    const ENABLE: u32 = 1 << 31;
+    const BUS_DEVFN_SHIFT: u32 = 8;
+    ENABLE | (bus_devfn as u32) << BUS_DEVFN_SHIFT | (register & 0xfc) as u32
+}
 
 /// What the BIOS remembers between calls.
 pub(crate) struct Bios {
@@ -789,6 +820,9 @@ impl Cpu {
     }
 
     fn bios_time(&mut self) {
+        if self.ah() == PCI_BIOS_FUNCTION {
+            return self.bios_pci();
+        }
         match self.ah() {
             0x00 => {
                 let ticks = self.peek_u32(BDA_TICKS).unwrap_or(0);
@@ -827,7 +861,138 @@ impl Cpu {
                 }
                 self.set_returned_flag(CF, false);
             }
-            _ => self.set_returned_flag(CF, true),
+            function => {
+                self.log_once(LOG_KEY_BIOS_UNSUPPORTED_TIME + function as u64, || {
+                    format!("BIOS: int 1ah function {function:#04x} is not supported")
+                });
+                self.set_returned_flag(CF, true);
+            }
+        }
+    }
+
+    /// One config-space access through mechanism #1, so the BIOS sees exactly what a guest
+    /// driver poking the ports would. `size` is 1, 2 or 4 and `register` aligned to it.
+    fn pci_config_read(&mut self, bus_devfn: u16, register: u16, size: u8) -> u32 {
+        let now = self.now_ns();
+        let mut dev = self.dev.lock();
+        dev.io_out(
+            CONFIG_ADDRESS_PORT,
+            4,
+            pci_config_address(bus_devfn, register),
+            now,
+        );
+        dev.io_in(CONFIG_DATA_PORT + (register & 3), size, now)
+    }
+
+    fn pci_config_write(&mut self, bus_devfn: u16, register: u16, size: u8, value: u32) {
+        let now = self.now_ns();
+        let mut dev = self.dev.lock();
+        dev.io_out(
+            CONFIG_ADDRESS_PORT,
+            4,
+            pci_config_address(bus_devfn, register),
+            now,
+        );
+        dev.io_out(CONFIG_DATA_PORT + (register & 3), size, value, now);
+    }
+
+    /// The `index`th function on bus 0 (BH = bus, BL = devfn) whose config dword at `register`
+    /// matches `want` under `mask`.
+    fn pci_find(&mut self, register: u16, mask: u32, want: u32, index: u16) -> Option<u16> {
+        (0..PCI_DEVFN_COUNT)
+            .filter(|&devfn| {
+                let id = self.pci_config_read(devfn, PCI_REGISTER_VENDOR_DEVICE, 4);
+                id as u16 != PCI_VENDOR_ABSENT
+                    && self.pci_config_read(devfn, register, 4) & mask == want
+            })
+            .nth(index as usize)
+    }
+
+    /// `int 1ah` AH=B1h, the PCI BIOS 2.1 real-mode interface (PCI BIOS Specification 2.1,
+    /// section 3). The protected-mode entry point (EDI of B101h, the BIOS32 directory) is not
+    /// offered: iPXE and Linux's real-mode code use only this.
+    fn bios_pci(&mut self) {
+        let bus_devfn = self.reg16(RBX);
+        let register = self.reg16(RDI);
+        let access = |size: u16| register < PCI_CONFIG_SPACE_BYTES && register.is_multiple_of(size);
+        match self.al() {
+            0x01 => {
+                self.set_reg32(RDX, PCI_BIOS_SIGNATURE);
+                self.set_reg16(RBX, PCI_BIOS_VERSION);
+                self.set_reg16(RCX, (self.reg16(RCX) & 0xff00) | PCI_LAST_BUS as u16);
+                self.set_al(PCI_CONFIG_MECHANISM_ONE);
+                self.succeed();
+            }
+            0x02 => {
+                let (device, vendor) = (self.reg16(RCX), self.reg16(RDX));
+                if vendor == PCI_VENDOR_ABSENT {
+                    return self.fail(PCI_STATUS_BAD_VENDOR_ID);
+                }
+                let id = (device as u32) << 16 | vendor as u32;
+                let found = self.pci_find(PCI_REGISTER_VENDOR_DEVICE, !0, id, self.reg16(RSI));
+                self.pci_found(found);
+            }
+            0x03 => {
+                // ECX bits 23:0 are class, subclass and programming interface: the top three
+                // bytes of the class/revision dword.
+                let class = self.gpr[RCX] as u32 & 0x00ff_ffff;
+                let found = self.pci_find(
+                    PCI_REGISTER_CLASS_REVISION,
+                    0xffff_ff00,
+                    class << 8,
+                    self.reg16(RSI),
+                );
+                self.pci_found(found);
+            }
+            0x08 if access(1) => {
+                let value = self.pci_config_read(bus_devfn, register, 1);
+                self.set_reg16(RCX, (self.reg16(RCX) & 0xff00) | value as u16);
+                self.succeed();
+            }
+            0x09 if access(2) => {
+                let value = self.pci_config_read(bus_devfn, register, 2);
+                self.set_reg16(RCX, value as u16);
+                self.succeed();
+            }
+            0x0a if access(4) => {
+                let value = self.pci_config_read(bus_devfn, register, 4);
+                self.set_reg32(RCX, value);
+                self.succeed();
+            }
+            0x0b if access(1) => {
+                let value = self.gpr[RCX] as u32 & 0xff;
+                self.pci_config_write(bus_devfn, register, 1, value);
+                self.succeed();
+            }
+            0x0c if access(2) => {
+                let value = self.gpr[RCX] as u32 & 0xffff;
+                self.pci_config_write(bus_devfn, register, 2, value);
+                self.succeed();
+            }
+            0x0d if access(4) => {
+                let value = self.gpr[RCX] as u32;
+                self.pci_config_write(bus_devfn, register, 4, value);
+                self.succeed();
+            }
+            0x08..=0x0d => self.fail(PCI_STATUS_BAD_REGISTER),
+            // Generate special cycle, the IRQ routing table and set IRQ: nothing here routes
+            // interrupts through the BIOS (the guest reads ACPI).
+            function => {
+                self.log_once(LOG_KEY_BIOS_UNSUPPORTED_PCI + function as u64, || {
+                    format!("BIOS: int 1ah function 0xb1{function:02x} is not supported")
+                });
+                self.fail(PCI_STATUS_FUNCTION_NOT_SUPPORTED);
+            }
+        }
+    }
+
+    fn pci_found(&mut self, found: Option<u16>) {
+        match found {
+            Some(bus_devfn) => {
+                self.set_reg16(RBX, bus_devfn);
+                self.succeed();
+            }
+            None => self.fail(PCI_STATUS_DEVICE_NOT_FOUND),
         }
     }
 
@@ -1653,6 +1818,105 @@ mod tests {
         run_to_halt(&mut harness);
         assert_eq!(harness.cpu.reg16(RCX), 1);
         assert_eq!(harness.cpu.reg16(RDX), 0x0203);
+    }
+
+    /// mov ax,0xb101; int 0x1a
+    const PCI_INSTALLATION_CHECK: [u8; 6] = [0xb8, 0x01, 0xb1, 0xcd, 0x1a, 0xf4];
+    /// mov ax,0xb102; mov cx,0x1042; mov dx,0x1af4; xor si,si; int 0x1a; jc done;
+    /// mov ax,0xb10a; xor di,di; int 0x1a; done:
+    const FIND_BLOCK_DEVICE_AND_READ_ITS_ID: [u8; 23] = [
+        0xb8, 0x02, 0xb1, 0xb9, 0x42, 0x10, 0xba, 0xf4, 0x1a, 0x31, 0xf6, 0xcd, 0x1a, 0x72, 0x07,
+        0xb8, 0x0a, 0xb1, 0x31, 0xff, 0xcd, 0x1a, 0xf4,
+    ];
+    /// mov ax,0xb102; mov cx,0x1042; mov dx,0x1af4; mov si,1; int 0x1a
+    const FIND_A_SECOND_BLOCK_DEVICE: [u8; 15] = [
+        0xb8, 0x02, 0xb1, 0xb9, 0x42, 0x10, 0xba, 0xf4, 0x1a, 0xbe, 0x01, 0x00, 0xcd, 0x1a, 0xf4,
+    ];
+    /// mov ax,0xb102; mov cx,0x1042; mov dx,0x1af4; xor si,si; int 0x1a; mov ax,0xb10a;
+    /// mov di,8; int 0x1a; shr ecx,8; mov ax,0xb103; xor si,si; int 0x1a: finds the block
+    /// device again by its class code
+    const FIND_THE_BLOCK_DEVICE_BY_CLASS: [u8; 33] = [
+        0xb8, 0x02, 0xb1, 0xb9, 0x42, 0x10, 0xba, 0xf4, 0x1a, 0x31, 0xf6, 0xcd, 0x1a, 0xb8, 0x0a,
+        0xb1, 0xbf, 0x08, 0x00, 0xcd, 0x1a, 0x66, 0xc1, 0xe9, 0x08, 0xb8, 0x03, 0xb1, 0x31, 0xf6,
+        0xcd, 0x1a, 0xf4,
+    ];
+    /// mov ax,0xb102; mov cx,0x1042; mov dx,0x1af4; xor si,si; int 0x1a; mov ax,0xb10c;
+    /// mov di,4; mov cx,2; int 0x1a; mov ax,0xb109; mov di,4; int 0x1a: sets the command
+    /// register's memory-space enable and reads it back
+    const WRITE_AND_READ_THE_COMMAND_WORD: [u8; 33] = [
+        0xb8, 0x02, 0xb1, 0xb9, 0x42, 0x10, 0xba, 0xf4, 0x1a, 0x31, 0xf6, 0xcd, 0x1a, 0xb8, 0x0c,
+        0xb1, 0xbf, 0x04, 0x00, 0xb9, 0x02, 0x00, 0xcd, 0x1a, 0xb8, 0x09, 0xb1, 0xbf, 0x04, 0x00,
+        0xcd, 0x1a, 0xf4,
+    ];
+    /// mov bx,8; mov ax,0xb109; mov di,3; int 0x1a: a word read at an odd register
+    const MISALIGNED_WORD_READ: [u8; 12] = [
+        0xbb, 0x08, 0x00, 0xb8, 0x09, 0xb1, 0xbf, 0x03, 0x00, 0xcd, 0x1a, 0xf4,
+    ];
+    /// mov ax,0xb1ff; int 0x1a
+    const UNKNOWN_PCI_FUNCTION: [u8; 6] = [0xb8, 0xff, 0xb1, 0xcd, 0x1a, 0xf4];
+
+    #[test]
+    fn the_pci_bios_reports_configuration_mechanism_one() {
+        let mut harness = machine_with(patterned_disk(), &PCI_INSTALLATION_CHECK);
+        run_to_halt(&mut harness);
+        assert!(!carry(&harness));
+        assert_eq!(ah(&harness), STATUS_OK);
+        assert_eq!(harness.cpu.gpr[RDX] as u32, PCI_BIOS_SIGNATURE);
+        assert_eq!(harness.cpu.reg16(RBX), PCI_BIOS_VERSION);
+        assert_ne!(harness.cpu.al() & PCI_CONFIG_MECHANISM_ONE, 0);
+        assert_eq!(harness.cpu.gpr[RCX] as u8, PCI_LAST_BUS);
+    }
+
+    #[test]
+    fn the_pci_bios_finds_the_virtio_block_device_and_reads_its_ids() {
+        let mut harness = machine_with(patterned_disk(), &FIND_BLOCK_DEVICE_AND_READ_ITS_ID);
+        run_to_halt(&mut harness);
+        assert!(!carry(&harness), "status {:#x}", ah(&harness));
+        assert_eq!(harness.cpu.reg16(RBX) >> 8, 0, "bus 0");
+        assert_ne!(harness.cpu.reg16(RBX) & 0xff, 0, "not the host bridge");
+        assert_eq!(harness.cpu.gpr[RCX] as u32, 0x1042_1af4);
+    }
+
+    #[test]
+    fn the_pci_bios_finds_only_as_many_devices_as_there_are() {
+        let mut harness = machine_with(patterned_disk(), &FIND_A_SECOND_BLOCK_DEVICE);
+        run_to_halt(&mut harness);
+        assert!(carry(&harness));
+        assert_eq!(ah(&harness), PCI_STATUS_DEVICE_NOT_FOUND);
+    }
+
+    #[test]
+    fn the_pci_bios_finds_a_device_by_its_class_code() {
+        let mut harness = machine_with(patterned_disk(), &FIND_THE_BLOCK_DEVICE_BY_CLASS);
+        let mut by_id = machine_with(patterned_disk(), &FIND_BLOCK_DEVICE_AND_READ_ITS_ID);
+        run_to_halt(&mut harness);
+        run_to_halt(&mut by_id);
+        assert!(!carry(&harness), "status {:#x}", ah(&harness));
+        assert_eq!(harness.cpu.reg16(RBX), by_id.cpu.reg16(RBX));
+    }
+
+    #[test]
+    fn the_pci_bios_writes_config_space_through_to_the_device() {
+        let mut harness = machine_with(patterned_disk(), &WRITE_AND_READ_THE_COMMAND_WORD);
+        run_to_halt(&mut harness);
+        assert!(!carry(&harness), "status {:#x}", ah(&harness));
+        assert_eq!(harness.cpu.reg16(RCX) & 0x2, 0x2);
+    }
+
+    #[test]
+    fn the_pci_bios_refuses_a_misaligned_register() {
+        let mut harness = machine_with(patterned_disk(), &MISALIGNED_WORD_READ);
+        run_to_halt(&mut harness);
+        assert!(carry(&harness));
+        assert_eq!(ah(&harness), PCI_STATUS_BAD_REGISTER);
+    }
+
+    #[test]
+    fn an_unknown_pci_bios_function_fails() {
+        let mut harness = machine_with(patterned_disk(), &UNKNOWN_PCI_FUNCTION);
+        run_to_halt(&mut harness);
+        assert!(carry(&harness));
+        assert_eq!(ah(&harness), PCI_STATUS_FUNCTION_NOT_SUPPORTED);
     }
 
     #[test]
