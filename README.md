@@ -31,7 +31,7 @@ cargo build --release -p uemulator-cli    # produces target/release/uemulator
 Create a named machine and boot it. `quick create` downloads the distribution's netboot kernel and initramfs, so it needs network access. It also gives the machine a sparse disk and a NAT network card.
 
 ```sh
-cargo run --release -p uemulator-cli -- quick create test --install alpine   # or debian, fedora
+cargo run --release -p uemulator-cli -- quick create test --install alpine   # or debian, fedora, netboot-xyz
 cargo run --release -p uemulator-cli -- quick boot test --cpus 4
 cargo run --release -p uemulator-cli -- quick boot test --display framebuffer   # prints the viewer's URL
 ```

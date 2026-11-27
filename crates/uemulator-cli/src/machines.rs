@@ -352,7 +352,14 @@ pub fn create(
             });
         }
         if settings.consoles.is_empty() {
-            settings.consoles.push(ConsoleArg::Virtio);
+            // The kernels netboot.xyz chains to put their console on ttyS0 or the screen, never
+            // hvc0, and with a virtio console the terminal's keystrokes go to hvc0 once the
+            // guest's driver is up, which would leave such an installer unreachable.
+            settings.consoles.push(if install == Distro::NetbootXyz {
+                ConsoleArg::Serial
+            } else {
+                ConsoleArg::Virtio
+            });
         }
         let mut machine = Machine {
             name: name.to_string(),
@@ -436,10 +443,31 @@ pub struct Launch {
     pub settings: Settings,
 }
 
+/// What to tell the user before an installer boot, if anything: netboot.xyz's menu is on the
+/// terminal, but many of the kernels it starts (Debian's among them) put their console on the
+/// screen only.
+pub fn installer_hint(machine: &Machine, launch: &Launch) -> Option<String> {
+    let screen = matches!(
+        launch.settings.display,
+        Some(DisplayArg::Framebuffer | DisplayArg::Both)
+    );
+    (machine.install == Distro::NetbootXyz && launch.source == BootSource::Installer && !screen)
+        .then(|| {
+            format!(
+                "the installers netboot.xyz starts may show only on a screen: \
+                 `quick boot {} --display both` gives the machine one",
+                machine.name
+            )
+        })
+}
+
 /// The distro's contribution to an installer boot, applied last so it never reaches the saved
 /// file: its kernel arguments come before the user's, and its memory default stands in for an
 /// unset one.
 pub fn with_distro_defaults(mut settings: Settings, distro: Distro) -> Settings {
+    if distro.bare_cmdline() {
+        settings.cmdline.get_or_insert_with(String::new);
+    }
     let distro_args = distro.cmdline();
     if !distro_args.is_empty() {
         settings.append = Some(match settings.append.take() {
@@ -568,11 +596,27 @@ pub fn prepare_boot(
             settings,
         });
     }
+    if machine.install.needs_uefi() && machine.firmware != Firmware::Uefi {
+        return Err(format!(
+            "the {} installer is an EFI application, and the machine's firmware is {}: \
+             `quick edit {} --firmware uefi` first",
+            machine.install.name(),
+            machine.firmware.name(),
+            machine.name
+        ));
+    }
+    if machine.install.needs_uefi() && hypervisor.is_some() {
+        return Err(format!(
+            "the {} installer is not a kernel the hypervisor can run as dom0: boot it without \
+             the hypervisor (--remove-hypervisor)",
+            machine.install.name()
+        ));
+    }
     let artifacts = ensure_in(&machine.artifacts_dir(), machine.install, false, fetch)?;
     Ok(Launch {
         source: BootSource::Installer,
         kernel: read_file(&artifacts.kernel)?,
-        initramfs: Some(read_file(&artifacts.initramfs)?),
+        initramfs: artifacts.initramfs.as_deref().map(read_file).transpose()?,
         firmware: machine.firmware,
         // The installer writes the boot entries the installed system is found through.
         nvram: (machine.firmware == Firmware::Uefi).then(|| machine.nvram_path()),
@@ -599,7 +643,7 @@ pub fn bootstrap_launch(
     answers: &Answers,
     fetch: impl FnMut(&str, &Path) -> Result<(), String>,
 ) -> Result<Launch, String> {
-    let payload = render(machine.install.into(), answers)?;
+    let payload = render(machine.install.try_into()?, answers)?;
     let mut launch = prepare_boot(
         machine,
         &HardwareArgs::default(),
@@ -1376,6 +1420,117 @@ mod tests {
     }
 
     #[test]
+    fn a_netboot_xyz_machine_boots_its_efi_image_bare_through_uefi_on_a_serial_console() {
+        let home = TempDir::new("machines-netboot-xyz");
+        let (hardware, linux) = create_args(&["--append", "quiet"]);
+        let machine = create(
+            home.path(),
+            "m",
+            Distro::NetbootXyz,
+            &hardware,
+            &linux,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(machine.settings.consoles, vec![ConsoleArg::Serial]);
+        assert_eq!(machine.firmware, Firmware::Uefi);
+        let (hardware, linux, remove) = boot_args(&[]);
+        let fetcher = FakeFetcher::new();
+        let launch = prepare_boot(&machine, &hardware, &linux, &remove, None, None, |u, d| {
+            fetcher.fetch(u, d)
+        })
+        .unwrap();
+        assert_eq!(fetcher.count(), 1);
+        assert_eq!(launch.kernel, Distro::NetbootXyz.source_urls().0.as_bytes());
+        assert_eq!(launch.initramfs, None);
+        // No library default `console=`: iPXE runs its load options as a script. The user's own
+        // arguments still go where they asked.
+        assert_eq!(launch.settings.cmdline.as_deref(), Some(""));
+        assert_eq!(launch.settings.append.as_deref(), Some("quiet"));
+        assert_eq!(
+            launch.settings.memory,
+            Some(Distro::NetbootXyz.default_memory_mib())
+        );
+    }
+
+    #[test]
+    fn a_netboot_xyz_boot_without_a_screen_says_how_to_get_one() {
+        let home = TempDir::new("machines-netboot-xyz-hint");
+        let (hardware, linux) = create_args(&[]);
+        let machine = create(
+            home.path(),
+            "m",
+            Distro::NetbootXyz,
+            &hardware,
+            &linux,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let fetcher = FakeFetcher::new();
+        let launch_with = |extra: &[&str]| {
+            let (hardware, linux, remove) = boot_args(extra);
+            prepare_boot(&machine, &hardware, &linux, &remove, None, None, |u, d| {
+                fetcher.fetch(u, d)
+            })
+            .unwrap()
+        };
+        let bare = launch_with(&[]);
+        assert!(
+            installer_hint(&machine, &bare)
+                .unwrap()
+                .contains("--display both")
+        );
+        let screen = launch_with(&["--display", "both"]);
+        assert_eq!(installer_hint(&machine, &screen), None);
+        let alpine = create_machine(&home.path().join("other"), &[]);
+        let launch = prepare_boot(
+            &alpine,
+            &boot_args(&[]).0,
+            &boot_args(&[]).1,
+            &boot_args(&[]).2,
+            None,
+            None,
+            |u, d| fetcher.fetch(u, d),
+        )
+        .unwrap();
+        assert_eq!(installer_hint(&alpine, &launch), None);
+    }
+
+    #[test]
+    fn a_netboot_xyz_installer_is_refused_without_the_uefi_firmware() {
+        let home = TempDir::new("machines-netboot-xyz-bios");
+        let (hardware, linux) = create_args(&[]);
+        let machine = create(
+            home.path(),
+            "m",
+            Distro::NetbootXyz,
+            &hardware,
+            &linux,
+            None,
+            Some(Firmware::Bios),
+            None,
+        )
+        .unwrap();
+        let (hardware, linux, remove) = boot_args(&[]);
+        let fetcher = FakeFetcher::new();
+        let error = prepare_boot(&machine, &hardware, &linux, &remove, None, None, |u, d| {
+            fetcher.fetch(u, d)
+        })
+        .err()
+        .unwrap();
+        assert!(error.contains("--firmware uefi"), "{error}");
+        assert_eq!(
+            fetcher.count(),
+            0,
+            "nothing fetched for a boot that cannot run"
+        );
+    }
+
+    #[test]
     fn booting_fetches_missing_artifacts_once_and_uses_the_distro_defaults() {
         let home = TempDir::new("machines-boot-fetch");
         let machine = create_machine(home.path(), &["--append", "quiet"]);
@@ -1874,6 +2029,7 @@ mod tests {
         assert!(error.contains("injected"), "{error}");
         let artifacts = home.path().join("machines/m/artifacts");
         let (kernel_url, initramfs_url) = Distro::Alpine.source_urls();
+        let initramfs_url = initramfs_url.unwrap();
         assert_eq!(
             fs::read_to_string(artifacts.join("vmlinuz-virt")).unwrap(),
             kernel_url
@@ -2259,7 +2415,7 @@ mod tests {
         let launch =
             bootstrap_launch(&machine, &bootstrap_answers(), |u, d| fetcher.fetch(u, d)).unwrap();
         assert_eq!(launch.source, BootSource::Installer);
-        let artifact = Distro::Debian.source_urls().1;
+        let artifact = Distro::Debian.source_urls().1.unwrap();
         let initramfs = launch.initramfs.unwrap();
         assert!(initramfs.starts_with(artifact.as_bytes()));
         assert!(contains(&initramfs, b"preseed.cfg"));

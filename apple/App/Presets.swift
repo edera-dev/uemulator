@@ -8,6 +8,8 @@ enum Distro: String, CaseIterable, Identifiable {
     case alpine
     case debian
     case fedora
+    // netboot.xyz's iPXE, an EFI application and no initramfs: a menu of network installers.
+    case netbootXyz = "netboot-xyz"
 
     var id: String { rawValue }
 
@@ -16,16 +18,19 @@ enum Distro: String, CaseIterable, Identifiable {
         case .alpine: "Alpine Linux"
         case .debian: "Debian"
         case .fedora: "Fedora"
+        case .netbootXyz: "netboot.xyz"
         }
     }
 
     // What `ua_bootstrap_initrd` takes for it. The same spelling as the raw value today, but the
-    // raw value is machine.toml's and this is the C ABI's: they need not stay equal.
-    var bootstrapName: String {
+    // raw value is machine.toml's and this is the C ABI's: they need not stay equal. Nil for
+    // netboot.xyz, which has no unattended install: its menu picks the distro when it runs.
+    var bootstrapName: String? {
         switch self {
         case .alpine: "alpine"
         case .debian: "debian"
         case .fedora: "fedora"
+        case .netbootXyz: nil
         }
     }
 
@@ -40,16 +45,21 @@ enum Distro: String, CaseIterable, Identifiable {
         case .alpine: Download(file: "vmlinuz-virt", url: Self.alpineNetboot.appendingPathComponent("vmlinuz-virt"))
         case .debian: Download(file: "linux", url: Self.debianNetboot.appendingPathComponent("linux"))
         case .fedora: Download(file: "vmlinuz", url: Self.fedoraPxeboot.appendingPathComponent("vmlinuz"))
+        case .netbootXyz: Download(file: "netboot.xyz.efi", url: URL(string: "https://boot.netboot.xyz/ipxe/netboot.xyz.efi")!)
         }
     }
 
-    var initrd: Download {
+    var initrd: Download? {
         switch self {
         case .alpine: Download(file: "initramfs-virt", url: Self.alpineNetboot.appendingPathComponent("initramfs-virt"))
         case .debian: Download(file: "initrd.gz", url: Self.debianNetboot.appendingPathComponent("initrd.gz"))
         case .fedora: Download(file: "initrd.img", url: Self.fedoraPxeboot.appendingPathComponent("initrd.img"))
+        case .netbootXyz: nil
         }
     }
+
+    // What `start` fetches before the installer boots.
+    var downloads: [Download] { [kernel] + (initrd.map { [$0] } ?? []) }
 
     // Appended to the command line while the installer runs (`Distro::cmdline`).
     var cmdline: String {
@@ -60,12 +70,22 @@ enum Distro: String, CaseIterable, Identifiable {
             ""
         case .fedora:
             "ip=dhcp rd.neednet=1 inst.text inst.repo=https://dl.fedoraproject.org/pub/fedora/linux/releases/44/Server/x86_64/os/"
+        case .netbootXyz:
+            ""
         }
     }
 
-    // Fedora's 915 MB stage2 is downloaded into RAM beside Anaconda (`FEDORA_INSTALL_MEMORY_MIB`).
+    // No command line at all, not even the library's default `console=` (`Distro::bare_cmdline`):
+    // iPXE runs its load options as a script.
+    var bareCmdline: Bool { self == .netbootXyz }
+
+    // Boots only through the UEFI firmware, whose PCI I/O protocols iPXE drives the NIC with.
+    var needsUefi: Bool { self == .netbootXyz }
+
+    // Fedora's 915 MB stage2 is downloaded into RAM beside Anaconda (`FEDORA_INSTALL_MEMORY_MIB`),
+    // and netboot.xyz offers Fedora.
     var memoryMib: Int {
-        self == .fedora ? 4096 : Self.easyMemoryMib
+        self == .fedora || self == .netbootXyz ? 4096 : Self.easyMemoryMib
     }
 
     static let easyMemoryMib = 2048

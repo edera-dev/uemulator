@@ -606,6 +606,7 @@ fn prepare_reinstall(
         let machine = machines::reinstall(home, name, request.install, None, fetch)?;
         return Ok((machine, None));
     }
+    uemulator_bootstrap::Distro::try_from(request.install.unwrap_or(machine.install))?;
     bootstrap::refuse_unbootable_machine(machine.firmware, machine.hypervisor.is_some(), name)?;
     bootstrap::refuse_framebuffer_machine(machine.settings.display, name)?;
     let mut saved = machine.bootstrap.clone();
@@ -729,6 +730,9 @@ fn quick_command(cmd: QuickCmd) -> Result<Option<ExitReason>, String> {
                 None,
                 quick::download,
             )?;
+            if let Some(hint) = machines::installer_hint(&machine, &launch) {
+                eprintln!("{hint}");
+            }
             boot_launch(launch, &UefiBootArgs::default(), &RuntimeArgs::default()).map(Some)
         }
         QuickCmd::Bootstrap {
@@ -742,6 +746,7 @@ fn quick_command(cmd: QuickCmd) -> Result<Option<ExitReason>, String> {
             uefi,
             mut runtime,
         } => {
+            uemulator_bootstrap::Distro::try_from(install)?;
             refuse_bootstrap(&home, &name, &hardware, &linux, &firmware, &uefi, &runtime)?;
             // Before the machine exists, so a mistyped password or a missing key file leaves
             // nothing behind.
@@ -823,6 +828,9 @@ fn quick_command(cmd: QuickCmd) -> Result<Option<ExitReason>, String> {
                 .resume_from
                 .as_deref()
                 .is_some_and(checkpoints::is_checkpoint);
+            if let Some(hint) = machines::installer_hint(&machine, &launch) {
+                eprintln!("{hint}");
+            }
             boot_launch(launch, &uefi, &runtime).map(Some)
         }
         QuickCmd::Reinstall {
@@ -2712,7 +2720,7 @@ mod tests {
         );
         assert!(
             help.contains(&format!(
-                "{} for a fedora install",
+                "{} for a fedora or netboot-xyz install",
                 Distro::Fedora.default_memory_mib()
             )),
             "{help}"

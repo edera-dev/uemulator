@@ -9,7 +9,8 @@ use crate::run::DEFAULT_MEMORY_MIB;
 
 /// What a Fedora install gets: its stage2 image (915 MB for Fedora 44) is downloaded into a RAM
 /// file system and must fit beside the initramfs and Anaconda. 3072 MiB ran out of space
-/// partway through the download.
+/// partway through the download. netboot.xyz gets it too, since Fedora is one of the installers
+/// it offers.
 const FEDORA_INSTALL_MEMORY_MIB: usize = 4096;
 const DOWNLOAD_CHUNK_LEN: usize = 1 << 16;
 
@@ -23,12 +24,18 @@ pub enum Distro {
     Debian,
     Alpine,
     Fedora,
+    /// netboot.xyz's iPXE (`netboot.xyz.efi`), a menu of network installers fetched at run
+    /// time. Its "kernel" is an EFI application with no initramfs, so it needs the UEFI firmware,
+    /// which gives it the PCI I/O protocols iPXE drives the NIC through.
+    #[value(name = "netboot-xyz")]
+    #[serde(rename = "netboot-xyz")]
+    NetbootXyz,
 }
 
 impl Distro {
     pub fn default_memory_mib(self) -> usize {
         match self {
-            Distro::Fedora => FEDORA_INSTALL_MEMORY_MIB,
+            Distro::Fedora | Distro::NetbootXyz => FEDORA_INSTALL_MEMORY_MIB,
             _ => DEFAULT_MEMORY_MIB,
         }
     }
@@ -48,24 +55,47 @@ impl Distro {
             Distro::Fedora => {
                 "ip=dhcp rd.neednet=1 inst.text inst.repo=https://dl.fedoraproject.org/pub/fedora/linux/releases/44/Server/x86_64/os/"
             }
+            // iPXE's load options are a script it runs (`efi_cmdline.c`): see `bare_cmdline`.
+            Distro::NetbootXyz => "",
         }
+    }
+
+    /// Whether the installer image takes no Linux command line at all, not even the library's
+    /// default `console=`: netboot.xyz's iPXE would run one as a script. The kernels it chains to
+    /// get their arguments from netboot.xyz's menu.
+    pub fn bare_cmdline(self) -> bool {
+        self == Distro::NetbootXyz
+    }
+
+    /// Whether the installer boots only through the UEFI firmware.
+    pub fn needs_uefi(self) -> bool {
+        self == Distro::NetbootXyz
     }
 }
 
-/// The bootstrap crate has its own copy of the three, so it needs nothing from the CLI.
-impl From<Distro> for uemulator_bootstrap::Distro {
-    fn from(distro: Distro) -> Self {
+/// The bootstrap crate has its own copy of the three it can install unattended, so it needs
+/// nothing from the CLI. netboot.xyz is not one: its menu picks the distro at run time, so there is
+/// no installer to write answers for.
+impl TryFrom<Distro> for uemulator_bootstrap::Distro {
+    type Error = String;
+
+    fn try_from(distro: Distro) -> Result<Self, String> {
         match distro {
-            Distro::Debian => uemulator_bootstrap::Distro::Debian,
-            Distro::Alpine => uemulator_bootstrap::Distro::Alpine,
-            Distro::Fedora => uemulator_bootstrap::Distro::Fedora,
+            Distro::Debian => Ok(uemulator_bootstrap::Distro::Debian),
+            Distro::Alpine => Ok(uemulator_bootstrap::Distro::Alpine),
+            Distro::Fedora => Ok(uemulator_bootstrap::Distro::Fedora),
+            Distro::NetbootXyz => Err(
+                "netboot-xyz has no unattended install: its menu picks the distro when it runs; \
+                 install alpine, debian or fedora unattended, or netboot-xyz with `quick create`"
+                    .into(),
+            ),
         }
     }
 }
 
 pub struct Artifacts {
     pub kernel: PathBuf,
-    pub initramfs: PathBuf,
+    pub initramfs: Option<PathBuf>,
 }
 
 struct Download {
@@ -76,7 +106,13 @@ struct Download {
 
 struct NetbootImages {
     kernel: Download,
-    initramfs: Download,
+    initramfs: Option<Download>,
+}
+
+impl NetbootImages {
+    fn all(&self) -> impl Iterator<Item = &Download> {
+        core::iter::once(&self.kernel).chain(&self.initramfs)
+    }
 }
 
 impl Distro {
@@ -85,6 +121,7 @@ impl Distro {
             Distro::Debian => "debian",
             Distro::Alpine => "alpine",
             Distro::Fedora => "fedora",
+            Distro::NetbootXyz => "netboot-xyz",
         }
     }
 
@@ -94,18 +131,19 @@ impl Distro {
             Distro::Debian => "Debian",
             Distro::Alpine => "Alpine",
             Distro::Fedora => "Fedora",
+            Distro::NetbootXyz => "netboot.xyz",
         }
     }
 
     /// The kernel and initramfs URLs, for tests that check what was fetched.
     #[cfg(test)]
-    pub fn source_urls(self) -> (&'static str, &'static str) {
+    pub fn source_urls(self) -> (&'static str, Option<&'static str>) {
         let source = self.source();
-        (source.kernel.url, source.initramfs.url)
+        (source.kernel.url, source.initramfs.map(|image| image.url))
     }
 
     /// Debian and Fedora URLs are pinned to a release (Debian `trixie`, Fedora 44) and must be
-    /// bumped by hand; Alpine tracks `latest-stable`.
+    /// bumped by hand; Alpine tracks `latest-stable`, netboot.xyz its current release.
     fn source(self) -> NetbootImages {
         match self {
             Distro::Debian => NetbootImages {
@@ -113,10 +151,10 @@ impl Distro {
                     file_name: "linux",
                     url: "https://deb.debian.org/debian/dists/trixie/main/installer-amd64/current/images/netboot/debian-installer/amd64/linux",
                 },
-                initramfs: Download {
+                initramfs: Some(Download {
                     file_name: "initrd.gz",
                     url: "https://deb.debian.org/debian/dists/trixie/main/installer-amd64/current/images/netboot/debian-installer/amd64/initrd.gz",
-                },
+                }),
             },
             // boot.alpinelinux.org only serves iPXE images; the netboot files live on the CDN.
             Distro::Alpine => NetbootImages {
@@ -124,20 +162,27 @@ impl Distro {
                     file_name: "vmlinuz-virt",
                     url: "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/netboot/vmlinuz-virt",
                 },
-                initramfs: Download {
+                initramfs: Some(Download {
                     file_name: "initramfs-virt",
                     url: "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/x86_64/netboot/initramfs-virt",
-                },
+                }),
             },
             Distro::Fedora => NetbootImages {
                 kernel: Download {
                     file_name: "vmlinuz",
                     url: "https://dl.fedoraproject.org/pub/fedora/linux/releases/44/Server/x86_64/os/images/pxeboot/vmlinuz",
                 },
-                initramfs: Download {
+                initramfs: Some(Download {
                     file_name: "initrd.img",
                     url: "https://dl.fedoraproject.org/pub/fedora/linux/releases/44/Server/x86_64/os/images/pxeboot/initrd.img",
+                }),
+            },
+            Distro::NetbootXyz => NetbootImages {
+                kernel: Download {
+                    file_name: "netboot.xyz.efi",
+                    url: "https://boot.netboot.xyz/ipxe/netboot.xyz.efi",
                 },
+                initramfs: None,
             },
         }
     }
@@ -149,15 +194,15 @@ fn needs_download(path: &Path, update: bool) -> bool {
     update || !cached
 }
 
-/// Whether `ensure_in` would find both of the distro's images already in `dir`.
+/// Whether `ensure_in` would find all of the distro's images already in `dir`.
 pub fn artifacts_present(dir: &Path, distro: Distro) -> bool {
-    let source = distro.source();
-    [source.kernel, source.initramfs]
-        .iter()
+    distro
+        .source()
+        .all()
         .all(|image| !needs_download(&dir.join(image.file_name), false))
 }
 
-/// Puts the distro's kernel and initramfs in `dir`, fetching only what is missing unless `update`.
+/// Puts the distro's kernel and initramfs (if it has one) in `dir`, fetching only what is missing unless `update`.
 /// The transfer is injected so the skip logic runs without a network.
 pub fn ensure_in(
     dir: &Path,
@@ -176,7 +221,7 @@ pub fn ensure_in(
     };
     Ok(Artifacts {
         kernel: fetch(src.kernel)?,
-        initramfs: fetch(src.initramfs)?,
+        initramfs: src.initramfs.map(&mut fetch).transpose()?,
     })
 }
 
@@ -226,16 +271,30 @@ mod tests {
     use super::*;
     use crate::test_support::TempDir;
 
-    const ALL_DISTROS: [Distro; 3] = [Distro::Debian, Distro::Alpine, Distro::Fedora];
+    const ALL_DISTROS: [Distro; 4] = [
+        Distro::Debian,
+        Distro::Alpine,
+        Distro::Fedora,
+        Distro::NetbootXyz,
+    ];
+
+    fn initramfs(source: &NetbootImages) -> &Download {
+        source.initramfs.as_ref().expect("an initramfs")
+    }
 
     #[test]
     fn each_distro_is_the_bootstrap_crates_of_the_same_name() {
         use uemulator_bootstrap::Distro as Bootstrap;
-        let converted: Vec<Bootstrap> = ALL_DISTROS.into_iter().map(Bootstrap::from).collect();
+        let converted: Vec<Bootstrap> = ALL_DISTROS
+            .into_iter()
+            .filter_map(|distro| Bootstrap::try_from(distro).ok())
+            .collect();
         assert_eq!(
             converted,
             [Bootstrap::Debian, Bootstrap::Alpine, Bootstrap::Fedora]
         );
+        let refused = Bootstrap::try_from(Distro::NetbootXyz).unwrap_err();
+        assert!(refused.contains("quick create"), "{refused}");
     }
 
     /// The release component of `.../releases/<n>/...`.
@@ -252,12 +311,21 @@ mod tests {
         assert_eq!(Distro::Debian.name(), "debian");
         assert_eq!(Distro::Alpine.name(), "alpine");
         assert_eq!(Distro::Fedora.name(), "fedora");
+        assert_eq!(Distro::NetbootXyz.name(), "netboot-xyz");
+        for distro in ALL_DISTROS {
+            let parsed = <Distro as ValueEnum>::from_str(distro.name(), false).unwrap();
+            assert_eq!(parsed, distro);
+        }
     }
 
     #[test]
-    fn only_fedora_gets_more_than_the_default_memory() {
+    fn only_fedora_and_netboot_xyz_get_more_than_the_default_memory() {
         assert_eq!(Distro::Debian.default_memory_mib(), DEFAULT_MEMORY_MIB);
         assert_eq!(Distro::Alpine.default_memory_mib(), DEFAULT_MEMORY_MIB);
+        assert_eq!(
+            Distro::NetbootXyz.default_memory_mib(),
+            FEDORA_INSTALL_MEMORY_MIB
+        );
         assert_eq!(
             Distro::Fedora.default_memory_mib(),
             FEDORA_INSTALL_MEMORY_MIB
@@ -280,7 +348,7 @@ mod tests {
     fn every_source_url_is_https_and_ends_in_its_cache_file_name() {
         for distro in ALL_DISTROS {
             let source = distro.source();
-            for image in [&source.kernel, &source.initramfs] {
+            for image in source.all() {
                 assert!(image.url.starts_with("https://"), "{}", image.url);
                 assert!(
                     image.url.ends_with(&format!("/{}", image.file_name)),
@@ -298,8 +366,10 @@ mod tests {
     fn kernel_and_initramfs_have_different_names_and_urls_per_distro() {
         for distro in ALL_DISTROS {
             let source = distro.source();
-            assert_ne!(source.kernel.file_name, source.initramfs.file_name);
-            assert_ne!(source.kernel.url, source.initramfs.url);
+            if let Some(initramfs) = &source.initramfs {
+                assert_ne!(source.kernel.file_name, initramfs.file_name);
+                assert_ne!(source.kernel.url, initramfs.url);
+            }
         }
     }
 
@@ -308,10 +378,12 @@ mod tests {
         for distro in ALL_DISTROS {
             let source = distro.source();
             let dir = Path::new("/cache");
-            assert_ne!(
-                part_path(&dir.join(source.kernel.file_name)),
-                part_path(&dir.join(source.initramfs.file_name))
-            );
+            if let Some(initramfs) = &source.initramfs {
+                assert_ne!(
+                    part_path(&dir.join(source.kernel.file_name)),
+                    part_path(&dir.join(initramfs.file_name))
+                );
+            }
         }
     }
 
@@ -319,7 +391,7 @@ mod tests {
     fn debian_files_match_the_netboot_layout() {
         let source = Distro::Debian.source();
         assert_eq!(source.kernel.file_name, "linux");
-        assert_eq!(source.initramfs.file_name, "initrd.gz");
+        assert_eq!(initramfs(&source).file_name, "initrd.gz");
         assert!(source.kernel.url.contains("/dists/trixie/"));
         assert!(
             source
@@ -344,9 +416,9 @@ mod tests {
     fn alpine_tracks_latest_stable_for_kernel_and_modloop_alike() {
         let source = Distro::Alpine.source();
         assert_eq!(source.kernel.file_name, "vmlinuz-virt");
-        assert_eq!(source.initramfs.file_name, "initramfs-virt");
+        assert_eq!(initramfs(&source).file_name, "initramfs-virt");
         let cmdline = Distro::Alpine.cmdline();
-        for url in [source.kernel.url, source.initramfs.url] {
+        for url in [source.kernel.url, initramfs(&source).url] {
             assert!(
                 url.contains("/alpine/latest-stable/releases/x86_64/netboot/"),
                 "{url}"
@@ -365,7 +437,7 @@ mod tests {
     fn fedora_repo_release_matches_the_cached_kernel_release() {
         let source = Distro::Fedora.source();
         let kernel_release = release_in(source.kernel.url);
-        assert_eq!(kernel_release, release_in(source.initramfs.url));
+        assert_eq!(kernel_release, release_in(initramfs(&source).url));
         let cmdline = Distro::Fedora.cmdline();
         let repo = cmdline
             .split_whitespace()
@@ -378,7 +450,7 @@ mod tests {
     fn fedora_files_match_the_pxeboot_layout() {
         let source = Distro::Fedora.source();
         assert_eq!(source.kernel.file_name, "vmlinuz");
-        assert_eq!(source.initramfs.file_name, "initrd.img");
+        assert_eq!(initramfs(&source).file_name, "initrd.img");
         assert!(source.kernel.url.contains("/images/pxeboot/"));
     }
 
@@ -398,6 +470,31 @@ mod tests {
         );
         assert!(Distro::Fedora.cmdline().contains("rd.neednet=1"));
         assert!(Distro::Fedora.cmdline().contains("inst.text"));
+    }
+
+    #[test]
+    fn netboot_xyz_is_one_efi_image_booted_bare_through_uefi() {
+        let source = Distro::NetbootXyz.source();
+        assert_eq!(source.kernel.file_name, "netboot.xyz.efi");
+        assert!(source.initramfs.is_none());
+        assert_eq!(Distro::NetbootXyz.cmdline(), "");
+        assert!(Distro::NetbootXyz.bare_cmdline() && Distro::NetbootXyz.needs_uefi());
+        for distro in [Distro::Debian, Distro::Alpine, Distro::Fedora] {
+            assert!(!distro.bare_cmdline() && !distro.needs_uefi(), "{distro:?}");
+        }
+    }
+
+    #[test]
+    fn an_installer_without_an_initramfs_fetches_only_its_kernel() {
+        let dir = TempDir::new("quick-netboot-xyz");
+        let fetcher = FakeFetcher::new();
+        let artifacts = ensure_in(dir.path(), Distro::NetbootXyz, false, |u, d| {
+            fetcher.fetch(u, d)
+        })
+        .unwrap();
+        assert_eq!(fetcher.urls(), vec![Distro::NetbootXyz.source().kernel.url]);
+        assert_eq!(artifacts.initramfs, None);
+        assert!(artifacts_present(dir.path(), Distro::NetbootXyz));
     }
 
     #[test]
@@ -468,10 +565,10 @@ mod tests {
         let source = Distro::Debian.source();
         assert_eq!(
             fetcher.urls(),
-            vec![source.kernel.url, source.initramfs.url]
+            vec![source.kernel.url, initramfs(&source).url]
         );
         assert_eq!(artifacts.kernel, artifacts_dir.join("linux"));
-        assert_eq!(artifacts.initramfs, artifacts_dir.join("initrd.gz"));
+        assert_eq!(artifacts.initramfs, Some(artifacts_dir.join("initrd.gz")));
         assert_eq!(
             fs::read_to_string(&artifacts.kernel).unwrap(),
             source.kernel.url
@@ -515,7 +612,10 @@ mod tests {
             fetcher.fetch(u, d)
         })
         .unwrap();
-        assert_eq!(fetcher.urls(), vec![Distro::Alpine.source().initramfs.url]);
+        assert_eq!(
+            fetcher.urls(),
+            vec![initramfs(&Distro::Alpine.source()).url]
+        );
         assert_eq!(
             fs::read(dir.path().join("vmlinuz-virt")).unwrap(),
             b"kernel"
@@ -550,7 +650,7 @@ mod tests {
         assert!(!dir.path().join("initrd.gz").exists());
         let retry = FakeFetcher::new();
         ensure_in(dir.path(), Distro::Debian, false, |u, d| retry.fetch(u, d)).unwrap();
-        assert_eq!(retry.urls(), vec![Distro::Debian.source().initramfs.url]);
+        assert_eq!(retry.urls(), vec![initramfs(&Distro::Debian.source()).url]);
     }
 
     #[test]

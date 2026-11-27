@@ -224,7 +224,7 @@ final class MachineStore: ObservableObject {
     }
 
     func initrd(_ name: String, install: Distro? = nil) -> URL {
-        artifacts(name).appendingPathComponent(install?.initrd.file ?? "initrd")
+        artifacts(name).appendingPathComponent(install?.initrd?.file ?? "initrd")
     }
 
     // The display stays on while any machine runs or suspends (iOS): the idle timer locking the
