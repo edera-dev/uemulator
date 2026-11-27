@@ -8,7 +8,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-cargo-nextest = "=0.9.151"
+cargo-nextest = "=0.9.152"
 
 # Keeps this out of the root workspace.
 [workspace]
