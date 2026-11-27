@@ -1,5 +1,4 @@
 version: 1
-mode: observe
 rules:
   - purpose: "One person is enough for every change. Dependabot's pull requests merge on Claude's review alone once it passes."
     paths: ["**"]
