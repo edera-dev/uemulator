@@ -443,22 +443,35 @@ pub struct Launch {
     pub settings: Settings,
 }
 
-/// What to tell the user before an installer boot, if anything: netboot.xyz's menu is on the
+/// What to tell the user before an installer boot, if anything. netboot.xyz's menu is on the
 /// terminal, but many of the kernels it starts (Debian's among them) put their console on the
-/// screen only.
+/// screen only; and they never use hvc0, so with a virtio first console (a machine reinstalled to
+/// netboot-xyz keeps its console) the terminal's keys go to hvc0 once the guest's driver is up and
+/// the installer on ttyS0 hears nothing.
 pub fn installer_hint(machine: &Machine, launch: &Launch) -> Option<String> {
+    if machine.install != Distro::NetbootXyz || launch.source != BootSource::Installer {
+        return None;
+    }
+    let name = &machine.name;
+    let mut hints = Vec::new();
+    if launch.settings.consoles.first() == Some(&ConsoleArg::Virtio) {
+        hints.push(format!(
+            "the installers netboot.xyz starts use ttyS0, and this machine's first console is \
+             virtio, which takes the keyboard once the guest loads its driver: \
+             `quick edit {name} --remove-console 0 --console serial` fixes that"
+        ));
+    }
     let screen = matches!(
         launch.settings.display,
         Some(DisplayArg::Framebuffer | DisplayArg::Both)
     );
-    (machine.install == Distro::NetbootXyz && launch.source == BootSource::Installer && !screen)
-        .then(|| {
-            format!(
-                "the installers netboot.xyz starts may show only on a screen: \
-                 `quick boot {} --display both` gives the machine one",
-                machine.name
-            )
-        })
+    if !screen {
+        hints.push(format!(
+            "the installers netboot.xyz starts may show only on a screen: \
+             `quick boot {name} --display both` gives the machine one"
+        ));
+    }
+    (!hints.is_empty()).then(|| hints.join("\n"))
 }
 
 /// The distro's contribution to an installer boot, applied last so it never reaches the saved
@@ -1498,6 +1511,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(installer_hint(&alpine, &launch), None);
+        let virtio = launch_with(&[
+            "--remove-console",
+            "0",
+            "--console",
+            "virtio",
+            "--display",
+            "both",
+        ]);
+        let hint = installer_hint(&machine, &virtio).unwrap();
+        assert!(
+            hint.contains("--remove-console 0 --console serial"),
+            "{hint}"
+        );
+        assert!(!hint.contains("--display both"), "{hint}");
     }
 
     #[test]
