@@ -32,3 +32,16 @@ updates:
     interval: weekly
   cooldown:
     default-days: 7
+- package-ecosystem: swift
+  # The app's SwiftPM dependencies live in the Xcode project (no Package.swift):
+  # apple/uemulator.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved.
+  directory: /apple
+  schedule:
+    interval: weekly
+  cooldown:
+    default-days: 7
+  groups:
+    swift-updates:
+      patterns:
+      - "*"
+      applies-to: version-updates

@@ -4,14 +4,18 @@ use crate::testkit::fake_bzimage;
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 
-/// Prints 'S', runs 40 million iterations of integer, memory, SSE and x87 work, then prints the
+/// Prints 'S', runs 10 million iterations of integer, memory, SSE and x87 work, then prints the
 /// result as 16 hex digits and a newline and halts with interrupts off (a shutdown). Any state a
 /// suspend loses changes the digits; the work is long enough that a suspend lands inside it.
+/// The count is a trade: the loop takes about 1 s under the JIT on an M-series Mac against
+/// 20-35 ms for the three checkpoints the tests take inside it (a shorter loop risks the guest
+/// finishing first on a loaded CI runner), and about 5 s on the interpreter, which several
+/// tests pay twice. Changing it changes `EXPECTED_CHECKSUM_OUTPUT`.
 ///
 /// ```text
 /// mov rax, cr4; or eax, 0x600; mov cr4, rax   (OSFXSR, OSXMMEXCPT: SSE is off at entry)
 /// mov dx, 0x3f8; mov al, 'S'; out dx, al
-/// xor eax, eax; movabs rbx, 0x9e3779b97f4a7c15; mov r8d, 40000000; mov r9d, 0x300000
+/// xor eax, eax; movabs rbx, 0x9e3779b97f4a7c15; mov r8d, 10000000; mov r9d, 0x300000
 /// pxor xmm0, xmm0; fld1
 /// 2: imul rax, rbx; add rax, r8; rol rax, 13; mov [r9], rax; add rax, [r9 + 8]
 ///    mov [r9 + 8], rax; movq xmm1, rax; paddq xmm0, xmm1; fadd st(0), st(0); fsqrt
@@ -25,7 +29,7 @@ use std::time::{Duration, Instant};
 const CHECKSUM_GUEST: [u8; 147] = [
     0x0f, 0x20, 0xe0, 0x0d, 0x00, 0x06, 0x00, 0x00, 0x0f, 0x22, 0xe0, 0x66, 0xba, 0xf8, 0x03, 0xb0,
     0x53, 0xee, 0x31, 0xc0, 0x48, 0xbb, 0x15, 0x7c, 0x4a, 0x7f, 0xb9, 0x79, 0x37, 0x9e, 0x41, 0xb8,
-    0x00, 0x5a, 0x62, 0x02, 0x41, 0xb9, 0x00, 0x00, 0x30, 0x00, 0x66, 0x0f, 0xef, 0xc0, 0xd9, 0xe8,
+    0x80, 0x96, 0x98, 0x00, 0x41, 0xb9, 0x00, 0x00, 0x30, 0x00, 0x66, 0x0f, 0xef, 0xc0, 0xd9, 0xe8,
     0x48, 0x0f, 0xaf, 0xc3, 0x4c, 0x01, 0xc0, 0x48, 0xc1, 0xc0, 0x0d, 0x49, 0x89, 0x01, 0x49, 0x03,
     0x41, 0x08, 0x49, 0x89, 0x41, 0x08, 0x66, 0x48, 0x0f, 0x6e, 0xc8, 0x66, 0x0f, 0xd4, 0xc1, 0xd8,
     0xc0, 0xd9, 0xfa, 0x41, 0xff, 0xc8, 0x75, 0xd8, 0x41, 0xdf, 0x79, 0x10, 0x49, 0x03, 0x41, 0x10,
@@ -153,53 +157,92 @@ fn resume(config: MachineConfig, bytes: Vec<u8>) -> (Run, bool) {
     (run, finished.load(Ordering::SeqCst))
 }
 
-fn reference_output(jit: JitMode) -> Vec<u8> {
+/// What `CHECKSUM_GUEST` prints when nothing interrupts it. A constant rather than a reference
+/// run per test: each run of the loop costs seconds on the interpreter, and nextest runs every
+/// test in its own process, so nothing could share one. If the guest changes,
+/// `the_checksum_guest_prints_its_known_result` prints the new value.
+const EXPECTED_CHECKSUM_OUTPUT: &[u8; CHECKSUM_OUTPUT_BYTES] = b"SE9AB5B3888721597\n";
+
+fn assert_uninterrupted_result(jit: JitMode) {
     let run = run(config(&CHECKSUM_GUEST, jit), None);
-    assert_eq!(run.exit, ExitReason::Shutdown);
-    assert_eq!(run.output.len(), CHECKSUM_OUTPUT_BYTES);
-    run.output
+    assert_eq!(run.exit, ExitReason::Shutdown, "{jit:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&run.output),
+        String::from_utf8_lossy(EXPECTED_CHECKSUM_OUTPUT),
+        "{jit:?}"
+    );
+}
+
+#[test]
+fn the_checksum_guest_prints_its_known_result() {
+    assert_uninterrupted_result(JitMode::Off);
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn the_checksum_guest_prints_its_known_result_under_the_jit() {
+    let _turn = crate::jit::serialize_jit_tests();
+    assert_uninterrupted_result(JitMode::Auto);
+}
+
+fn suspend_and_resume_mid_computation(jit: JitMode) {
+    let (snapshot, before) = suspend_mid_checksum(config(&CHECKSUM_GUEST, jit));
+    let (after, consumed) = resume(config(&CHECKSUM_GUEST, jit), snapshot);
+    assert_eq!(after.exit, ExitReason::Shutdown, "{jit:?}");
+    assert!(consumed, "the source was not told the restore finished");
+    let mut whole = before;
+    whole.extend_from_slice(&after.output);
+    assert_eq!(
+        String::from_utf8_lossy(&whole),
+        String::from_utf8_lossy(EXPECTED_CHECKSUM_OUTPUT),
+        "{jit:?}"
+    );
 }
 
 #[test]
 fn a_machine_suspended_mid_computation_resumes_to_the_result_an_uninterrupted_one_gets() {
-    for jit in [JitMode::Off, JitMode::Auto] {
-        let _turn = (jit != JitMode::Off).then(crate::jit::serialize_jit_tests);
-        let expected = reference_output(jit);
-        let (snapshot, before) = suspend_mid_checksum(config(&CHECKSUM_GUEST, jit));
-        let (after, consumed) = resume(config(&CHECKSUM_GUEST, jit), snapshot);
-        assert_eq!(after.exit, ExitReason::Shutdown, "{jit:?}");
-        assert!(consumed, "the source was not told the restore finished");
-        let mut whole = before;
-        whole.extend_from_slice(&after.output);
-        assert_eq!(
-            String::from_utf8_lossy(&whole),
-            String::from_utf8_lossy(&expected),
-            "{jit:?}"
-        );
-    }
+    suspend_and_resume_mid_computation(JitMode::Off);
+}
+
+// Without the `jit` feature `JitMode::Auto` is the interpreter, which the test above covers.
+#[cfg(feature = "jit")]
+#[test]
+fn a_machine_suspended_mid_computation_under_the_jit_resumes_to_the_same_result() {
+    let _turn = crate::jit::serialize_jit_tests();
+    suspend_and_resume_mid_computation(JitMode::Auto);
 }
 
 /// The interpreter's snapshot resumes under the JIT and the other way round: the snapshot
 /// carries no generated code.
-#[test]
-fn a_snapshot_resumes_with_the_jit_on_or_off_whichever_took_it() {
+#[cfg(feature = "jit")]
+fn resume_with_the_other_engine(taken: JitMode, resumed: JitMode) {
     let _turn = crate::jit::serialize_jit_tests();
-    let expected = reference_output(JitMode::Off);
-    for (taken, resumed) in [(JitMode::Off, JitMode::Auto), (JitMode::Auto, JitMode::Off)] {
-        let (snapshot, mut whole) = suspend_mid_checksum(config(&CHECKSUM_GUEST, taken));
-        let (after, _) = resume(config(&CHECKSUM_GUEST, resumed), snapshot);
-        assert_eq!(after.exit, ExitReason::Shutdown);
-        whole.extend_from_slice(&after.output);
-        assert_eq!(whole, expected, "{taken:?} then {resumed:?}");
-    }
+    let (snapshot, mut whole) = suspend_mid_checksum(config(&CHECKSUM_GUEST, taken));
+    let (after, _) = resume(config(&CHECKSUM_GUEST, resumed), snapshot);
+    assert_eq!(after.exit, ExitReason::Shutdown);
+    whole.extend_from_slice(&after.output);
+    assert_eq!(
+        whole, EXPECTED_CHECKSUM_OUTPUT,
+        "{taken:?} then {resumed:?}"
+    );
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn an_interpreter_snapshot_resumes_under_the_jit() {
+    resume_with_the_other_engine(JitMode::Off, JitMode::Auto);
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn a_jit_snapshot_resumes_on_the_interpreter() {
+    resume_with_the_other_engine(JitMode::Auto, JitMode::Off);
 }
 
 /// The native engine runs vCPUs on threads, the WebKit one time-shares them: a snapshot from
 /// either resumes in the other.
-#[test]
-fn a_snapshot_moves_between_threaded_and_time_shared_vcpus() {
+fn move_between_smp_modes(taken: SmpMode, resumed: SmpMode) {
     const CPUS: usize = 2;
-    let expected = reference_output(JitMode::Off);
     let smp = |mode: SmpMode| {
         config(&CHECKSUM_GUEST, JitMode::Off)
             .cpus(CPUS)
@@ -210,20 +253,28 @@ fn a_snapshot_moves_between_threaded_and_time_shared_vcpus() {
                 ClockMode::Virtual
             })
     };
-    for (taken, resumed) in [
-        (SmpMode::Threads, SmpMode::Timeshare),
-        (SmpMode::Timeshare, SmpMode::Threads),
-    ] {
-        let (snapshot, mut whole) = suspend_mid_checksum(smp(taken));
-        let (after, _) = resume(smp(resumed), snapshot);
-        assert_eq!(
-            after.exit,
-            ExitReason::Shutdown,
-            "{taken:?} then {resumed:?}"
-        );
-        whole.extend_from_slice(&after.output);
-        assert_eq!(whole, expected, "{taken:?} then {resumed:?}");
-    }
+    let (snapshot, mut whole) = suspend_mid_checksum(smp(taken));
+    let (after, _) = resume(smp(resumed), snapshot);
+    assert_eq!(
+        after.exit,
+        ExitReason::Shutdown,
+        "{taken:?} then {resumed:?}"
+    );
+    whole.extend_from_slice(&after.output);
+    assert_eq!(
+        whole, EXPECTED_CHECKSUM_OUTPUT,
+        "{taken:?} then {resumed:?}"
+    );
+}
+
+#[test]
+fn a_snapshot_moves_from_threaded_to_time_shared_vcpus() {
+    move_between_smp_modes(SmpMode::Threads, SmpMode::Timeshare);
+}
+
+#[test]
+fn a_snapshot_moves_from_time_shared_to_threaded_vcpus() {
+    move_between_smp_modes(SmpMode::Timeshare, SmpMode::Threads);
 }
 
 /// Every device a machine can have, so the byte comparison below covers each one's state.
@@ -490,52 +541,74 @@ fn a_delta_chain_restores_exactly_the_machine_it_was_taken_from() {
 
 /// Checkpoints taken during the computation change nothing the guest computes, and the chain of
 /// them resumes to the same result, on threads and time-shared, with the interpreter and the JIT.
-#[test]
-fn checkpoints_leave_a_computation_alone_and_its_chain_resumes_it() {
-    let expected = reference_output(JitMode::Off);
-    for (jit, cpus, smp) in [
-        (JitMode::Off, 1, SmpMode::Auto),
-        (JitMode::Auto, 1, SmpMode::Auto),
-        (JitMode::Off, 2, SmpMode::Timeshare),
-        (JitMode::Off, 2, SmpMode::Threads),
-        (JitMode::Auto, 2, SmpMode::Threads),
-    ] {
-        let _turn = (jit != JitMode::Off).then(crate::jit::serialize_jit_tests);
-        let machine = || {
-            config(&CHECKSUM_GUEST, jit)
-                .cpus(cpus)
-                .smp(smp)
-                .clock(if smp == SmpMode::Threads {
-                    ClockMode::Realtime
-                } else {
-                    ClockMode::Virtual
-                })
-                .check_dirty_tracking(true)
-        };
-        let mut running = start(machine());
-        running.wait_for(STARTED);
-        let mut taken = Vec::new();
-        for _ in 0..3 {
-            taken.push(running.checkpoint().expect("a checkpoint"));
-        }
-        assert_eq!(
-            running.output(),
-            [STARTED],
-            "the guest finished before the checkpoints; lengthen its loop"
-        );
-        for pair in taken.windows(2) {
-            assert_eq!(pair[1].0.parent, Some(pair[0].0.id));
-        }
-        assert_eq!(running.machine.wait(), ExitReason::Shutdown);
-        assert_eq!(running.output(), expected, "{jit:?} {cpus} {smp:?}");
-
-        let snapshots: Vec<&Vec<u8>> = taken.iter().map(|(_, bytes)| bytes).collect();
-        let resumed = run(machine().resume_from_chain(chain(&snapshots)), None);
-        assert_eq!(resumed.exit, ExitReason::Shutdown, "{jit:?} {cpus} {smp:?}");
-        let mut whole = vec![STARTED];
-        whole.extend_from_slice(&resumed.output);
-        assert_eq!(whole, expected, "{jit:?} {cpus} {smp:?}");
+/// One test per configuration so nextest runs them side by side.
+fn checkpoint_a_computation(jit: JitMode, cpus: usize, smp: SmpMode) {
+    let _turn = (jit != JitMode::Off).then(crate::jit::serialize_jit_tests);
+    let machine = || {
+        config(&CHECKSUM_GUEST, jit)
+            .cpus(cpus)
+            .smp(smp)
+            .clock(if smp == SmpMode::Threads {
+                ClockMode::Realtime
+            } else {
+                ClockMode::Virtual
+            })
+            .check_dirty_tracking(true)
+    };
+    let mut running = start(machine());
+    running.wait_for(STARTED);
+    let mut taken = Vec::new();
+    for _ in 0..3 {
+        taken.push(running.checkpoint().expect("a checkpoint"));
     }
+    assert_eq!(
+        running.output(),
+        [STARTED],
+        "the guest finished before the checkpoints; lengthen its loop"
+    );
+    for pair in taken.windows(2) {
+        assert_eq!(pair[1].0.parent, Some(pair[0].0.id));
+    }
+    assert_eq!(running.machine.wait(), ExitReason::Shutdown);
+    assert_eq!(
+        running.output(),
+        EXPECTED_CHECKSUM_OUTPUT,
+        "{jit:?} {cpus} {smp:?}"
+    );
+
+    let snapshots: Vec<&Vec<u8>> = taken.iter().map(|(_, bytes)| bytes).collect();
+    let resumed = run(machine().resume_from_chain(chain(&snapshots)), None);
+    assert_eq!(resumed.exit, ExitReason::Shutdown, "{jit:?} {cpus} {smp:?}");
+    let mut whole = vec![STARTED];
+    whole.extend_from_slice(&resumed.output);
+    assert_eq!(whole, EXPECTED_CHECKSUM_OUTPUT, "{jit:?} {cpus} {smp:?}");
+}
+
+#[test]
+fn checkpoints_leave_an_interpreted_computation_alone_and_its_chain_resumes_it() {
+    checkpoint_a_computation(JitMode::Off, 1, SmpMode::Auto);
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn checkpoints_leave_a_jit_computation_alone_and_its_chain_resumes_it() {
+    checkpoint_a_computation(JitMode::Auto, 1, SmpMode::Auto);
+}
+
+#[test]
+fn checkpoints_leave_a_time_shared_computation_alone_and_its_chain_resumes_it() {
+    checkpoint_a_computation(JitMode::Off, 2, SmpMode::Timeshare);
+}
+
+#[test]
+fn checkpoints_leave_a_threaded_computation_alone_and_its_chain_resumes_it() {
+    checkpoint_a_computation(JitMode::Off, 2, SmpMode::Threads);
+}
+
+#[cfg(feature = "jit")]
+#[test]
+fn checkpoints_leave_a_threaded_jit_computation_alone_and_its_chain_resumes_it() {
+    checkpoint_a_computation(JitMode::Auto, 2, SmpMode::Threads);
 }
 
 /// A chain whose pieces do not fit together is refused before anything runs.
@@ -593,7 +666,7 @@ fn a_failed_checkpoint_leaves_the_machine_running_and_the_chain_intact() {
     let (second, _) = running.checkpoint().unwrap();
     assert_eq!(second.parent, Some(first.id));
     assert_eq!(running.machine.wait(), ExitReason::Shutdown);
-    assert_eq!(running.output(), reference_output(JitMode::Off));
+    assert_eq!(running.output(), EXPECTED_CHECKSUM_OUTPUT);
 }
 
 /// A checkpoint asked for from the callback of the one before (so while the machine is paused
@@ -615,7 +688,7 @@ fn a_checkpoint_asked_for_while_one_is_written_is_taken_too() {
     let second = answered.recv_timeout(LIMIT).unwrap().unwrap();
     assert_eq!(second.parent, Some(first.id));
     assert_eq!(running.machine.wait(), ExitReason::Shutdown);
-    assert_eq!(running.output(), reference_output(JitMode::Off));
+    assert_eq!(running.output(), EXPECTED_CHECKSUM_OUTPUT);
     // And one asked for once the machine is gone is answered at once.
     let (answer, answered) = std::sync::mpsc::channel();
     running.handle.checkpoint(Shared::default(), move |result| {

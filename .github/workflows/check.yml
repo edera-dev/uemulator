@@ -41,8 +41,20 @@ jobs:
       run: cargo build --release --workspace
 
   test:
-    name: test
+    # The two runs share nothing but the checkout, so they go side by side: in series they were
+    # about 10 minutes each, almost all of it a handful of long machine and JIT tests.
+    name: test (${{ matrix.name }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - name: workspace
+          id: workspace
+          args: --workspace
+        - name: no default features
+          id: no-default-features
+          args: -p uemulator --no-default-features
     steps:
     - name: harden runner
       uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
@@ -56,6 +68,13 @@ jobs:
 
     - name: install firmware target
       run: rustup target add x86_64-unknown-none
+
+    - name: cache cargo
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      with:
+        key: test-${{ matrix.id }}
+        # Pull requests read main's cache; only main writes it, so they cannot evict it.
+        save-if: ${{ github.ref == 'refs/heads/main' }}
 
     - name: cache nextest
       id: nextest-cache
@@ -73,10 +92,7 @@ jobs:
         cargo install --locked cargo-nextest --version "${version}"
 
     - name: cargo nextest
-      run: cargo nextest run --release --workspace
-
-    - name: cargo nextest without default features
-      run: cargo nextest run --release -p uemulator --no-default-features
+      run: cargo nextest run --release ${{ matrix.args }}
 
   clippy:
     name: clippy

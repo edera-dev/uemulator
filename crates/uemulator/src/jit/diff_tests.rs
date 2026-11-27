@@ -169,6 +169,23 @@ pub(super) fn check_with(code: &[u8], setup: impl Fn(&mut Harness)) -> Different
     result
 }
 
+/// `check_with` comparing only `HOT_RAM`, for tests that loop over thousands of operand
+/// combinations: there the full 32 MiB compare is most of the run time. Only for snippets whose
+/// memory operands stay in the seeded scratch data or the stack.
+#[track_caller]
+pub(super) fn check_hot_with(code: &[u8], setup: impl Fn(&mut Harness)) {
+    let result = run_serialized(code, setup);
+    if let Some(difference) = difference_in(&result, HOT_RAM) {
+        panic!("jit differs from the interpreter, {difference}");
+    }
+    assert_eq!(
+        result.interpreter_stop,
+        Stop::Halted,
+        "{}",
+        result.interpreter.cpu.dump_regs()
+    );
+}
+
 #[track_caller]
 pub(super) fn check(code: &[u8]) -> Differential {
     check_with(code, seed_registers_and_memory)

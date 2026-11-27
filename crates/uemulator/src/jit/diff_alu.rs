@@ -1181,7 +1181,7 @@ fn bit_scan_forms_match_over_edge_sources() {
     for (_name, code) in forms {
         for &source in &sources {
             for flags in [0u64, crate::cpu::flags::ARITH] {
-                check_with(code, |harness| {
+                check_hot_with(code, |harness| {
                     seed_registers_and_memory(harness);
                     harness.cpu.gpr[1] = source;
                     harness.cpu.gpr[0] = 0x1122_3344_5566_7788;
@@ -1233,7 +1233,7 @@ fn one_operand_multiply_forms_match_over_edge_operands() {
     for code in forms {
         for &first in &operands {
             for &second in &operands {
-                check_with(code, |harness| {
+                check_hot_with(code, |harness| {
                     seed_registers_and_memory(harness);
                     harness.cpu.gpr[0] = first;
                     harness.cpu.gpr[1] = second;
@@ -1283,7 +1283,7 @@ fn double_shift_by_immediate_matches_over_edge_operands() {
             for &first in &operands {
                 for &second in &operands {
                     for flags in [0u64, crate::cpu::flags::ARITH] {
-                        check_with(&code, |harness| {
+                        check_hot_with(&code, |harness| {
                             seed_registers_and_memory(harness);
                             harness.cpu.gpr[0] = first;
                             harness.cpu.gpr[1] = second;
