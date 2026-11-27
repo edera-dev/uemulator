@@ -1,11 +1,12 @@
 version: 1
 rules:
-  - purpose: "One person is enough for every change. Dependabot's pull requests merge on Claude's review alone once it passes."
+  - purpose: "One person is enough for every change. Pull requests by Dependabot, or written entirely by people with write access, merge on Claude's review alone once it passes."
     paths: ["**"]
     verdict: { claude: comments, seats: 1 }
     findings: { resolution: humans }
     override:
       - { if: "ALL pr/authors = bot:dependabot AND claude/code_review = pass", verdict: { claude: approves, seats: 0 } }
+      - { if: "ALL pr/authors = humans AND claude/code_review = pass", verdict: { claude: approves, seats: 0 } }
     advisory: ["claude/code_review"]  # without this line, Code Review no longer starts automatically
   - purpose: "The review rules and Git attributes keep the one-person rule with no shortcut, and Claude never approves them."
     paths: ["**/.claude/**", "**/REVIEW.md", "**/.gitattributes", "**/.gitmodules"]
