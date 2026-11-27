@@ -387,6 +387,46 @@ pub(crate) const TLB_FLAG_LARGE: TlbFlags = 1 << 10;
 /// biggest leaf there is, 1 GiB. The slots keep no leaf size, so an INVLPG also drops the other
 /// large-leaf pages of its GiB; dropping more than asked is always allowed.
 pub(crate) const TLB_LARGE_REGION_SHIFT: u32 = 30;
+/// How many regions `LargeRegions` names before it stops telling them apart. A Linux guest's
+/// large leaves sit in a few: one per GiB of the direct map it touches, the kernel image, and
+/// whatever transparent huge pages its processes use.
+pub(crate) const LARGE_REGIONS_TRACKED: usize = 16;
+
+/// The `TLB_LARGE_REGION_SHIFT` regions that may hold a `Cpu::tlb_large` entry, so an INVLPG
+/// elsewhere (most of them: Linux flushes 4 KiB user pages while its direct map fills the TLB
+/// with large-leaf entries) skips the scan of `tlb_large`. Always a superset: a region may
+/// outlive its entries, but a filled entry's region must be in it, or `Cpu::invlpg` leaves a
+/// stale large-leaf entry behind. `overflowed` stands for every region.
+#[derive(Clone, Copy)]
+pub(crate) struct LargeRegions {
+    regions: [u64; LARGE_REGIONS_TRACKED],
+    len: usize,
+    overflowed: bool,
+}
+
+impl LargeRegions {
+    pub(crate) const EMPTY: LargeRegions = LargeRegions {
+        regions: [0; LARGE_REGIONS_TRACKED],
+        len: 0,
+        overflowed: false,
+    };
+
+    pub(crate) fn may_hold(&self, region: u64) -> bool {
+        self.overflowed || self.regions[..self.len].contains(&region)
+    }
+
+    pub(crate) fn add(&mut self, region: u64) {
+        if self.may_hold(region) {
+            return;
+        }
+        if self.len == LARGE_REGIONS_TRACKED {
+            self.overflowed = true;
+        } else {
+            self.regions[self.len] = region;
+            self.len += 1;
+        }
+    }
+}
 pub(crate) const TLB_INDEX_BITS: usize = 12;
 /// `Cpu::tlb` holds two halves of this many entries: supervisor first, then user. They are
 /// separate because the same page can be accessible to one privilege and not the other, and a
@@ -608,6 +648,9 @@ pub(crate) struct Cpu {
     /// transparent huge page with one INVLPG at its base). Never set without the `tlb_filled` bit.
     #[snapshot(skip)]
     pub tlb_large: Vec<u64>,
+    /// Where the `tlb_large` entries may be; it swaps with them (`svm::ParkedTlb`).
+    #[snapshot(skip)]
+    pub tlb_large_regions: LargeRegions,
     #[snapshot(skip)]
     pub decode_cache: Vec<DecodeCacheEntry>,
     /// Bumping it invalidates the whole decode cache at once. Starts at 1 so the zeroed
@@ -1023,6 +1066,7 @@ impl Cpu {
             tlb_filled: vec![0; TLB_FILLED_WORDS],
             tlb_global: vec![0; TLB_FILLED_WORDS],
             tlb_large: vec![0; TLB_FILLED_WORDS],
+            tlb_large_regions: LargeRegions::EMPTY,
             ram_base: 0,
             decode_cache: if has_machine_state {
                 vec![
