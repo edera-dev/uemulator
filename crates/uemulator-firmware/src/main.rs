@@ -147,6 +147,7 @@ extern "C" fn firmware_main(handoff: *const u8) -> ! {
     time::init(&handoff);
     services::init(&handoff);
     serial::trace!("services ready");
+    cpu::start_tick();
     boot::run(handoff.payload.as_ref())
 }
 

@@ -296,11 +296,28 @@ extern "efiapi" fn raise_tpl(new: usize) -> usize {
     if new >= old {
         state.tpl = new;
     }
+    if new >= TPL_HIGH_LEVEL {
+        cpu::disable_interrupts();
+    }
     old
 }
 
+/// Whether `restore_tpl` is already firing timers further up the stack: their notification
+/// functions raise and restore the TPL themselves.
+static POLLING: Global<bool> = Global::new(false);
+
 extern "efiapi" fn restore_tpl(old: usize) {
     STATE.get().tpl = old;
+    if old < TPL_HIGH_LEVEL {
+        cpu::enable_interrupts();
+    }
+    // Where a real firmware's tick would deliver timer notifications: an application that drops
+    // its TPL to let time pass (iPXE's `currticks`) must see its periodic timer fire.
+    if old < TPL_CALLBACK && !*POLLING.get() {
+        *POLLING.get() = true;
+        poll();
+        *POLLING.get() = false;
+    }
     run_pending();
 }
 
