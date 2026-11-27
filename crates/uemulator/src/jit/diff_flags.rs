@@ -9,7 +9,7 @@
 //! `helper_exec` and the interpreter's flag code, so a smaller consumer set suffices.
 
 use super::diff_tests::{
-    HOT_RAM, check_with, difference_in, run_serialized, seed_registers_and_memory,
+    HOT_RAM, check_hot_with, difference_in, run_serialized, seed_registers_and_memory,
 };
 use crate::testkit::*;
 
@@ -716,7 +716,7 @@ fn a_condition_at_the_start_of_a_block_reads_the_previous_blocks_flags() {
             for &first in &operands {
                 for &second in &operands {
                     let outcome = std::panic::catch_unwind(|| {
-                        check_with(&code, |harness| {
+                        check_hot_with(&code, |harness| {
                             seed_registers_and_memory(harness);
                             harness.cpu.gpr[0] = first;
                             harness.cpu.gpr[1] = second;
@@ -784,7 +784,7 @@ fn a_carry_in_at_the_start_of_a_block_reads_the_previous_blocks_flags() {
             for &first in &operands {
                 for &second in &operands {
                     let outcome = std::panic::catch_unwind(|| {
-                        check_with(&code, |harness| {
+                        check_hot_with(&code, |harness| {
                             seed_registers_and_memory(harness);
                             harness.cpu.gpr[0] = first;
                             harness.cpu.gpr[1] = second;
