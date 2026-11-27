@@ -976,7 +976,7 @@ impl Cpu {
             {
                 refilled.tag_w = page;
             }
-            self.fill_tlb(slot, refilled, walk_flags);
+            self.fill_tlb(slot, page, refilled, walk_flags);
         }
         Ok(page_pa | (linear & PAGE_OFFSET_MASK))
     }
@@ -1082,7 +1082,7 @@ impl Cpu {
             };
             refilled.addend = (self.ram_base + page).wrapping_sub(linear_page);
             refilled.tag_w = linear_page | TLB_TAG_SHADOW_STACK;
-            self.fill_tlb(slot, refilled, flags);
+            self.fill_tlb(slot, linear_page, refilled, flags);
         }
         Ok(page | (linear & PAGE_OFFSET_MASK))
     }
@@ -1100,6 +1100,7 @@ impl Cpu {
     }
 
     fn empty_tlb_slots(&mut self, including_global: bool) {
+        let mut large_left = 0;
         for (word_index, ((filled_word, global_word), large_word)) in self
             .tlb_filled
             .iter_mut()
@@ -1112,20 +1113,25 @@ impl Cpu {
             *filled_word = kept;
             *global_word = kept;
             *large_word &= kept;
+            large_left |= *large_word;
             while emptied != 0 {
                 let slot = word_index * u64::BITS as usize + emptied.trailing_zeros() as usize;
                 self.tlb[slot] = TLB_EMPTY;
                 emptied &= emptied - 1;
             }
         }
+        // The global large-leaf entries a CR3 write keeps keep their regions too.
+        if large_left == 0 {
+            self.tlb_large_regions = LargeRegions::EMPTY;
+        }
         // Large leaves do not record whether they are global; a walk refills them.
         self.large_pages = [LARGE_PAGE_EMPTY; LARGE_PAGE_CACHE_ENTRIES];
     }
 
-    /// Stores a TLB entry and records the slot for the flushes; `flags` are the walk's
-    /// (`TLB_FLAG_GLOBAL`, `TLB_FLAG_LARGE`).
+    /// Stores the TLB entry for linear page `page` and records the slot for the flushes;
+    /// `flags` are the walk's (`TLB_FLAG_GLOBAL`, `TLB_FLAG_LARGE`).
     #[inline]
-    fn fill_tlb(&mut self, slot: usize, entry: TlbEntry, flags: TlbFlags) {
+    fn fill_tlb(&mut self, slot: usize, page: u64, entry: TlbEntry, flags: TlbFlags) {
         self.tlb[slot] = entry;
         let word = slot / u64::BITS as usize;
         let bit = 1 << (slot % u64::BITS as usize);
@@ -1137,6 +1143,7 @@ impl Cpu {
         }
         if flags & TLB_FLAG_LARGE != 0 {
             self.tlb_large[word] |= bit;
+            self.tlb_large_regions.add(page >> TLB_LARGE_REGION_SHIFT);
         } else {
             self.tlb_large[word] &= !bit;
         }
@@ -1147,7 +1154,8 @@ impl Cpu {
     /// it must drop them all (SDM 4.10.4.1): so every large-leaf entry of the same
     /// `TLB_LARGE_REGION_SHIFT` region goes as well. The large-page cache cannot say which leaf
     /// `linear` was in (it may have evicted it, it skips nested paging and 32-bit paging), and
-    /// the guest has usually rewritten the PDE already, so a walk cannot either.
+    /// the guest has usually rewritten the PDE already, so a walk cannot either. The scan is
+    /// skipped where `tlb_large_regions` says there is nothing, and rebuilds it where it runs.
     pub fn invlpg(&mut self, linear: u64) {
         for leaf in self.large_pages.iter_mut() {
             if leaf.shift != 0 && linear >> leaf.shift == leaf.linear_base >> leaf.shift {
@@ -1158,23 +1166,36 @@ impl Cpu {
         self.tlb[slot] = TLB_EMPTY;
         self.tlb[TLB_ENTRIES_PER_MODE + slot] = TLB_EMPTY;
         let region = linear >> TLB_LARGE_REGION_SHIFT;
-        let in_region = |tag: u64| {
-            tag != TLB_TAG_INVALID
-                && (tag & !TLB_TAG_SHADOW_STACK) >> TLB_LARGE_REGION_SHIFT == region
+        if !self.tlb_large_regions.may_hold(region) {
+            return;
+        }
+        // Every tag of an entry is for the same page, so the first valid one names its region.
+        let entry_region = |entry: &TlbEntry| {
+            [entry.tag_r, entry.tag_x, entry.tag_w]
+                .into_iter()
+                .find(|&tag| tag != TLB_TAG_INVALID)
+                .map(|tag| (tag & !TLB_TAG_SHADOW_STACK) >> TLB_LARGE_REGION_SHIFT)
         };
+        let mut remaining = LargeRegions::EMPTY;
         for (word_index, large_word) in self.tlb_large.iter_mut().enumerate() {
             let mut bits = *large_word;
             while bits != 0 {
                 let bit = bits.trailing_zeros() as usize;
                 bits &= bits - 1;
                 let slot = word_index * u64::BITS as usize + bit;
-                let entry = &self.tlb[slot];
-                if in_region(entry.tag_r) || in_region(entry.tag_w) || in_region(entry.tag_x) {
-                    self.tlb[slot] = TLB_EMPTY;
-                    *large_word &= !(1 << bit);
+                match entry_region(&self.tlb[slot]) {
+                    Some(other) if other != region => remaining.add(other),
+                    found => {
+                        // An entry already emptied (by the slot clear above) just loses its bit.
+                        if found.is_some() {
+                            self.tlb[slot] = TLB_EMPTY;
+                        }
+                        *large_word &= !(1 << bit);
+                    }
                 }
             }
         }
+        self.tlb_large_regions = remaining;
     }
 
     /// Reads `size` bytes (at most 8, all inside one page) at a physical address: RAM, else
@@ -3047,6 +3068,67 @@ mod tests {
                 translate(&mut h, GIGA_VA + far, AccessKind::Read),
                 0x4000_0000 + far
             );
+        }
+
+        /// Maps a 1 GiB leaf at `GIGA_VA` plus `index` GiB onto physical 0 and fills one of
+        /// its pages into the TLB, in a slot of its own; returns the leaf's PTE address.
+        fn fill_giga_leaf(h: &mut Harness, tables: &mut PageTables, index: u64, extra: u64) -> u64 {
+            let base = GIGA_VA + (index << 30);
+            let leaf = tables.map(&mut h.cpu, base, 0, &[FULL, FULL | PTE_A | PTE_D | extra]);
+            translate(h, base + index * PAGE, AccessKind::Read);
+            leaf
+        }
+
+        /// Points the leaf `fill_giga_leaf` made at another GiB, INVLPGs another page of it and
+        /// checks the filled page follows.
+        #[track_caller]
+        fn remap_and_check(h: &mut Harness, leaf: u64, index: u64) {
+            let base = GIGA_VA + (index << 30);
+            write_pte(
+                &mut h.cpu,
+                leaf,
+                0x4000_0000 | FULL | PTE_PS | PTE_A | PTE_D,
+            );
+            h.cpu.invlpg(base + 0x1fff_f000);
+            assert_eq!(
+                translate(h, base + index * PAGE, AccessKind::Read),
+                0x4000_0000 + index * PAGE,
+                "leaf {index}"
+            );
+        }
+
+        #[test]
+        fn invlpg_still_drops_large_leaf_pages_in_more_regions_than_are_tracked() {
+            let (mut h, mut tables) = paged();
+            let count = LARGE_REGIONS_TRACKED as u64 + 1;
+            let leaves: Vec<u64> = (0..count)
+                .map(|index| fill_giga_leaf(&mut h, &mut tables, index, 0))
+                .collect();
+            for (index, &leaf) in leaves.iter().enumerate().rev() {
+                remap_and_check(&mut h, leaf, index as u64);
+            }
+        }
+
+        #[test]
+        fn invlpg_elsewhere_leaves_large_leaf_pages_and_their_region_alone() {
+            let (mut h, mut tables) = paged();
+            let first = fill_giga_leaf(&mut h, &mut tables, 0, 0);
+            let second = fill_giga_leaf(&mut h, &mut tables, 1, 0);
+            // A 4 KiB page's INVLPG, as Linux mostly does, in a region with no large leaf (and
+            // a slot neither filled page uses).
+            h.cpu.invlpg(0x0000_7000_0000_5000);
+            // Its scan of region 1 must not forget region 0.
+            remap_and_check(&mut h, second, 1);
+            remap_and_check(&mut h, first, 0);
+        }
+
+        #[test]
+        fn a_global_large_leaf_page_kept_across_a_cr3_write_is_still_dropped_by_invlpg() {
+            let (mut h, mut tables) = paged();
+            h.cpu.cr4 |= CR4_PGE;
+            let leaf = fill_giga_leaf(&mut h, &mut tables, 0, PTE_GLOBAL);
+            h.cpu.flush_tlb_non_global();
+            remap_and_check(&mut h, leaf, 0);
         }
 
         #[test]
