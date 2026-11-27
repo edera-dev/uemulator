@@ -228,6 +228,14 @@ pub mod guids {
         0x4812,
         [0xb2, 0xba, 0x87, 0x91, 0xe5, 0x2d, 0x4a, 0x89],
     );
+    /// `ff3b21ff-5188-41d2-913a-51b6da7458f5`: uemulator's vendor-hardware node, the device path
+    /// of the handle a kernel the library placed in RAM is loaded from (`kernel_boot`).
+    pub const UEMULATOR_SUPPLIED_IMAGE: Guid = Guid::new(
+        0xff3b21ff,
+        0x5188,
+        0x41d2,
+        [0x91, 0x3a, 0x51, 0xb6, 0xda, 0x74, 0x58, 0xf5],
+    );
     pub const LOAD_FILE2: Guid = Guid::new(
         0x4006c0c1,
         0xfcb3,
@@ -245,6 +253,12 @@ pub mod guids {
         0xb6e8,
         0x4827,
         [0xb7, 0x84, 0x7f, 0xfd, 0xc4, 0xb6, 0x85, 0x61],
+    );
+    pub const PCI_ROOT_BRIDGE_IO: Guid = Guid::new(
+        0x2f707ebb,
+        0x4a1a,
+        0x11d4,
+        [0x9a, 0x38, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d],
     );
     pub const PCI_IO: Guid = Guid::new(
         0x4cf5b200,

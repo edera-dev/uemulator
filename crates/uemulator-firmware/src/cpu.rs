@@ -20,6 +20,16 @@ pub fn outb(port: u16, value: u8) {
     unsafe { asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack)) }
 }
 
+pub fn outw(port: u16, value: u16) {
+    unsafe { asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack)) }
+}
+
+pub fn inw(port: u16) -> u16 {
+    let value: u16;
+    unsafe { asm!("in ax, dx", out("ax") value, in("dx") port, options(nomem, nostack)) }
+    value
+}
+
 pub fn outl(port: u16, value: u32) {
     unsafe { asm!("out dx, eax", in("dx") port, in("eax") value, options(nomem, nostack)) }
 }
