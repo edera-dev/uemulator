@@ -9,6 +9,11 @@ struct MachineSettingsView: View {
     let onDelete: () -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var draft: MachineDefinition
+    // `bootFrom` when the sheet opened. An unattended install that finishes while the sheet is
+    // open switches the machine to `auto` (`settleBootstrap`); Done must not put the stale
+    // `installer` back, or the next start runs the interactive installer over the installed
+    // system. State, not a let: the view is re-made whenever the model changes.
+    @State private var openedBootFrom: BootFrom
     @State private var engine: EngineKind
     @State private var confirmingDelete = false
     @State private var picking: Pick?
@@ -42,6 +47,7 @@ struct MachineSettingsView: View {
         self.model = model
         self.onDelete = onDelete
         _draft = State(initialValue: model.definition)
+        _openedBootFrom = State(initialValue: model.definition.bootFrom)
         _engine = State(initialValue: model.kind)
     }
 
@@ -324,6 +330,8 @@ struct MachineSettingsView: View {
         removeCreatedDisks(keeping: draft.disks.map(\.url))
         // Named before the save, so its command line is saved with it; the file follows.
         if let newHypervisor { draft.hypervisor = newHypervisor.lastPathComponent }
+        // Left alone here, so whatever the machine has now stands (see `openedBootFrom`).
+        if draft.bootFrom == openedBootFrom { draft.bootFrom = model.definition.bootFrom }
         model.save(draft, engine: engine)
         let isos = newISOs, images = newImages, kernel = newKernel, initrd = newInitrd, hypervisor = newHypervisor
         guard !isos.isEmpty || !images.isEmpty || kernel != nil || initrd != nil || hypervisor != nil else {
