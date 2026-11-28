@@ -593,6 +593,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "uemulator-bootstrap"
+version = "0.1.0"
+dependencies = [
+ "uemulator-crypto",
+]
+
+[[package]]
 name = "uemulator-cli"
 version = "0.1.0"
 dependencies = [

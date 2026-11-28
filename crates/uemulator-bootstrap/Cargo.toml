@@ -1,0 +1,8 @@
+[package]
+name = "uemulator-bootstrap"
+description = "SHA-512 crypt password hashes and initramfs cpio appending for uemulator's quick bootstrap"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+uemulator-crypto = { path = "../uemulator-crypto" }
