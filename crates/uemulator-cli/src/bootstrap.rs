@@ -114,7 +114,6 @@ fn locale_from_lang(lang: Option<&str>) -> Option<String> {
 /// The plain layout name every installer accepts (`Answers::keymap`): console keymaps such as
 /// `de-latin1-nodeadkeys` lose their variant; anything that is not then two or three lowercase
 /// letters (`dvorak`, `fr_CH`) is not a layout all three know.
-#[cfg(any(target_os = "linux", test))]
 fn keymap_layout(keymap: &str) -> Option<String> {
     let layout = keymap.split('-').next()?;
     let plain = (2..=3).contains(&layout.len()) && layout.chars().all(|c| c.is_ascii_lowercase());
@@ -222,7 +221,8 @@ fn read_password(
 /// SHA-512 crypt with a fresh salt from the OS's random source.
 fn hash_password(password: &str) -> Result<String, String> {
     let mut random = [0u8; SALT_LEN];
-    getrandom::fill(&mut random).map_err(|e| format!("random salt for a password hash: {e}"))?;
+    getrandom::getrandom(&mut random)
+        .map_err(|e| format!("random salt for a password hash: {e}"))?;
     Ok(sha512_crypt(password, &salt_from_bytes(&random)))
 }
 
@@ -328,12 +328,22 @@ pub fn resolve_answers(
         packages,
     };
     answers.validate().map_err(|error| {
-        if hostname_given {
-            error
-        } else {
+        // `validate` names the field first, so this catches only the host name's own error.
+        if !hostname_given && error.starts_with("hostname") {
             format!("{error}; the machine name is the default, give --hostname NAME")
+        } else {
+            error
         }
     })?;
+    // `validate` takes any keymap-looking name, but a console keymap such as `de-latin1` is not
+    // a layout every installer knows, and an installer that does not know it stops and asks.
+    if keymap_layout(&answers.keymap).as_deref() != Some(answers.keymap.as_str()) {
+        return Err(format!(
+            "keymap {:?}: must be a layout name all the installers take, such as us, de or fr \
+             (de-latin1 is de)",
+            answers.keymap
+        ));
+    }
 
     let password_source =
         PasswordSource::given(&args.password, args.ask_password, &args.password_file);
@@ -490,17 +500,27 @@ fn read_secret_with(
     };
     // Echo goes off before the prompt shows: whatever is typed once it shows must not appear.
     let saved = stty(&["-g"]).ok_or_else(no_echo_control)?;
+    // Raw mode covers what is typed (Ctrl-C comes here as a byte); a SIGTERM or SIGHUP from
+    // outside during the prompt still leaves the terminal without echo.
     if stty(&["raw", "-echo"]).is_none() {
-        stty(&[&saved]);
+        restore_terminal(&stty, &saved);
         return Err(no_echo_control());
     }
     let line = write!(output, "{prompt}")
         .and_then(|()| output.flush())
         .and_then(|()| read_secret_line(input));
-    stty(&[&saved]);
+    restore_terminal(&stty, &saved);
     // The Enter that ended the line was not echoed either.
     writeln!(output)?;
     line
+}
+
+/// Puts back the settings `stty -g` saved. A failure is only reported: the password is read
+/// by then, and `stty sane` is what the person needs to know about.
+fn restore_terminal(stty: &impl Fn(&[&str]) -> Option<String>, saved: &str) {
+    if stty(&[saved]).is_none() {
+        eprintln!("warning: could not restore the terminal's settings; `stty sane` does");
+    }
 }
 
 /// `resolve_answers`'s `read_secret` for a person at the terminal: the prompt goes to stderr.
@@ -718,6 +738,44 @@ mod tests {
         };
         let error = refused(resolve(&args, None));
         assert!(error.contains("hostname"), "{error}");
+        assert!(!error.contains("--hostname"), "{error}");
+        // The hint is for a host name that came from the machine name, and only for that.
+        let error = refused(resolve_answers(
+            &args_with_password(Some("root")),
+            None,
+            "my_box",
+            false,
+            no_prompt,
+        ));
+        assert!(error.starts_with("user"), "{error}");
+        assert!(!error.contains("--hostname"), "{error}");
+        let error = refused(resolve_answers(
+            &args_with_password(Some("alex")),
+            None,
+            "my_box",
+            false,
+            no_prompt,
+        ));
+        assert!(error.starts_with("hostname"), "{error}");
+        assert!(error.contains("--hostname"), "{error}");
+    }
+
+    #[test]
+    fn a_keymap_must_be_a_plain_layout_name() {
+        for keymap in ["de-latin1", "dvorak", "US", "fr_CH"] {
+            let args = BootstrapArgs {
+                keymap: Some(keymap.into()),
+                ..args_with_password(Some("alex"))
+            };
+            let error = refused(resolve(&args, None));
+            assert!(error.starts_with("keymap"), "{keymap}: {error}");
+        }
+        let args = BootstrapArgs {
+            keymap: Some("de".into()),
+            ..args_with_password(Some("alex"))
+        };
+        let (answers, _) = resolve(&args, None).unwrap();
+        assert_eq!(answers.keymap, "de");
     }
 
     #[test]
