@@ -4,6 +4,8 @@ Minimal embeddable x86_64 system emulator in Rust. Boots an unmodified Linux bzI
 
 Read `docs/plans/README.md` first (`docs/README.md` indexes all the docs by topic); the plans are the source of truth for design and milestones (`docs/plans/10-milestones.md` for current status).
 
+New design docs and plans go in `docs/plans/NN-topic.md` (the next free number, with a status line, listed in `docs/plans/README.md` and `docs/README.md`), whatever a skill or tool suggests: never `docs/superpowers/` or another directory.
+
 ## Commands
 
 - Run: `cargo run --release -p uemulator-cli -- quick create test --install debian` then `-- quick boot test` (a named machine in `~/.uemulator/machines/test/`: `machine.toml`, the netboot kernel and initramfs in `artifacts/`, sparse disks; `UEMULATOR_HOME` moves `~/.uemulator`; `quick update-artifacts test` refetches and `quick reinstall test --install alpine` swaps the distro and keeps the disk; `quick create` gives a machine a NAT NIC by default so the installers can reach their mirrors) or `-- advanced boot --kernel K --initramfs I`
