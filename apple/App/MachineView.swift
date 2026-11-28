@@ -61,9 +61,13 @@ final class MachineModel: ObservableObject, ScreenInput {
     // boot printed (an installer's final screen, say).
     private var restartingAfterReset = false
     private let downloader = Downloader()
-    // This run is an unattended install (`MachineStore.pendingBootstrap`): its reset is the
-    // install's end, a success only once the console has shown the completion marker.
+    // This run is an unattended install (`MachineStore.pendingBootstrap`): however it ends, the
+    // install is over, a success only if the console has shown the completion marker.
     private var bootstrapRun = false
+    // The suspended state is of a bootstrap run, which its resume continues. Its own flag rather
+    // than "a request is pending": a request left behind would make any later resume look like
+    // an install.
+    private var suspendedBootstrapRun = false
     private var completionMarker = CompletionMarkerWatch()
     static let bootstrapFailedReason = "The installer reset before it finished. Use Reinstall… to try again."
 
@@ -153,6 +157,7 @@ final class MachineModel: ObservableObject, ScreenInput {
     func discardSuspended() {
         guard !isRunning else { return }
         store.discardSnapshot(name)
+        forgetSuspendedBootstrap()
         suspended = false
         if case .stopped(EngineState.suspendedReason) = state { state = .stopped("") }
     }
@@ -203,6 +208,7 @@ final class MachineModel: ObservableObject, ScreenInput {
                 self.releaseScope()
                 if reason == EngineState.suspendedReason {
                     self.store.recordSnapshot(self.name, disks: self.runningDisks)
+                    self.suspendedBootstrapRun = self.bootstrapRun
                 } else if reason.hasPrefix("Resume failed") {
                     // Kept: settings changed since the suspend can be put back. Settings can discard it.
                     self.problem = "\(reason). Put the machine's settings back as they were, or discard the suspended state in Settings."
@@ -223,10 +229,14 @@ final class MachineModel: ObservableObject, ScreenInput {
                 #endif
                 // Before the restarts below: their `boot` decides afresh whether the next run is one.
                 let wasBootstrapRun = self.bootstrapRun
-                // A suspended install is still one when it resumes; any other end is not.
+                // A suspended install is still one when it resumes; any other end is not. Nor is a
+                // resume that failed: its snapshot, and `suspendedBootstrapRun`, are kept.
+                let installEnded = wasBootstrapRun && reason != EngineState.suspendedReason && !reason.hasPrefix("Resume failed")
                 if reason != EngineState.suspendedReason { self.bootstrapRun = false }
-                if wasBootstrapRun && reason == EngineState.resetReason {
-                    self.bootstrapReset()
+                // Gone with the snapshot, which a resume uses up (the engine deletes it).
+                if !self.suspended { self.suspendedBootstrapRun = false }
+                if installEnded {
+                    self.settleBootstrap(afterReset: reason == EngineState.resetReason)
                 } else if reason == EngineState.resetReason && self.definition.reboot {
                     // Booted afresh, so an installer that rebooted comes up on its disk.
                     self.restartingAfterReset = true
@@ -237,26 +247,41 @@ final class MachineModel: ObservableObject, ScreenInput {
     }
 
     // The end of an unattended install (docs/plans/35-quick-bootstrap.md, "After the install"),
-    // whatever `reboot` says: the request is spent either way. After the marker the installed disk
-    // boots (`auto` finds it installed; a reinstall's `installer` must not run the install
-    // again). Without it, starting again would run an interactive installer nobody asked for.
-    private func bootstrapReset() {
+    // however it ended: a reset, the user's Stop, a poweroff, a triple fault. The request is spent
+    // either way, so a later Start never runs an unattended install (and erases the disk) the
+    // user did not just ask for. After the marker `boot_from` becomes `auto`, which finds the
+    // disk installed (a reinstall's `installer` would run the installer again), and a reset
+    // boots it at once, whatever `reboot` says; the marker can come well before the reset
+    // (Debian's late_command, Fedora's %post). A reset without it is a failed install, which
+    // stops rather than start an interactive installer nobody asked for.
+    private func settleBootstrap(afterReset: Bool) {
         store.pendingBootstrap[name] = nil
         guard completionMarker.seen else {
-            state = .stopped(Self.bootstrapFailedReason)
-            problem = Self.bootstrapFailedReason
+            if afterReset {
+                state = .stopped(Self.bootstrapFailedReason)
+                problem = Self.bootstrapFailedReason
+            }
             return
         }
         var changed = definition
         changed.bootFrom = .auto
         do {
             try store.save(changed, as: name)
+            definition = try store.load(name)
         } catch {
             problem = error.localizedDescription
             return
         }
+        guard afterReset else { return }
         restartingAfterReset = true
         start()
+    }
+
+    // The suspended state is going away unresumed: an install it held ends with it, request and
+    // all, as a stopped one does.
+    private func forgetSuspendedBootstrap() {
+        if suspendedBootstrapRun { store.pendingBootstrap[name] = nil }
+        suspendedBootstrapRun = false
     }
 
     // Reinstall…: the disk is erased by an unattended install of the same distro, with fresh
@@ -430,6 +455,8 @@ final class MachineModel: ObservableObject, ScreenInput {
         settings.cols = UInt16(clamping: size.cols)
         settings.rows = UInt16(clamping: size.rows)
         var cmdline = [definition.cmdline]
+        // The distro whose installer boots, for an unattended install's answers below.
+        var installer: Distro?
         if definition.firmware == .uefi {
             settings.firmwareImage = try? Data(contentsOf: Bundle.main.resourceURL!.appendingPathComponent("uemulator-firmware.bin"))
             guard settings.firmwareImage != nil else {
@@ -445,19 +472,7 @@ final class MachineModel: ObservableObject, ScreenInput {
             settings.kernel = kernel
             settings.initrd = (try? Data(contentsOf: store.initrd(name, install: distro))) ?? Data()
             cmdline.insert(distro.cmdline, at: 0)
-            if let request = store.pendingBootstrap[name] {
-                // The answers follow the distro's own installer arguments (the bootstrap crate's
-                // `Payload::cmdline`), before the user's.
-                do {
-                    let extended = try request.extend(settings.initrd, distro: distro)
-                    settings.initrd = extended.initrd
-                    cmdline.insert(extended.cmdline, at: 1)
-                    bootstrapRun = true
-                } catch {
-                    state = .stopped("The install's answers: \(error.localizedDescription)")
-                    return
-                }
-            }
+            installer = distro
         } else if definition.install == nil && definition.bootsKernel {
             guard let kernel = try? Data(contentsOf: store.kernel(name)) else {
                 state = .stopped("The kernel is missing")
@@ -467,7 +482,6 @@ final class MachineModel: ObservableObject, ScreenInput {
             settings.initrd = (try? Data(contentsOf: store.initrd(name))) ?? Data()
         }
         if definition.demo != nil { cmdline.append(Demo.hostArgument) }
-        settings.cmdlineAppend = cmdline.filter { !$0.isEmpty }.joined(separator: " ")
         settings.replaceCmdline = definition.replaceCmdline
         // A hypervisor boots the kernel as its dom0; an installed disk's boot loader cannot start
         // under it, so the disk boots without (the CLI refuses that combination instead).
@@ -504,16 +518,32 @@ final class MachineModel: ObservableObject, ScreenInput {
                     "resuming over them would corrupt them. The machine boots afresh."
             }
             store.discardSnapshot(name)
+            forgetSuspendedBootstrap()
             suspended = false
         }
         runningDisks = disks
-        if settings.resumeFrom == nil {
-            completionMarker = CompletionMarkerWatch()
-        } else {
+        if settings.resumeFrom != nil {
             // A resumed install is the same run, whatever its half-written disk makes `auto`
-            // choose above, and may have shown the marker before its suspend.
-            bootstrapRun = store.pendingBootstrap[name] != nil
+            // choose above, and may have shown the marker before its suspend. Its initramfs is
+            // in the snapshot: the answers are not rendered again.
+            bootstrapRun = suspendedBootstrapRun
+        } else {
+            completionMarker = CompletionMarkerWatch()
+            if let installer, let request = store.pendingBootstrap[name] {
+                // The answers follow the distro's own installer arguments (the bootstrap crate's
+                // `Payload::cmdline`), before the user's.
+                do {
+                    let extended = try request.extend(settings.initrd, distro: installer)
+                    settings.initrd = extended.initrd
+                    cmdline.insert(extended.cmdline, at: 1)
+                    bootstrapRun = true
+                } catch {
+                    state = .stopped("The install's answers: \(error.localizedDescription)")
+                    return
+                }
+            }
         }
+        settings.cmdlineAppend = cmdline.filter { !$0.isEmpty }.joined(separator: " ")
         // A resumed guest carries on where its console left off in this session.
         if !restartingAfterReset && settings.resumeFrom == nil { terminal.reset() }
         restartingAfterReset = false
