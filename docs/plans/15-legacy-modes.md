@@ -18,7 +18,7 @@ Real mode and virtual-8086 mode are `Bits16` with CR0.PE clear or EFLAGS.VM set.
 
 `decode_in_mode(bytes, mode)` resolves prefixes for the mode: `Insn::opsize` is already 2, 4 or 8, and `addr16`/`addr32` say what the effective address size is. `40..4f` are `inc`/`dec` outside 64-bit mode; `c4`/`c5` are VEX only when ModRM.mod would be 3 (else `les`/`lds`); the 64-bit invalid opcode set applies only in `Long64`; `mod=0, rm=5` is an absolute `disp32` (RIP-relative only in `Long64`); 16-bit ModRM uses the `[bx+si]` table (`ADDRESS16_REGISTERS`) and sets `ss_default` for `bp`-based forms (also `ebp`/`esp` in 32-bit code). `Insn::mode` records it, and the decode cache hit requires `insn.mode == code_mode()` so the same bytes decode once per mode.
 
-The JIT only compiles `Long64`: `Cpu::run` and `run_verify` call `step_block` only while `is_long64()`, and every instruction that can change CS, CR0, EFER or the page tables already ends a block (`ends_block`). The interpreter is the only implementation of everything in this document.
+The JIT only compiles `Long64`: `Cpu::run` and `run_verify` call `step_block` only while `is_long64()` (`Cpu::uses_jit`), and every instruction that can change CS, CR0, EFER or the page tables already ends a block (`ends_block`). The interpreter is the only implementation of everything in this document.
 
 ## Segmentation
 
@@ -61,7 +61,7 @@ A bzImage without `XLF_KERNEL_64` is no longer rejected: `boot::load` places it 
 
 ## Tests
 
-`cpu/legacy_tests.rs` holds 49 tests, generated from assembly snippets (`BITS=16 hack/asm.sh`, `BITS=32 hack/asm.sh`) and run on real-mode and flat 32-bit harnesses (`Harness::real`, `legacy_support::protected32`): 16-bit addressing and wrap, segment bases and limits, stack widths, real-mode interrupts, far jumps/calls, string ops, BCD, 32-bit gates, error codes, ring 3 to ring 0 and back through the TSS, V86 entry and exit, sysenter/sysexit, call gates with parameters, task switch and nested-task return, LDT, 16-bit code in protected mode, real mode to protected mode to long mode with the boot code a real loader runs, compatibility mode and the far jump back to 64-bit mode. `machine/tests.rs` boots a real-mode firmware image on the full machine under both JIT modes.
+`cpu/legacy_tests.rs` holds 60 tests, generated from assembly snippets (`BITS=16 hack/asm.sh`, `BITS=32 hack/asm.sh`) and run on real-mode and flat 32-bit harnesses (`Harness::real`, `legacy_support::protected32`): 16-bit addressing and wrap, segment bases and limits, stack widths, real-mode interrupts, far jumps/calls, string ops, BCD, 32-bit gates, error codes, ring 3 to ring 0 and back through the TSS, V86 entry and exit, sysenter/sysexit, call gates with parameters, task switch and nested-task return, LDT, 16-bit code in protected mode, real mode to protected mode to long mode with the boot code a real loader runs, compatibility mode and the far jump back to 64-bit mode. `machine/tests.rs` boots a real-mode firmware image on the full machine under both JIT modes.
 
 SVM guests may be in any of these modes (see 03, "SVM"); the VMRUN state swap also flushes the decode cache, since the same bytes decode differently per mode.
 

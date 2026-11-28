@@ -4,9 +4,9 @@
 
 ## Unit tests (`cargo test --release`)
 
-- `boot.rs`: parse the real bzImage header from the cache when present (skip if absent) and assert the numbers in 02.
+- `boot/tests.rs`: parse bzImage headers built by `testkit::FakeKernel` (no cached kernel) and assert the numbers in 02.
 - Decoder: byte sequences → expected `Insn` (length, operand shape) incl. prefixes, REX, RIP-relative, 0F 18–1F nops, ENDBR64.
-- Flags: `compute_all` vs reference formulas for every `cc_op` × width × edge values (0, 1, max, min, signed overflow).
+- Flags (`cpu/flags.rs`): the lazy evaluation vs reference formulas for every `LazyFlagsOp` × width × edge values (0, 1, max, min, signed overflow).
 - Devices: 16550 register protocol (probe sequence the 8250 driver uses), PIT counting against the clock, PIC priority/EOI.
 - aarch64 encoder: instruction bytes vs known encodings.
 
@@ -18,7 +18,7 @@ Optional oracle: build `../ext/qemu-uplink` out of tree (never write inside it) 
 
 ## Differential harness (JIT vs interpreter)
 
-Gated on `jit_available()`. For each snippet and a random-state fuzz corpus (random GPRs/flags/memory, random valid instruction forms from the decoder tables): run the TB in the interpreter and JIT from identical snapshots and compare GPRs, rflags (materialized), XMM, memory dirty pages, exit reason and exception vector/error code/CR2. Also run chained-TB loops and SMC (write to code page between runs) in both modes.
+`testkit::run_both`/`assert_jit_matches_interpreter`, which pass trivially on a host without a JIT. For each snippet (`jit/diff_*.rs`) and a fixed-seed random corpus (`jit/diff_random.rs`: straight-line programs from instruction templates over seeded registers and memory): run it in the interpreter and JIT from identical starting states and compare GPRs, rflags (materialized), vector and x87 state, instruction count, all of RAM, and the stop reason (exception vector/error code/CR2). The same corpus runs on the WebAssembly backend under Node (CLAUDE.md). Also run chained-TB loops and SMC (write to code page between runs) in both modes.
 
 ## Boot tests (`tests/boot.rs`, `#[ignore]` unless cached assets exist or `UEMULATOR_BOOT=1`)
 
@@ -34,3 +34,5 @@ Both `JitMode::Off` and `On` run in CI-equivalent local runs. Record MIPS (icoun
 ## Debug aids (behind `log` hook, off by default)
 
 Opcode coverage report (#UD sites), last-N-instruction trace ring dumped on triple fault, `cc_op` histogram, TB stats (translated, flushed, chained).
+
+Done differently: `--debug` (`MachineConfig::debug`) dumps on exit the CPU state, the last instruction addresses (`Cpu::trace`), a histogram of the instructions that went through the interpreter from JIT blocks (`Cpu::helper_histogram`, what is left to lower), one of a guest hypervisor's #VMEXITs, and the guest's kernel log scanned from RAM. Not done: a #UD-site report, a `cc_op` histogram and reporting of the JIT's block counts (`JitStats`: translated, flushes, links), which only tests read.

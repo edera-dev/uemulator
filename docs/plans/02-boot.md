@@ -13,7 +13,7 @@
 - `cmdline_size` max 2047
 - initrd.gz: ~39 MB (Debian installer)
 
-Re-run the header parse in `boot.rs` tests so the numbers in this file stay verified.
+These numbers come from a one-off inspection; no test pins them (unit tests may not read a cached kernel, so `boot/tests.rs` builds bzImages with `testkit::FakeKernel`).
 
 The loader accepts protocol 2.12 and newer (2.12 added `xloadflags`, the newest field it reads), so memtest86+ (`mt86+x64`, protocol 2.12, XLF_KERNEL_64) boots directly too, and through the UEFI firmware by its EFI stub: `advanced boot --kernel mt86+x64 --cmdline console=ttyS0,115200 --console serial` (add `--cpus N` for its SMP tests). Its startup reloads CS with `ljmp *m16:32` in 64-bit mode.
 
@@ -21,13 +21,13 @@ The loader accepts protocol 2.12 and newer (2.12 added `xloadflags`, the newest 
 
 Follow the kernel's 64-bit boot protocol (Documentation/arch/x86/boot.rst, "64-bit Boot Protocol") and QEMU's `x86_load_linux` for the boot_params layout:
 
-1. Copy setup header (0x1F1..) into a zeroed `boot_params` (4 KiB) and patch fields: `type_of_loader=0xFF`, `loadflags |= LOADED_HIGH|KEEP_SEGMENTS?` (check), `cmd_line_ptr`, `ramdisk_image/size`, `hdr.heap_end_ptr` unused for 64-bit.
+1. Copy setup header (0x1F1..) into a zeroed `boot_params` (4 KiB) and patch fields: `type_of_loader=0xFF`, `loadflags |= CAN_USE_HEAP` (as built; KEEP_SEGMENTS is obsolete), `cmd_line_ptr`, `ramdisk_image/size`, `hdr.heap_end_ptr` unused for 64-bit.
 2. Copy protected-mode kernel (file offset `(setup_sects+1)*512`) to `0x1000000`.
 3. cmdline NUL-terminated at e.g. `0x20000`; boot_params at `0x7000`; initrd at top of low RAM (below 4 GiB, page aligned, below `initrd_addr_max` header field) — 512 MiB default RAM keeps it simple.
 4. e820 table in `boot_params.e820_table`, `e820_entries`:
    - `0x0 – 0x9FC00` usable (kernel needs low memory for trampoline), reserved `0x9FC00 – 0x100000`, usable `0x100000 – top`.
-5. Initial CPU state: long mode active (CR0.PE|PG, CR4.PAE, EFER.LME|LMA), identity-mapped page tables covering the first 4 GiB (2 MiB pages) placed at e.g. `0x9000`; GDT with `__BOOT_CS` at selector 0x10 (64-bit code) and `__BOOT_DS` at 0x18 per protocol; `RIP = 0x1000200`; `RSI = &boot_params`; interrupts masked; `CLD`; other GPRs zero.
-6. No ACPI, no MP table → `acpi=off` (superseded for `EmulatedMachine`: `boot::load_with_acpi` publishes tables, see 07; `Platform` hosts still say `acpi=off`). No LAPIC/IOAPIC in CPUID → kernel uses 8259 PIC + PIT.
+5. Initial CPU state: long mode active (CR0.PE|PG, CR4.PAE, EFER.LME|LMA), identity-mapped page tables at `0x9000` covering the first 4 GiB with 2 MiB pages and, as built, the rest of the first TiB with 1 GiB pages (`boot.rs`, so RAM above 4 GiB is mapped too); GDT with `__BOOT_CS` at selector 0x10 (64-bit code) and `__BOOT_DS` at 0x18 per protocol; `RIP = 0x1000200`; `RSI = &boot_params`; interrupts masked; `CLD`; other GPRs zero.
+6. No ACPI, no MP table → `acpi=off` (superseded for `EmulatedMachine`: `boot::load_with_acpi` publishes tables, see 07; `Platform` hosts still say `acpi=off`). No LAPIC/IOAPIC in CPUID → kernel uses 8259 PIC + PIT (superseded: the machine has a local APIC per vCPU, an IOAPIC and HPET, all in the MADT/CPUID; 07, 03 "SMP").
 
 ## Things to verify during implementation
 
@@ -51,4 +51,4 @@ The default command lines leave KASLR on. Checked on the Alpine 6.18 virt kernel
 
 ## Reset
 
-Port 0x64←0xFE, port 0xCF9 reset bits, and triple fault → machine exit (`ExitReason::Reset`/`TripleFault`). Kernel `reboot=` defaults then terminate automated runs; `panic=-1` makes panics reboot immediately.
+Port 0x64←0xFE, port 0xCF9 reset bits, and triple fault → machine exit (`ExitReason::Reset`/`TripleFault`). Kernel `reboot=` defaults then terminate automated runs; `panic=-1` makes panics reboot immediately. (Superseded for resets: by default the machine now restarts in place and only `reboot(false)` returns `Reset`; a triple fault still ends the run. See 01, "Rules".)

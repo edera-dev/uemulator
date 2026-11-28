@@ -20,7 +20,7 @@
 | 16550 | `hw/char/serial.c` |
 | PIC, PIT, RTC | `hw/intc/i8259.c`, `hw/timer/i8254.c`, `hw/rtc/mc146818rtc.c` |
 | port 0x61 | `hw/audio/pcspk.c` / `hw/i386/pc.c` (port92, kbd controller `hw/input/pckbd.c`) |
-| LAPIC (later) | `hw/intc/apic.c`, `apic_common.c` |
+| LAPIC | `hw/intc/apic.c`, `apic_common.c` |
 
 ## Fork triage (`git log $(git merge-base HEAD <latest upstream tag>)..HEAD`)
 

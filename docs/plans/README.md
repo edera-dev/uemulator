@@ -1,6 +1,6 @@
 # uemulator plans
 
-Index of the design plans, in reading order. Each file starts with a status line (implemented, partially implemented, proposal); several end with open questions to check against the QEMU tree or the kernel docs. [`../README.md`](../README.md) groups them by topic.
+Index of the design plans, in reading order. Each file starts with a status line (implemented, partially implemented, proposal, reference); several end with open questions to check against the QEMU tree or the kernel docs. [`../README.md`](../README.md) groups them by topic.
 
 | file | topic |
 |------|-------|
@@ -25,17 +25,17 @@ Index of the design plans, in reading order. Each file starts with a status line
 | 18-xen-dom0.md | Xen dom0 on a modern AMD machine through UEFI: ACPI, IOMMU wiring, SMP, firmware, Xen itself; status per step |
 | 19-uefi-firmware.md | the UEFI firmware, key-value store, handoff page |
 | 20-jit-perf.md | JIT performance: direct chaining, inline integer ops, SIMD fast paths, measured against the initramfs unpack |
-| 21-ryzen-7000-parity.md | the Zen 5 Turin CPU model and its speculation posture, and the remaining parity work with public documentation: LA57, PKU, CET, SVM extras, PerfMonV2, CPU profile (partly a proposal) |
+| 21-ryzen-7000-parity.md | the Zen 5 Turin CPU model and its speculation posture, and the parity work from public documentation: the small Zen extensions, LA57, PKU, CET, the SVM additions, PerfMonV2, LBR v2 and IBS (done); a selectable CPU profile with a Ryzen 7000 identity (proposal) |
 | 22-smp-threads.md | one host thread per vCPU: shared RAM and devices, the exclusive section, code invalidation across threads, atomics and x86 ordering, the thread-spawn provider |
 | 23-guest-io-perf.md | guest-visible performance (syscalls, memcpy/memset, disk, network): the in-guest benchmarks in `hack/perf/guest/`, what bounded each and what changed |
 | 24-display-input.md | graphical console: virtio-gpu (2D), virtio-input keyboard and tablet, the boot framebuffer and the firmware's GOP and screen console, the display/input handles, `--display`, the CLI's web viewer |
 | 25-gpu-3d.md | guest 3D through virtio-gpu (partially implemented: the device side and `GpuLink`, and the web spike that clears through Mesa's virgl driver): virgl on WebGL2 against Venus on WebGPU, the render worker, fences, milestones |
 | 26-tpm-secure-boot.md | TPM 2.0 (CRB device, measured-boot command set), the firmware's TCG2 protocol and event log, Secure Boot with Microsoft's keys and authenticated variables, `uemulator-crypto` |
 | 27-wisp.md | internet for web guests through a Wisp relay over WebSocket; the user-mode gateway moved into the library and shared with the CLI (implemented) |
-| 28-apple.md | SwiftUI app for macOS, iOS and iPadOS (proposal): a native engine (JIT on macOS, interpreter on iOS) and a WebKit engine that runs the WebAssembly build and its JIT in a hidden `WKWebView`, the Xcode project, the bridge, milestones |
+| 28-apple.md | SwiftUI app for macOS, iOS and iPadOS (M0-M5 built: `apple/uemulator.xcodeproj`; the in-app network segment between machines is not): a native engine (JIT on macOS, interpreter on iOS) and a WebKit engine that runs the WebAssembly build and its JIT in a hidden `WKWebView`, the Xcode project, the bridge, milestones |
 | 29-snapshots.md | machine snapshots: suspend and resume through a host sink, the same on every host, so a machine moves between the native and WebAssembly builds; `#[derive(Snapshot)]`, I/O consistency, the iOS background flow (implemented) |
 | 30-gdb-stub.md | GDB remote stub: the RSP engine in the library (sans-I/O), breakpoints, watchpoints and single-step through the interpreter's debug path, a thread per vCPU, `--gdb` on the CLI (implemented) |
 | 31-host-fpu.md | SSE/AVX/AVX-512 floating point on the host FPU (`x-ssefp`): when the host's result is exactly soft-float's, the exactness checks and the fallbacks, per host (implemented) |
 | 34-incremental-snapshots.md | dirty-page tracking, snapshot format 2 (deltas, LZ page compression), checkpoints of a running machine and resuming a chain (implemented) |
 
-Rules for implementers: `../ext/qemu-uplink` is read-only reference. Behaviour and algorithms are studied there; code is written fresh in Rust, not transliterated. The library has zero crate dependencies when built with `--no-default-features`.
+Rules for implementers: `../ext/qemu-uplink` is read-only reference. Behaviour and algorithms are studied there; code is written fresh in Rust, not transliterated. Built with `--no-default-features` the library has no third-party dependencies on hosted targets (only the workspace's `uemulator-crypto` and `uemulator-snapshot-derive`; UEFI and wasm32 builds add `libm`).
