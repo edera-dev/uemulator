@@ -6,6 +6,7 @@ keyboard --vckeymap=de
 timezone Europe/Berlin --utc
 network --bootproto=dhcp --hostname=devbox
 url --url=https://dl.fedoraproject.org/pub/fedora/linux/releases/44/Server/x86_64/os/
+repo --name=everything --baseurl=https://dl.fedoraproject.org/pub/fedora/linux/releases/44/Everything/x86_64/os/
 user --name=alex --groups=wheel --iscrypted --password=$6$testsalt$fakeuserhash
 rootpw --iscrypted $6$testsalt$fakeroothash
 sshkey --username=alex "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyOne alex@laptop"
