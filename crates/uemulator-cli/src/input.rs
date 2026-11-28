@@ -80,6 +80,10 @@ impl TerminalInput {
                     *held = Some(chunk);
                     return;
                 }
+                // Not airtight: `ended` can flip between the check above and `handle`, and then
+                // this one chunk goes to the machine that just stopped and is lost. The window is
+                // a few instructions wide, against keystrokes typed while the next run starts;
+                // closing it would mean handing the chunk back from inside `handle`.
                 if !handle(&chunk) {
                     return;
                 }

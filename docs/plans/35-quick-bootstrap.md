@@ -62,7 +62,14 @@ the three distros `quick create --install` already knows.
 The rest of `quick create`'s options (memory, disk size, display, TPM and so on) work on `quick
 bootstrap` unchanged: it is `quick create --install` plus the answers. The exceptions are
 `--firmware none` and `--hypervisor`, which bootstrap refuses up front, because neither can boot
-the installed disk afterwards (`machines::prepare_boot` refuses both).
+the installed disk afterwards (`machines::prepare_boot` refuses both); `--display framebuffer`,
+which moves `/dev/console`, where the answer files print the completion marker, to the screen the
+run cannot watch (`--display both` gives the screen and keeps the console; an unattended `quick
+reinstall` of a machine saved with `framebuffer` is refused the same way, pointing at `quick
+edit --display both`); and a `--disk` image as the first disk, which every answer file erases
+without a question (`--create-disk` first keeps an attached image as a second disk; `quick
+create` plus `quick reinstall --user`, which asks, installs onto an existing image). The machine
+name is checked before any password is asked for.
 
 Passwords are hashed with SHA-512 crypt (`$6$`, random salt) as soon as they are read, and only
 the hash goes into the answer file. All three installers take a crypted password (Debian
@@ -87,6 +94,13 @@ again. So a bootstrap run turns it off and loops itself, the way the app already
   prompt, and later resets restart that system as `quick boot` would.
 - A reset without the marker (a failed or aborted install): stop the run with an error that names
   the machine and says to `quick reinstall` it. It does not loop. `boot_from` stays `installer`.
+- Any other end of the run (Ctrl-], `--timeout`, a poweroff) after the marker: save `boot_from =
+  auto`, as the app does, so the next `quick boot` boots the installed disk, but do not boot it
+  now. Before the marker `boot_from` stays `installer`.
+
+A new machine, CLI or app, is saved with `boot_from = installer` for its unattended install and
+switched to `auto` only by the marker, so a disk the installer partitioned and then failed on is
+never booted.
 
 The app does the same: its reset handler checks for the marker in the console output before it
 starts the machine again on the disk.
@@ -327,6 +341,9 @@ engine, `--root-password`, and an install with a screen (`--display`).
   reinstall error instead. Turning those errors into a reset is not done; skipping the name
   silently (kickstart's `%packages --ignoremissing`) would be worse.
 - `--timeout` restarts with the installed system's boot, so a bootstrap run can last up to twice
-  as long.
+  as long (its help on `quick bootstrap` and `quick reinstall` says so).
+- A key typed just as the installer's run ends can still reach the stopped machine and be lost
+  (`TerminalInput::attach`: the end is checked before each chunk is handed over, not atomically
+  with it).
 - Fedora's 4 GiB install is more than the app's WebKit engine allows (3 GiB): Fedora installs need
   the native engine.

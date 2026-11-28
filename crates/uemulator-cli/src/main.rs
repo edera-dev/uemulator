@@ -168,6 +168,7 @@ enum QuickCmd {
     /// reinstall` to repeat. --firmware none and --hypervisor are refused: neither can boot the
     /// installed disk.
     #[command(mut_arg("user", |user| user.required(true)))]
+    #[command(mut_arg("timeout", |timeout| timeout.help(BOOTSTRAP_TIMEOUT_HELP)))]
     Bootstrap {
         /// Machine name: letters, digits, '.', '_' and '-'
         name: String,
@@ -235,6 +236,7 @@ enum QuickCmd {
     /// answers, which the options here override and replace, and its first disk is erased after
     /// a question (--yes skips it). The passwords are not saved: they are asked for again, or
     /// given as options. Any other machine boots its distro's interactive installer.
+    #[command(mut_arg("timeout", |timeout| timeout.help(BOOTSTRAP_TIMEOUT_HELP)))]
     Reinstall {
         /// The machine to reinstall
         name: String,
@@ -380,6 +382,11 @@ fn refuse_uefi_args(uefi: &UefiBootArgs, firmware: args::Firmware) -> Result<(),
     Ok(())
 }
 
+/// `--timeout` on the commands that run an unattended install and then boot the installed disk:
+/// each of the two runs gets the whole timeout.
+const BOOTSTRAP_TIMEOUT_HELP: &str = "Stop the machine after this many seconds: once for the \
+    installer, and again for the installed system's boot that follows a finished install";
+
 const INSTALLER_BOOT_MENU: &str =
     "--boot-menu is for disk boots: the installer's kernel is booted directly, without the menu";
 
@@ -446,19 +453,25 @@ enum AfterInstaller {
     BootDisk,
     /// The guest reset before the install said it had finished.
     Failed,
-    /// The run is over: the host stopped or suspended it (Ctrl-], `--timeout`), or the guest
-    /// powered off or failed. The machine stays on its installer.
+    /// The install finished, but the run ended some other way before the disk boot: the host
+    /// stopped or suspended it (Ctrl-], `--timeout`) or the guest powered off. The machine is
+    /// switched to its disk, as the app does, so the next `quick boot` does not install again.
+    Installed,
+    /// The run is over before the install finished: the host stopped or suspended it, or the
+    /// guest powered off or failed. The machine stays on its installer.
     Done,
 }
 
 /// What `quick bootstrap` does once its installer run has ended. The answer files print the
 /// marker and then reboot, and the run has `no_reboot` set, so only a reset is the install's own
-/// end; any other reason is reported as `quick boot` would, marker or not.
+/// end and only a reset boots the disk; any other reason is reported as `quick boot` would, but
+/// once the marker was seen the install is done whichever way the run ended.
 fn after_installer(reason: &ExitReason, marker_seen: bool) -> AfterInstaller {
-    match reason {
-        ExitReason::Reset if marker_seen => AfterInstaller::BootDisk,
-        ExitReason::Reset => AfterInstaller::Failed,
-        _ => AfterInstaller::Done,
+    match (reason, marker_seen) {
+        (ExitReason::Reset, true) => AfterInstaller::BootDisk,
+        (ExitReason::Reset, false) => AfterInstaller::Failed,
+        (_, true) => AfterInstaller::Installed,
+        (_, false) => AfterInstaller::Done,
     }
 }
 
@@ -487,6 +500,10 @@ fn run_bootstrap(
     let name = machine.name.clone();
     match after_installer(&reason, watch.seen()) {
         AfterInstaller::Done => Ok(reason),
+        AfterInstaller::Installed => {
+            machine.set_boot_from(args::BootSource::Auto)?;
+            Ok(reason)
+        }
         AfterInstaller::Failed => Err(format!(
             "the installer of {name} reset before it finished: run `uemulator quick reinstall \
              {name}` to try again"
@@ -554,6 +571,7 @@ fn prepare_reinstall(
         return Ok((machine, None));
     }
     bootstrap::refuse_unbootable_machine(machine.firmware, machine.hypervisor.is_some(), name)?;
+    bootstrap::refuse_framebuffer_machine(machine.settings.display, name)?;
     let mut saved = machine.bootstrap.clone();
     if request.no_root_password
         && let Some(record) = &mut saved
@@ -688,7 +706,12 @@ fn quick_command(cmd: QuickCmd) -> Result<Option<ExitReason>, String> {
             uefi,
             mut runtime,
         } => {
+            // Before anything else, the password prompt included: `machines::exists` below
+            // would look outside the machines directory for a name such as `../x`.
+            machines::validate_name(&name)?;
             bootstrap::refuse_unbootable(firmware.firmware, &linux.hypervisor)?;
+            bootstrap::refuse_attached_first_disk(&hardware.disk_steps)?;
+            bootstrap::refuse_framebuffer_display(hardware.display)?;
             run::refuse_runtime_conflicts(&runtime)?;
             if runtime.resume_from.is_some() {
                 return Err(format!(
@@ -1567,8 +1590,8 @@ mod tests {
             after_installer(&ExitReason::Reset, false),
             AfterInstaller::Failed
         );
-        // Ctrl-], --timeout and --suspend-to end the run as they would any other, marker or
-        // not: the machine stays on its installer.
+        // Ctrl-], --timeout and --suspend-to end the run as they would any other; only the
+        // marker decides whether the machine moves to its disk for the next boot.
         let others = [
             ExitReason::Shutdown,
             ExitReason::Stopped,
@@ -1579,13 +1602,16 @@ mod tests {
             ExitReason::Internal("x".into()),
         ];
         for reason in &others {
-            for marker_seen in [false, true] {
-                assert_eq!(
-                    after_installer(reason, marker_seen),
-                    AfterInstaller::Done,
-                    "{reason:?} marker {marker_seen}"
-                );
-            }
+            assert_eq!(
+                after_installer(reason, false),
+                AfterInstaller::Done,
+                "{reason:?}"
+            );
+            assert_eq!(
+                after_installer(reason, true),
+                AfterInstaller::Installed,
+                "{reason:?}"
+            );
         }
     }
 
@@ -1594,10 +1620,16 @@ mod tests {
         let home = crate::test_support::TempDir::new("main-bootstrap-refused");
         let home_text = home.path().to_str().unwrap().to_string();
         let _env = crate::test_support::EnvGuard::set(&[("UEMULATOR_HOME", Some(&home_text))]);
+        let image = home.path().join("precious.img");
+        std::fs::write(&image, vec![1u8; 4096]).unwrap();
+        let image = image.to_str().unwrap();
         for extra in [
             &["--firmware", "none"][..],
             &["--hypervisor", "xen.gz"][..],
             &["--resume-from", "old.snapshot"][..],
+            &["--disk", image][..],
+            &["--disk", image, "--create-disk", "1024"][..],
+            &["--display", "framebuffer"][..],
         ] {
             let mut args = vec!["--user", "alex", "--password", "pw"];
             args.extend_from_slice(extra);
@@ -1610,6 +1642,63 @@ mod tests {
                 !home.path().join("machines/m").exists(),
                 "{extra:?} left a machine behind"
             );
+        }
+    }
+
+    /// The name is checked before the password: a bad one must not cost the user a prompt, and
+    /// `machines::exists` must not look outside the machines directory. A missing password
+    /// file stands in for the prompt (tests may run on a terminal).
+    #[test]
+    fn bootstrap_checks_the_name_before_the_password() {
+        let home = crate::test_support::TempDir::new("main-bootstrap-bad-name");
+        let home_text = home.path().to_str().unwrap().to_string();
+        let _env = crate::test_support::EnvGuard::set(&[("UEMULATOR_HOME", Some(&home_text))]);
+        for name in ["../x", ".hidden", "a/b"] {
+            let cli = parse(&[
+                "quick",
+                "bootstrap",
+                name,
+                "--install",
+                "debian",
+                "--user",
+                "alex",
+                "--password-file",
+                "/nonexistent/password",
+            ])
+            .unwrap();
+            let error = match execute(cli) {
+                Err(error) => error,
+                Ok(_) => panic!("{name} was bootstrapped"),
+            };
+            assert!(error.starts_with("invalid machine name"), "{name}: {error}");
+        }
+    }
+
+    /// The installed disk boots only on a reset, but `--display both` is fine and
+    /// `--create-disk` before `--disk` puts the attached image second, where it is not erased.
+    #[test]
+    fn bootstrap_takes_a_screen_and_an_attached_second_disk() {
+        let image = std::path::Path::new("/images/data.img");
+        let cli = bootstrap_parse(&[
+            "--user",
+            "alex",
+            "--ask-password",
+            "--create-disk",
+            "1024",
+            "--disk",
+            image.to_str().unwrap(),
+            "--display",
+            "both",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::Quick {
+                cmd: QuickCmd::Bootstrap { hardware, .. },
+            } => {
+                assert!(bootstrap::refuse_attached_first_disk(&hardware.disk_steps).is_ok());
+                assert!(bootstrap::refuse_framebuffer_display(hardware.display).is_ok());
+            }
+            _ => unreachable!(),
         }
     }
 
@@ -2613,6 +2702,15 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_timeout_help_says_it_applies_twice() {
+        for path in [&["quick", "bootstrap"][..], &["quick", "reinstall"]] {
+            let help = help_of(path);
+            assert!(help.contains("once for the installer"), "{path:?}: {help}");
+        }
+        assert!(!help_of(&["quick", "boot"]).contains("once for the installer"));
+    }
+
+    #[test]
     fn edit_help_explains_how_removals_and_additions_combine() {
         let help = help_of(&["quick", "edit"]);
         assert!(help.contains("Removals apply first"), "{help}");
@@ -2907,6 +3005,37 @@ mod tests {
         .err()
         .unwrap();
         assert!(error.contains("--yes"), "{error}");
+    }
+
+    #[test]
+    fn unattended_reinstall_of_a_framebuffer_machine_is_refused_before_touching_artifacts() {
+        let home = reinstall_home("main-reinstall-framebuffer", Some(saved_record()));
+        machines::edit(
+            home.path(),
+            "m",
+            &hardware(&["--display", "framebuffer"]),
+            &LinuxArgs::default(),
+            &RemoveArgs::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let bootstrap = BootstrapArgs {
+            password_file: Some(password_file(&home)),
+            ..BootstrapArgs::default()
+        };
+        let uefi = UefiBootArgs::default();
+        let error = prepare_reinstall(
+            home.path(),
+            &request(&bootstrap, &uefi),
+            false,
+            never_asked,
+            never_asked,
+            |_, _| panic!("fetched for a machine that cannot report its install"),
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("--display both"), "{error}");
     }
 
     #[test]
