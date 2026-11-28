@@ -227,14 +227,32 @@ enum QuickCmd {
         #[command(flatten)]
         runtime: Box<RuntimeArgs>,
     },
-    /// Throw away a machine's kernel and initramfs and download fresh ones; the disk and the
-    /// configuration are kept
+    /// Install a machine's distro again, then boot
+    ///
+    /// The kernel and initramfs are downloaded fresh; the settings are kept. A machine made by
+    /// `quick bootstrap` (or any machine, given --user) is installed unattended with its saved
+    /// answers, which the options here override and replace, and its first disk is erased after
+    /// a question (--yes skips it). The passwords are not saved: they are asked for again, or
+    /// given as options. Any other machine boots its distro's interactive installer.
     Reinstall {
         /// The machine to reinstall
         name: String,
         /// Switch the machine to another distro [default: the one it has]
         #[arg(long, value_name = "DISTRO")]
         install: Option<Distro>,
+        /// Boxed, as `runtime` is: together they would make this variant the size of the enum.
+        #[command(flatten)]
+        bootstrap: Box<BootstrapArgs>,
+        /// Erase the disk without asking; required when stdin is not a terminal to ask on
+        #[arg(long)]
+        yes: bool,
+        /// Give root no password this time, though the saved answers say it had one
+        #[arg(long, conflicts_with = "root_password_source")]
+        no_root_password: bool,
+        #[command(flatten)]
+        uefi: UefiBootArgs,
+        #[command(flatten)]
+        runtime: Box<RuntimeArgs>,
     },
     /// Download the current kernel and initramfs of the machine's distro
     UpdateArtifacts {
@@ -485,6 +503,125 @@ fn run_bootstrap(
     }
 }
 
+/// What `quick reinstall` was asked to do, short of running anything.
+struct ReinstallRequest<'a> {
+    name: &'a str,
+    install: Option<Distro>,
+    bootstrap: &'a BootstrapArgs,
+    yes: bool,
+    no_root_password: bool,
+    uefi: &'a UefiBootArgs,
+}
+
+/// Readies `quick reinstall` (`docs/plans/35-quick-bootstrap.md`, "Reinstall"): the machine with
+/// fresh artifacts and the new answers saved, and the answers when the reinstall is unattended
+/// (the machine has saved answers, or --user is given). Everything that can refuse runs first,
+/// the passwords and the erase question included: until the artifacts are thrown away a refused
+/// reinstall leaves the machine as it was, still booting its installed system.
+fn prepare_reinstall(
+    home: &std::path::Path,
+    request: &ReinstallRequest,
+    tty: bool,
+    read_secret: impl FnMut(&str) -> std::io::Result<String>,
+    ask: impl FnMut(&str) -> std::io::Result<String>,
+    fetch: impl FnMut(&str, &std::path::Path) -> Result<(), String>,
+) -> Result<(machines::Machine, Option<uemulator_bootstrap::Answers>), String> {
+    let name = request.name;
+    let mut machine = machines::load(home, name)?;
+    refuse_uefi_args(request.uefi, machine.firmware)?;
+    let unattended = machine.bootstrap.is_some() || request.bootstrap.user.is_some();
+    if !unattended {
+        if request.bootstrap.any() || request.no_root_password {
+            return Err(format!(
+                "{name} has no saved answers, so it reinstalls with the interactive installer: \
+                 give --user NAME to install it unattended with these answers"
+            ));
+        }
+        let machine = machines::reinstall(home, name, request.install, None, fetch)?;
+        return Ok((machine, None));
+    }
+    bootstrap::refuse_unbootable_machine(machine.firmware, machine.hypervisor.is_some(), name)?;
+    let mut saved = machine.bootstrap.clone();
+    if request.no_root_password
+        && let Some(record) = &mut saved
+    {
+        record.root_password = false;
+    }
+    let (answers, record) =
+        bootstrap::resolve_answers(request.bootstrap, saved.as_ref(), name, tty, read_secret)?;
+    // The question names the distro being installed, which --install may have changed.
+    machine.install = request.install.unwrap_or(machine.install);
+    confirm_erase(&machine, tty, request.yes, ask)?;
+    let machine = machines::reinstall(home, name, request.install, Some(record), fetch)?;
+    Ok((machine, Some(answers)))
+}
+
+/// Asks before an unattended install erases `machine`'s first disk, the one the answer files
+/// install to; the installer itself no longer asks. `yes` (--yes) answers for the user, and
+/// without a terminal it is the only answer. A machine without a disk has nothing to erase.
+fn confirm_erase(
+    machine: &machines::Machine,
+    tty: bool,
+    yes: bool,
+    mut ask: impl FnMut(&str) -> std::io::Result<String>,
+) -> Result<(), String> {
+    let Some(disk) = machine.settings.disks.first() else {
+        return Ok(());
+    };
+    if yes {
+        return Ok(());
+    }
+    // A disk the machine made is named by its file, as `quick show` lists the machine's own;
+    // one attached with --disk lives elsewhere and gets its whole path.
+    let shown = match (disk.path.parent(), disk.path.file_name()) {
+        (Some(parent), Some(file)) if parent == machine.dir => file.to_string_lossy(),
+        _ => disk.path.to_string_lossy(),
+    };
+    let size = images::open_disk(&images::Location::File(disk.path.clone()), true)
+        .map_err(|e| format!("open {}: {e}", disk.path.display()))?
+        .len();
+    let question = format!(
+        "Erase {shown} ({}) and install {}? [y/N]",
+        size_in_words(size),
+        machine.install.title()
+    );
+    if !tty {
+        return Err(format!(
+            "the unattended install erases {shown} and stdin is not a terminal to ask on: give \
+             --yes to erase it"
+        ));
+    }
+    let answer = ask(&question).map_err(|e| format!("read the answer: {e}"))?;
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Ok(()),
+        _ => Err("not reinstalled".into()),
+    }
+}
+
+/// A disk size as a person would say it: whole GiB or MiB when it is one, else bytes.
+fn size_in_words(bytes: u64) -> String {
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+    if bytes != 0 && bytes.is_multiple_of(GIB) {
+        format!("{} GiB", bytes / GIB)
+    } else if bytes != 0 && bytes.is_multiple_of(MIB) {
+        format!("{} MiB", bytes / MIB)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
+/// Prints `question` on stderr and reads one line of answer from stdin, echoed as typed.
+fn ask_on_terminal(question: &str) -> std::io::Result<String> {
+    use std::io::Write;
+    let mut stderr = std::io::stderr();
+    write!(stderr, "{question} ")?;
+    stderr.flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(answer)
+}
+
 /// `None` is a command that did not run a machine.
 fn quick_command(cmd: QuickCmd) -> Result<Option<ExitReason>, String> {
     let home = machines::home()?;
@@ -567,7 +704,8 @@ fn quick_command(cmd: QuickCmd) -> Result<Option<ExitReason>, String> {
             )?;
             machines::fetch_artifacts(&machine, quick::download).map_err(|e| {
                 format!(
-                    "{e}\nmachine {name} was created; `quick reinstall {name}` retries the download"
+                    "{e}\nmachine {name} was created; `uemulator quick reinstall {name}` retries \
+                     the download"
                 )
             })?;
             eprint!("{}", machines::describe(&machine));
@@ -627,14 +765,56 @@ fn quick_command(cmd: QuickCmd) -> Result<Option<ExitReason>, String> {
                 .is_some_and(checkpoints::is_checkpoint);
             boot_launch(launch, &uefi, &runtime).map(Some)
         }
-        QuickCmd::Reinstall { name, install } => {
-            let machine = machines::reinstall(&home, &name, install, quick::download)?;
-            eprintln!(
-                "{name} will install {}; its disks and settings are unchanged. It boots the \
-                 installer until `quick edit {name} --boot-from auto`",
-                machine.install.name()
-            );
-            Ok(None)
+        QuickCmd::Reinstall {
+            name,
+            install,
+            bootstrap: bootstrap_args,
+            yes,
+            no_root_password,
+            uefi,
+            mut runtime,
+        } => {
+            run::refuse_runtime_conflicts(&runtime)?;
+            if runtime.resume_from.is_some() {
+                return Err(format!(
+                    "--resume-from: reinstall starts the install over; resume a machine with \
+                     `uemulator quick boot {name} --resume-from FILE`"
+                ));
+            }
+            let tty = std::io::stdin().is_terminal();
+            let request = ReinstallRequest {
+                name: &name,
+                install,
+                bootstrap: &bootstrap_args,
+                yes,
+                no_root_password,
+                uefi: &uefi,
+            };
+            let (mut machine, answers) = prepare_reinstall(
+                &home,
+                &request,
+                tty,
+                bootstrap::read_secret_from_terminal,
+                ask_on_terminal,
+                quick::download,
+            )?;
+            eprint!("{}", machines::describe(&machine));
+            match answers {
+                Some(answers) => run_bootstrap(&mut machine, &answers, &uefi, &mut runtime),
+                None => {
+                    let launch = machines::prepare_boot(
+                        &machine,
+                        &HardwareArgs::default(),
+                        &LinuxArgs::default(),
+                        &RemoveArgs::default(),
+                        None,
+                        None,
+                        quick::download,
+                    )?;
+                    boot_launch(launch, &uefi, &runtime)
+                }
+            }
+            .map(Some)
         }
         QuickCmd::UpdateArtifacts { name } => {
             machines::update_artifacts(&home, &name, quick::download)?;
@@ -883,6 +1063,7 @@ mod tests {
 
     use super::*;
     use crate::args::{ConsoleArg, DiskSpec, DiskStep, NetLink, NetModel, Nic, parse_disk_spec};
+    use crate::bootstrap::BootstrapRecord;
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         let mut argv = vec!["uemulator"];
@@ -2438,5 +2619,432 @@ mod tests {
         let path = dir.path().join("blob");
         std::fs::write(&path, [1u8, 2, 3, 0, 255]).unwrap();
         assert_eq!(read(&path).unwrap(), vec![1, 2, 3, 0, 255]);
+    }
+
+    fn reinstall_parse(extra: &[&str]) -> Result<Cli, clap::Error> {
+        let mut args = vec!["quick", "reinstall", "m"];
+        args.extend_from_slice(extra);
+        parse(&args)
+    }
+
+    #[test]
+    fn quick_reinstall_takes_the_answers_and_yes() {
+        match reinstall_parse(&["--user", "alex", "--password-file", "f", "--yes"])
+            .unwrap()
+            .cmd
+        {
+            Cmd::Quick {
+                cmd:
+                    QuickCmd::Reinstall {
+                        name,
+                        install,
+                        bootstrap,
+                        yes,
+                        no_root_password,
+                        ..
+                    },
+            } => {
+                assert_eq!(name, "m");
+                assert_eq!(install, None);
+                assert_eq!(bootstrap.user.as_deref(), Some("alex"));
+                assert_eq!(bootstrap.password_file, Some(PathBuf::from("f")));
+                assert!(yes);
+                assert!(!no_root_password);
+            }
+            _ => panic!("expected quick reinstall"),
+        }
+        // A reinstall repeats saved answers, so --user is optional there.
+        assert!(reinstall_parse(&[]).is_ok());
+    }
+
+    #[test]
+    fn yes_is_for_reinstall_only() {
+        assert_eq!(
+            bootstrap_parse(&["--user", "alex", "--ask-password", "--yes"])
+                .err()
+                .map(|e| e.kind()),
+            Some(ErrorKind::UnknownArgument)
+        );
+    }
+
+    #[test]
+    fn no_root_password_conflicts_with_giving_one() {
+        for given in [
+            "--root-password=x",
+            "--ask-root-password",
+            "--root-password-file=f",
+        ] {
+            assert_eq!(
+                reinstall_parse(&["--no-root-password", given])
+                    .err()
+                    .map(|e| e.kind()),
+                Some(ErrorKind::ArgumentConflict),
+                "{given}"
+            );
+        }
+        assert_eq!(
+            bootstrap_parse(&["--user", "alex", "--ask-password", "--no-root-password"])
+                .err()
+                .map(|e| e.kind()),
+            Some(ErrorKind::UnknownArgument)
+        );
+    }
+
+    fn reinstall_home(
+        label: &str,
+        record: Option<BootstrapRecord>,
+    ) -> crate::test_support::TempDir {
+        let home = crate::test_support::TempDir::new(label);
+        let machine = machines::create(
+            home.path(),
+            "m",
+            Distro::Alpine,
+            &HardwareArgs::default(),
+            &LinuxArgs::default(),
+            None,
+            None,
+            record,
+        )
+        .unwrap();
+        machines::fetch_artifacts(&machine, fake_fetch).unwrap();
+        home
+    }
+
+    fn fake_fetch(url: &str, destination: &std::path::Path) -> Result<(), String> {
+        std::fs::write(destination, url).map_err(|e| e.to_string())
+    }
+
+    fn saved_record() -> BootstrapRecord {
+        BootstrapRecord {
+            user: "alex".into(),
+            hostname: "box".into(),
+            ssh_keys: Vec::new(),
+            timezone: "UTC".into(),
+            locale: "en_US.UTF-8".into(),
+            keymap: "us".into(),
+            packages: vec!["vim".into()],
+            root_password: false,
+        }
+    }
+
+    fn never_asked(prompt: &str) -> std::io::Result<String> {
+        panic!("asked {prompt:?}")
+    }
+
+    fn request<'a>(bootstrap: &'a BootstrapArgs, uefi: &'a UefiBootArgs) -> ReinstallRequest<'a> {
+        ReinstallRequest {
+            name: "m",
+            install: None,
+            bootstrap,
+            yes: true,
+            no_root_password: false,
+            uefi,
+        }
+    }
+
+    fn password_file(home: &crate::test_support::TempDir) -> PathBuf {
+        let path = home.path().join("password");
+        std::fs::write(&path, "secret\n").unwrap();
+        path
+    }
+
+    #[test]
+    fn confirm_erase_needs_yes_without_tty() {
+        let home = reinstall_home("main-confirm-tty", None);
+        let machine = machines::load(home.path(), "m").unwrap();
+        let error = confirm_erase(&machine, false, false, never_asked).unwrap_err();
+        assert!(error.contains("--yes"), "{error}");
+        assert!(confirm_erase(&machine, false, true, never_asked).is_ok());
+        assert!(confirm_erase(&machine, true, true, never_asked).is_ok());
+    }
+
+    #[test]
+    fn confirm_erase_accepts_y_and_yes() {
+        let home = reinstall_home("main-confirm-answers", None);
+        let machine = machines::load(home.path(), "m").unwrap();
+        for answer in ["y", "Y", "yes", "YES", "Yes\n", " y \n"] {
+            let reply = || Ok(answer.to_string());
+            assert!(
+                confirm_erase(&machine, true, false, |_| reply()).is_ok(),
+                "{answer:?}"
+            );
+        }
+        for answer in ["", "\n", "n", "no", "yess", "sure"] {
+            let reply = || Ok(answer.to_string());
+            assert_eq!(
+                confirm_erase(&machine, true, false, |_| reply()),
+                Err("not reinstalled".into()),
+                "{answer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn confirm_erase_names_first_disk_and_size() {
+        let home = reinstall_home("main-confirm-prompt", None);
+        let mut machine = machines::load(home.path(), "m").unwrap();
+        machine.install = Distro::Fedora;
+        let mut prompts = Vec::new();
+        confirm_erase(&machine, true, false, |prompt| {
+            prompts.push(prompt.to_string());
+            Ok("y".into())
+        })
+        .unwrap();
+        assert_eq!(
+            prompts,
+            vec!["Erase disk-0.udisk (8 GiB) and install Fedora? [y/N]"]
+        );
+    }
+
+    #[test]
+    fn confirm_erase_of_a_machine_without_a_disk_asks_nothing() {
+        let home = reinstall_home("main-confirm-diskless", None);
+        let mut machine = machines::load(home.path(), "m").unwrap();
+        machine.settings.disks.clear();
+        assert!(confirm_erase(&machine, false, false, never_asked).is_ok());
+    }
+
+    #[test]
+    fn reinstall_with_record_and_no_password_off_tty_fails_before_touching_artifacts() {
+        let home = reinstall_home("main-reinstall-no-password", Some(saved_record()));
+        let machine = machines::load(home.path(), "m").unwrap();
+        let disk = machine.settings.disks[0].path.clone();
+        let disk_before = std::fs::read(&disk).unwrap();
+        let artifacts_before: Vec<_> = std::fs::read_dir(machine.artifacts_dir())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        let (bootstrap, uefi) = (BootstrapArgs::default(), UefiBootArgs::default());
+        let fetches = std::cell::Cell::new(0);
+        let error = prepare_reinstall(
+            home.path(),
+            &request(&bootstrap, &uefi),
+            false,
+            never_asked,
+            never_asked,
+            |url, destination| {
+                fetches.set(fetches.get() + 1);
+                fake_fetch(url, destination)
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("--password-file"), "{error}");
+        assert_eq!(fetches.get(), 0);
+        let artifacts_after: Vec<_> = std::fs::read_dir(machine.artifacts_dir())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(!artifacts_after.is_empty());
+        assert_eq!(artifacts_after, artifacts_before);
+        assert_eq!(std::fs::read(&disk).unwrap(), disk_before);
+        assert_eq!(
+            machines::load(home.path(), "m").unwrap().boot_from,
+            machine.boot_from
+        );
+    }
+
+    #[test]
+    fn reinstall_without_yes_off_tty_fails_before_touching_artifacts() {
+        let home = reinstall_home("main-reinstall-no-yes", Some(saved_record()));
+        let bootstrap = BootstrapArgs {
+            password_file: Some(password_file(&home)),
+            ..BootstrapArgs::default()
+        };
+        let uefi = UefiBootArgs::default();
+        let mut unconfirmed = request(&bootstrap, &uefi);
+        unconfirmed.yes = false;
+        let error = prepare_reinstall(
+            home.path(),
+            &unconfirmed,
+            false,
+            never_asked,
+            never_asked,
+            |_, _| panic!("fetched before the confirmation"),
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("--yes"), "{error}");
+    }
+
+    #[test]
+    fn reinstall_flag_overrides_saved_record_and_is_saved() {
+        let home = reinstall_home("main-reinstall-override", Some(saved_record()));
+        let bootstrap = BootstrapArgs {
+            password_file: Some(password_file(&home)),
+            hostname: Some("other".into()),
+            ..BootstrapArgs::default()
+        };
+        let uefi = UefiBootArgs::default();
+        let mut switch = request(&bootstrap, &uefi);
+        switch.install = Some(Distro::Debian);
+        let (machine, answers) = prepare_reinstall(
+            home.path(),
+            &switch,
+            false,
+            never_asked,
+            never_asked,
+            fake_fetch,
+        )
+        .unwrap();
+        let answers = answers.expect("a machine with a record reinstalls unattended");
+        assert_eq!(answers.hostname, "other");
+        assert_eq!(answers.user, "alex");
+        assert_eq!(answers.packages, vec!["vim"]);
+        let saved = machines::load(home.path(), "m").unwrap();
+        assert_eq!(saved.install, Distro::Debian);
+        assert_eq!(saved.boot_from, args::BootSource::Installer);
+        assert_eq!(
+            saved.bootstrap,
+            Some(BootstrapRecord {
+                hostname: "other".into(),
+                ..saved_record()
+            })
+        );
+        assert_eq!(machine.bootstrap, saved.bootstrap);
+        // The new distro's artifacts were fetched.
+        let (kernel_url, _) = Distro::Debian.source_urls();
+        let fetched = std::fs::read_dir(machine.artifacts_dir())
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect::<Vec<_>>();
+        assert!(fetched.iter().any(|url| url == kernel_url), "{fetched:?}");
+    }
+
+    #[test]
+    fn reinstall_with_user_makes_a_bootstrap_of_an_interactive_machine() {
+        let home = reinstall_home("main-reinstall-user", None);
+        let bootstrap = BootstrapArgs {
+            user: Some("sam".into()),
+            password_file: Some(password_file(&home)),
+            ..BootstrapArgs::default()
+        };
+        let uefi = UefiBootArgs::default();
+        let (_, answers) = prepare_reinstall(
+            home.path(),
+            &request(&bootstrap, &uefi),
+            false,
+            never_asked,
+            never_asked,
+            fake_fetch,
+        )
+        .unwrap();
+        assert_eq!(answers.unwrap().user, "sam");
+        let record = machines::load(home.path(), "m").unwrap().bootstrap.unwrap();
+        assert_eq!(record.user, "sam");
+    }
+
+    #[test]
+    fn reinstall_without_record_or_user_stays_interactive() {
+        let home = reinstall_home("main-reinstall-interactive", None);
+        let (bootstrap, uefi) = (BootstrapArgs::default(), UefiBootArgs::default());
+        let mut interactive = request(&bootstrap, &uefi);
+        interactive.yes = false;
+        let (machine, answers) = prepare_reinstall(
+            home.path(),
+            &interactive,
+            false,
+            never_asked,
+            never_asked,
+            fake_fetch,
+        )
+        .unwrap();
+        assert!(answers.is_none());
+        assert!(machine.bootstrap.is_none());
+        assert_eq!(machine.boot_from, args::BootSource::Installer);
+    }
+
+    #[test]
+    fn reinstall_refuses_answers_without_a_user_on_an_interactive_machine() {
+        let home = reinstall_home("main-reinstall-answers-no-user", None);
+        let bootstrap = BootstrapArgs {
+            hostname: Some("box".into()),
+            ..BootstrapArgs::default()
+        };
+        let uefi = UefiBootArgs::default();
+        let error = prepare_reinstall(
+            home.path(),
+            &request(&bootstrap, &uefi),
+            false,
+            never_asked,
+            never_asked,
+            |_, _| panic!("fetched"),
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("--user"), "{error}");
+    }
+
+    #[test]
+    fn no_root_password_drops_a_saved_root_password() {
+        let home = reinstall_home(
+            "main-reinstall-no-root",
+            Some(BootstrapRecord {
+                root_password: true,
+                ..saved_record()
+            }),
+        );
+        let bootstrap = BootstrapArgs {
+            password_file: Some(password_file(&home)),
+            ..BootstrapArgs::default()
+        };
+        let uefi = UefiBootArgs::default();
+        // Without the flag, root's password is asked for again, and there is no terminal.
+        let error = prepare_reinstall(
+            home.path(),
+            &request(&bootstrap, &uefi),
+            false,
+            never_asked,
+            never_asked,
+            |_, _| panic!("fetched"),
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("--root-password-file"), "{error}");
+        let mut dropped = request(&bootstrap, &uefi);
+        dropped.no_root_password = true;
+        let (_, answers) = prepare_reinstall(
+            home.path(),
+            &dropped,
+            false,
+            never_asked,
+            never_asked,
+            fake_fetch,
+        )
+        .unwrap();
+        assert_eq!(answers.unwrap().root_password_hash, None);
+        let record = machines::load(home.path(), "m").unwrap().bootstrap.unwrap();
+        assert!(!record.root_password);
+    }
+
+    #[test]
+    fn bootstrap_reinstall_refuses_firmware_none_and_a_hypervisor() {
+        let home = reinstall_home("main-reinstall-unbootable", Some(saved_record()));
+        machines::edit(
+            home.path(),
+            "m",
+            &HardwareArgs::default(),
+            &LinuxArgs::default(),
+            &RemoveArgs::default(),
+            None,
+            Some(args::Firmware::None),
+        )
+        .unwrap();
+        let bootstrap = BootstrapArgs {
+            password_file: Some(password_file(&home)),
+            ..BootstrapArgs::default()
+        };
+        let uefi = UefiBootArgs::default();
+        let error = prepare_reinstall(
+            home.path(),
+            &request(&bootstrap, &uefi),
+            false,
+            never_asked,
+            never_asked,
+            |_, _| panic!("fetched"),
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("firmware none"), "{error}");
     }
 }

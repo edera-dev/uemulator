@@ -395,10 +395,26 @@ pub struct BootstrapArgs {
     /// A distro package for the installer to add, by the distro's name for it. Repeat for more
     #[arg(long, value_name = "P")]
     pub package: Vec<String>,
-    /// Erase the disk without asking (`quick reinstall`; a new machine's disk is new, so
-    /// `quick bootstrap` never asks)
-    #[arg(long)]
-    pub yes: bool,
+}
+
+impl BootstrapArgs {
+    /// Whether any answer was given: on a machine without saved answers they make a reinstall
+    /// unattended, which needs --user, rather than being ignored by the interactive installer.
+    pub fn any(&self) -> bool {
+        self.user.is_some()
+            || self.password.is_some()
+            || self.ask_password
+            || self.password_file.is_some()
+            || self.root_password.is_some()
+            || self.ask_root_password
+            || self.root_password_file.is_some()
+            || self.hostname.is_some()
+            || !self.ssh_key.is_empty()
+            || self.timezone.is_some()
+            || self.locale.is_some()
+            || self.keymap.is_some()
+            || !self.package.is_empty()
+    }
 }
 
 /// Variables written into the nvram before a boot through the UEFI firmware.

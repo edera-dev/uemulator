@@ -611,17 +611,21 @@ pub fn fetch_artifacts(
     ensure_in(&machine.artifacts_dir(), machine.install, false, fetch)
 }
 
-/// Throws the artifacts away (the disk and the settings stay), optionally switches the distro, and
-/// fetches the new ones.
+/// Throws the artifacts away (the disk and the settings stay), optionally switches the distro and
+/// replaces the saved bootstrap answers (`None` keeps them), and fetches the new artifacts.
 pub fn reinstall(
     home: &Path,
     name: &str,
     install: Option<Distro>,
+    bootstrap: Option<BootstrapRecord>,
     fetch: impl FnMut(&str, &Path) -> Result<(), String>,
 ) -> Result<Machine, String> {
     let mut machine = load(home, name)?;
     if let Some(distro) = install {
         machine.install = distro;
+    }
+    if bootstrap.is_some() {
+        machine.bootstrap = bootstrap;
     }
     machine.boot_from = BootSource::Installer;
     machine.save()?;
@@ -1681,7 +1685,8 @@ mod tests {
         let machine = create_machine(home.path(), &[]);
         finish_install(&machine);
         let fetcher = FakeFetcher::new();
-        let reinstalled = reinstall(home.path(), "m", None, |u, d| fetcher.fetch(u, d)).unwrap();
+        let reinstalled =
+            reinstall(home.path(), "m", None, None, |u, d| fetcher.fetch(u, d)).unwrap();
         assert_eq!(reinstalled.boot_from, BootSource::Installer);
         assert_eq!(
             load(home.path(), "m").unwrap().boot_from,
@@ -1757,7 +1762,7 @@ mod tests {
         drop(image);
         let disk_file = fs::read(&disk).unwrap();
 
-        let reinstalled = reinstall(home.path(), "m", Some(Distro::Debian), |u, d| {
+        let reinstalled = reinstall(home.path(), "m", Some(Distro::Debian), None, |u, d| {
             fetcher.fetch(u, d)
         })
         .unwrap();
@@ -1781,7 +1786,8 @@ mod tests {
         let machine = create_machine(home.path(), &[]);
         let fetcher = FakeFetcher::new();
         fetch_artifacts(&machine, |u, d| fetcher.fetch(u, d)).unwrap();
-        let reinstalled = reinstall(home.path(), "m", None, |u, d| fetcher.fetch(u, d)).unwrap();
+        let reinstalled =
+            reinstall(home.path(), "m", None, None, |u, d| fetcher.fetch(u, d)).unwrap();
         assert_eq!(reinstalled.install, Distro::Alpine);
         assert_eq!(fetcher.count(), 4);
     }
@@ -1791,7 +1797,7 @@ mod tests {
         let home = TempDir::new("machines-reinstall-fresh");
         create_machine(home.path(), &[]);
         let fetcher = FakeFetcher::new();
-        reinstall(home.path(), "m", None, |u, d| fetcher.fetch(u, d)).unwrap();
+        reinstall(home.path(), "m", None, None, |u, d| fetcher.fetch(u, d)).unwrap();
         assert_eq!(fetcher.count(), 2);
     }
 
@@ -2099,6 +2105,25 @@ mod tests {
             packages: vec!["vim".into(), "git".into()],
             root_password: true,
         }
+    }
+
+    #[test]
+    fn reinstall_saves_a_new_record_and_keeps_the_old_one_without() {
+        let home = TempDir::new("machines-reinstall-record");
+        create_machine(home.path(), &[]);
+        let fetcher = FakeFetcher::new();
+        let record = bootstrap_record();
+        let reinstalled = reinstall(home.path(), "m", None, Some(record.clone()), |u, d| {
+            fetcher.fetch(u, d)
+        })
+        .unwrap();
+        assert_eq!(reinstalled.bootstrap.as_ref(), Some(&record));
+        assert_eq!(load(home.path(), "m").unwrap().bootstrap, Some(record));
+        reinstall(home.path(), "m", None, None, |u, d| fetcher.fetch(u, d)).unwrap();
+        assert_eq!(
+            load(home.path(), "m").unwrap().bootstrap,
+            Some(bootstrap_record())
+        );
     }
 
     #[test]
