@@ -21,9 +21,10 @@ use crate::args::{
     BootSource, ConsoleArg, DiskSpec, DiskStep, DisplayArg, Firmware, HardwareArgs, HypervisorArgs,
     LinuxArgs, NetLink, NetModel, Nic, RemoveArgs, Settings, attach_only, set_or_clear,
 };
+use crate::checkpoints;
 use crate::images;
 use crate::quick::{Artifacts, Distro, artifacts_present, ensure_in, write_atomically};
-use crate::run::{DEFAULT_MEMORY_MIB, Hypervisor};
+use crate::run::{DEFAULT_MEMORY_MIB, Hypervisor, machine_files};
 
 const MACHINES_DIR: &str = "machines";
 const MACHINE_FILE: &str = "machine.toml";
@@ -457,17 +458,27 @@ fn boot_hypervisor(
 
 /// A boot of a saved machine with this command line's overrides, which are not saved. Missing
 /// installer artifacts (never fetched, or thrown away by `reinstall`) are fetched first.
+///
+/// `resume_from` a checkpoint puts its disks and nvram back first (the caller then sets
+/// `RuntimeArgs::checkpoint_files_restored`): the choice between installer and disk is the one
+/// the machine's next reboot makes, so it must look at the disk the resumed guest has, not the
+/// one it was resumed over.
 pub fn prepare_boot(
     machine: &Machine,
     hardware: &HardwareArgs,
     linux: &LinuxArgs,
     remove: &RemoveArgs,
     boot_from: Option<BootSource>,
+    resume_from: Option<&Path>,
     fetch: impl FnMut(&str, &Path) -> Result<(), String>,
 ) -> Result<Launch, String> {
     let mut settings = machine.settings.clone();
     settings.remove_devices(remove)?;
     settings.add(hardware, linux, attach_only(&hardware.disk_steps)?);
+    let nvram = (machine.firmware == Firmware::Uefi).then(|| machine.nvram_path());
+    if let Some(checkpoint) = resume_from.filter(|path| checkpoints::is_checkpoint(path)) {
+        machine_files(&settings, nvram.as_deref()).restore_from(checkpoint)?;
+    }
     let hypervisor = boot_hypervisor(machine, &linux.hypervisor, remove.remove_hypervisor)?;
     let installed = match (
         boot_from.unwrap_or(machine.boot_from),
@@ -1231,7 +1242,7 @@ mod tests {
             "serial",
         ]);
         let fetcher = FakeFetcher::new();
-        let launch = prepare_boot(&machine, &hardware, &linux, &remove, None, |u, d| {
+        let launch = prepare_boot(&machine, &hardware, &linux, &remove, None, None, |u, d| {
             fetcher.fetch(u, d)
         })
         .unwrap();
@@ -1251,7 +1262,7 @@ mod tests {
         let machine = create_machine(home.path(), &["--append", "quiet"]);
         let (hardware, linux, remove) = boot_args(&[]);
         let fetcher = FakeFetcher::new();
-        let launch = prepare_boot(&machine, &hardware, &linux, &remove, None, |u, d| {
+        let launch = prepare_boot(&machine, &hardware, &linux, &remove, None, None, |u, d| {
             fetcher.fetch(u, d)
         })
         .unwrap();
@@ -1271,7 +1282,7 @@ mod tests {
             launch.settings.memory,
             Some(Distro::Alpine.default_memory_mib())
         );
-        prepare_boot(&machine, &hardware, &linux, &remove, None, |u, d| {
+        prepare_boot(&machine, &hardware, &linux, &remove, None, None, |u, d| {
             fetcher.fetch(u, d)
         })
         .unwrap();
@@ -1307,9 +1318,15 @@ mod tests {
     ) -> Result<Launch, String> {
         let (hardware, linux, remove) = boot_args(extra);
         let fetcher = FakeFetcher::new();
-        prepare_boot(machine, &hardware, &linux, &remove, boot_from, |u, d| {
-            fetcher.fetch(u, d)
-        })
+        prepare_boot(
+            machine,
+            &hardware,
+            &linux,
+            &remove,
+            boot_from,
+            None,
+            |u, d| fetcher.fetch(u, d),
+        )
     }
 
     #[test]
@@ -1410,6 +1427,41 @@ mod tests {
     }
 
     #[test]
+    fn resuming_a_checkpoint_decides_on_the_disk_the_checkpoint_saw() {
+        let home = TempDir::new("machines-resume-checkpoint");
+        let machine = create_machine(home.path(), &[]);
+        // The checkpoint was taken during the install, while the disk was still blank; the
+        // install finished afterwards, and now the machine goes back to the checkpoint.
+        let checkpoints = home.path().join("checkpoints");
+        fs::create_dir(&checkpoints).unwrap();
+        let checkpoint = checkpoints.join("0001.checkpoint");
+        fs::write(&checkpoint, b"snapshot").unwrap();
+        fs::copy(
+            &machine.settings.disks[0].path,
+            checkpoint.with_extension("disk-0"),
+        )
+        .unwrap();
+        fs::write(checkpoint.with_extension("nvram"), b"").unwrap();
+        finish_install(&machine);
+
+        let (hardware, linux, remove) = boot_args(&[]);
+        let fetcher = FakeFetcher::new();
+        let launch = prepare_boot(
+            &machine,
+            &hardware,
+            &linux,
+            &remove,
+            None,
+            Some(&checkpoint),
+            |u, d| fetcher.fetch(u, d),
+        )
+        .unwrap();
+        // A guest reboot after the resume goes where the resumed guest expects: the installer.
+        assert_eq!(launch.source, BootSource::Installer);
+        assert!(disk_is_blank(&machine.settings.disks[0].path).unwrap());
+    }
+
+    #[test]
     fn auto_looks_at_the_first_disk_after_this_boots_overrides() {
         let home = TempDir::new("machines-first-disk");
         let machine = create_machine(home.path(), &[]);
@@ -1420,7 +1472,7 @@ mod tests {
         // Detach the installed disk and attach a blank one: nothing is installed any more.
         let (hardware, linux, remove) = boot_args(&["--remove-disk", "0", "--disk", &blank_arg]);
         let fetcher = FakeFetcher::new();
-        let launch = prepare_boot(&machine, &hardware, &linux, &remove, None, |u, d| {
+        let launch = prepare_boot(&machine, &hardware, &linux, &remove, None, None, |u, d| {
             fetcher.fetch(u, d)
         })
         .unwrap();
@@ -1456,6 +1508,7 @@ mod tests {
             &linux,
             &remove_all,
             Some(BootSource::Disk),
+            None,
             |u, d| fetcher.fetch(u, d),
         )
         .err()

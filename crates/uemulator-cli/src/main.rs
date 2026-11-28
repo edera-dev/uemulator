@@ -418,6 +418,7 @@ fn quick_command(cmd: QuickCmd) -> Result<Option<ExitReason>, String> {
                 &LinuxArgs::default(),
                 &RemoveArgs::default(),
                 None,
+                None,
                 quick::download,
             )?;
             boot_launch(launch, &UefiBootArgs::default(), &RuntimeArgs::default()).map(Some)
@@ -456,7 +457,7 @@ fn quick_command(cmd: QuickCmd) -> Result<Option<ExitReason>, String> {
             remove,
             source,
             uefi,
-            runtime,
+            mut runtime,
         } => {
             let machine = machines::load(&home, &name)?;
             let launch = machines::prepare_boot(
@@ -465,8 +466,13 @@ fn quick_command(cmd: QuickCmd) -> Result<Option<ExitReason>, String> {
                 &linux,
                 &remove,
                 source.boot_from,
+                runtime.resume_from.as_deref(),
                 quick::download,
             )?;
+            runtime.checkpoint_files_restored = runtime
+                .resume_from
+                .as_deref()
+                .is_some_and(checkpoints::is_checkpoint);
             boot_launch(launch, &uefi, &runtime).map(Some)
         }
         QuickCmd::Reinstall { name, install } => {

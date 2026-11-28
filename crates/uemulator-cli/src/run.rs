@@ -126,7 +126,7 @@ fn read_escape(chunk: &[u8], pending: &mut bool) -> Vec<Escape> {
 }
 
 /// The writable disks of `settings` and the nvram: what a checkpoint copies beside itself.
-fn machine_files(settings: &Settings, nvram: Option<&std::path::Path>) -> MachineFiles {
+pub(crate) fn machine_files(settings: &Settings, nvram: Option<&std::path::Path>) -> MachineFiles {
     let disks: Vec<std::path::PathBuf> = settings
         .disks
         .iter()
@@ -222,7 +222,9 @@ fn build_config(
         // Before the disks are opened below: they go back to what the checkpoint saw.
         Some(path) if checkpoints::is_checkpoint(path) => {
             let chain = checkpoints::sources(path)?;
-            files.restore_from(path)?;
+            if !runtime.checkpoint_files_restored {
+                files.restore_from(path)?;
+            }
             cfg = cfg.resume_from_chain(chain);
         }
         Some(path) => {
