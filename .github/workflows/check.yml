@@ -86,10 +86,13 @@ jobs:
     - name: install nextest
       if: steps.nextest-cache.outputs.cache-hit != 'true'
       # The version comes from hack/ci/Cargo.lock, which Dependabot keeps current.
+      # --force: rust-cache restores ~/.cargo/bin without cargo's install records,
+      # so after a version bump misses the nextest cache the old binary is still
+      # there and an unforced install refuses to replace it.
       run: |
         version=$(awk '/^name = "cargo-nextest"$/ { getline; gsub(/[^0-9.]/, "", $3); print $3 }' hack/ci/Cargo.lock)
         test -n "${version}"
-        cargo install --locked cargo-nextest --version "${version}"
+        cargo install --locked --force cargo-nextest --version "${version}"
 
     - name: cargo nextest
       run: cargo nextest run --release ${{ matrix.args }}
