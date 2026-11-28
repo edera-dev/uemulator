@@ -348,6 +348,59 @@ pub struct BootSourceArgs {
     pub boot_from: Option<BootSource>,
 }
 
+/// The answers of an unattended install (`docs/plans/35-quick-bootstrap.md`, "Settings"). All
+/// optional here: `bootstrap::resolve_answers` fills the gaps from a machine's saved
+/// `[bootstrap]` record, then from the host, and `quick bootstrap` makes `--user` required.
+#[derive(Args, Default)]
+pub struct BootstrapArgs {
+    /// The account to create, in the admin group (sudo on Debian, wheel on Fedora and Alpine)
+    #[arg(long, value_name = "NAME")]
+    pub user: Option<String>,
+    /// The user's password. Visible to other users of this host in the process list: prefer
+    /// --ask-password or --password-file
+    #[arg(long, value_name = "TEXT", group = "password_source")]
+    pub password: Option<String>,
+    /// Ask for the user's password twice on the terminal, without echo
+    #[arg(long, group = "password_source")]
+    pub ask_password: bool,
+    /// Read the user's password from FILE (one trailing newline is dropped)
+    #[arg(long, value_name = "FILE", group = "password_source")]
+    pub password_file: Option<PathBuf>,
+    /// Give root this password [default: root is locked and the user's sudo is the way in]
+    #[arg(long, value_name = "TEXT", group = "root_password_source")]
+    pub root_password: Option<String>,
+    /// Ask for root's password twice on the terminal, without echo
+    #[arg(long, group = "root_password_source")]
+    pub ask_root_password: bool,
+    /// Read root's password from FILE (one trailing newline is dropped)
+    #[arg(long, value_name = "FILE", group = "root_password_source")]
+    pub root_password_file: Option<PathBuf>,
+    /// The installed system's host name [default: the machine name]
+    #[arg(long, value_name = "NAME")]
+    pub hostname: Option<String>,
+    /// Install and enable the OpenSSH server and authorize the public key(s) in FILE for the
+    /// user. Repeat for more
+    #[arg(long, value_name = "FILE")]
+    pub ssh_key: Vec<PathBuf>,
+    /// IANA time zone, such as Europe/Berlin [default: the host's, else UTC]
+    #[arg(long, value_name = "TZ")]
+    pub timezone: Option<String>,
+    /// Such as en_US.UTF-8; Alpine has no locales and ignores it [default: the host's, else
+    /// en_US.UTF-8]
+    #[arg(long, value_name = "LOCALE")]
+    pub locale: Option<String>,
+    /// Keyboard layout, such as us or de [default: the host's, else us]
+    #[arg(long, value_name = "MAP")]
+    pub keymap: Option<String>,
+    /// A distro package for the installer to add, by the distro's name for it. Repeat for more
+    #[arg(long, value_name = "P")]
+    pub package: Vec<String>,
+    /// Erase the disk without asking (`quick reinstall`; a new machine's disk is new, so
+    /// `quick bootstrap` never asks)
+    #[arg(long)]
+    pub yes: bool,
+}
+
 /// Variables written into the nvram before a boot through the UEFI firmware.
 #[derive(Args, Default)]
 pub struct UefiBootArgs {
