@@ -2107,10 +2107,21 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// What a locked x86 instruction is on top of its atomic access: a full barrier, so no later
+    /// load is satisfied before its store is visible. `ldaxr`/`stlxr` are only an acquire and a
+    /// release, and the vector and partial loads that follow are plain `ldr` plus `dmb ishld`
+    /// (`ordered_memory`), which a release store does not order; Linux's fully ordered LL/SC
+    /// atomics end in the same `dmb ish`. Emitted on a failed compare too: x86 fences then as well.
+    fn full_barrier_after_locked_access(&mut self) {
+        if self.ordered_memory {
+            self.asm.dmb_ish();
+        }
+    }
+
     /// A read-modify-write of the 4- or 8-byte memory operand of `insn`, atomic when it has to
     /// be. With threads (`ordered_memory`) the old value is loaded exclusively and the new one
-    /// stored only if nothing wrote the location in between, else it starts over; that is also
-    /// a full barrier, as a locked x86 instruction is. With one vCPU running at a time a plain
+    /// stored only if nothing wrote the location in between, else it starts over; a `dmb ish`
+    /// follows (`full_barrier_after_locked_access`). With one vCPU running at a time a plain
     /// load and store are atomic already. A misaligned operand (a split lock, which raises #DB
     /// under DEBUGCTL.BLD, as Linux sets it, and cannot be exclusive on the host) and a TLB
     /// miss go to the interpreter, which does the locked access its own way.
@@ -2232,12 +2243,16 @@ impl<'a> Gen<'a> {
         if matches!(op, RmwOp::Cmpxchg) {
             self.asm.b(done);
             // A failed compare stores nothing: the old value written back (what x86 does) would
-            // change nothing a reader could see.
+            // change nothing a reader could see. (cmpxchg16b differs: its 16-byte read is atomic
+            // only with a completed `stlxp`.)
             self.asm.bind(mismatch);
             if self.ordered_memory {
                 self.asm.clrex();
             }
             self.asm.bind(done);
+        }
+        if insn.lock || matches!(op, RmwOp::Xchg) {
+            self.full_barrier_after_locked_access();
         }
         // Flags and registers, all from the host flags and x0, VALUE and the operand.
         match op {
@@ -2477,16 +2492,20 @@ impl<'a> Gen<'a> {
         }
         self.asm.mov_imm(zero, 1);
         self.asm.b(done);
-        // No store when they differ: writing the old value back, as hardware does, would only
-        // matter for a write fault, which the write-tag probe already ruled out.
+        // When they differ the old value is written back, as hardware does. Not for a write
+        // fault (the write-tag probe ruled that out) but because `ldaxp` reads the 16 bytes as
+        // one only when a later `stlxp` succeeds; without it rdx:rax could take halves of two
+        // different writes, a value x86 never shows.
         self.asm.bind(mismatch);
         if self.ordered_memory {
-            self.asm.clrex();
+            self.asm.stlxp(status, low, high, host);
+            self.asm.cbnz(status, retry, false);
         }
         self.store_gpr(RAX, low);
         self.store_gpr(RDX, high);
         self.asm.mov_imm(zero, 0);
         self.asm.bind(done);
+        self.full_barrier_after_locked_access();
         self.asm.ldr(SCRATCH_A, CPU, EFLAGS_OFFSET);
         self.asm.bfi(SCRATCH_A, zero, ZF.trailing_zeros(), 1, true);
         self.asm.str(SCRATCH_A, CPU, EFLAGS_OFFSET);
