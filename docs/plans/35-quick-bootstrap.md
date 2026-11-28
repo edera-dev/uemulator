@@ -1,6 +1,6 @@
 # 35 — `quick bootstrap`: unattended distro installs
 
-**Status:** proposal. Builds on `quick create --install` (`crates/uemulator-cli/src/quick.rs`) and the Apple app (`28-apple.md`).
+**Status:** implemented (plan: `35-quick-bootstrap-plan.md`). Real unattended installs of Alpine, Debian and Fedora through the CLI, and a `quick reinstall` from Debian to Fedora, reached the installed system's login prompt and were logged in to ("Checked" below). The app's Install sheet is built for macOS and the iOS simulator but has not been run. Builds on `quick create --install` (`crates/uemulator-cli/src/quick.rs`) and the Apple app (`28-apple.md`).
 
 ## Intent
 
@@ -164,8 +164,9 @@ call; see below.)
   `finish-install/reboot_in_progress`.
 - **Fedora**: put `/ks.cfg` in the archive and add `inst.ks=file:/ks.cfg`. The kickstart uses
   `text`, `lang`, `keyboard`, `timezone`, `network --bootproto=dhcp --hostname`, `url` (the same
-  repo `inst.repo` names today), `user --groups=wheel --iscrypted`, `rootpw --iscrypted` or
-  `rootpw --lock`, `sshkey`, `autopart` (Anaconda's default), `clearpart --all --initlabel
+  repo `inst.repo` names today), `repo` for the release's Everything tree when extra packages are
+  asked for (the Server tree lacks most of them), `user --groups=wheel --iscrypted`, `rootpw
+  --iscrypted` or `rootpw --lock`, `sshkey`, `autopart` (Anaconda's default), `clearpart --all --initlabel
   --drives=vda`, `%packages` with the extras, and `reboot`.
 - **Alpine**: the netboot init has no answer-file hook of its own, but it does take an overlay
   from inside the initramfs (spiked and confirmed to run a script at boot). The archive carries
@@ -178,8 +179,9 @@ call; see below.)
     boot services (devfs, mdev, hwdrivers, modloop and so on), and the
     init only adds them when the file is present (it deletes it afterwards).
   - `etc/local.d/bootstrap.start`, mode 0755, `#!/bin/sh`: runs `apk add alpine-conf e2fsprogs`
-    (and whatever else `setup-disk` needs) from the repository the init already knows, then
-    `setup-alpine -e -f <answers>`, `setup-disk -m sys /dev/vda`, `chpasswd -e` for the
+    (and whatever else `setup-disk` needs) from the repository the init already knows, names the
+    running release (`v3.24`) in place of its `latest-stable` (else `setup-apkrepos` picks
+    edge), then `setup-alpine -e -f <answers>`, `setup-disk -m sys /dev/vda`, `chpasswd -e` for the
     passwords, writes the SSH key into the installed system, prints the completion marker and
     reboots. Output goes to `/dev/console`.
   - `etc/runlevels/default/local`, a symlink to `/etc/init.d/local`.
@@ -247,3 +249,84 @@ installer checks are today.
 - The app's `-new-source bootstrap:` launch arguments.
 - Whether `quick bootstrap` on an existing machine name is an error (like `quick create`) or
   suggests `reinstall`. Suggesting `reinstall` is preferred.
+
+## Checked (2026-11-27)
+
+Each install ran the release CLI on an Apple Silicon Mac (aarch64 JIT, `--cpus 2`, the user-mode
+NAT to the distro's mirrors) as `quick bootstrap bt-DISTRO --install DISTRO --user alex
+--password-file pw --ssh-key key.pub --package htop`, under a scratch `UEMULATOR_HOME`, with
+stdin a pty that a script answered only once the installed system's login prompt was up: `root`
+with the user's password (refused: `Login incorrect`), then `alex`, `sudo true` (`doas true` on
+Alpine) with the password, `htop --version`, `id`, and checks that sshd ran and the key was in
+`~/.ssh/authorized_keys`. Nothing was typed before that. Each run printed the completion marker
+on the console, saved `boot_from = auto`, booted the disk through the UEFI firmware and reached
+`bt-DISTRO login:`. No `$6$` hash was in `machine.toml`, `nvram.kv` or the downloaded
+artifacts (only on the guest's own disk, in its `/etc/shadow`).
+
+| distro | marker | login prompt | notes |
+|--------|--------|--------------|-------|
+| Alpine 3.24 | 81 s | 104 s | `doas` for `wheel`, htop 3.5.3, sshd running, time zone the host's (`/etc/localtime` to `America/Los_Angeles`); a later `quick boot` logs in the same |
+| Debian 13 | 916 s | 984 s | GRUB from the disk through shim, groups `sudo` and the installer's defaults, htop 3.4.1, sshd running; the marker shows up between the newt screens |
+| Fedora 44 | 1992 s | 2046 s | 4096 MiB (the new default), 435 packages, `wheel` (sudo works), htop 3.4.1 from Everything, sshd running |
+
+Times are from the command's start and include the downloads.
+
+`quick reinstall bt-debian --install fedora --password-file pw --yes` then installed Fedora 44 over
+the Debian machine from its recorded answers and reached `bt-debian login:` after 2119 s, with the
+same checks passing. Its first try stopped at a mirror's `Peer disconnected` while downloading the
+initramfs, before the installer started; the same command again went through.
+
+What the installs showed, each fixed with a test first where one could fail:
+
+- **The terminal went to the ended installer.** Each machine of a run had its own stdin reader,
+  and the installer's stayed blocked in `read` after its machine ended and took the bytes: nothing
+  typed at the installed system's login prompt arrived, Ctrl-] included. One reader now lives for
+  the process (`crates/uemulator-cli/src/input.rs`) and hands its chunks to the running machine.
+- **Alpine installed edge.** The netboot repositories say `latest-stable`, which
+  `setup-apkrepos` does not take for a release and turns into `edge`; the installed system came up
+  as `3.25.0_alpha` with edge's kernel. The script now writes the running release (`v3.24`) into
+  the repositories first.
+- **Debian's guided partitioning refused 8 GiB** ("Unable to satisfy all constraints on the
+  partition", under UEFI with the `atomic` recipe). New machines now get the app's 64 GiB
+  (sparse) disk.
+- **Fedora's stage2 did not fit in 3072 MiB**: dracut downloads the 915 MB `install.img` into a
+  RAM file system and stopped at `No space left on device`. A Fedora install now gets 4096 MiB,
+  CLI and app.
+- **htop is not in Fedora's Server tree**, the installer's repository, and Anaconda stopped at
+  its exception prompt (`No match for argument: htop`). With extra packages the kickstart adds the
+  release's Everything tree.
+- A new bootstrap machine was saved `boot_from = auto` until the marker. It is `installer` now,
+  as the spec says, so a disk the installer partitioned and then failed on is not booted.
+- `quick bootstrap` of an existing name now suggests `quick reinstall`.
+
+Confirmed on the way: Alpine's `USEROPTS`/`SSHDOPTS` `none` asked nothing and `TIMEZONEOPTS` took
+the bare IANA name; `setup-disk` carried the live world (doas, openssh, htop) into the installed
+system; a failing step (`--package no-such-package-uemu`) fired the script's `trap reboot EXIT`
+under OpenRC's `local`, and the run ended with `the installer of bt-alpine-fail reset before it
+finished: run uemulator quick reinstall bt-alpine-fail to try again`. Debian's
+`passwd/user-default-groups` gave `sudo` plus the usual groups. Fedora's `%post --nochroot` marker
+reached the CLI's console. The kickstart's minimal package set was enough for sshd and sudo.
+
+Not checked: the app (built for macOS and the iOS simulator, not run, `28-apple.md`), the webkit
+engine, `--root-password`, and an install with a screen (`--display`).
+
+## Accepted limitations
+
+- A suspended bootstrap install cannot be finished with `--resume-from`. `quick bootstrap`
+  refuses it, and `quick boot --resume-from` resumes without the bootstrap run's reset handling:
+  the install in guest RAM carries on, but its closing reboot restarts in place into the installer,
+  now without the answers (they were only ever in memory), instead of booting the disk.
+  `quick reinstall` starts the install again.
+- The app loses a pending bootstrap request when it quits: a machine relaunched or resumed
+  mid-install ends in the interactive installer. Reinstall… starts it again.
+- The app's Reinstall… always runs unattended, also on a machine installed by hand; the CLI keeps
+  such a machine interactive unless `quick reinstall` is given `--user`.
+- A misspelled `--package` makes Debian and Fedora go interactive: d-i stops at "Installation step
+  failed" (Select and install software, seen with a made-up name) and Anaconda at its exception
+  prompt (seen with htop before the Everything fix), on the console for a person to answer or stop. Alpine ends the run with the
+  reinstall error instead. Turning those errors into a reset is not done; skipping the name
+  silently (kickstart's `%packages --ignoremissing`) would be worse.
+- `--timeout` restarts with the installed system's boot, so a bootstrap run can last up to twice
+  as long.
+- Fedora's 4 GiB install is more than the app's WebKit engine allows (3 GiB): Fedora installs need
+  the native engine.
