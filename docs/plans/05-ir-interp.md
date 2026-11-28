@@ -1,10 +1,10 @@
 # IR, TB cache, interpreter
 
-**Status:** partially implemented. The status note below predates the JIT and the legacy modes. The uop layer was not built as designed: there is no `ir.rs`, and the interpreter and the JITs both work from decoded `Insn` records.
+**Status:** partially implemented. The status note below predates the JIT and the legacy modes. The uop layer was not built as designed and is not planned: there is no `ir.rs`, `tbcache.rs` or uop interpreter, and the interpreter and the JITs both work from decoded `Insn` records. The block cache, jump cache, chaining and invalidation the JIT does have are in 06-jit.md.
 
 ## Status / deviation (M1-M2 built this way)
 
-The interpreter currently executes decoded `Insn` records directly (`src/cpu/decode.rs`, `exec.rs`), with a decode cache keyed by guest physical address (`mem.rs::fetch_decode`) and generation-based invalidation when a store hits a page that holds cached code. There is no uop layer yet; it is introduced with the JIT (M4), lowering from `Insn` (or via uops) while the Insn interpreter stays the oracle. Only 64-bit long mode (CS.L=1) is executed; other modes are not implemented. Measured: ~35-60 MIPS release on an Apple M-series host.
+The interpreter currently executes decoded `Insn` records directly (`src/cpu/decode.rs`, `exec.rs`), with a decode cache keyed by guest physical address (`mem.rs::fetch_decode`) and generation-based invalidation when a store hits a page that holds cached code. There is no uop layer yet; it is introduced with the JIT (M4), lowering from `Insn` (or via uops) while the Insn interpreter stays the oracle. Only 64-bit long mode (CS.L=1) is executed; other modes are not implemented. Measured: ~35-60 MIPS release on an Apple M-series host. (Since then: the JIT lowers `Insn` directly with no uops, and the interpreter runs every legacy mode, 15.)
 
 The text below is the target design for the JIT phase.
 
@@ -49,7 +49,7 @@ loop {
 }
 ```
 
-With several vCPUs the loop body is `Cpu::run_slice`, which also returns when the vCPU should give way (quantum end at the event tick, `pause`, halted with nothing to wake it) and `cpu/smp.rs` picks the next vCPU; the TB/decode caches are shared between them (`docs/plans/03-cpu.md`, "SMP").
+With several vCPUs the loop body is `Cpu::run_slice`, which also returns when the vCPU should give way (quantum end at the event tick, `pause`, halted with nothing to wake it) and `cpu/smp.rs` picks the next vCPU; the JIT block cache is shared between them, and the decode cache too when they time-share (with threads each vCPU has its own; `docs/plans/03-cpu.md`, "SMP").
 
 Chained TBs bypass the loop; therefore every `GotoTb` slot decrements/checks `exit_request` (one load+branch) — loops that never leave a chain must still be interruptible by timers (virtual clock deadline compares at the same point; use an icount budget counter in Env decremented per TB: reaching zero exits to the loop).
 

@@ -1,11 +1,11 @@
 # Ryzen 5 7000-class feature parity
 
-**Status:** proposal.
+**Status:** partially implemented. Sections A to E (all but the host-visible `VIRT_SPEC_CTRL` of C) and step 10 are done, on the Zen 5 Turin model that replaced Genoa ("Zen 5 Turin model" below); the selectable CPU profile and the Ryzen 7000 identity of section F (steps 3 and 9) are not: `CpuProfile` (`cpu/profile.rs`) carries only the processor count, threads per core and brand, and there is no `MachineConfig::cpu_model` or `--cpu-model`.
 
 Goal: the emulated CPU **has every feature a Ryzen 5 7000-series part (Zen 4: Raphael 7600/7600X, Phoenix 7640U/7640HS, family 19h) advertises**, so a guest, a hypervisor or a test suite that looks for a feature finds it and it works. This is a feature list, not a fidelity project:
 
 - Not the exact core. Instruction latency, speculation, cache and TLB replacement, performance-counter values, undefined-flag quirks beyond what the manuals specify: out of scope.
-- Not the exact platform. ACPI, PCI topology and fabric registers stay the generic virtual PC (`docs/plans/07-devices.md`).
+- Not the exact platform. ACPI, PCI topology and fabric registers stay the generic virtual PC (`docs/plans/07-devices.md`). (Written for the Ryzen goal; with the Turin model the platform did take Turin's identity, "Platform identity" below.)
 - No access to the real part. Everything comes from public documents; nothing here needs a capture from silicon. Where a public source is silent or two disagree, we follow the manual and record the choice.
 
 The identity was an EPYC 9004 Genoa (family 19h model 11h) when this plan was written and is now an EPYC 9005 Turin (Zen 5, family 1Ah model 02h; "Zen 5 Turin model" below, `docs/plans/03-cpu.md`, "CPUID/MSR contract"). Either shares the Zen 4 ISA baseline (AVX2, AVX-512 with VNNI/BF16/IFMA/VBMI/BITALG/VPOPCNTDQ, SHA, GFNI, VAES, VPCLMULQDQ, SMEP/SMAP/UMIP, FSGSBASE, PCID/INVPCID, RDPID, RDSEED, XSAVEC, SVM with nested paging). The work is the delta.
@@ -25,6 +25,8 @@ Rules from `CLAUDE.md` hold for all of it: a CPUID bit goes on in the same commi
 
 ### A. Small instruction sets (each independent, days not weeks)
 
+All done, on the Turin model ("Small Zen extensions" below).
+
 | feature | CPUID | what it needs |
 |---|---|---|
 | SSE4A | 8000_0001 ECX 6 | `extrq`, `insertq`, `movntss`, `movntsd` (decoder, interpreter, JIT) |
@@ -40,7 +42,7 @@ Rules from `CLAUDE.md` hold for all of it: a CPUID bit goes on in the same commi
 
 1. **LA57, 5-level paging.** Done for the Turin model (03, "5-level paging and protection keys"): `PagingMode` kept one `Long` variant and `walk_wide` takes its top level from CR4.LA57; the JIT needed no change, since its probe only matches tags `translate` validated. The original plan: `CR4.LA57`, a fifth page-walk level (PML5), 57-bit canonical checks (the `translate` canonical test, branch targets, `lea`-based address generation, `invlpg`, `invpcid`), the 57-bit virtual-address field in 0x8000_0008, LA57 in the SVM nested-paging guest state, and the JIT's inline canonical check. `PagingMode` gains a `Long5` variant; `walk_wide` already loops over levels, so the level count is the main parameter. Large-page cache (`docs/plans/04-memory.md`) needs the shift for the new level only if 1 GiB+ leaves at the top are allowed (they are not at PML5).
 2. **PKU/OSPKE, protection keys for user pages.** Done for the Turin model (03, same section), with the second option below: restricted tags stay out of the soft TLB and a PKRU change flushes it. The original plan: `CR4.PKE`, `PKRU`, `rdpkru`/`wrpkru`, PTE bits 62:59, page-fault error-code bit 5 (PK), XSAVE component 9, leaf 7 ECX bits for PKU/OSPKE. The walker evaluates the key against `PKRU` per access (user pages only; supervisor keys are Intel-only), so cached TLB entries must carry or recheck the key: either fold the key into the permission tags at fill time (and flush on `wrpkru`, which is architecturally not a TLB flush, so this must be re-evaluated per access) or keep PK pages out of the write/read tags like the SMAP case in `translate`.
-3. **CET shadow stacks (user and supervisor).** `CR4.CET`, `U_CET`/`S_CET`/`PL0_SSP..PL3_SSP`/`ISST_ADDR` MSRs, `#CP` (vector 21), shadow-stack pages (`W=0, D=1` encoding), `incssp`, `rdssp`, `saveprevssp`, `rstorssp`, `wrss`, `setssbsy`, `clrssbsy`, shadow-stack pushes on `call` and checks on `ret`/`iret`/far transfers, the supervisor shadow-stack token protocol, XSS components 11 and 12. Zen 4 has shadow stacks but not indirect-branch tracking (the `endbr64` NOP encoding already decodes). This is the largest item in the plan and last in this section; Linux uses it for user shadow stacks (6.6+) and the SVM guest state carries `S_CET` and `SSP` fields. **Done** (`cpu/cet.rs`, see "Zen 5 Turin model"); the JIT leaves shadow-stack code to the interpreter.
+3. **CET shadow stacks (user and supervisor).** `CR4.CET`, `U_CET`/`S_CET`/`PL0_SSP..PL3_SSP`/`ISST_ADDR` MSRs, `#CP` (vector 21), shadow-stack pages (`W=0, D=1` encoding), `incssp`, `rdssp`, `saveprevssp`, `rstorssp`, `wrss`, `setssbsy`, `clrssbsy`, shadow-stack pushes on `call` and checks on `ret`/`iret`/far transfers, the supervisor shadow-stack token protocol, XSS components 11 and 12. Zen 4 has shadow stacks but not indirect-branch tracking (the `endbr64` NOP encoding already decodes). This is the largest item in the plan and last in this section; Linux uses it for user shadow stacks (6.6+) and the SVM guest state carries `S_CET` and `SSP` fields. **Done** (`cpu/cet.rs`, see "Zen 5 Turin model"); the JIT compiles near call and ret with the shadow-stack push and compare inline and leaves the rest to the interpreter.
 
 ### C. Virtualisation (SVM) completeness
 
@@ -51,12 +53,16 @@ Rules from `CLAUDE.md` hold for all of it: a CPUID bit goes on in the same commi
 
 ### D. Counters and monitoring a guest can program
 
+All done ("Performance monitoring" and IBS below; MPERF/APERF and RAPL with the small Zen extensions). The plan as written:
+
 - **PerfMonV2** (`PERFCTR_CORE` `8000_0001 ECX 23`, `PERFMON_V2` `8000_0022 EAX 0`): six core counters at `0xC0010200`, global control/status MSRs (`0xC0000300..`), counting a small set of events the emulator can count exactly: retired instructions, retired branches, retired taken branches, cycles (= `icount` at the model's rate, `NS_PER_INSN`). Keep the legacy four-counter set that is already there. Overflow raises the LVT performance-counter interrupt, which makes the NMI watchdog and `perf stat` work.
 - `PERFCTR_NB`/`PERFCTR_L2`: counters that read zero (present, never counting); only if a guest probes them and fails otherwise.
 - **LBR v2** (`8000_0022 EAX 1`), **IBS** (`8000_0001 ECX 10`, `8000_001B`) and the extended APIC space (`EXTAPIC`, `8000_0001 ECX 3`) it hangs its LVT on: moderate; all three are done (below), IBS with a sampling model on the retired-instruction count.
 - MPERF/APERF (`0xE7/0xE8`) at ratio 1, RAPL energy MSRs reading a monotonic fake counter: cheap, and they stop `amd_pstate`/`turbostat`/`powertop` probes failing.
 
 ### E. Security and system bits that are cheap and honest
+
+Done: NULL_SEL_CLR_BASE, NO_NESTED_DATA_BP and AUTOIBRS are advertised (the speculation-control table below). The departures the last bullet kept are gone too: the speculation bits are in the AMD spelling only and `TSA_*_NO` are Turin's own bits; there are still no hypervisor leaves. The plan as written:
 
 Add only where the behaviour is real in this implementation and testable:
 - `NullSelectorClearsBase` (`8000_0021 EAX 6`): loading a null selector into a data segment register clears the base in 64-bit mode; confirm the current behaviour and set the bit.
@@ -71,7 +77,7 @@ Add only where the behaviour is real in this implementation and testable:
 
 ## Zen 5 Turin model (the current identity)
 
-The emulated CPU presents a 2024 AMD server core, an EPYC 9005 "Turin" (Zen 5), so that Linux sees hardware that needs no software mitigation and the default command line can go without `mitigations=off`. There is no `CpuProfile` (section F is still a plan), so Turin replaced Genoa outright: the Genoa leaves are in the history of `cpu/cpuid.rs`, not selectable.
+The emulated CPU presents a 2024 AMD server core, an EPYC 9005 "Turin" (Zen 5), so that Linux sees hardware that needs no software mitigation and the default command line can go without `mitigations=off`. `CpuProfile` holds only the processor count, threads per core and brand (section F's selectable profile is still a plan), so Turin replaced Genoa outright: the Genoa leaves are in the history of `cpu/cpuid.rs`, not selectable.
 
 Identity and sources:
 - Signature `0x00B00F21`: family 1Ah, model 02h, stepping 1, the Turin (classic, Zen 5) die. Linux's `bsp_init_amd` names family 1Ah models 00h-2Fh, 40h-4Fh and 60h-7Fh Zen 5, and `init_amd_zen5` keeps RDSEED only when model, stepping and microcode revision match `zen5_rdseed_microcode`, whose entry for 1Ah/02h/1 is revision `0x0b00215a`; PATCH_LEVEL (MSR 0x8b) reports exactly that. Model 11h stepping 0 in the same table is Turin Dense (Zen 5c). QEMU's `EPYC-Turin` uses model 0 stepping 0, which is in no kernel table and would cost RDSEED, so only its feature list and cache sizes were used as a cross-check (`../ext/qemu-uplink/target/i386/cpu.c`).
@@ -151,6 +157,8 @@ Present on Turin, not advertised (not implemented): ERAPS, UpperAddressIgnore, W
 | 9 | Ryzen profile; boot the installers and the Xen dom0 on it and compare `lscpu` flags, `/sys/devices/system/cpu/vulnerabilities/` and `dmesg` CPU lines with the Genoa profile (expected differences only: brand, model, topology); flip the default | 1-8 |
 | 10 | LBR v2, IBS, EXTAPIC, AVIC if wanted | 6, 7 |
 
+Done: steps 1, 2, 4 to 6, 8 and 10, on the Turin model, and step 7 but for the host-visible `VIRT_SPEC_CTRL`. Step 3 only in part: `CpuProfile` exists for the count, threads and brand, but signature, caches and features are fixed in `cpu/cpuid.rs` and there is no Genoa profile. Step 9 is not started.
+
 ## Checking it
 
 - Per feature: unit tests beside the code, interpreter first, JIT through `assert_jit_matches_interpreter`; CPUID tests spell the expected words from the APM rather than the constants in `cpuid.rs`, as `cpuid_tests.rs` does.
@@ -161,5 +169,5 @@ Present on Turin, not advertised (not implemented): ERAPS, UpperAddressIgnore, W
 
 - Which SKU names the profile (Raphael 7600X vs Phoenix 7640U changes the PPR consulted and the brand string, not the feature set)?
 - Keep TSC-deadline as a departure (fast calibration) or remove it for fidelity? Decided: removed, as on the hardware; Linux calibrates the APIC timer against the PIT.
-- Is a guest hypervisor with AVIC a requirement, or is the legacy SVM path enough?
-- LA57 changes the JIT's inline fast paths (canonical checks): confirm with `docs/plans/20-jit-perf.md` how much it costs before turning it on by default in the profile. CET is always on, and the JIT compiles shadow-stacked near `call`/`ret` inline (a run-time byte test, `Cpu::shadow_stack_on`, rather than a block key; `docs/plans/06-jit.md`), so Xen, which enables supervisor shadow stacks on Zen 5 by default, runs its own code in the JIT.
+- Is a guest hypervisor with AVIC a requirement, or is the legacy SVM path enough? Settled by doing it: AVIC and x2AVIC are implemented (section C).
+- LA57 changes the JIT's inline fast paths (canonical checks): confirm with `docs/plans/20-jit-perf.md` how much it costs before turning it on by default in the profile. Moot: the Turin model advertises LA57 and the JIT needed no change (section B). CET is always on, and the JIT compiles shadow-stacked near `call`/`ret` inline (a run-time byte test, `Cpu::shadow_stack_on`, rather than a block key; `docs/plans/06-jit.md`), so Xen, which enables supervisor shadow stacks on Zen 5 by default, runs its own code in the JIT.

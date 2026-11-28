@@ -64,8 +64,8 @@ DHCP: the agent's DHCP server always gives router 10.0.2.2 and DNS server 10.0.2
 
 The WebSocket lives where an event loop runs: on the page (`main.js`), or under Node in the parent of the machine's worker thread (`hack/wasm/segment.mjs`/`segment_machine.mjs` pattern). The emulator's worker cannot receive messages while `uw_run` runs, so Wisp traffic moves the way segment frames do:
 - Worker to page: a new host import (say `host_wisp_send(ptr, len)`) posts encoded Wisp packets; the page sends each as one WebSocket binary message.
-- Page to worker: a second byte ring in the shared control block (`protocol.js`), written by the page, drained by the worker in the poll hook, which wakes the worker's idle wait like the frame ring. Unlike the frame ring it must never drop: when it is full the page queues in JavaScript and writes the queue out as the worker drains.
-- The Wisp client (packet codec, stream ids, CONTINUE credits, the connection's state) is Rust in `uemulator-web` (or the library, if the builder finds it reusable), not JavaScript, so it is unit-tested with the gateway. The page side only opens, reconnects and carries bytes.
+- Page to worker: a ring in the shared control block (`protocol.js`; as built, the fourth, `WISP_OFFSET`, of records rather than bytes, `13-web.md`), written by the page, drained by the worker in the poll hook, which wakes the worker's idle wait like the frame ring. Unlike the frame ring it must never drop: when it is full the page queues in JavaScript and writes the queue out as the worker drains.
+- The Wisp client (packet codec, stream ids, CONTINUE credits, the connection's state) is Rust (it landed in the library, `crates/uemulator/src/wisp/`, exported as `WispClient`), not JavaScript, so it is unit-tested with the gateway. The page side only opens, reconnects and carries bytes.
 
 The Wisp client (v1, `MercuryWorkshop/wisp-protocol` `protocol.md`):
 - Waits for the server's CONTINUE on stream 0 before any CONNECT; its value is every new stream's initial credit. Packet type 5 (v2's INFO) is ignored, which makes a v2 server treat this as a v1 client.
@@ -111,9 +111,11 @@ The client must not be written against this endpoint alone, which shares its aut
 
 ## Open
 
-- Third-party Wisp servers (wisp-js, wisp-server-python) were not checked: installing them was not approved. Only `serve.py`'s endpoint has run against the client, so a reading of the spec that both share is untested.
+- Third-party Wisp servers (wisp-js, wisp-server-python) were not checked: installing them was not approved. Only `serve.py`'s endpoint has run against the client, so a reading of the spec that both share is untested (the Apple app's `Wisp.swift` follows `serve.py` and does not change that).
 
 ## Left to the builder
+
+Settled as built: `Gateway` (`crates/uemulator/src/gateway/mod.rs`) with `take_requests` giving `GatewayRequest`s, `opened`, `failed`, `remote_data`, `remote_closed`, `reset`, `pop_for_guest` and `poll(now_ms)` in place of the sketch's names; the codec in the library; DATA packets of at most 16 KiB (`WISP_DATA_MAX`); backoff 1 s doubling to 30 s.
 
 - Exact API names and shapes of `Gateway` and the stream calls; whether the Wisp codec sits in the library or in `uemulator-web`.
 - Wisp DATA packet size, reconnect backoff, the page's queue limits beyond "never drop".

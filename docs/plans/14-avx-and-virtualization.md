@@ -4,11 +4,11 @@
 
 ## AVX, AVX2, FMA, F16C
 
-Done: see 03, "AVX, AVX2, FMA, F16C" and "AVX-512" (including AVX512_BF16, SHA-NI and ADX). Not done: AVX512_FP16/VP2INTERSECT, the Xeon Phi sets (PF, ER), AVX-VNNI.
+Done: see 03, "AVX, AVX2, FMA, F16C" and "AVX-512" (including AVX512_BF16, SHA-NI and ADX). VP2INTERSECT (`cpu/avx512_misc.rs`) and AVX-VNNI are done too. Not done: AVX512_FP16, the Xeon Phi sets (PF, ER).
 
 ## SVM (AMD-V) for nested guests
 
-Done, for guests in any CPU mode: see 03, "SVM (AMD-V)", including the limits. What remains: a guest-side `vmrun` (nested virtualization), AVIC, decode assists, and above all a run against a real nested hypervisor.
+Done, for guests in any CPU mode: see 03, "SVM (AMD-V)", including the limits. AVIC and x2AVIC (`cpu/svm_avic.rs`) and decode assists are done, and a real hypervisor runs on it: `hack/kvm/run.sh` has Linux's kvm_amd start vCPUs in every CPU mode. What remains: a guest that itself executes `vmrun` (a hypervisor inside the guest hypervisor's guest), which is intercepted like any other VMRUN and #UD without that intercept (`cpu/svm.rs` module docs).
 
 ## VMX (Intel VT-x)
 
@@ -17,4 +17,4 @@ Not a fit for the AMD identity (`GenuineIntel` would also change Linux's model-s
 ## Other items not done
 
 - ERMS/FSRM: done (03, "ERMS and FSRM").
-- PKU, CET (shadow stacks; the kernel only needs `endbr64`, which is a NOP here), LA57. (XSAVEC/XSAVES and x2APIC/APIC are done, see 03.)
+- PKU, CET shadow stacks and LA57: done (03; `cpu/pku.rs`, `cpu/cet.rs`, `cpu/la57_tests.rs`; shadow stacks in the JIT: 06). XSAVEC/XSAVES and x2APIC/APIC are done too, see 03.
