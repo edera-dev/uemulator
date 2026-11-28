@@ -8,6 +8,7 @@
 
 #![cfg(target_vendor = "apple")]
 
+mod bootstrap;
 mod machine_file;
 mod network;
 
