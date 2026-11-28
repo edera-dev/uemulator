@@ -19,6 +19,7 @@
 		B1000000000000000000B00A /* MachineStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000F00C /* MachineStore.swift */; };
 		B1000000000000000000B00B /* MachineView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000F00D /* MachineView.swift */; };
 		B1000000000000000000B00C /* Wisp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000F00E /* Wisp.swift */; };
+		B1000000000000000000B011 /* BootstrapSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000F013 /* BootstrapSheet.swift */; };
 		B1000000000000000000B00D /* MachineSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000F00F /* MachineSettingsView.swift */; };
 		B1000000000000000000B00E /* uemulator.icon in Resources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000F010 /* uemulator.icon */; };
 		B1000000000000000000B00F /* Presets.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000F011 /* Presets.swift */; };
@@ -41,6 +42,7 @@
 		B1000000000000000000F00C /* MachineStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MachineStore.swift; sourceTree = "<group>"; };
 		B1000000000000000000F00D /* MachineView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MachineView.swift; sourceTree = "<group>"; };
 		B1000000000000000000F00E /* Wisp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Wisp.swift; sourceTree = "<group>"; };
+		B1000000000000000000F013 /* BootstrapSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BootstrapSheet.swift; sourceTree = "<group>"; };
 		B1000000000000000000F00F /* MachineSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MachineSettingsView.swift; sourceTree = "<group>"; };
 		B1000000000000000000F010 /* uemulator.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; path = uemulator.icon; sourceTree = "<group>"; };
 		B1000000000000000000F011 /* Presets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Presets.swift; sourceTree = "<group>"; };
@@ -76,6 +78,7 @@
 				B1000000000000000000F002 /* NativeEngine.swift */,
 				B1000000000000000000F003 /* TerminalPane.swift */,
 				B1000000000000000000F00E /* Wisp.swift */,
+				B1000000000000000000F013 /* BootstrapSheet.swift */,
 				B1000000000000000000F00F /* MachineSettingsView.swift */,
 				B1000000000000000000F00D /* MachineView.swift */,
 				B1000000000000000000F00C /* MachineStore.swift */,
@@ -219,6 +222,7 @@
 				B1000000000000000000B002 /* NativeEngine.swift in Sources */,
 				B1000000000000000000B003 /* TerminalPane.swift in Sources */,
 				B1000000000000000000B00C /* Wisp.swift in Sources */,
+				B1000000000000000000B011 /* BootstrapSheet.swift in Sources */,
 				B1000000000000000000B00D /* MachineSettingsView.swift in Sources */,
 				B1000000000000000000B00F /* Presets.swift in Sources */,
 				B10000000000000000F01DB0 /* FoldedLayout.swift in Sources */,

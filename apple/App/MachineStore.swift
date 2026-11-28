@@ -78,6 +78,9 @@ struct MachineDefinition {
     // An installer machine: what it installs and whether it boots that or its disk.
     var install: Distro?
     var bootFrom = BootFrom.auto
+    // The unattended install's non-secret answers, machine.toml's `[bootstrap]`: what Reinstall…
+    // fills in. Nil for a machine installed by hand (or not an installer machine).
+    var bootstrap: BootstrapRecord?
     // The name of the file the hypervisor image came from (xen.gz, xen.efi); nil for none.
     var hypervisor: String?
     var hypervisorCmdline = ""
@@ -111,6 +114,10 @@ final class MachineStore: ObservableObject {
     // One model per machine, kept while the app runs: a machine keeps running when another is
     // selected.
     private var models: [String: MachineModel] = [:]
+    // Unattended installs waiting for the machine's next installer boot, by machine name. Memory
+    // only, because they hold the passwords: never machine.toml, app.json, the Keychain or a log.
+    // A quit app forgets them, and its machine then boots the installer interactively.
+    var pendingBootstrap: [String: BootstrapRequest] = [:]
 
     private static let machineFile = "machine.toml"
     private static let sidecarFile = "app.json"
@@ -293,6 +300,7 @@ final class MachineStore: ObservableObject {
         }
         definition.install = (table["install"] as? String).flatMap(Distro.init(rawValue:))
         definition.bootFrom = (table["boot_from"] as? String).flatMap(BootFrom.init(rawValue:)) ?? .auto
+        definition.bootstrap = (table["bootstrap"] as? [String: Any]).flatMap(BootstrapRecord.init(table:))
         definition.hypervisor = table["hypervisor"] as? String
         definition.hypervisorCmdline = table["hypervisor_cmdline"] as? String ?? ""
         definition.networks = table["networks"] as? [[String: Any]] ?? []
@@ -338,6 +346,7 @@ final class MachineStore: ObservableObject {
             "append": definition.replaceCmdline ? NSNull() : optional(definition.cmdline),
             "install": definition.install?.rawValue ?? NSNull(),
             "boot_from": definition.install == nil ? NSNull() : definition.bootFrom.rawValue,
+            "bootstrap": definition.install == nil ? NSNull() : definition.bootstrap?.table ?? NSNull(),
             "hypervisor": definition.hypervisor ?? NSNull(),
             "hypervisor_cmdline": definition.hypervisor == nil ? NSNull() : optional(definition.hypervisorCmdline),
             "disks": definition.disks.map { ["path": $0.url.path, "read_only": $0.readOnly] },
@@ -362,8 +371,9 @@ final class MachineStore: ObservableObject {
     enum Preset {
         case demo(Demo)
         // Easy mode: 2 GiB (Fedora 3), a 64 GiB disk, a NIC and the installer, downloaded on first
-        // start.
-        case install(Distro)
+        // start. With a request, the installer runs unattended: its record goes in machine.toml,
+        // the request itself in `pendingBootstrap`.
+        case install(Distro, BootstrapRequest?)
         // Hardware only: the caller imports what it boots (`importDisk`, `importKernel`).
         case custom(memoryMib: Int, diskGib: Int, display: DisplayChoice, network: Bool)
     }
@@ -392,8 +402,9 @@ final class MachineStore: ObservableObject {
                     definition.hypervisorCmdline = manifest.hypervisorArgs ?? ""
                     definition.iommu = manifest.iommu ?? false
                 }
-            case .install(let distro):
+            case .install(let distro, let request):
                 definition.install = distro
+                definition.bootstrap = request?.record
                 // The installer talks on the terminal (the console stays there), and the screen is
                 // there for what the installed system draws. The demos stay terminal only.
                 definition.display = .both
@@ -406,6 +417,7 @@ final class MachineStore: ObservableObject {
                 if diskGib > 0 { definition.disks = [try createDisk(name, sizeMib: UInt64(diskGib) * Self.mibPerGib)] }
             }
             try save(definition, as: name)
+            if case .install(_, let request?) = preset { pendingBootstrap[name] = request }
         } catch {
             try? FileManager.default.removeItem(at: folder)
             throw error
@@ -465,6 +477,14 @@ final class MachineStore: ObservableObject {
         return ua_disk_installed(url.path, &error, error.count) == 1
     }
 
+    // An installer's kernel and initramfs, so the next start fetches them again, as `quick
+    // reinstall` does: netboot images go stale against their mirrors (a kernel whose modules the
+    // mirror no longer has).
+    func removeInstaller(_ name: String, install: Distro) {
+        try? FileManager.default.removeItem(at: kernel(name, install: install))
+        try? FileManager.default.removeItem(at: initrd(name, install: install))
+    }
+
     func removeKernel(_ name: String) throws {
         try? FileManager.default.removeItem(at: kernel(name))
         try? FileManager.default.removeItem(at: initrd(name))
@@ -476,6 +496,7 @@ final class MachineStore: ObservableObject {
 
     func delete(_ name: String) throws {
         models.removeValue(forKey: name)?.stop()
+        pendingBootstrap[name] = nil
         updateKeepAwake()
         try FileManager.default.removeItem(at: directory(name))
         reload()

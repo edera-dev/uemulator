@@ -26,13 +26,21 @@ struct UemulatorApp: App {
 //   -autostart                start the selected machine
 //   -new-machine NAME         create it first if it does not exist, from -new-source demo (the
 //                             default), demo:xen, install:alpine|debian|fedora, iso:FILE (in
-//                             Documents, imported) or empty
+//                             Documents, imported), empty, or bootstrap:alpine|debian|fedora (an
+//                             unattended install, with the answers below)
+//   -bootstrap-user NAME, -bootstrap-password TEXT (both required), -bootstrap-root-password TEXT,
+//   -bootstrap-hostname NAME (the machine's name), -bootstrap-ssh-key FILE (in Documents),
+//   -bootstrap-timezone TZ, -bootstrap-locale LOCALE, -bootstrap-keymap MAP (the device's, as
+//   the Install sheet has them), -bootstrap-packages "P Q"
+//                             for UI tests and Xcode Cloud; the passwords stay in memory
 //   -engine native|webkit, -debug-log FILE   see MachineModel
 //   -debug-drop-sockets SECONDS (Debug)      see WebKitEngine
 struct LibraryView: View {
     @StateObject private var store = MachineStore()
     @State private var selection: String?
     @State private var creating = false
+    // The Install sheet's distro, while it is open.
+    @State private var installing: Distro?
     @State private var problem: String?
     @State private var deleting: String?
     // Only the screen or terminal: no sidebar, no bars (MachineView).
@@ -64,7 +72,7 @@ struct LibraryView: View {
                 ToolbarItem(placement: Self.brandPlacement) { BrandMark() }
                 ToolbarItem(placement: .primaryAction) {
                     Menu {
-                        NewMachineMenu(onDemo: add, onInstall: add) { creating = true }
+                        NewMachineMenu(onDemo: add, onInstall: { installing = $0 }) { creating = true }
                     } label: {
                         Label("New Machine", systemImage: "plus")
                     }
@@ -100,6 +108,11 @@ struct LibraryView: View {
                 selection = name
             }
         }
+        .sheet(item: $installing) { distro in
+            BootstrapSheet(distro: distro, purpose: .create, hostname: store.freeName(distro.rawValue), record: nil) { request in
+                install(distro, request)
+            }
+        }
         .confirmationDialog("Delete \(deleting ?? "")?", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
                             titleVisibility: .visible) {
             Button("Delete", role: .destructive) {
@@ -128,11 +141,20 @@ struct LibraryView: View {
         make(demo.machineName, .demo(demo))
     }
 
-    private func add(_ distro: Distro) {
-        make(distro.rawValue, .install(distro))
+    // The Install sheet's Create: the machine made, selected and started, unattended with a
+    // request; why not, for the sheet to show.
+    private func install(_ distro: Distro, _ request: BootstrapRequest?) -> String? {
+        do {
+            let name = try store.create(distro.rawValue, preset: .install(distro, request))
+            selection = name
+            store.model(name).start()
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
     }
 
-    // Demos and installs need nothing more from the user: made, selected and started.
+    // Demos need nothing more from the user: made, selected and started.
     private func make(_ base: String, _ preset: MachineStore.Preset) {
         do {
             let name = try store.create(base, preset: preset)
@@ -152,6 +174,28 @@ struct LibraryView: View {
         }
     }
 
+    // `-bootstrap-*`'s answers, defaulted as the Install sheet defaults them.
+    private static func launchBootstrap(hostname: String) throws -> BootstrapRequest {
+        let defaults = UserDefaults.standard
+        guard let user = defaults.string(forKey: "bootstrap-user"), let password = defaults.string(forKey: "bootstrap-password") else {
+            throw MachineStoreError.failed("-new-source bootstrap: needs -bootstrap-user and -bootstrap-password")
+        }
+        var sshKeys: [String] = []
+        if let file = defaults.string(forKey: "bootstrap-ssh-key") {
+            let text = try String(contentsOf: MachineStore.documents.appendingPathComponent(file), encoding: .utf8)
+            sshKeys = BootstrapSheet.sshKeys(in: text)
+        }
+        let rootPassword = defaults.string(forKey: "bootstrap-root-password")
+        let record = BootstrapRecord(
+            user: user, hostname: defaults.string(forKey: "bootstrap-hostname") ?? hostname, sshKeys: sshKeys,
+            timezone: defaults.string(forKey: "bootstrap-timezone") ?? TimeZone.current.identifier,
+            locale: defaults.string(forKey: "bootstrap-locale") ?? BootstrapSheet.deviceLocale,
+            keymap: defaults.string(forKey: "bootstrap-keymap") ?? BootstrapSheet.defaultKeymap,
+            packages: (defaults.string(forKey: "bootstrap-packages") ?? "").split(separator: " ").map(String.init),
+            rootPassword: rootPassword != nil)
+        return BootstrapRequest(record: record, password: password, rootPassword: rootPassword)
+    }
+
     private func launch() {
         let defaults = UserDefaults.standard
         if let name = defaults.string(forKey: "new-machine"), !store.names.contains(name) {
@@ -160,7 +204,12 @@ struct LibraryView: View {
                 switch source {
                 case let value where value.hasPrefix("install:"):
                     guard let distro = Distro(rawValue: String(value.dropFirst("install:".count))) else { break }
-                    try store.create(name, preset: .install(distro))
+                    try store.create(name, preset: .install(distro, nil))
+                case let value where value.hasPrefix("bootstrap:"):
+                    guard let distro = Distro(rawValue: String(value.dropFirst("bootstrap:".count))) else { break }
+                    let request = try Self.launchBootstrap(hostname: name)
+                    if let invalid = request.problem(for: distro) { throw MachineStoreError.failed(invalid) }
+                    try store.create(name, preset: .install(distro, request))
                 case let value where value.hasPrefix("iso:"):
                     let iso = MachineStore.documents.appendingPathComponent(String(value.dropFirst("iso:".count)))
                     try store.create(name, preset: .custom(memoryMib: MachineModel.cdromMemoryMib, diskGib: Distro.easyDiskGib,

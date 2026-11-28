@@ -61,6 +61,11 @@ final class MachineModel: ObservableObject, ScreenInput {
     // boot printed (an installer's final screen, say).
     private var restartingAfterReset = false
     private let downloader = Downloader()
+    // This run is an unattended install (`MachineStore.pendingBootstrap`): its reset is the
+    // install's end, a success only once the console has shown the completion marker.
+    private var bootstrapRun = false
+    private var completionMarker = CompletionMarkerWatch()
+    static let bootstrapFailedReason = "The installer reset before it finished. Use Reinstall… to try again."
 
     init(name: String, store: MachineStore) {
         self.name = name
@@ -181,6 +186,7 @@ final class MachineModel: ObservableObject, ScreenInput {
             guard let self, let engine, engine === self.engine else { return }
             self.terminal.feed(bytes)
             self.debugLog?.write(Data(bytes))
+            if self.bootstrapRun { self.completionMarker.feed(bytes) }
         }
         engine.onLog = { [weak self] text in
             self?.debugLog?.write(Data("\n[engine] \(text)\n".utf8))
@@ -215,13 +221,63 @@ final class MachineModel: ObservableObject, ScreenInput {
                     self.resumeOnForeground = false
                 }
                 #endif
-                // Booted afresh, so an installer that rebooted comes up on its disk.
-                if reason == EngineState.resetReason && self.definition.reboot {
+                // Before the restarts below: their `boot` decides afresh whether the next run is one.
+                let wasBootstrapRun = self.bootstrapRun
+                // A suspended install is still one when it resumes; any other end is not.
+                if reason != EngineState.suspendedReason { self.bootstrapRun = false }
+                if wasBootstrapRun && reason == EngineState.resetReason {
+                    self.bootstrapReset()
+                } else if reason == EngineState.resetReason && self.definition.reboot {
+                    // Booted afresh, so an installer that rebooted comes up on its disk.
                     self.restartingAfterReset = true
                     self.start()
                 }
             }
         }
+    }
+
+    // The end of an unattended install (docs/plans/35-quick-bootstrap.md, "After the install"),
+    // whatever `reboot` says: the request is spent either way. After the marker the installed disk
+    // boots (`auto` finds it installed; a reinstall's `installer` must not run the install
+    // again). Without it, starting again would run an interactive installer nobody asked for.
+    private func bootstrapReset() {
+        store.pendingBootstrap[name] = nil
+        guard completionMarker.seen else {
+            state = .stopped(Self.bootstrapFailedReason)
+            problem = Self.bootstrapFailedReason
+            return
+        }
+        var changed = definition
+        changed.bootFrom = .auto
+        do {
+            try store.save(changed, as: name)
+        } catch {
+            problem = error.localizedDescription
+            return
+        }
+        restartingAfterReset = true
+        start()
+    }
+
+    // Reinstall…: the disk is erased by an unattended install of the same distro, with fresh
+    // installer images, booted at once as `quick reinstall` does. Only while stopped.
+    func reinstall(_ request: BootstrapRequest) {
+        guard !isRunning, let distro = definition.install else { return }
+        // A suspended state describes the disk the install is about to erase.
+        discardSuspended()
+        var changed = definition
+        changed.bootstrap = request.record
+        // `auto` would boot the disk that is already installed.
+        changed.bootFrom = .installer
+        do {
+            try store.save(changed, as: name)
+        } catch {
+            problem = error.localizedDescription
+            return
+        }
+        store.removeInstaller(name, install: distro)
+        store.pendingBootstrap[name] = request
+        start()
     }
 
     var isRunning: Bool {
@@ -353,6 +409,7 @@ final class MachineModel: ObservableObject, ScreenInput {
     }
 
     private func boot() {
+        bootstrapRun = false
         let size = terminal.size
         var settings = MachineSettings(kernel: Data(), initrd: Data())
         settings.disks = definition.disks
@@ -388,6 +445,19 @@ final class MachineModel: ObservableObject, ScreenInput {
             settings.kernel = kernel
             settings.initrd = (try? Data(contentsOf: store.initrd(name, install: distro))) ?? Data()
             cmdline.insert(distro.cmdline, at: 0)
+            if let request = store.pendingBootstrap[name] {
+                // The answers follow the distro's own installer arguments (the bootstrap crate's
+                // `Payload::cmdline`), before the user's.
+                do {
+                    let extended = try request.extend(settings.initrd, distro: distro)
+                    settings.initrd = extended.initrd
+                    cmdline.insert(extended.cmdline, at: 1)
+                    bootstrapRun = true
+                } catch {
+                    state = .stopped("The install's answers: \(error.localizedDescription)")
+                    return
+                }
+            }
         } else if definition.install == nil && definition.bootsKernel {
             guard let kernel = try? Data(contentsOf: store.kernel(name)) else {
                 state = .stopped("The kernel is missing")
@@ -437,6 +507,13 @@ final class MachineModel: ObservableObject, ScreenInput {
             suspended = false
         }
         runningDisks = disks
+        if settings.resumeFrom == nil {
+            completionMarker = CompletionMarkerWatch()
+        } else {
+            // A resumed install is the same run, whatever its half-written disk makes `auto`
+            // choose above, and may have shown the marker before its suspend.
+            bootstrapRun = store.pendingBootstrap[name] != nil
+        }
         // A resumed guest carries on where its console left off in this session.
         if !restartingAfterReset && settings.resumeFrom == nil { terminal.reset() }
         restartingAfterReset = false

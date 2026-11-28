@@ -22,6 +22,10 @@ struct MachineSettingsView: View {
     // Disks New Disk made in this sheet: the file exists from the moment it is added, so Cancel,
     // or Detach before Done, has to delete it or it stays behind in the machine's folder.
     @State private var createdDisks: [URL] = []
+    @State private var reinstalling = false
+    // Reinstall…'s answers, acted on once its sheet is gone: the reinstall saves these settings
+    // first and closes this sheet too, and a sheet closed under its open child misbehaves.
+    @State private var reinstallRequest: BootstrapRequest?
 
     enum Pick: Identifiable {
         case iso, image, kernel, initrd, hypervisor
@@ -65,13 +69,7 @@ struct MachineSettingsView: View {
                 } footer: {
                     Text(engineFooter)
                 }
-                if let distro = draft.install {
-                    Section(distro.title) {
-                        Picker("Boot From", selection: $draft.bootFrom) {
-                            ForEach(BootFrom.allCases) { Text($0.title).tag($0) }
-                        }
-                    }
-                }
+                if let distro = draft.install { installSection(distro) }
                 disksSection
                 Section("Security") {
                     Toggle("TPM 2.0", isOn: $draft.tpm)
@@ -132,6 +130,18 @@ struct MachineSettingsView: View {
                 case .hypervisor: newHypervisor = url
                 }
             }
+            .sheet(isPresented: $reinstalling, onDismiss: {
+                guard let request = reinstallRequest else { return }
+                reinstallRequest = nil
+                done { model.reinstall(request) }
+            }) {
+                if let distro = draft.install {
+                    BootstrapSheet(distro: distro, purpose: .reinstall, hostname: model.name, record: draft.bootstrap) { request in
+                        reinstallRequest = request
+                        return nil
+                    }
+                }
+            }
             .confirmationDialog("Delete \(model.name)?", isPresented: $confirmingDelete, titleVisibility: .visible) {
                 Button("Delete", role: .destructive) {
                     dismiss()
@@ -148,6 +158,27 @@ struct MachineSettingsView: View {
         #else
         .formSheetSizing()
         #endif
+    }
+
+    // An installer machine's: what it boots, its unattended install's answers, and Reinstall….
+    private func installSection(_ distro: Distro) -> some View {
+        Section {
+            Picker("Boot From", selection: $draft.bootFrom) {
+                ForEach(BootFrom.allCases) { Text($0.title).tag($0) }
+            }
+            if let record = draft.bootstrap { BootstrapRecordRows(record: record) }
+            Button("Reinstall…", role: .destructive) { reinstalling = true }
+                .disabled(model.isRunning)
+        } header: {
+            Text(distro.title)
+        } footer: {
+            Text(installFooter(distro))
+        }
+    }
+
+    private func installFooter(_ distro: Distro) -> String {
+        if model.isRunning { return "Stop the machine to reinstall it." }
+        return "Reinstall… erases the disk and installs \(distro.title) again without questions, then saves these settings and starts the machine."
     }
 
     private var disksSection: some View {
@@ -276,7 +307,8 @@ struct MachineSettingsView: View {
         }
     }
 
-    private func done() {
+    // Saves the draft and imports the picked files, then closes the sheet and runs `after`.
+    private func done(after: (() -> Void)? = nil) {
         removeCreatedDisks(keeping: draft.disks.map(\.url))
         // Named before the save, so its command line is saved with it; the file follows.
         if let newHypervisor { draft.hypervisor = newHypervisor.lastPathComponent }
@@ -284,6 +316,7 @@ struct MachineSettingsView: View {
         let isos = newISOs, images = newImages, kernel = newKernel, initrd = newInitrd, hypervisor = newHypervisor
         guard !isos.isEmpty || !images.isEmpty || kernel != nil || initrd != nil || hypervisor != nil else {
             dismiss()
+            after?()
             return
         }
         saving = true
@@ -295,6 +328,7 @@ struct MachineSettingsView: View {
             }
             saving = false
             dismiss()
+            after?()
         }
     }
 
