@@ -1817,6 +1817,20 @@ impl Cpu {
     /// the record after the banner: on x86 that is always `Command line:` (`setup_arch`), and
     /// reports it first, then the other matches below it in address order.
     fn kernel_log_matches(&self) -> String {
+        self.kernel_log_matches_in_views(crate::ram::MAX_VIEW_BYTES)
+    }
+
+    /// `kernel_log_matches`, looking at RAM through views of at most `max_view` bytes: guest RAM
+    /// can be longer than one slice may be (`isize::MAX`, 2 GiB on wasm32), and a 3 GiB guest's
+    /// low RAM alone is. Tests pass a small `max_view` to cross view boundaries.
+    fn kernel_log_matches_in_views(&self, max_view: usize) -> String {
+        let view = |range: core::ops::Range<usize>| -> &[u8] {
+            assert!(
+                range.len() <= max_view,
+                "guest RAM view {range:?} is longer than {max_view}"
+            );
+            &self.ram[range]
+        };
         // Matches reported, the log included.
         const MAX_BANNER_MATCHES: usize = 6;
         // Log text extracted after each match.
@@ -1842,18 +1856,24 @@ impl Cpu {
         'scan: for (range_start, range_end) in ranges {
             let mut search_from = range_start;
             while search_from + BANNER.len() < range_end {
-                let Some(relative) = self.ram[search_from..range_end]
+                let view_end = range_end.min(search_from.saturating_add(max_view));
+                let Some(relative) = view(search_from..view_end)
                     .windows(BANNER.len())
                     .position(|window| window == BANNER)
                 else {
-                    break;
+                    if view_end == range_end {
+                        break;
+                    }
+                    // The next view starts early enough to catch a banner this one cut.
+                    search_from = view_end - (BANNER.len() - 1);
+                    continue;
                 };
                 let start = search_from + relative;
                 search_from = start + BANNER.len();
                 let end = (start + LOG_SCAN_BYTES).min(range_end);
                 let mut text = String::new();
                 let mut printable_run = String::new();
-                for &byte in &self.ram[start..end] {
+                for &byte in view(start..end) {
                     if (b' '..0x7f).contains(&byte) {
                         printable_run.push(byte as char);
                     } else {
@@ -3265,6 +3285,33 @@ mod cpu_tests {
             );
             assert!(dump.contains("Command line: console=ttyS0\n"), "{dump}");
             assert_eq!(dump.matches("--- ram match at").count(), 6);
+        }
+
+        #[test]
+        fn the_kernel_log_scan_looks_through_views_no_longer_than_a_slice_may_be() {
+            // On wasm32 a slice is at most 2 GiB, and a 3072 MiB guest's low RAM is longer than
+            // that: the scan must walk it in pieces, and find a banner a piece boundary cuts.
+            let mut h = harness();
+            // Longer than the text taken after a match, which is one short view of its own.
+            const MAX_VIEW: usize = 0x4000;
+            // Views start at 0 and each next one 12 bytes (the banner's length less one) before
+            // the end of the last: put the banner across the first view end inside SCRATCH.
+            let step = MAX_VIEW - (b"Linux version".len() - 1);
+            let view_end = MAX_VIEW + (SCRATCH as usize - MAX_VIEW).div_ceil(step) * step;
+            let log_at = view_end as u64 - 5;
+            h.write(
+                log_at,
+                b"Linux version 1.2.3 banner\0\0\0\0\0\0\0\0Command line: console=ttyS0\0",
+            );
+            let matches = h.cpu.kernel_log_matches_in_views(MAX_VIEW);
+            assert!(
+                matches.contains(&format!("--- ram match at {log_at:#x}\n")),
+                "{matches}"
+            );
+            assert!(
+                matches.contains("Command line: console=ttyS0\n"),
+                "{matches}"
+            );
         }
 
         #[test]

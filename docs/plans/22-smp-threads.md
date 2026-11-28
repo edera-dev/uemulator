@@ -10,7 +10,7 @@ With `MachineConfig::cpus(n)` the guest has n vCPUs. Time-sharing them on one ho
 - `Timeshare`: never threads.
 - `Threads`: `EmulatedMachine::new` fails instead of falling back.
 
-Threads need: more than one vCPU, `ClockMode::Realtime` (the default), no `verify_jit`, a host clock, and a way to start threads. Hosted builds have `std::thread` and `Instant`. A freestanding build (UEFI, WebAssembly) gets threads only if the embedder gives `MachineConfig::thread_spawner` (a closure that runs a `Box<dyn FnOnce() + Send>` on a new thread) and a `host_clock`; the host must offer real parallel threads (WebAssembly: shared memory and atomics). Without them the machine time-shares exactly as before.
+Threads need: more than one vCPU, `ClockMode::Realtime` (the default), no `verify_jit`, a host clock, and a way to start threads. Hosted builds have `std::thread` and `Instant`. A freestanding build (UEFI, WebAssembly) gets threads only if the embedder gives `MachineConfig::thread_spawner` (a closure that runs a `Box<dyn FnOnce() + Send>` on a new thread) and a `host_clock`; the host must offer real parallel threads (WebAssembly: shared memory and atomics). Without them the machine time-shares exactly as before. On wasm32 the JIT also rules threads out: its blocks are called through one instance's function table, which another thread cannot reach, so with the JIT on the vCPUs take turns (`Vcpu::runs_on_threads` in `machine.rs`); the web build passes no `thread_spawner`.
 
 Why realtime only: the virtual clock is the instruction count, which cannot be one deterministic timeline across threads, and Linux checks that the TSC is the same on every CPU. In threaded mode guest time is the shared host clock (`Cpu::wall_clock`), so every vCPU reads the same TSC.
 

@@ -1124,7 +1124,7 @@ fn mirrored_devices(main: &mut DevConfig, main_uart: &ConsoleHandle) -> (DevConf
         nets: main
             .nets
             .iter()
-            .map(|(mac, _)| (*mac, NetHandle::default()))
+            .map(|(mac, net)| (*mac, net.verify_twin()))
             .collect(),
         virtio_consoles: main
             .virtio_consoles

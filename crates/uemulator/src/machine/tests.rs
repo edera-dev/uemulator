@@ -353,6 +353,43 @@ mod twin_devices {
     }
 
     #[test]
+    fn the_twin_nic_offers_the_main_ones_offloads_and_gets_each_frame_it_takes() {
+        // Under --verify the twin's NIC used to be an empty handle: it offered the guest other
+        // features (a divergence at the driver's feature read) and never got a frame (one at the
+        // first interrupt a frame raised).
+        let mut main = full_config(false);
+        let offloads = crate::netdev::NetOffloads {
+            takes_guest_segments: true,
+            sends_large_segments: true,
+        };
+        main.nets[0].1.set_offloads(offloads);
+        let twin = mirrored(&mut main);
+        let (main_net, twin_net) = (&main.nets[0].1, &twin.nets[0].1);
+        assert_eq!(twin_net.offloads(), offloads);
+
+        main_net.send_frame(b"first");
+        main_net.send_frame(b"second");
+        assert!(
+            !twin_net.has_pending(),
+            "the twin gets a frame when the main device takes it, not when the host sends it"
+        );
+        // No room in the guest's buffers: both devices put the frame back and take it again.
+        let first = main_net.guest_recv().unwrap();
+        main_net.guest_unrecv(first);
+        let twin_first = twin_net.guest_recv().unwrap();
+        assert_eq!(twin_first.bytes, b"first");
+        twin_net.guest_unrecv(twin_first);
+        assert_eq!(main_net.guest_recv_bytes().as_deref(), Some(&b"first"[..]));
+        assert_eq!(twin_net.guest_recv_bytes().as_deref(), Some(&b"first"[..]));
+        assert_eq!(main_net.guest_recv_bytes().as_deref(), Some(&b"second"[..]));
+        assert_eq!(twin_net.guest_recv_bytes().as_deref(), Some(&b"second"[..]));
+        assert!(
+            !twin_net.has_pending(),
+            "a frame put back is not copied twice"
+        );
+    }
+
+    #[test]
     fn mirror_has_the_same_virtio_functions_in_the_same_slots() {
         let mut main = full_config(false);
         let mut mirror = Devices::new(ConsoleHandle::default(), mirrored(&mut main));

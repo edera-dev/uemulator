@@ -93,7 +93,7 @@ The time is what the host sees from the request to `done`, so it includes the vC
 - `cpu/smp_tests.rs`: two vCPUs on threads, each with write tags from a first run, store after arming; both pages are dirty (fails without the revocation).
 - `machine/suspend/tests.rs`: a checkpoint, a delta after the guest rewrote, zeroed, byte-poked and lock-added pages, and a suspend of the same moment; the chain restores to the same bytes as the suspend (interpreter, JIT, two time-shared vCPUs; with the dirty-log check, which named the seven missed pages when the revocation was removed). Checkpoints during the 40-million-iteration computation leave its result alone and their chain resumes it (interpreter, JIT, time-shared, threads with both engines). Chains that do not fit are refused before anything runs; a failed checkpoint leaves the machine running and the next delta against the last good one; a checkpoint that meets a stop is answered with an error. Format 1 loads. Eight rounds of random device writes (zero, one byte, compressible, random, a few bytes) each restore exactly from the whole chain, and each delta holds only the pages written.
 - `snapshot/compress.rs`: round trips of 3000 generated pages, random pages refused, every truncation and 20000 bit flips of a compressed page and random junk decoded without a panic, generation wrap.
-- The CLI: the escape key's parsing, checkpoint numbering, disk and nvram copies made and put back, a failed copy leaving no checkpoint.
+- The CLI: the escape key's parsing, checkpoint numbering, disk and nvram copies made and put back, a failed copy leaving no checkpoint. `quick boot NAME --resume-from DIR/NNNN.checkpoint` puts the checkpoint's disks and nvram back before it chooses between the installer and the disk (`machines::prepare_boot`), so a guest reboot after the resume boots what the resumed guest expects; `resuming_a_checkpoint_decides_on_the_disk_the_checkpoint_saw` covers it.
 
 ## Limits and next steps
 
@@ -102,4 +102,3 @@ The time is what the host sees from the request to `done`, so it includes the vC
 - Compression runs on the vCPU thread, one page at a time, single-threaded.
 - Restoring a chain reads every link's CPU and device state; only the last one's counts. Long chains (hundreds) are slow to resume; nothing merges them.
 - The CLI copies whole disk files; on a file system without clones that is a full copy per checkpoint. Read-only disks and http-backed bases are not copied (they cannot change).
-- `quick boot NAME --resume-from DIR/NNNN.checkpoint` decides between the installer and the disk before the disk is put back; the resume is right, but a guest reboot afterwards may boot the other one.

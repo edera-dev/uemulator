@@ -17,7 +17,7 @@ The design plans in [`plans/`](plans/README.md) are the source of truth for how 
 - [14-avx-and-virtualization.md](plans/14-avx-and-virtualization.md): AVX and SVM pointers, and the VMX design that has not been implemented.
 - [15-legacy-modes.md](plans/15-legacy-modes.md): real mode, 16/32-bit protected mode, compatibility mode, virtual-8086 and task switching.
 - [22-smp-threads.md](plans/22-smp-threads.md): one host thread per vCPU, covering shared state, the exclusive section, atomics and x86 memory ordering.
-- [21-ryzen-7000-parity.md](plans/21-ryzen-7000-parity.md): proposal for feature parity with a Zen 4 Ryzen 7000-class part.
+- [21-ryzen-7000-parity.md](plans/21-ryzen-7000-parity.md): the Zen 5 Turin CPU model (speculation controls, performance monitoring, IBS, CET, LA57, PKU, the SVM additions) and the parity work behind it; a selectable Ryzen 7000-class profile is still a proposal.
 
 ## Memory
 
@@ -48,7 +48,7 @@ The design plans in [`plans/`](plans/README.md) are the source of truth for how 
 ## Other hosts
 
 - [13-web.md](plans/13-web.md): the WebAssembly port and the browser page.
-- [28-apple.md](plans/28-apple.md): the SwiftUI app for macOS and iOS (proposal): native engine, and the WebAssembly JIT run in a hidden WebKit view on iOS.
+- [28-apple.md](plans/28-apple.md): the SwiftUI app for macOS and iOS in `apple/` (milestones M0-M5 built): native engine, and the WebAssembly JIT run in a hidden WebKit view.
 - [12-uefi.md](plans/12-uefi.md): uemulator as a UEFI application, including the hardware-virtualization path.
 - [29-snapshots.md](plans/29-snapshots.md): suspending a machine to a snapshot and resuming it, on any host, keeping its disks consistent: how the app survives iOS ending it and moves a machine between engines.
 - [34-incremental-snapshots.md](plans/34-incremental-snapshots.md): dirty-page tracking, delta snapshots with page compression, and checkpoints of a running machine to go back to.
@@ -74,3 +74,4 @@ The design plans in [`plans/`](plans/README.md) are the source of truth for how 
 Step-by-step task plans for single changes, kept for the decisions they record.
 
 - [superpowers/plans/2026-10-28-uefi-default-kernel-boot.md](superpowers/plans/2026-10-28-uefi-default-kernel-boot.md): making UEFI the default firmware, and booting `--kernel` through it.
+- [superpowers/plans/2026-11-05-wisp.md](superpowers/plans/2026-11-05-wisp.md): internet for web guests through a Wisp server, with the user-mode gateway moved into the library (27).

@@ -870,8 +870,8 @@ impl Cpu {
     /// (16, 32 or 64 bits). The destination offset must be 64-byte aligned (#GP(0)), so it lies in
     /// one page: the source is read in full first, and a fault on the destination's first store
     /// leaves memory untouched. The SDM promises the 64-byte write is a single unit to other
-    /// agents; with one host thread per vCPU the eight 8-byte stores below are not, which no
-    /// guest has been seen to depend on (`docs/plans/21-ryzen-7000-parity.md`).
+    /// agents: the eight 8-byte stores run with the other vCPUs stopped. Device DMA and an MMIO
+    /// destination still see eight writes; no emulated device takes 64-byte enqueue stores.
     fn movdir64b(&mut self, i: &Insn, next: u64) -> ExecResult<()> {
         const BYTES: u64 = 64;
         const CHUNK: u8 = 8;
@@ -895,10 +895,17 @@ impl Cpu {
         for (k, word) in data.iter_mut().enumerate() {
             *word = self.read(source + k as u64 * CHUNK as u64, CHUNK)?;
         }
-        for (k, word) in data.iter().enumerate() {
-            self.write(destination + k as u64 * CHUNK as u64, CHUNK, *word)?;
-        }
-        Ok(())
+        // The SDM makes the 64-byte store a single write, and no host has a 64-byte atomic
+        // store for ordinary memory (aarch64's ST64B is for device memory and optional, wasm32
+        // stops at 8 bytes). With the other vCPUs stopped, they see none of it or all of it.
+        // The destination is 64-byte aligned, so within one page: a fault comes from the first
+        // write, before anything is stored.
+        self.with_exclusive(|cpu| {
+            for (k, word) in data.iter().enumerate() {
+                cpu.write(destination + k as u64 * CHUNK as u64, CHUNK, *word)?;
+            }
+            Ok(())
+        })
     }
 
     /// ADCX (66 0F 38 F6) and ADOX (F3 0F 38 F6): add with carry where the carry chain is CF

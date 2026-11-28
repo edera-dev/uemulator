@@ -119,3 +119,15 @@ pub fn reference_checksum(data: &[u8]) -> u16 {
     }
     !(sum as u16)
 }
+
+/// The header of a snapshot as `checkpoints::chain` reads it: format 2, full or a delta of
+/// `parent`, ids made of one repeated byte. Nothing past the header: enough for the chain to be
+/// found, not to be restored.
+pub fn snapshot_header(id: u8, parent: Option<u8>) -> Vec<u8> {
+    let mut header = b"UEMUSNAP".to_vec();
+    header.extend_from_slice(&2u32.to_le_bytes());
+    header.push(u8::from(parent.is_some()));
+    header.extend_from_slice(&[id; 16]);
+    header.extend_from_slice(&[parent.unwrap_or(0); 16]);
+    header
+}

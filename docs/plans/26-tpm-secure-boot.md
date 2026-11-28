@@ -56,8 +56,8 @@ Cost: the firmware hashes what it measures in guest code. Debian's 12 MB kernel 
 
 ## Front ends
 
-- CLI: `--tpm[=BOOL]` and `--secure-boot[=BOOL]` on every command with hardware options; `machine.toml` keeps `tpm` and `secure_boot`. A named machine's Secure Boot keys and TPM state live in its `nvram.kv`; `advanced boot` and the web page, which keep no store, give the TPM one in memory that lasts as long as the machine.
-- Web: "TPM 2.0" (needs ACPI) and "Secure Boot" (needs UEFI) in Advanced, `?tpm` and `?secure-boot`, `OPTION_TPM`/`OPTION_SECURE_BOOT` (bits 11 and 12) in the C ABI. The page keeps no variables, so the keys are enrolled again on every load and the TPM is new on every load. `node hack/wasm/boot.mjs --tpm --secure-boot` passes them too.
+- CLI: `--tpm[=BOOL]` and `--secure-boot[=BOOL]` on every command with hardware options; `machine.toml` keeps `tpm` and `secure_boot`. A named machine's Secure Boot keys and TPM state live in its `nvram.kv`, and `advanced boot-uefi --nvram FILE` keeps them in FILE; `advanced boot` and the web page, which keep no store, give the TPM one in memory that lasts as long as the machine.
+- Web: "TPM 2.0" (needs ACPI) and "Secure Boot" (needs UEFI) in Advanced, `?tpm` and `?secure-boot`, `OPTION_TPM`/`OPTION_SECURE_BOOT` (bits 11 and 12) in the C ABI. The page keeps no variables, so the keys are enrolled again on every load and the TPM is new on every load; a host that keeps an nvram log hands it over with `uw_set_nvram` (the Apple app, `node hack/wasm/boot.mjs --nvram FILE`; `docs/plans/13-web.md`). `node hack/wasm/boot.mjs --tpm --secure-boot` passes them too, and the Apple app has both switches.
 
 ## Verification
 
