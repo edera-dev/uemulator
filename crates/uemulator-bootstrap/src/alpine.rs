@@ -26,6 +26,12 @@ const PRIVATE_DIRECTORY_MODE: u32 = S_IFDIR | 0o700;
 const SYMLINK_MODE: u32 = S_IFLNK | 0o777;
 /// The installed system's first disk (virtio-blk).
 const DISK: &str = "/dev/vda";
+/// The netboot repositories say `latest-stable` (`quick.rs`), which `setup-apkrepos` does not
+/// recognize as a release and turns into `edge`: the installed system then upgrades itself to
+/// edge from the mixed repositories (seen on a real install). Naming the running release
+/// (`v3.24` from `3.24.4`) first makes it pick that one. `alpine-release` is in the netboot world.
+const PIN_RELEASE: &str =
+    "sed -i \"s|/latest-stable/|/v$(cut -d. -f1,2 /etc/alpine-release)/|\" /etc/apk/repositories";
 
 pub(crate) fn render(answers: &Answers) -> Payload {
     let entry = |path: &str, mode: u32, data: Vec<u8>| TarEntry {
@@ -116,6 +122,7 @@ fn install_script(answers: &Answers) -> String {
          trap reboot EXIT\n\
          \n\
          apk add alpine-conf e2fsprogs\n\
+         {PIN_RELEASE}\n\
          setup-alpine -e -f /{ANSWERS_PATH}\n"
     );
     // After setup-alpine, whose setup-apkrepos adds the community repository. setup-disk
@@ -237,6 +244,18 @@ mod tests {
             text(&entries, "etc/bootstrap/answers"),
             include_str!("../testdata/alpine-minimal.answers")
         );
+    }
+
+    #[test]
+    fn the_installed_release_is_the_netboot_one_not_edge() {
+        for answers in [full(), minimal()] {
+            let entries = overlay(&answers);
+            let script = text(&entries, "etc/local.d/bootstrap.start");
+            let pin = script
+                .find(&format!("\n{PIN_RELEASE}\n"))
+                .expect("the repositories name the netboot release");
+            assert!(pin < script.find("\nsetup-alpine ").unwrap());
+        }
     }
 
     #[test]

@@ -8,6 +8,7 @@ exec > /dev/console 2>&1
 trap reboot EXIT
 
 apk add alpine-conf e2fsprogs
+sed -i "s|/latest-stable/|/v$(cut -d. -f1,2 /etc/alpine-release)/|" /etc/apk/repositories
 setup-alpine -e -f /etc/bootstrap/answers
 apk add doas openssh git htop
 ERASE_DISKS=/dev/vda setup-disk -m sys /dev/vda
