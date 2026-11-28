@@ -411,3 +411,37 @@ Native aarch64 (M-series), wall seconds to a console line, medians of interleave
 Cross-page links show up in the far-jump loop but not measurably in the boots: what they replace is the stub's jump-cache probe and validity byte, while the TLB probe stays, and returns and indirect branches (most of the stub's traffic in round 2's profile) still take the stub. Not measured: the WebAssembly build (unchanged), Xen (the demo artifacts were not on this host; round 3 counted 134M `helper_set_rotate_flags` calls in a PV boot, each of which now stores and reloads the pinned registers, so a Xen PV boot is where a regression would show first), and how many cross-page exits stay unlinked because their target was neither in the TLB at translation nor reached through the run loop afterwards (a target the chain stub keeps finding in the jump cache never comes back to be linked).
 
 `--verify` (lockstep JIT against interpreter, unchained, so the pinning and not the links) ran the Alpine kernel above for 600 s through the initramfs to its emergency shell without a divergence. Under Rosetta (x86-64 backend) the suite passes alone; in mixed runs on the loaded host the `machine::suspend` tests time out on main and on the branch alike, and two `jit::diff_hazards` cases failed once each in about ten mixed runs of the branch (none in seven of main, none in six runs of the module alone). Those snippets have no cross-page exit, so their x86-64 code is the same as main's; it looks like the Rosetta translation-cache staleness `mod.rs` describes, but that was not proven.
+
+## Round 9: the interpreter fallbacks, measured and lowered on every backend (2026-11-27)
+
+Goal: send as few guest instructions through `helper_exec` as possible, on all three backends. `--debug`'s histogram now also keys LOCK, a ModRM memory operand and a 67 prefix (register and memory forms of one opcode are lowered apart) and prints the share: `instructions through the interpreter: N (M per million retired)`. Native aarch64 numbers, base 8881609, on a host at a load of 4 to 9 from other sessions:
+
+| workload | fallbacks before | after | per million retired, before / after |
+|---|---:|---:|---:|
+| Debian 13 netboot to the installer, 1 vCPU, 40 s | 25.4M | 5.9M | 3369 / 778 |
+| Same, 4 vCPUs, 30 s (vCPU 0) | 27.1M | 3.0M | 7176 / 1167 |
+| Debian live 13.7 KDE to sddm, 1 vCPU, 300 s | 649M | 80M | 6547 / 807 |
+| Same, 4 vCPUs, 300 s (vCPU 0) | 161M | 28M | 6790 / 976 |
+| WebAssembly build (Node 26), Debian netboot to the installer | 15.2M | 3.2M | 2989 / 626 |
+
+What was at the top before, and is now inline on aarch64, x86-64 and WebAssembly (`jit/diff_coverage.rs` holds a differential case and a "reaches no interpreter" check for every form, both run on all three):
+
+- movzx/movsx from ah..bh (128M in the KDE boot; the native generators refused the form), adcx/adox (176M) and mulx (81M; only wasm had it), movd/movq between xmm and general registers (41M), div/idiv (19M), cmpxchg (16M), bt/bts/btr/btc, pause, rdtsc/rdtscp, pushf, sti, leave, xchg, xadd, bswap, kortest/ktest, cmpxchg16b, rdpkru, mov r/m,sreg, cld/std, vzeroupper, and the swapgs/clac/stac/cli group on wasm.
+- Instructions that read or replace single flags (adcx/adox chains, bt*, pushf, cmpxchg16b) resolve the lazy record into `Cpu::eflags` once (`helper_materialize_flags`, skipped while `lazy_op` is already `Eflags`) and then work on its bits; a bignum chain of adcx and adox pays for that once.
+- LOCK forms and xchg with memory: on aarch64 with threads an exclusive load/store loop (`ldaxr`/`stlxr`, `ldaxp`/`stlxp` for cmpxchg16b), on x86-64 the host's own locked instruction, and plain loads and stores where one vCPU runs at a time (one vCPU, time-sharing, the web build). A misaligned operand goes to the interpreter: it cannot be exclusive on the host and is a split lock, which raises #DB under DEBUGCTL.BLD as Linux sets it. `cpu::smp_tests` fail when the exclusive loop is replaced with a plain load and store (checked).
+- SSE: `helpers::whole_vector` now also classifies the SSE2 integer family `vector_alu` leaves, pshuflw/pshufhw, pblendw and movhlps/movlhps, which all three backends send through `helper_whole_vector` (no decode, no dispatch); `helpers::partial_move` covers movss/movsd/movlps/movlpd/movhps/movhpd and movq xmm, xmm/m64.
+- Instructions an SVM guest's host may intercept (pause, rdtsc, pushf) go to the interpreter while `Svm::guest` is set. rdtsc prepays `icount` like the helper path, so the virtual clock reads the same. sti ends its block with an exit to the run loop, not a chain, so a pending interrupt is taken once the shadow passes.
+- Register forms with a 67 prefix (compilers pad with it: 2M `addr32 inc` in the KDE boot) are lowered like those without.
+
+Found on the way: with threads (`ordered_memory`) the aarch64 TLB probe sent every access that was not naturally aligned to the interpreter, because `ldar`/`stlr` need alignment; that included 16- to 64-byte vector loads and stores, which are plain `ldr q`/`stp` with a barrier and take any alignment. glibc's string functions load unaligned vectors all the time: 14M fallbacks in 30 s of a 4-vCPU Debian boot. The check now only applies up to 8 bytes, and the partial moves use plain accesses with barriers too.
+
+Wall time (interleaved, medians): Debian installer to its first frame natively 4.38 -> 4.09 s (5 pairs, 1.07x); the WebAssembly build 11.5 -> 11.4 s (2 pairs, the same). The KDE boots are guest-timeout-bound: in the same 300 s the 4-vCPU boot's vCPU 0 retired 28.3G instructions after against 23.7G before (1.2x). A `--verify` lockstep run of the Debian installer (1200 s, to the installer's screen) and of the Alpine netboot (to its init exiting, as on the base build) found no divergence.
+
+What is left, in order of size (the KDE boot after, natively):
+
+- rep stos/movs (17M): the interpreter does each one in bulk (`Cpu::rep_bulk`), so a helper call per instruction is cheap next to the copy; a lowering would duplicate the page-splitting rules.
+- EVEX vpcmpeqd and vptestmd into an opmask (12M): only the byte forms are inline; the dword ones need the element mask gathered per backend (`EvexKind` grows a variant every generator must handle). VEX vpcmpgtb (3M) needs a signed compare in `VectorOp`.
+- Scalar SSE floating point (cvtsi2sd, comisd, addsd/mulsd/subsd, andpd: about 15M): exact MXCSR flags and #XM delivery; `31-host-fpu.md` has the host-FPU plan.
+- syscall/sysret and iretq (about 5M): privilege and segment changes; they end blocks anyway.
+- LOCK on byte operands (lock or/xor byte, 1M with 4 vCPUs) and lock bt* with a register offset: rare, left to the interpreter.
+- jrcxz (0.4M), masked EVEX stores and broadcasts from memory, VEX/EVEX shifts by an immediate (vpsrld, under 1M each).

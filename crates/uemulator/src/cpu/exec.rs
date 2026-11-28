@@ -447,6 +447,17 @@ impl Cpu {
         }
     }
 
+    /// What `pause` does beyond waiting: a vCPU on its own thread spins (and now and then yields
+    /// its host core); one that takes turns with others asks to hand over. Also the JIT's
+    /// `helper_pause`.
+    pub(crate) fn pause_hint(&mut self) {
+        if self.threads.is_some() {
+            self.pause_threaded();
+        } else if self.multi {
+            self.request_yield();
+        }
+    }
+
     /// Whether `exec` has to run this instruction as an atomic read-modify-write: it carries a
     /// LOCK prefix, or it is `xchg` with a memory operand, which is locked implicitly (SDM
     /// vol. 2, XCHG).
@@ -1549,10 +1560,8 @@ impl Cpu {
                     let b = self.read_gpr(r, osz, true);
                     self.write_gpr(0, osz, true, b);
                     self.write_gpr(r, osz, true, a);
-                } else if i.rep != 0 && self.threads.is_some() {
-                    self.pause_threaded();
-                } else if i.rep != 0 && self.multi {
-                    self.request_yield();
+                } else if i.rep != 0 {
+                    self.pause_hint();
                 }
             }
             // xchg r, rax

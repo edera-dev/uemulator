@@ -138,6 +138,8 @@ mod diff_alias_cases;
 mod diff_alu;
 #[cfg(test)]
 mod diff_bmi;
+#[cfg(test)]
+mod diff_coverage;
 #[cfg(all(
     test,
     feature = "jit",

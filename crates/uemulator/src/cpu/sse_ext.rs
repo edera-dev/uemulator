@@ -580,6 +580,23 @@ fn blend_immediate<T: Lane>(dst: u128, src: u128, selector: u8) -> u128 {
     result
 }
 
+/// pblendw: `blend_immediate` on words, for the JIT's whole-vector helper (the interpreter
+/// reaches it through `decode_sse41_op`).
+#[cfg_attr(
+    not(all(
+        feature = "jit",
+        any(
+            target_arch = "aarch64",
+            target_arch = "x86_64",
+            target_arch = "wasm32"
+        )
+    )),
+    allow(dead_code)
+)]
+pub(crate) fn pblendw(dst: u128, src: u128, selector: u8) -> u128 {
+    blend_immediate::<u16>(dst, src, selector)
+}
+
 /// pmovsx*/pmovzx*: the low `128 / to_bits` lanes of `from_bits` bits, extended.
 fn widen(src: u128, signed: bool, from_bits: u32, to_bits: u32) -> u128 {
     let from_mask = (1u128 << from_bits) - 1;
