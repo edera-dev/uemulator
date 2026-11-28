@@ -16,3 +16,6 @@ uemulator = { path = "../uemulator" }
 # survive it; JSON is how it crosses to Swift.
 toml = "1.1.8"
 serde_json = "1"
+serde = { version = "1.0.229", features = ["derive"] }
+# quick bootstrap's answer files and initramfs appending (ua_bootstrap_initrd).
+uemulator-bootstrap = { path = "../uemulator-bootstrap" }

@@ -205,6 +205,22 @@ void ua_string_free(char *text);
 int32_t ua_disk_installed(const char *path, char *error, size_t error_capacity);
 // A new, empty, sparse udisk image of `size_mib` at `path`; never replaces a file. 0, or -1.
 int32_t ua_disk_create(const char *path, uint64_t size_mib, char *error, size_t error_capacity);
+// The line a bootstrapped install prints on the console once it has succeeded, just before it
+// reboots: boot the disk once it shows up.
+#define UA_BOOTSTRAP_COMPLETION_MARKER "uemulator-bootstrap: installed"
+// `answers_json`: {"user","password","root_password"?,"hostname","ssh_keys":[],"timezone",
+// "locale","keymap","packages":[]}, plain-text passwords (hashed here with `salt`, 16 random
+// bytes from SecRandomCopyBytes). On success *out/*out_len is the extended initramfs (free
+// with ua_bytes_free) and *cmdline the arguments to append (free with ua_string_free).
+// `distro` is "alpine", "debian" or "fedora"; `initrd` that distro's installer initramfs. A null
+// or missing root_password locks root; unknown keys are refused. 0, or -1 with the message in
+// `error` (it names the bad field, never a password) and the outputs untouched.
+int32_t ua_bootstrap_initrd(const char *distro, const char *answers_json,
+                            const uint8_t *salt, size_t salt_len,
+                            const uint8_t *initrd, size_t initrd_len,
+                            uint8_t **out, size_t *out_len, char **cmdline,
+                            char *error, size_t error_capacity);
+void ua_bytes_free(uint8_t *bytes, size_t len);
 // One Wisp v1 packet from the machine's client, for the app's Wisp server. Runs on the network's
 // thread; `packet` is valid only during the call.
 typedef void (*ua_wisp_send_fn)(void *context, const uint8_t *packet, size_t len);
