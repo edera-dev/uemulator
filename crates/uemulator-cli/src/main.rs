@@ -460,6 +460,8 @@ fn quick_command(cmd: QuickCmd) -> Result<Option<ExitReason>, String> {
             mut runtime,
         } => {
             let machine = machines::load(&home, &name)?;
+            // Before `prepare_boot` copies a checkpoint's disks back.
+            run::refuse_runtime_conflicts(&runtime)?;
             let launch = machines::prepare_boot(
                 &machine,
                 &hardware,

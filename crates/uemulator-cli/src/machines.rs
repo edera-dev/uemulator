@@ -459,7 +459,8 @@ fn boot_hypervisor(
 /// A boot of a saved machine with this command line's overrides, which are not saved. Missing
 /// installer artifacts (never fetched, or thrown away by `reinstall`) are fetched first.
 ///
-/// `resume_from` a checkpoint puts its disks and nvram back first (the caller then sets
+/// `resume_from` a checkpoint puts its disks and nvram back first, once its chain is found to be
+/// whole and after the caller's `run::refuse_runtime_conflicts` (the caller then sets
 /// `RuntimeArgs::checkpoint_files_restored`): the choice between installer and disk is the one
 /// the machine's next reboot makes, so it must look at the disk the resumed guest has, not the
 /// one it was resumed over.
@@ -477,6 +478,9 @@ pub fn prepare_boot(
     settings.add(hardware, linux, attach_only(&hardware.disk_steps)?);
     let nvram = (machine.firmware == Firmware::Uefi).then(|| machine.nvram_path());
     if let Some(checkpoint) = resume_from.filter(|path| checkpoints::is_checkpoint(path)) {
+        // The chain is checked first, as the run does: a resume that cannot happen must leave
+        // the disks as they are.
+        checkpoints::sources(checkpoint)?;
         machine_files(&settings, nvram.as_deref()).restore_from(checkpoint)?;
     }
     let hypervisor = boot_hypervisor(machine, &linux.hypervisor, remove.remove_hypervisor)?;
@@ -798,7 +802,7 @@ mod tests {
     use std::cell::RefCell;
 
     use super::*;
-    use crate::test_support::{EnvGuard, TempDir};
+    use crate::test_support::{EnvGuard, TempDir, snapshot_header};
     use crate::{Cmd, QuickCmd, parse_cli};
 
     const MIB: u64 = 1 << MIB_SHIFT;
@@ -1427,6 +1431,41 @@ mod tests {
     }
 
     #[test]
+    fn a_checkpoint_whose_chain_is_broken_leaves_the_disks_alone() {
+        let home = TempDir::new("machines-broken-chain");
+        let machine = create_machine(home.path(), &[]);
+        let checkpoints = home.path().join("checkpoints");
+        fs::create_dir(&checkpoints).unwrap();
+        // A delta whose parent is gone: the resume must fail before anything is copied back.
+        let checkpoint = checkpoints.join("0002.checkpoint");
+        fs::write(&checkpoint, snapshot_header(2, Some(1))).unwrap();
+        fs::copy(
+            &machine.settings.disks[0].path,
+            checkpoint.with_extension("disk-0"),
+        )
+        .unwrap();
+        fs::write(checkpoint.with_extension("nvram"), b"").unwrap();
+        finish_install(&machine);
+
+        let (hardware, linux, remove) = boot_args(&[]);
+        let fetcher = FakeFetcher::new();
+        let result = prepare_boot(
+            &machine,
+            &hardware,
+            &linux,
+            &remove,
+            None,
+            Some(&checkpoint),
+            |u, d| fetcher.fetch(u, d),
+        );
+        assert!(result.is_err());
+        assert!(
+            !disk_is_blank(&machine.settings.disks[0].path).unwrap(),
+            "the install written since the checkpoint is still there"
+        );
+    }
+
+    #[test]
     fn resuming_a_checkpoint_decides_on_the_disk_the_checkpoint_saw() {
         let home = TempDir::new("machines-resume-checkpoint");
         let machine = create_machine(home.path(), &[]);
@@ -1435,7 +1474,7 @@ mod tests {
         let checkpoints = home.path().join("checkpoints");
         fs::create_dir(&checkpoints).unwrap();
         let checkpoint = checkpoints.join("0001.checkpoint");
-        fs::write(&checkpoint, b"snapshot").unwrap();
+        fs::write(&checkpoint, snapshot_header(1, None)).unwrap();
         fs::copy(
             &machine.settings.disks[0].path,
             checkpoint.with_extension("disk-0"),
