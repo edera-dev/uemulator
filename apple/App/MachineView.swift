@@ -284,10 +284,38 @@ final class MachineModel: ObservableObject, ScreenInput {
         suspendedBootstrapRun = false
     }
 
+    // Why an unattended install of `definition` could not end on its installed disk, as `quick
+    // reinstall` refuses it (`refuse_unbootable_machine`, `refuse_framebuffer_machine` in the
+    // CLI's bootstrap.rs; docs/plans/35-quick-bootstrap.md): nil when it can. Checked before
+    // anything is erased.
+    static func reinstallRefusal(_ definition: MachineDefinition) -> String? {
+        if definition.firmware == .none {
+            return "Firmware None cannot boot the disk the install writes: choose UEFI or BIOS under Advanced first."
+        }
+        if definition.hypervisor != nil {
+            return "The installer runs under the hypervisor, and the installed disk's boot loader cannot start under it: remove the hypervisor under Advanced first."
+        }
+        // The answer files print their completion marker to /dev/console, which the library puts
+        // on the screen for `.screen`; only the terminal's bytes reach `completionMarker`, so a
+        // finished install would be reported as failed and the machine left on its installer.
+        if definition.display == .screen {
+            return "The install reports that it has finished on the console, which the Screen display moves to the screen where it cannot be watched: choose Screen and terminal first."
+        }
+        // The answer files install to /dev/vda, the first disk, and `importDisk` puts an ISO first.
+        if let first = definition.disks.first, first.readOnly {
+            return "The install erases the first disk, and \(first.url.lastPathComponent) is read-only: detach it first."
+        }
+        return nil
+    }
+
     // Reinstall…: the disk is erased by an unattended install of the same distro, with fresh
     // installer images, booted at once as `quick reinstall` does. Only while stopped.
     func reinstall(_ request: BootstrapRequest) {
         guard !isRunning, let distro = definition.install else { return }
+        if let refusal = Self.reinstallRefusal(definition) {
+            problem = refusal
+            return
+        }
         // A suspended state describes the disk the install is about to erase.
         discardSuspended()
         var changed = definition
