@@ -147,7 +147,10 @@ New Machine
 The answers are passed to the core over the C ABI. The password is never written to the
 sidecar, the Keychain or `machine.toml`. The machine settings view shows the recorded
 `[bootstrap]` answers and offers "Reinstall…", which asks for the password again and has a
-destructive "Erase and Install" button, as `reinstall`'s confirmation.
+destructive "Erase and Install" button, as `reinstall`'s confirmation. It is disabled, with the
+reason in the section's footer, for what `quick reinstall` refuses (firmware None, a hypervisor,
+the Screen display) and for a read-only first disk: an ISO is attached first, and the answer files
+install to `/dev/vda`.
 
 `-new-machine NAME -new-source bootstrap:debian` with `-bootstrap-user`, `-bootstrap-password`
 and so on makes one from the command line, for UI tests and Xcode Cloud. (This is the builder's
