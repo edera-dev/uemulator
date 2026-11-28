@@ -243,7 +243,8 @@ enum QuickCmd {
         /// Boxed, as `runtime` is: together they would make this variant the size of the enum.
         #[command(flatten)]
         bootstrap: Box<BootstrapArgs>,
-        /// Erase the disk without asking; required when stdin is not a terminal to ask on
+        /// Erase the disk without asking, for an unattended reinstall; required there when
+        /// stdin is not a terminal to ask on
         #[arg(long)]
         yes: bool,
         /// Give root no password this time, though the saved answers say it had one
@@ -378,6 +379,9 @@ fn refuse_uefi_args(uefi: &UefiBootArgs, firmware: args::Firmware) -> Result<(),
     Ok(())
 }
 
+const INSTALLER_BOOT_MENU: &str =
+    "--boot-menu is for disk boots: the installer's kernel is booted directly, without the menu";
+
 fn boot_launch(
     launch: machines::Launch,
     uefi: &UefiBootArgs,
@@ -409,9 +413,7 @@ fn boot_launch(
         _ => match launch.firmware {
             args::Firmware::Uefi => {
                 if uefi.boot_menu {
-                    return Err("--boot-menu is for disk boots: the installer's kernel is \
-                                booted directly, without the menu"
-                        .into());
+                    return Err(INSTALLER_BOOT_MENU.into());
                 }
                 match launch.hypervisor {
                     Some(_) => eprintln!(
@@ -536,6 +538,12 @@ fn prepare_reinstall(
                 "{name} has no saved answers, so it reinstalls with the interactive installer: \
                  give --user NAME to install it unattended with these answers"
             ));
+        }
+        // `boot_launch` refuses it too, but only after the machine was switched to its
+        // installer and its artifacts thrown away. An unattended reinstall keeps it for the disk
+        // boot after the install.
+        if request.uefi.boot_menu {
+            return Err(INSTALLER_BOOT_MENU.into());
         }
         let machine = machines::reinstall(home, name, request.install, None, fetch)?;
         return Ok((machine, None));
@@ -802,6 +810,12 @@ fn quick_command(cmd: QuickCmd) -> Result<Option<ExitReason>, String> {
             match answers {
                 Some(answers) => run_bootstrap(&mut machine, &answers, &uefi, &mut runtime),
                 None => {
+                    // The machine stays on its installer: an interactive install does not say
+                    // when it has finished, so nothing switches it to the disk.
+                    eprintln!(
+                        "after the install, `uemulator quick edit {name} --boot-from auto` boots \
+                         the disk"
+                    );
                     let launch = machines::prepare_boot(
                         &machine,
                         &HardwareArgs::default(),
@@ -3046,5 +3060,104 @@ mod tests {
         .err()
         .unwrap();
         assert!(error.contains("firmware none"), "{error}");
+    }
+
+    fn machine_state(
+        home: &crate::test_support::TempDir,
+    ) -> (String, Vec<(std::ffi::OsString, Vec<u8>)>) {
+        let dir = home.path().join("machines/m");
+        let toml = std::fs::read_to_string(dir.join("machine.toml")).unwrap();
+        let mut artifacts: Vec<_> = std::fs::read_dir(dir.join("artifacts"))
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), std::fs::read(entry.path()).unwrap())
+            })
+            .collect();
+        artifacts.sort();
+        (toml, artifacts)
+    }
+
+    #[test]
+    fn interactive_reinstall_refuses_boot_menu_before_any_change() {
+        let home = reinstall_home("main-reinstall-boot-menu", None);
+        let before = machine_state(&home);
+        let bootstrap = BootstrapArgs::default();
+        let uefi = UefiBootArgs {
+            boot_menu: true,
+            ..UefiBootArgs::default()
+        };
+        let error = prepare_reinstall(
+            home.path(),
+            &request(&bootstrap, &uefi),
+            false,
+            never_asked,
+            never_asked,
+            |_, _| panic!("fetched"),
+        )
+        .err()
+        .unwrap();
+        assert!(error.starts_with("--boot-menu"), "{error}");
+        assert_eq!(machine_state(&home), before);
+    }
+
+    #[test]
+    fn unattended_reinstall_keeps_boot_menu_for_the_disk_boot() {
+        let home = reinstall_home("main-reinstall-boot-menu-unattended", Some(saved_record()));
+        let bootstrap = BootstrapArgs {
+            password_file: Some(password_file(&home)),
+            ..BootstrapArgs::default()
+        };
+        let uefi = UefiBootArgs {
+            boot_menu: true,
+            ..UefiBootArgs::default()
+        };
+        assert!(
+            prepare_reinstall(
+                home.path(),
+                &request(&bootstrap, &uefi),
+                false,
+                never_asked,
+                never_asked,
+                fake_fetch,
+            )
+            .unwrap()
+            .1
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn reinstall_question_names_the_new_distro() {
+        let home = reinstall_home("main-reinstall-question", Some(saved_record()));
+        let bootstrap = BootstrapArgs {
+            password_file: Some(password_file(&home)),
+            ..BootstrapArgs::default()
+        };
+        let uefi = UefiBootArgs::default();
+        let mut switch = request(&bootstrap, &uefi);
+        switch.install = Some(Distro::Fedora);
+        switch.yes = false;
+        let mut questions = Vec::new();
+        prepare_reinstall(
+            home.path(),
+            &switch,
+            true,
+            never_asked,
+            |question| {
+                questions.push(question.to_string());
+                Ok("yes\n".into())
+            },
+            fake_fetch,
+        )
+        .unwrap();
+        assert_eq!(
+            questions,
+            vec!["Erase disk-0.udisk (8 GiB) and install Fedora? [y/N]"]
+        );
+        assert_eq!(
+            machines::load(home.path(), "m").unwrap().install,
+            Distro::Fedora
+        );
     }
 }

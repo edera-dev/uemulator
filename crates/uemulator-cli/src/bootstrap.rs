@@ -1248,4 +1248,17 @@ mod tests {
         watch.feed(format!("\x1b[0m\r\n{COMPLETION_MARKER}\r\n\x1b[2J").as_bytes());
         assert!(watch.seen());
     }
+
+    #[test]
+    fn refuse_unbootable_machine_names_the_edit_that_fixes_it() {
+        assert!(refuse_unbootable_machine(Firmware::Uefi, false, "m").is_ok());
+        assert!(refuse_unbootable_machine(Firmware::Bios, false, "m").is_ok());
+        let error = refuse_unbootable_machine(Firmware::None, false, "m").unwrap_err();
+        assert!(error.contains("quick edit m --firmware uefi"), "{error}");
+        let error = refuse_unbootable_machine(Firmware::Uefi, true, "m").unwrap_err();
+        assert!(
+            error.contains("quick edit m --remove-hypervisor"),
+            "{error}"
+        );
+    }
 }
