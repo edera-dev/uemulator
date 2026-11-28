@@ -167,13 +167,29 @@ call; see below.)
   repo `inst.repo` names today), `user --groups=wheel --iscrypted`, `rootpw --iscrypted` or
   `rootpw --lock`, `sshkey`, `autopart` (Anaconda's default), `clearpart --all --initlabel
   --drives=vda`, `%packages` with the extras, and `reboot`.
-- **Alpine**: the netboot init has no answer-file hook of its own, so this is the open risk (see
-  below). The plan: the archive carries an `apkovl` overlay with an `/etc/local.d` script (and
-  `local` enabled in the default runlevel) that runs `setup-alpine -e -f <answers>` with the
-  answers file, `setup-disk -m sys /dev/vda`, sets the passwords with `chpasswd -e`, writes the
-  key into the installed system, and reboots. The open question is how the init finds an overlay
-  that lives in the initramfs. Candidates: `apkovl=` naming a local path, or an archive file that
-  replaces the init's overlay-search step.
+- **Alpine**: the netboot init has no answer-file hook of its own, but it does take an overlay
+  from inside the initramfs (spiked and confirmed to run a script at boot). The archive carries
+  `bootstrap.apkovl.tar.gz` at the initramfs root, and the kernel arguments add
+  `apkovl=/bootstrap.apkovl.tar.gz`. A value with no `:` and no URL scheme is used by the init as a
+  plain path in the initramfs (`prepare_apkovl` in `/init` only splits `device:path`), unpacked
+  with `tar -zx` into the new root before OpenRC starts. The overlay, a gzip tar of root-relative
+  paths with owner root, holds:
+  - `etc/.default_boot_services`, an empty file. Without it an overlay replaces the init's default
+    boot services (devfs, mdev, hwdrivers, modloop and so on), and the
+    init only adds them when the file is present (it deletes it afterwards).
+  - `etc/local.d/bootstrap.start`, mode 0755, `#!/bin/sh`: runs `apk add alpine-conf e2fsprogs`
+    (and whatever else `setup-disk` needs) from the repository the init already knows, then
+    `setup-alpine -e -f <answers>`, `setup-disk -m sys /dev/vda`, `chpasswd -e` for the
+    passwords, writes the SSH key into the installed system, prints the completion marker and
+    reboots. Output goes to `/dev/console`.
+  - `etc/runlevels/default/local`, a symlink to `/etc/init.d/local`.
+
+  Two things the archive builder must do: pad the original gzip initramfs with zero bytes to a
+  multiple of 4 before appending the newc archive (Linux only recognizes a plain cpio segment at a
+  4-byte aligned offset: unpadded, the boot logs `Initramfs unpacking failed: invalid magic at
+  start of compressed archive` and the init is missing), and keep `apkovl=` as a kernel argument.
+  Evidence: the console showed `Loading user settings from /bootstrap.apkovl.tar.gz: ok.` and
+  then `Starting local ...hello`.
 
 The answers file and archive are generated per boot, in memory, and handed to the library with
 the initramfs. They are never written under the machine directory, because they contain the
@@ -223,8 +239,8 @@ installer checks are today.
 
 ## Left to the builder
 
-- **Alpine's overlay hook** (above). Spike it first. If no hook works from inside the initramfs,
-  come back before falling back to approach 2 for Alpine alone.
+- **Alpine's overlay hook** is settled (above); what is left is the script's installed-system steps,
+  which the spike did not run.
 - The exact preseed and kickstart contents, kept to what the table above needs.
 - How host defaults are read on macOS, Linux and Windows. Fall back to `UTC`, `en_US.UTF-8` and
   `us`.
