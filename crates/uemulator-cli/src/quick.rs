@@ -7,14 +7,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::run::DEFAULT_MEMORY_MIB;
 
-/// What a Fedora install gets: its stage2 image (~900 MB) is downloaded into RAM and must fit
-/// beside Anaconda.
-const FEDORA_INSTALL_MEMORY_MIB: usize = 3072;
+/// What a Fedora install gets: its stage2 image (915 MB for Fedora 44) is downloaded into a RAM
+/// file system and must fit beside the initramfs and Anaconda. 3072 MiB ran out of space
+/// partway through the download.
+const FEDORA_INSTALL_MEMORY_MIB: usize = 4096;
 const DOWNLOAD_CHUNK_LEN: usize = 1 << 16;
 
 /// The lowercase name is both the command-line value and what `machine.toml` stores. The Apple
-/// app keeps a copy of these URLs, file names, command lines and memory sizes
-/// (`apple/App/Presets.swift`): change both.
+/// app keeps a copy of these URLs, file names, command lines, memory sizes and the name
+/// `ua_bootstrap_initrd` takes (`bootstrapName`, the bootstrap crate's spelling) in
+/// `apple/App/Presets.swift`: change both.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Distro {
@@ -261,6 +263,9 @@ mod tests {
             FEDORA_INSTALL_MEMORY_MIB
         );
         assert!(Distro::Fedora.default_memory_mib() > DEFAULT_MEMORY_MIB);
+        // Fedora 44's 915 MB stage2 did not fit in 3072 MiB: dracut's download into a RAM
+        // file system stopped at "No space left on device". 4096 fits.
+        assert!(Distro::Fedora.default_memory_mib() >= 4096);
     }
 
     #[test]

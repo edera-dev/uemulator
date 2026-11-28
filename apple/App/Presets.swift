@@ -1,8 +1,9 @@
 import Foundation
 
 // The installers `uemulator quick create --install` sets up. crates/uemulator-cli/src/quick.rs is
-// the source: keep the URLs, file names, command lines and memory here in step with it, and the
-// raw values with its `machine.toml` spelling, so the CLI can boot an installer machine the app made.
+// the source: keep the URLs, file names, command lines and memory here in step with it, the raw
+// values with its `machine.toml` spelling, so the CLI can boot an installer machine the app made,
+// and `bootstrapName` with the distro names `uemulator-bootstrap` (`ua_bootstrap_initrd`) takes.
 enum Distro: String, CaseIterable, Identifiable {
     case alpine
     case debian
@@ -62,9 +63,9 @@ enum Distro: String, CaseIterable, Identifiable {
         }
     }
 
-    // Fedora's ~900 MB stage2 is downloaded into RAM beside Anaconda (`FEDORA_INSTALL_MEMORY_MIB`).
+    // Fedora's 915 MB stage2 is downloaded into RAM beside Anaconda (`FEDORA_INSTALL_MEMORY_MIB`).
     var memoryMib: Int {
-        self == .fedora ? 3072 : Self.easyMemoryMib
+        self == .fedora ? 4096 : Self.easyMemoryMib
     }
 
     static let easyMemoryMib = 2048

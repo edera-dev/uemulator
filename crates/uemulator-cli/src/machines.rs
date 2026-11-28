@@ -1505,7 +1505,7 @@ mod tests {
         assert_eq!(
             settings.memory,
             Some(DEFAULT_MEMORY_MIB),
-            "not the installer's 3072"
+            "not the installer's 4096"
         );
         let installer = launch(&fedora, Some(BootSource::Installer)).unwrap();
         assert_eq!(
@@ -1990,7 +1990,7 @@ mod tests {
         fs::write(home.path().join("machines/m/machine.toml"), "install = 5").unwrap();
         let text = format_list(&list(home.path()).unwrap());
         assert!(text.contains("good  fedora"), "{text}");
-        assert!(text.contains("3072 MiB, 1 disk(s), 1 network(s)"), "{text}");
+        assert!(text.contains("4096 MiB, 1 disk(s), 1 network(s)"), "{text}");
         assert!(
             text.lines().any(|l| l.starts_with("m     unreadable: ")),
             "{text}"
