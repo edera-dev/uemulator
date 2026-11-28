@@ -134,6 +134,19 @@ impl Cpu {
 
     /// One step of the run loop: a JIT block where one may run (`Cpu::uses_jit`), else one
     /// interpreted instruction, through `step_debug` when it may raise a #DB.
+    /// `dispatch_step` for the instruction in the shadow of `sti` or `mov ss`: it runs alone,
+    /// never at the head of a JIT block, so the run loop looks for an interrupt right after it.
+    /// A block would run on past the end of the shadow, and a loop like iPXE's
+    /// `sti; nop; nop; cli` (the only window it gives the timer) would never take one. QEMU ends
+    /// the TB after the instruction following `sti` for the same reason.
+    pub(crate) fn dispatch_shadowed_step(&mut self) -> ExecResult<()> {
+        if self.debug_slow_path() {
+            self.step_debug()
+        } else {
+            self.step()
+        }
+    }
+
     pub(crate) fn dispatch_step(&mut self) -> ExecResult<()> {
         if self.debug_slow_path() {
             self.step_debug()

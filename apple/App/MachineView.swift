@@ -289,6 +289,9 @@ final class MachineModel: ObservableObject, ScreenInput {
     // CLI's bootstrap.rs; docs/plans/35-quick-bootstrap.md): nil when it can. Checked before
     // anything is erased.
     static func reinstallRefusal(_ definition: MachineDefinition) -> String? {
+        if let distro = definition.install, distro.bootstrapName == nil {
+            return "\(distro.title) has no unattended install: its menu picks the distro when it runs."
+        }
         if definition.firmware == .none {
             return "Firmware None cannot boot the disk the install writes: choose UEFI or BIOS under Advanced first."
         }
@@ -426,13 +429,13 @@ final class MachineModel: ObservableObject, ScreenInput {
         problem = nil
         reload()
         if bootsInstaller, let distro = definition.install,
-           [distro.kernel, distro.initrd].contains(where: { !FileManager.default.fileExists(atPath: artifact($0, distro).path) }) {
+           distro.downloads.contains(where: { !FileManager.default.fileExists(atPath: artifact($0, distro).path) }) {
             hasStarted = true
             state = .preparing("Downloading")
             preparing = Task { [weak self] in
                 guard let self else { return }
                 do {
-                    for file in [distro.kernel, distro.initrd] where !FileManager.default.fileExists(atPath: artifact(file, distro).path) {
+                    for file in distro.downloads where !FileManager.default.fileExists(atPath: artifact(file, distro).path) {
                         try FileManager.default.createDirectory(at: artifact(file, distro).deletingLastPathComponent(),
                                                                 withIntermediateDirectories: true)
                         let name = file.file
@@ -493,6 +496,10 @@ final class MachineModel: ObservableObject, ScreenInput {
             }
         }
         if bootsInstaller, let distro = definition.install {
+            if distro.needsUefi && definition.firmware != .uefi {
+                state = .stopped("\(distro.title) is an EFI application: set the firmware to UEFI")
+                return
+            }
             guard let kernel = try? Data(contentsOf: store.kernel(name, install: distro)) else {
                 state = .stopped("The installer's kernel is missing")
                 return
@@ -511,6 +518,7 @@ final class MachineModel: ObservableObject, ScreenInput {
         }
         if definition.demo != nil { cmdline.append(Demo.hostArgument) }
         settings.replaceCmdline = definition.replaceCmdline
+            || (bootsInstaller && definition.install?.bareCmdline == true)
         // A hypervisor boots the kernel as its dom0; an installed disk's boot loader cannot start
         // under it, so the disk boots without (the CLI refuses that combination instead).
         if definition.hypervisor != nil && !settings.kernel.isEmpty {

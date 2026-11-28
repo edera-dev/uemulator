@@ -137,7 +137,7 @@ pub enum DiskStep {
 
 #[derive(Args, Default)]
 pub struct HardwareArgs {
-    /// Guest memory in MiB, 64 to 1047552 (1 TiB less the PCI hole) [default: 2048, 4096 for a fedora install]
+    /// Guest memory in MiB, 64 to 1047552 (1 TiB less the PCI hole) [default: 2048, 4096 for a fedora or netboot-xyz install]
     #[arg(long, short = 'm')]
     pub memory: Option<usize>,
     /// Guest vCPUs, 1 to 384 (each runs on its own host thread unless `--smp timeshare`). Linux

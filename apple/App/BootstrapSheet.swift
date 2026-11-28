@@ -67,6 +67,9 @@ struct BootstrapRequest {
     // `initrd` (the distro's installer initramfs) with the answer files appended, and the kernel
     // arguments that make the installer read them, to go after the distro's own.
     func extend(_ initrd: Data, distro: Distro) throws -> (initrd: Data, cmdline: String) {
+        guard let bootstrapName = distro.bootstrapName else {
+            throw MachineStoreError.failed("\(distro.title) has no unattended install: its menu picks the distro when it runs")
+        }
         let answers: [String: Any] = [
             "user": record.user, "password": password, "root_password": rootPassword ?? NSNull(),
             "hostname": record.hostname, "ssh_keys": record.sshKeys, "timezone": record.timezone,
@@ -83,7 +86,7 @@ struct BootstrapRequest {
         var error = [CChar](repeating: 0, count: Self.errorCapacity)
         let errorLength = error.count
         let result = initrd.withUnsafeBytes { base in
-            ua_bootstrap_initrd(distro.bootstrapName, json, salt, salt.count,
+            ua_bootstrap_initrd(bootstrapName, json, salt, salt.count,
                                 base.bindMemory(to: UInt8.self).baseAddress, base.count,
                                 &out, &outLength, &arguments, &error, errorLength)
         }

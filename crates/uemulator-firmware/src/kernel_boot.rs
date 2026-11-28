@@ -8,7 +8,7 @@ use crate::devicepath::DevicePath;
 use crate::handoff::Payload;
 use crate::tables::BOOT_SERVICES;
 use crate::uefi::*;
-use crate::{images, media, text};
+use crate::{images, media, protocols, text};
 
 /// The name the loaded image's device path carries; nothing resolves it.
 const KERNEL_FILE_NAME: &str = "kernel";
@@ -30,10 +30,35 @@ pub fn load_options(text: &str) -> alloc::vec::Vec<u8> {
 /// `LoadImage` refused it with; `Ok` the status the image returned with, if it ever returns.
 pub fn start_from_buffer(image: &[u8], name: &str, options: &str) -> Result<Status, Status> {
     let path = DevicePath::new().file_path(name);
-    let handle = images::load(image, ptr::null_mut(), ptr::null_mut(), Some(&path))?;
+    let handle = images::load(
+        image,
+        ptr::null_mut(),
+        supplied_image_device()?,
+        Some(&path),
+    )?;
     images::set_load_options(handle, &load_options(options));
     let boot = unsafe { BOOT_SERVICES.get().assume_init_ref() };
     Ok((boot.start_image)(handle, ptr::null_mut(), ptr::null_mut()))
+}
+
+/// The `DeviceHandle` of an image loaded from a buffer: a handle whose device path is one
+/// vendor-hardware node. iPXE's `efi_init` refuses to start when its device handle has no device
+/// path; the Linux EFI stub looks at it only for `initrd=`, which then finds no file system.
+/// The loaded image's own device path stays the bare file name, so what the TPM measures for a
+/// kernel is unchanged.
+fn supplied_image_device() -> Result<Handle, Status> {
+    static DEVICE: crate::sync::Global<Handle> = crate::sync::Global::new(ptr::null_mut());
+    let device = DEVICE.get();
+    if device.is_null() {
+        let path = DevicePath::new().vendor_hardware(guids::UEMULATOR_SUPPLIED_IMAGE);
+        let bytes = alloc::boxed::Box::leak(path.as_bytes().to_vec().into_boxed_slice());
+        *device = protocols::install(
+            ptr::null_mut(),
+            guids::DEVICE_PATH,
+            bytes.as_mut_ptr().cast(),
+        )?;
+    }
+    Ok(*device)
 }
 
 /// Starts the kernel. Returns only when it could not be loaded or when it returned.

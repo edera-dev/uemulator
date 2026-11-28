@@ -22,9 +22,9 @@
 | 15h | E820 (the same map as the direct boot, `boot::e820_map`), E801, 88h, 87h block copy, A20 gate (always open, RAM is flat), delay; everything else fails with AH = 86h |
 | 16h | keys come from the UART's receive side; with none, 00h/10h halt until the next interrupt and retry. Terminal escape sequences become key words (`cpu/bios_keys.rs`): arrows, Home/End, PgUp/PgDn, Ins/Del and F1-F12 return AL=0 and the scan code in AH (GRUB maps AH only when AL is 0); Esc, Enter, Backspace (and DEL) and Tab carry their scan codes; other bytes are AL alone. The UART paces input, so a sequence can take several calls to arrive; an unfinished one counts as Escape once the line has held nothing for 50 ms |
 | 18h, 19h | no boot device; bootstrap again |
-| 1Ah | tick count and the RTC time and date from CMOS |
+| 1Ah | tick count and the RTC time and date from CMOS; AH=B1h is the PCI BIOS 2.1 real-mode interface: installation check (mechanism #1, version 2.10, last bus 0), find device and find class, config byte/word/dword reads and writes through 0xCF8/0xCFC (misaligned or past 256 bytes: 87h; unknown functions: 81h, logged once). iPXE's BIOS build finds its NIC this way. No protected-mode (BIOS32) entry |
 
-Not provided: VGA text memory (B8000 is plain RAM), ACPI/SMBIOS/MP tables (the kernel runs without them), PCI BIOS, floppies, a keyboard controller (port 64h reads as all ones: a loader that falls back to enabling A20 through it hangs, which is why the A20 test must see flat memory), a second boot device, and in-place reboot (a guest reset ends the run, as for firmware images). The JIT only runs 64-bit code, so the real-mode and 32-bit parts are interpreted, and `verify_jit` is refused.
+Not provided: VGA text memory (B8000 is plain RAM), ACPI/SMBIOS/MP tables (the kernel runs without them), the PCI IRQ routing table, floppies, a keyboard controller (port 64h reads as all ones: a loader that falls back to enabling A20 through it hangs, which is why the A20 test must see flat memory), a second boot device, and in-place reboot (a guest reset ends the run, as for firmware images). The JIT only runs 64-bit code, so the real-mode and 32-bit parts are interpreted, and `verify_jit` is refused.
 
 ## Why the stubs look like this
 
@@ -34,7 +34,7 @@ Not provided: VGA text memory (B8000 is plain RAM), ACPI/SMBIOS/MP tables (the k
 
 ## Verification
 
-`cpu/bios.rs` has unit tests for every service (including the failure statuses) and `machine/tests.rs` boots tiny boot sectors on a full machine, one of them waiting for the PIT's IRQ0 to reach the BIOS tick. Not a test, needs a disk you supply: an Alpine `setup-alpine` install (syslinux 6.04 MBR, `ldlinux.sys`, `menu.c32`) boots through the MBR, the menu countdown, the kernel and initramfs load (INT 13h, INT 15h), the kernel's real-mode setup and the 32-bit entry to `alpine login:` on hvc0 and ttyS0 (`quick boot` on a machine whose disk the installer wrote). The clock follows the host (`--verify` alone makes it virtual), so the menu's 1-second countdown takes one second.
+`cpu/bios.rs` has unit tests for every service (including the failure statuses) and `machine/tests.rs` boots tiny boot sectors on a full machine, one of them waiting for the PIT's IRQ0 to reach the BIOS tick. Not a test, needs a disk you supply: an Alpine `setup-alpine` install (syslinux 6.04 MBR, `ldlinux.sys`, `menu.c32`) boots through the MBR, the menu countdown, the kernel and initramfs load (INT 13h, INT 15h), the kernel's real-mode setup and the 32-bit entry to `alpine login:` on hvc0 and ttyS0 (`quick boot` on a machine whose disk the installer wrote). The clock follows the host (`--verify` alone makes it virtual), so the menu's 1-second countdown takes one second. netboot.xyz's `netboot.xyz.img` (syslinux, then its iPXE `.lkrn`) as the boot disk finds the virtio NIC through the PCI BIOS, gets an address over the NAT and fetches its menu over HTTPS.
 
 ## Open questions
 

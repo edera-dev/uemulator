@@ -131,6 +131,10 @@ impl DevicePath {
     }
 
     /// A vendor-defined media node: `guid` and no vendor data.
+    pub fn vendor_hardware(self, guid: Guid) -> Self {
+        self.push_node(TYPE_HARDWARE, SUBTYPE_VENDOR_HARDWARE, &guid.to_bytes())
+    }
+
     pub fn vendor_media(self, guid: Guid) -> Self {
         self.push_node(TYPE_MEDIA, SUBTYPE_VENDOR_MEDIA, &guid.to_bytes())
     }

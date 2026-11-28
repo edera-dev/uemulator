@@ -115,6 +115,8 @@ pub fn init(handoff: &Handoff) {
     crate::gop::init(handoff.framebuffer);
     crate::virtio_input::init();
     crate::serial::trace!("display and keyboard done");
+    crate::pci_io::install(handoff);
+    crate::serial::trace!("pci i/o done");
     tables::seal_all();
 }
 

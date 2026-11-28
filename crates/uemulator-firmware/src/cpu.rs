@@ -2,14 +2,32 @@
 //! any exception into a message on the serial port, and the legacy timer interrupt that lets
 //! `idle_wait` sleep instead of spinning (the emulator skips virtual time while the CPU halts
 //! with a timer pending, so a one-second `Stall` costs no host time).
+//!
+//! While boot services run, the timer also ticks on its own (`start_tick`) and interrupts are on
+//! below `TPL_HIGH_LEVEL`, as on EDK2: applications that wait with a bare `hlt` (iPXE's
+//! `cpu_nap`) need an interrupt to wake them, and this library powers the machine off on a `hlt`
+//! with IF clear. The interrupt only acknowledges the PIC; timer events are still fired from the
+//! boot services (`events::poll`), never from the interrupt, so nothing in the firmware has to be
+//! reentrant. `ExitBootServices` stops the tick and leaves interrupts off.
 
 use core::arch::{asm, global_asm};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::serial;
 use crate::sync::Global;
 
 pub fn outb(port: u16, value: u8) {
     unsafe { asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack)) }
+}
+
+pub fn outw(port: u16, value: u16) {
+    unsafe { asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack)) }
+}
+
+pub fn inw(port: u16) -> u16 {
+    let value: u16;
+    unsafe { asm!("in ax, dx", out("ax") value, in("dx") port, options(nomem, nostack)) }
+    value
 }
 
 pub fn outl(port: u16, value: u32) {
@@ -137,6 +155,14 @@ const PIT_CHANNEL0: u16 = 0x40;
 const PIT_COMMAND: u16 = 0x43;
 /// Channel 0, access lobyte/hibyte, mode 0 (interrupt on terminal count), binary.
 const PIT_ONE_SHOT: u8 = 0x30;
+/// Channel 0, access lobyte/hibyte, mode 2 (rate generator), binary.
+const PIT_RATE_GENERATOR: u8 = 0x34;
+/// The boot-services tick, 100 Hz as on EDK2's 8254 timer driver.
+const TICK_NS: u64 = 10_000_000;
+const NANOSECONDS_PER_SECOND: u128 = 1_000_000_000;
+
+/// Whether the boot-services tick runs (between `start_tick` and `stop_tick`).
+static TICKING: AtomicBool = AtomicBool::new(false);
 const PIT_HZ: u64 = 1_193_182;
 const PIT_MAX_COUNT: u64 = 0xffff;
 
@@ -318,17 +344,57 @@ pub fn mask_interrupts() {
     outb(PIC_SLAVE_DATA, MASK_ALL);
 }
 
-/// Halts until the timer fires or `max_nanoseconds` (at most about 54 ms) have passed. May return
-/// early; callers loop on their own deadline.
-pub fn idle_wait(max_nanoseconds: u64) {
-    let count = (max_nanoseconds as u128 * PIT_HZ as u128 / 1_000_000_000)
+fn pit_channel0(command: u8, nanoseconds: u64) {
+    let count = (nanoseconds as u128 * PIT_HZ as u128 / NANOSECONDS_PER_SECOND)
         .clamp(1, PIT_MAX_COUNT as u128) as u64;
-    outb(PIT_COMMAND, PIT_ONE_SHOT);
+    outb(PIT_COMMAND, command);
     outb(PIT_CHANNEL0, count as u8);
     outb(PIT_CHANNEL0, (count >> 8) as u8);
+}
+
+/// Starts the boot-services tick and turns interrupts on.
+pub fn start_tick() {
+    pit_channel0(PIT_RATE_GENERATOR, TICK_NS);
+    outb(PIC_MASTER_DATA, MASK_ALL_BUT_TIMER);
+    TICKING.store(true, Ordering::Relaxed);
+    enable_interrupts();
+}
+
+/// Stops the tick for good (`ExitBootServices`), with interrupts off and the PIC masked as the
+/// firmware has always handed it over. The mode command alone stops channel 0: in mode 0 the
+/// counter waits for a count that never comes, so the OS finds no interrupt pending from it.
+pub fn stop_tick() {
+    disable_interrupts();
+    TICKING.store(false, Ordering::Relaxed);
+    outb(PIT_COMMAND, PIT_ONE_SHOT);
+    mask_interrupts();
+}
+
+/// Interrupts on, while the tick runs (`RestoreTPL` below `TPL_HIGH_LEVEL`).
+pub fn enable_interrupts() {
+    if TICKING.load(Ordering::Relaxed) {
+        unsafe { asm!("sti", options(nomem, nostack)) }
+    }
+}
+
+/// Interrupts off (`RaiseTPL` to `TPL_HIGH_LEVEL`).
+pub fn disable_interrupts() {
+    unsafe { asm!("cli", options(nomem, nostack)) }
+}
+
+/// Halts until the timer fires or `max_nanoseconds` (at most about 54 ms) have passed. May return
+/// early; callers loop on their own deadline. Channel 0 becomes a one-shot for the wait, so a
+/// short `Stall` is not rounded up to the next tick, and the tick is re-armed afterwards. IF is
+/// what it was on entry.
+pub fn idle_wait(max_nanoseconds: u64) {
+    pit_channel0(PIT_ONE_SHOT, max_nanoseconds);
     outb(PIC_MASTER_DATA, MASK_ALL_BUT_TIMER);
     // `sti` takes effect after the next instruction, so the interrupt cannot slip in between it
     // and the `hlt` and leave the CPU asleep with the wakeup already spent.
-    unsafe { asm!("sti", "hlt", "cli", options(nomem, nostack)) }
-    outb(PIC_MASTER_DATA, MASK_ALL);
+    unsafe { asm!("pushfq", "sti", "hlt", "popfq", options(nomem)) }
+    if TICKING.load(Ordering::Relaxed) {
+        pit_channel0(PIT_RATE_GENERATOR, TICK_NS);
+    } else {
+        outb(PIC_MASTER_DATA, MASK_ALL);
+    }
 }

@@ -25,7 +25,7 @@ struct UemulatorApp: App {
 //   -machine NAME             select it
 //   -autostart                start the selected machine
 //   -new-machine NAME         create it first if it does not exist, from -new-source demo (the
-//                             default), demo:xen, install:alpine|debian|fedora, iso:FILE (in
+//                             default), demo:xen, install:alpine|debian|fedora|netboot-xyz, iso:FILE (in
 //                             Documents, imported), empty, or bootstrap:alpine|debian|fedora (an
 //                             unattended install, with the answers below)
 //   -bootstrap-user NAME, -bootstrap-password TEXT (both required), -bootstrap-root-password TEXT,
@@ -72,7 +72,14 @@ struct LibraryView: View {
                 ToolbarItem(placement: Self.brandPlacement) { BrandMark() }
                 ToolbarItem(placement: .primaryAction) {
                     Menu {
-                        NewMachineMenu(onDemo: add, onInstall: { installing = $0 }) { creating = true }
+                        NewMachineMenu(onDemo: add, onInstall: { distro in
+                            // Nothing to ask without an unattended install: made and started.
+                            if distro.bootstrapName == nil {
+                                problem = install(distro, nil)
+                            } else {
+                                installing = distro
+                            }
+                        }) { creating = true }
                     } label: {
                         Label("New Machine", systemImage: "plus")
                     }

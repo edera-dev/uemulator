@@ -24,6 +24,7 @@ mod keys;
 mod load_option;
 mod memory_map;
 mod mtrr;
+mod pci_access;
 mod pe;
 mod secure_boot;
 mod smbios;
@@ -62,6 +63,8 @@ mod media;
 mod memory;
 #[cfg(target_os = "none")]
 mod pci;
+#[cfg(target_os = "none")]
+mod pci_io;
 #[cfg(target_os = "none")]
 mod processors;
 #[cfg(target_os = "none")]
@@ -147,6 +150,7 @@ extern "C" fn firmware_main(handoff: *const u8) -> ! {
     time::init(&handoff);
     services::init(&handoff);
     serial::trace!("services ready");
+    cpu::start_tick();
     boot::run(handoff.payload.as_ref())
 }
 

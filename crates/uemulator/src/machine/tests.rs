@@ -2362,6 +2362,24 @@ mod clock {
         0xe6, 0x40, 0xb0, 0x5d, 0xe6, 0x40, 0xfb, 0xf4, 0x66, 0xba, 0xf8, 0x03, 0xb0, 0x74, 0xee,
         0xb0, 0xfe, 0xe6, 0x64, 0xf4,
     ];
+    /// `WAIT_FOR_PIT_IRQ` with its `sti; hlt` replaced by
+    /// `mov ecx,0x1000000; l: sti; nop; nop; cli; dec ecx; jnz l; hlt`: interrupts are open only
+    /// between the two `nop`s, which is how iPXE's BIOS build polls the tick counter
+    /// (`bios_currticks`). The loop outlasts the 20 ms one-shot many times over; if the IRQ is
+    /// never taken, `hlt` with IF clear powers off instead of resetting.
+    fn wait_for_pit_irq_in_a_one_instruction_window() -> Vec<u8> {
+        const STI_HLT_AT: usize = 111;
+        const LEA_DISPLACEMENT_AT: usize = 8;
+        const LOOP: [u8; 14] = [
+            0xb9, 0x00, 0x00, 0x00, 0x01, 0xfb, 0x90, 0x90, 0xfa, 0xff, 0xc9, 0x75, 0xf8, 0xf4,
+        ];
+        let mut code = WAIT_FOR_PIT_IRQ.to_vec();
+        assert_eq!(code[STI_HLT_AT..STI_HLT_AT + 2], [0xfb, 0xf4]);
+        code.splice(STI_HLT_AT..STI_HLT_AT + 2, LOOP);
+        // The handler's address is `lea rax, [rip + disp8]`'s; it moved by the growth.
+        code[LEA_DISPLACEMENT_AT] += (LOOP.len() - 2) as u8;
+        code
+    }
     const HANDLER_PRINTS: u8 = b't';
     /// PIT input clock and the count programmed above.
     const PIT_HZ: u128 = 1_193_182;
@@ -2377,6 +2395,22 @@ mod clock {
             harness.cpu.wall_clock = Some(crate::cpu::WallClock::new(crate::cpu::std_host_clock()));
         }
         harness
+    }
+
+    #[test]
+    fn an_interrupt_is_taken_between_the_sti_shadow_and_the_next_cli() {
+        // Under the JIT the instruction after `sti` must run alone: a block running on to the
+        // `cli` closes the window before the run loop looks for an interrupt again.
+        for jit in [false, true] {
+            let mut harness = Harness::new(&wait_for_pit_irq_in_a_one_instruction_window());
+            if jit && !harness.enable_jit() {
+                continue;
+            }
+            assert_eq!(harness.cpu.run(), ExitReason::Reset, "jit {jit}");
+            let mut output = [0u8; 4];
+            let length = harness.console.read(&mut output, None);
+            assert_eq!(output[..length], [HANDLER_PRINTS], "jit {jit}");
+        }
     }
 
     #[test]

@@ -250,8 +250,9 @@ fn run_multiboot2(
 
     println!("Starting the hypervisor at {entry:#x} (loaded at {load_base:#x})");
     // Multiboot2 3.3, EFI amd64 with boot services: 64-bit mode, the magic in eax and the boot
-    // information in rbx, the firmware's stack. Xen never returns from here. rbx cannot be an
-    // operand (LLVM reserves it), so it is loaded inside the block.
+    // information in rbx, the firmware's stack, IF clear. Xen never returns from here. rbx cannot
+    // be an operand (LLVM reserves it), so it is loaded inside the block.
+    crate::cpu::disable_interrupts();
     unsafe {
         core::arch::asm!(
             "mov rbx, {info}",

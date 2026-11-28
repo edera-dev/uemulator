@@ -414,7 +414,7 @@ extern "efiapi" fn exit_boot_services(_image: Handle, map_key: usize) -> Status 
     disks::shutdown();
     crate::virtio_input::shutdown();
     console::detach();
-    cpu::mask_interrupts();
+    cpu::stop_tick();
     SYSTEM_TABLE.get().boot_services = ptr::null_mut();
     memory::enter_runtime_mode();
     tables::seal_all();
