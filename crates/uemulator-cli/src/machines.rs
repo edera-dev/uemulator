@@ -135,10 +135,16 @@ impl Machine {
 
     /// Saves the new choice right away: `quick bootstrap` sets `auto` once the install has
     /// finished, before it boots the disk, so a disk boot that is stopped still left the machine
-    /// pointing at its install.
+    /// pointing at its install. Only `boot_from` is written, onto machine.toml as it is now:
+    /// `self` was loaded before an install that takes many minutes, and nothing locks the file,
+    /// so saving `self` whole would undo a `quick edit` made meanwhile. `self` becomes the fresh
+    /// copy, so the disk boot that follows runs with that edit too.
     pub fn set_boot_from(&mut self, boot_from: BootSource) -> Result<(), String> {
-        self.boot_from = boot_from;
-        self.save()
+        let mut fresh = load_dir(self.dir.clone(), &self.name)?;
+        fresh.boot_from = boot_from;
+        fresh.save()?;
+        *self = fresh;
+        Ok(())
     }
 
     fn save(&self) -> Result<(), String> {
@@ -166,7 +172,10 @@ pub fn exists(home: &Path, name: &str) -> bool {
 
 pub fn load(home: &Path, name: &str) -> Result<Machine, String> {
     validate_name(name)?;
-    let dir = home.join(MACHINES_DIR).join(name);
+    load_dir(home.join(MACHINES_DIR).join(name), name)
+}
+
+fn load_dir(dir: PathBuf, name: &str) -> Result<Machine, String> {
     let path = dir.join(MACHINE_FILE);
     let text = fs::read_to_string(&path).map_err(|e| match e.kind() {
         io::ErrorKind::NotFound => format!(
@@ -1096,6 +1105,29 @@ mod tests {
         assert_eq!(settings.consoles, vec![ConsoleArg::Serial]);
         assert_eq!(settings.append.as_deref(), Some("quiet"));
         assert!(settings.no_reboot && settings.disable_jit);
+    }
+
+    #[test]
+    fn set_boot_from_keeps_an_edit_made_while_the_machine_ran() {
+        let home = TempDir::new("machines-boot-from-edit");
+        let mut running = create_machine(home.path(), &[]);
+        let (hardware, linux) = create_args(&["--memory", "4096"]);
+        edit(
+            home.path(),
+            "m",
+            &hardware,
+            &linux,
+            &RemoveArgs::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        running.set_boot_from(BootSource::Installer).unwrap();
+        let saved = load(home.path(), "m").unwrap();
+        assert_eq!(saved.boot_from, BootSource::Installer);
+        assert_eq!(saved.settings.memory, Some(4096));
+        // The disk boot that follows runs with the edit too.
+        assert_eq!(running.settings.memory, Some(4096));
     }
 
     #[test]
