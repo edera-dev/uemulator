@@ -8,19 +8,19 @@
 
 - Boots the Alpine netboot kernel and initramfs to userspace on both targets (the same stop as the CLI without a disk: `Mounting boot media: failed`). Verified: aarch64 under `qemu-system-aarch64 -accel hvf`, about 39 s with the interpreter. x86_64 under TCG on an arm64 host reaches the kernel banner (about 8 minutes, an interpreter inside an emulator) but was not run to userspace.
 - Emulator path: interpreter only. The UEFI build has no `jit` feature: the executable-memory code in `sys.rs` is hosted-OS specific. To enable it: back `ExecMem` with `AllocatePages(EfiLoaderCode)` and flush the icache on aarch64, then run `--verify` equivalents. Firmware with NX memory protection may refuse to execute pool memory, so use pages typed as code.
-- No disk or network device in the UEFI build (`Disk` uses `std::fs`). Console only.
+- No disk or network device in the UEFI app: the library's disk code is `no_std` since (`docs/plans/11-storage-net-console.md`), but the app attaches no `BlockBackend` or `NetHandle`. Console only.
 
 ## Library changes for `no_std`
 
-The switch is `target_os = "uefi"`, not a feature, so `--no-default-features` on a hosted target is unchanged and still has no dependencies.
+The switch is `cfg(freestanding)` (set by `crates/uemulator/build.rs` for UEFI and for wasm32 other than WASI; it replaced `target_os = "uefi"`), not a feature, so `--no-default-features` on a hosted target is unchanged and still has no dependencies.
 
-- `lib.rs` is `no_std` on UEFI and links `alloc`. `prelude.rs` re-exports the `alloc` names that `std` provides implicitly.
+- `lib.rs` is `no_std` when freestanding and links `alloc`. `prelude.rs` re-exports the `alloc` names that `std` provides implicitly.
 - `sync.rs` re-exports `std::sync` on hosted targets; on UEFI `Mutex` is a spinlock and `Condvar` does nothing (one thread).
-- `math.rs` provides the float methods `core` lacks (`sin`, `sqrt`, `floor`, ...) through `libm`, under their `std` names.
-- No threads: `EmulatedMachine::start` only marks the machine started and `wait` runs the vCPU on the calling thread.
+- `math.rs` provides the float methods `core` lacks (`sin`, `sqrt`, `floor`, ...) through `libm` (a dependency on UEFI and wasm32 only), under their `std` names.
+- No threads unless the embedder supplies `MachineConfig::thread_spawner` and a `host_clock` (`docs/plans/22-smp-threads.md`); the UEFI app supplies neither, so `EmulatedMachine::start` only marks the machine started and `wait` runs the vCPUs on the calling thread.
 - `MachineConfig::poll(|console, idle| ..)` is called every `EVENT_INTERVAL` instructions and, with `idle = true`, whenever the guest is halted with nothing scheduled. A single-threaded host uses it to move console bytes and to wait.
 - The RTC starts at `unix_time` (the app reads the firmware clock); there is no `SystemTime`. `ClockMode::Realtime` is ignored, the clock stays virtual.
-- `HashMap` and `HashSet` in the CPU became `BTreeMap` and `BTreeSet`.
+- `HashMap` and `HashSet` in the CPU became `BTreeMap` and `BTreeSet` (the JIT's block map, `jit/native.rs`, is not built freestanding and keeps `HashMap`).
 
 ## Application
 
@@ -51,5 +51,5 @@ Physical interrupts are intercepted so the firmware keeps working: on that exit 
 
 ### Not supported
 
-- String port I/O (`INS`/`OUTS`), MMIO and the virtio devices (a guest access outside RAM ends the run with a message), APIC and SMP, XSAVE and AVX in the guest, TSC offsetting, and running under a hypervisor that does not expose SVM/VMX. The library's disk and network devices are not in the UEFI build either way.
+- String port I/O (`INS`/`OUTS`), MMIO and the virtio devices (a guest access outside RAM ends the run with a message), APIC and SMP, XSAVE and AVX in the guest, TSC offsetting, and running under a hypervisor that does not expose SVM/VMX. The UEFI app attaches no disk or network device either way.
 - A host with `ExitBootServices` already called: the app keeps boot services, so the firmware keeps handling its own interrupts.

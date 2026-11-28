@@ -2,7 +2,7 @@
 
 **Status:** implemented.
 
-`MachineConfig::boot_disk(true)` boots the first disk the way a PC with a BIOS does, so the disk's own boot loader (syslinux, GRUB) loads the kernel. There is no firmware image: the BIOS is host code in `cpu/bios.rs`. CLI: `quick boot` with `--boot-from auto|disk` (`docs/plans/01-api.md`).
+`MachineConfig::boot_disk(true)` boots the first disk the way a PC with a BIOS does, so the disk's own boot loader (syslinux, GRUB) loads the kernel. There is no firmware image: the BIOS is host code in `cpu/bios.rs`. CLI: `quick boot` of a machine made with `--firmware bios` (new machines are `uefi`), with `--boot-from auto|disk` (`docs/plans/01-api.md`); the web build and the Apple app take the same choice (`hack/wasm/boot.mjs --firmware bios`).
 
 ## Shape
 
@@ -19,7 +19,7 @@
 | 10h | text only, to the 16550: teletype, write char/string, cursor (an ANSI `ESC[r;cH` only when the caller moves it), clear, mode/cursor queries; no VGA, EGA or VESA (calls leave registers alone, which callers read as "absent") |
 | 11h, 12h | equipment word and base memory from the BDA |
 | 13h | drives 80h+ in disk order: reset, status, CHS read/write (255 heads x 63 sectors), parameters (08h), type (15h), EDD install check (41h), extended read/write (42h/43h, segmented or flat buffer), extended parameters (48h) |
-| 15h | E820 (the same three-entry map as the direct boot), E801, 88h, 87h block copy, A20 gate (always open, RAM is flat), delay; everything else fails with AH = 86h |
+| 15h | E820 (the same map as the direct boot, `boot::e820_map`), E801, 88h, 87h block copy, A20 gate (always open, RAM is flat), delay; everything else fails with AH = 86h |
 | 16h | keys come from the UART's receive side; with none, 00h/10h halt until the next interrupt and retry. Terminal escape sequences become key words (`cpu/bios_keys.rs`): arrows, Home/End, PgUp/PgDn, Ins/Del and F1-F12 return AL=0 and the scan code in AH (GRUB maps AH only when AL is 0); Esc, Enter, Backspace (and DEL) and Tab carry their scan codes; other bytes are AL alone. The UART paces input, so a sequence can take several calls to arrive; an unfinished one counts as Escape once the line has held nothing for 50 ms |
 | 18h, 19h | no boot device; bootstrap again |
 | 1Ah | tick count and the RTC time and date from CMOS |

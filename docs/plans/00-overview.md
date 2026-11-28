@@ -34,7 +34,11 @@ MachineConfig ──► EmulatedMachine ──► vCPU thread
 
 Both executors consume the same uop lists, so the interpreter is the correctness oracle for the JIT (see 08).
 
+As built there is no uop layer: the interpreter and the JITs (aarch64, x86_64 and WebAssembly hosts) both work from decoded `Insn` records (05, 06), the CPU state is `Cpu` (`cpu/mod.rs`), and the devices are `Devices` (`dev/mod.rs`), not a `Bus`.
+
 ## Crate layout (single crate, zero deps)
+
+The v1 plan, kept for the record. It is now a Cargo workspace (`uemulator` library, CLI, UEFI firmware and application, crypto, virgl, snapshot derive, web and Apple bindings; CLAUDE.md "Rules" has the list), and the library depends on `uemulator-crypto` and `uemulator-snapshot-derive` (both first-party). Of the files below, `clock.rs`, `ir.rs`, `exec/`, `mem/`, `cpu/{regs,tables,translate,seg,exc,msr}.rs`, `jit/{probe,buf}.rs` and `dev/{cmos,misc}.rs` were never created: guest RAM is `ram.rs`, the soft TLB and page walk are `cpu/mem.rs`, the decode cache and run loop are in `cpu/`, the JIT is `jit/` (`native.rs`, `emit.rs`/`a64.rs`, `emit_x64.rs`/`x64.rs`, `emit_wasm.rs`/`wasm.rs`).
 
 ```
 (paths relative to crates/uemulator/)
@@ -55,13 +59,13 @@ src/dev/{mod,serial,pic,pit,cmos,misc}.rs
 ## Locked decisions
 
 1. Interpreter first, JIT second; one decoder, one IR.
-2. JIT backend for aarch64 hosts only in v1. Everything else, and any host where the runtime probe fails, runs the interpreter. `JitMode::{Auto, Off, On}` in config.
+2. JIT backend for aarch64 hosts only in v1 (since then also x86_64 and WebAssembly hosts, 06). Everything else, and any host where the runtime probe fails, runs the interpreter. `JitMode::{Auto, Off, On}` in config.
 3. Faulting state is exact: guest RIP and architectural state are consistent at every instruction that can fault (memory access, helper). Instructions commit register writes only after all faulting accesses.
 4. Self-modifying code is handled by guest-physical page tracking (Linux alternatives/text_poke write through aliases).
 5. IRQ and exit-request checks happen at TB boundaries even when TBs are chained.
 6. One virtual clock feeds TSC, PIT, RTC. Default is instruction-count driven (deterministic); HLT warps time to the next deadline.
 7. CPUID is a contract: advertise only implemented features.
-8. Decoder is parameterized by mode (16/32/64-bit code size) even though only 64-bit is tested in v1; decompressor stubs and far returns may touch compat mode.
+8. Decoder is parameterized by mode (16/32/64-bit code size) even though only 64-bit is tested in v1; decompressor stubs and far returns may touch compat mode. (Real, 16/32-bit protected, virtual-8086 and compatibility mode now all run, on the interpreter only: 15.)
 9. 0F 18–1F hint space is NOP, including ENDBR64 (F3 0F 1E FA).
 10. The library never touches stdio, never calls `process::exit`, holds no global mutable state, and never panics on guest behavior (guest faults are guest exceptions; unimplemented opcodes raise #UD and are logged through an optional hook).
 11. The guest has one vCPU by default, or up to 384 (pairs of SMT threads by default when the count is even). They take turns on one host thread (`docs/plans/03-cpu.md`, "SMP"; deterministic on the virtual clock, and the only mode on a freestanding host with no threads) or, by default where the host allows it, run on one host thread each on the host clock (`docs/plans/22-smp-threads.md`). With threads, x86 memory ordering and atomics are the emulator's job (x-tso in the fork is no longer moot): acquire/release guest accesses, locked instructions as compare-exchanges, a lock around the devices.
