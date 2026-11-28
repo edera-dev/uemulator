@@ -2,10 +2,8 @@
 //! No compression: the deflate stream is all "stored" blocks, which every inflater reads, so the
 //! crate needs no deflate encoder (the overlay is a few kilobytes).
 
-use crate::{S_IFDIR, S_IFLNK};
+use crate::{S_IFDIR, S_IFLNK, S_IFMT};
 
-/// Mask of the file type bits in `st_mode`.
-const S_IFMT: u32 = 0o170_000;
 const PERMISSION_BITS: u32 = 0o7777;
 
 const BLOCK_BYTES: usize = 512;

@@ -36,6 +36,8 @@ pub struct Answers {
     pub timezone: String,
     /// Such as `en_US.UTF-8`. Alpine ignores it (musl has no locales to set up).
     pub locale: String,
+    /// A name all three installers accept (Debian's xkb layout, Fedora's vconsole keymap and
+    /// Alpine's bkeymaps layout), such as `us` or `de`. The CLI maps the host's keymap to one.
     pub keymap: String,
     /// Distro package names, added by the installer.
     pub packages: Vec<String>,
@@ -83,11 +85,75 @@ impl Answers {
     }
 }
 
+/// Accounts and groups the installed systems already have, or that d-i's user-setup reserves
+/// (`passwd/username-reserved`): Debian's base-passwd and adduser, Alpine's alpine-baselayout
+/// and Fedora's setup package, plus the admin and common login groups. d-i asks again at
+/// critical priority for a reserved name, which would stall the install; adduser and useradd
+/// fail on an existing account or a group of the same name.
+const RESERVED_USER_NAMES: &[&str] = &[
+    "adm",
+    "audio",
+    "backup",
+    "bin",
+    "cdrom",
+    "cron",
+    "daemon",
+    "dialout",
+    "dip",
+    "disk",
+    "floppy",
+    "ftp",
+    "games",
+    "gnats",
+    "guest",
+    "halt",
+    "input",
+    "irc",
+    "kmem",
+    "kvm",
+    "list",
+    "lp",
+    "mail",
+    "man",
+    "messagebus",
+    "netdev",
+    "news",
+    "nobody",
+    "nogroup",
+    "ntp",
+    "operator",
+    "plugdev",
+    "postmaster",
+    "proxy",
+    "render",
+    "shadow",
+    "shutdown",
+    "squid",
+    "sshd",
+    "staff",
+    "sudo",
+    "sync",
+    "sys",
+    "systemd-network",
+    "systemd-resolve",
+    "systemd-timesync",
+    "tape",
+    "tss",
+    "tty",
+    "users",
+    "utmp",
+    "uucp",
+    "video",
+    "voice",
+    "wheel",
+    "www-data",
+];
+
+/// d-i's user-setup takes `^[a-z][-a-z0-9_]*$` (`passwd/username-bad` otherwise), which is
+/// also within what adduser and useradd accept.
 fn validate_user(user: &str) -> Result<(), String> {
     let mut characters = user.chars();
-    let first_ok = characters
-        .next()
-        .is_some_and(|c| c.is_ascii_lowercase() || c == '_');
+    let first_ok = characters.next().is_some_and(|c| c.is_ascii_lowercase());
     let rest_ok =
         characters.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "_-".contains(c));
     if user == "root" {
@@ -96,7 +162,12 @@ fn validate_user(user: &str) -> Result<(), String> {
     if !first_ok || !rest_ok || user.len() > USER_NAME_MAX {
         return Err(format!(
             "user {user:?}: must be 1 to {USER_NAME_MAX} characters of a-z, 0-9, _ and -, \
-             starting with a letter or _"
+             starting with a letter"
+        ));
+    }
+    if RESERVED_USER_NAMES.contains(&user) || user.starts_with("systemd-") {
+        return Err(format!(
+            "user {user:?}: is a system account or group name; pick another"
         ));
     }
     Ok(())
@@ -248,14 +319,9 @@ mod tests {
 
     #[test]
     fn rejects_bad_users() {
+        let too_long = "a".repeat(33);
         for user in [
-            "",
-            "root",
-            "Alex",
-            "1alex",
-            "al ex",
-            "alex;rm",
-            &"a".repeat(33),
+            "", "root", "Alex", "1alex", "_svc", "-a", "al ex", "alex;rm", &too_long,
         ] {
             rejected(
                 &Answers {
@@ -265,13 +331,31 @@ mod tests {
                 "user",
             );
         }
-        for user in ["_svc", "a-b_c9", &"a".repeat(32)] {
+        for user in ["a-b_c9", "alex_", &"a".repeat(32)] {
             Answers {
                 user: user.into(),
                 ..minimal()
             }
             .validate()
             .unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_system_account_names() {
+        // d-i asks passwd/username-reserved at critical priority for these, and adduser and
+        // useradd fail on an existing account or group.
+        for user in [
+            "daemon", "bin", "sys", "games", "man", "mail", "www-data", "nobody", "wheel", "sudo",
+            "sshd",
+        ] {
+            rejected(
+                &Answers {
+                    user: user.into(),
+                    ..minimal()
+                },
+                "user",
+            );
         }
     }
 

@@ -13,7 +13,7 @@ const TRAILER_NAME: &str = "TRAILER!!!";
 /// Headers, names and file data all start on 4-byte boundaries.
 const ALIGNMENT: usize = 4;
 /// Mask of the file type bits in `st_mode`.
-const S_IFMT: u32 = 0o170_000;
+pub const S_IFMT: u32 = 0o170_000;
 const FILE_LINKS: u32 = 1;
 const DIRECTORY_LINKS: u32 = 2;
 
