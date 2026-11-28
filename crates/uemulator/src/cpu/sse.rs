@@ -1623,24 +1623,8 @@ impl Cpu {
                 let imm8 = i.imm as u8;
                 Some(match prefix {
                     Prefix::P66 => shuffle_dwords(s, imm8),
-                    Prefix::F2 => {
-                        let mut r = s & !LOW_64;
-                        for k in 0..4 {
-                            u16::put(&mut r, k, u16::get(s, ((imm8 >> (2 * k)) & 3) as usize));
-                        }
-                        r
-                    }
-                    _ => {
-                        let mut r = s & LOW_64;
-                        for k in 0..4 {
-                            u16::put(
-                                &mut r,
-                                4 + k,
-                                u16::get(s, 4 + ((imm8 >> (2 * k)) & 3) as usize),
-                            );
-                        }
-                        r
-                    }
+                    Prefix::F2 => shuffle_low_words(s, imm8),
+                    _ => shuffle_high_words(s, imm8),
                 })
             }
             // Shifts by immediate; ModRM.reg selects the operation (see `shift_immediate`)
@@ -1852,7 +1836,7 @@ fn shift_immediate(opcode: u8, group: u8, x: u128, count: u64) -> Option<u128> {
 /// The two-operand packed integer instructions shared by the xmm (66) forms: unpack, pack,
 /// compare, shifts by a register count (only the low 64 bits of `s` count) and arithmetic.
 /// `opcode` is the 0F-map opcode byte.
-fn integer_op(opcode: u8, dst: u128, s: u128) -> u128 {
+pub(crate) fn integer_op(opcode: u8, dst: u128, s: u128) -> u128 {
     // shift count: the low quadword only
     let count = s as u64;
     match opcode {
@@ -2085,6 +2069,33 @@ fn put_u64<T: Lane>(r: &mut u128, k: usize, v: u64, width: u32) {
 }
 
 /// pshufd: result dword `k` is source dword `order[2k+1:2k]`.
+/// pshuflw: the four low words picked from the low four by two bits of `order` each, the high
+/// quadword copied.
+pub(crate) fn shuffle_low_words(source: u128, order: u8) -> u128 {
+    let mut result = source & !LOW_64;
+    for k in 0..4 {
+        u16::put(
+            &mut result,
+            k,
+            u16::get(source, ((order >> (2 * k)) & 3) as usize),
+        );
+    }
+    result
+}
+
+/// pshufhw: `shuffle_low_words` on the high quadword, the low one copied.
+pub(crate) fn shuffle_high_words(source: u128, order: u8) -> u128 {
+    let mut result = source & LOW_64;
+    for k in 0..4 {
+        u16::put(
+            &mut result,
+            4 + k,
+            u16::get(source, 4 + ((order >> (2 * k)) & 3) as usize),
+        );
+    }
+    result
+}
+
 pub(crate) fn shuffle_dwords(source: u128, order: u8) -> u128 {
     const DWORDS: usize = 4;
     const SELECTOR_MASK: u8 = 3;

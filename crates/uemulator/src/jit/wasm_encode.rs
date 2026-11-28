@@ -57,6 +57,7 @@ pub(crate) mod op {
     pub const I32_CONST: u8 = 0x41;
     pub const I64_CONST: u8 = 0x42;
     pub const I32_EQZ: u8 = 0x45;
+    pub const I32_LE_U: u8 = 0x4d;
     pub const I64_GE_U: u8 = 0x5a;
     pub const I64_EQZ: u8 = 0x50;
     pub const I64_EQ: u8 = 0x51;
@@ -80,6 +81,8 @@ pub(crate) mod op {
     pub const I64_ADD: u8 = 0x7c;
     pub const I64_SUB: u8 = 0x7d;
     pub const I64_MUL: u8 = 0x7e;
+    pub const I64_DIV_S: u8 = 0x7f;
+    pub const I64_DIV_U: u8 = 0x80;
     pub const I64_AND: u8 = 0x83;
     pub const I64_OR: u8 = 0x84;
     pub const I64_XOR: u8 = 0x85;

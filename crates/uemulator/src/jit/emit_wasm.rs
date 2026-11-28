@@ -39,7 +39,7 @@ use super::wasm_encode::{
 };
 use crate::cpu::cet::Cet;
 use crate::cpu::decode::{Insn, NO_REG, VEX_OP_FLAG};
-use crate::cpu::flags::LazyFlagsOp;
+use crate::cpu::flags::{AC, ARITH, CF, DF, IF, LazyFlagsOp, OF, RF, VM, ZF};
 use crate::cpu::xsave::{XCR0_AVX, XCR0_AVX512, XCR0_SSE};
 use crate::cpu::{
     CR0_EM, CR0_TS, CR4_OSFXSR, CR4_OSXSAVE, Cpu, SEG_FS, SEG_GS, Seg, TLB_ENTRIES_PER_MODE,
@@ -60,6 +60,7 @@ const SLOW_ACCESS_INSN: u32 = offset_of!(Cpu, slow_access_insn) as u32;
 /// `tlb_active_base` is a `u64` holding a 32-bit address here; the low word is the address.
 const TLB_ACTIVE_BASE: u32 = offset_of!(Cpu, tlb_active_base) as u32;
 const LAZY_OP: u32 = offset_of!(Cpu, lazy_op) as u32;
+const EFLAGS: u32 = offset_of!(Cpu, eflags) as u32;
 const LAZY_SIZE_SHIFT: u32 = 8;
 const LAZY_DST: u32 = offset_of!(Cpu, lazy_dst) as u32;
 const LAZY_SRC: u32 = offset_of!(Cpu, lazy_src) as u32;
@@ -68,6 +69,25 @@ const LAZY_SRC2: u32 = offset_of!(Cpu, lazy_src2) as u32;
 const SEG_BASE: u32 = (offset_of!(Cpu, seg) + offset_of!(Seg, base)) as u32;
 const CR0: u32 = offset_of!(Cpu, cr0) as u32;
 const CR4: u32 = offset_of!(Cpu, cr4) as u32;
+const CPL: u32 = offset_of!(Cpu, cpl) as u32;
+const MULTI: u32 = offset_of!(Cpu, multi) as u32;
+const PKRU: u32 = offset_of!(Cpu, pkru) as u32;
+const TSC_AUX: u32 = offset_of!(Cpu, tsc_aux) as u32;
+const KGSBASE: u32 = offset_of!(Cpu, kgsbase) as u32;
+const INTERRUPT_SHADOW: u32 = offset_of!(Cpu, interrupt_shadow) as u32;
+const SEG_SELECTOR: u32 = (offset_of!(Cpu, seg) + offset_of!(Seg, sel)) as u32;
+/// `Svm::guest`, an `Option<Box<_>>`: a nullable pointer, so a 4-byte word on wasm32 that is
+/// zero exactly when no SVM guest runs (whose host could intercept pause, rdtsc and pushf).
+const SVM_GUEST: u32 = offset_of!(Cpu, svm.guest) as u32;
+const _: () = assert!(size_of::<Option<Box<u8>>>() == size_of::<u32>());
+/// CR4.TSD: rdtsc above CPL 0 raises #GP. CR4.PKE: rdpkru and wrpkru exist.
+const CR4_TSD: i64 = 1 << 2;
+const CR4_PKE: i64 = 1 << 22;
+/// EFLAGS.IOPL, bits 13:12.
+const IOPL_SHIFT: i64 = 12;
+const IOPL_MASK: i64 = 3;
+/// What pushf leaves out of the flags image.
+const PUSHF_CLEARED: u64 = RF | VM;
 const XMM: u32 = offset_of!(Cpu, xmm) as u32;
 const XMM_SIZE: u32 = size_of::<u128>() as u32;
 const XMM_HALF: u32 = XMM_SIZE / 2;
@@ -117,6 +137,8 @@ const SSP: u32 = (offset_of!(Cpu, cet) + offset_of!(Cet, ssp)) as u32;
 const SHADOW_STACK_ENTRY: i64 = 8;
 
 const _: () = assert!(size_of::<LazyFlagsOp>() == 1);
+/// adcx and adox test `lazy_op` for zero to skip materializing flags that already are.
+const _: () = assert!(LazyFlagsOp::Eflags as u8 == 0);
 const _: () = assert!(offset_of!(Cpu, lazy_size) == offset_of!(Cpu, lazy_op) + 1);
 const _: () = assert!(offset_of!(Cpu, gpr) == 0 || offset_of!(Cpu, gpr) < 1 << 16);
 
@@ -191,6 +213,7 @@ const ALU_ADC: u8 = 2;
 const ALU_SBB: u8 = 3;
 const ALU_AND: u8 = 4;
 const ALU_SUB: u8 = 5;
+const ALU_XOR: u8 = 6;
 const ALU_CMP: u8 = 7;
 /// `test`: and without writeback. Not a real group-1 number; must stay outside 0..=7.
 const ALU_TEST: u8 = 8;
@@ -216,6 +239,32 @@ const VEX_BMI_ANDN: u16 = VEX_OP_FLAG | 0x2f2;
 const VEX_BMI_GROUP17: u16 = VEX_OP_FLAG | 0x2f3;
 /// mulx (with F2; the other prefixes are not instructions there).
 const VEX_BMI_MULX: u16 = VEX_OP_FLAG | 0x2f6;
+/// The same opcode without VEX: adcx with 66, adox with F3.
+const ADCX_ADOX: u16 = 0x2f6;
+/// `Insn::rep` of an F3 prefix.
+const PREFIX_F3: u8 = 1;
+/// bt/bts/btr/btc r/m, r (0f a3, ab, b3, bb), in operation order, and group 8 (0f ba /4../7)
+/// with an imm8 offset.
+const BIT_TEST_REGISTER_OFFSET: [u16; 4] = [0x1a3, 0x1ab, 0x1b3, 0x1bb];
+const BIT_TEST_IMMEDIATE: u16 = 0x1ba;
+/// Group 8's /4 is bt; /5, /6 and /7 are bts, btr and btc (/0../3 are #UD).
+const GROUP8_FIRST_BIT_OP: u8 = 4;
+const BIT_SET: u8 = 1;
+const BIT_RESET: u8 = 2;
+/// Group 3 /6 and /7: div and idiv.
+const GROUP3_DIV: u8 = 6;
+const GROUP3_IDIV: u8 = 7;
+/// VEX 0f 98 kortest and 0f 99 ktest (the opmask register tests).
+const KORTEST: u16 = VEX_OP_FLAG | 0x198;
+const KTEST: u16 = VEX_OP_FLAG | 0x199;
+/// VEX 0f 77: vzeroupper (VEX.L 0) and vzeroall (VEX.L 1).
+const VZERO: u16 = VEX_OP_FLAG | 0x177;
+/// The vector registers vzeroupper and vzeroall clear (zmm16-31 keep their contents).
+const VZERO_REGISTERS: u8 = 16;
+const GUEST_RBX: u8 = 3;
+const GUEST_RBP: u8 = 5;
+/// cmpxchg16b's operand, which must be aligned to its size.
+const DOUBLE_QUADWORD_BYTES: u8 = 16;
 const BMI_GROUP_BLSR: u8 = 1;
 const BMI_GROUP_BLSMSK: u8 = 2;
 const BMI_GROUP_BLSI: u8 = 3;
@@ -245,6 +294,11 @@ pub(crate) struct Addrs {
     pub rotate_flags: u32,
     /// `helper_whole_vector`, called through `STORE_TYPE` (its result is dropped).
     pub whole_vector: u32,
+    /// `helper_materialize_flags`, `helper_rdtsc` (its result is the TSC) and `helper_pause`,
+    /// called through `COND_TYPE`.
+    pub materialize_flags: u32,
+    pub rdtsc: u32,
+    pub pause: u32,
     pub out: u32,
     /// Table slot of the chain stub, or 0 when blocks return to the run loop between each other.
     pub chain: u32,
@@ -299,6 +353,21 @@ pub(crate) struct CompiledBlock {
 enum Dst {
     Reg(u8, bool),
     Mem,
+}
+
+/// The read-modify-write of a memory operand that `Gen::memory_rmw` lowers.
+#[derive(Clone, Copy)]
+enum RmwOp {
+    /// add, or, and, sub or xor (`ALU_*`) with a register or immediate operand
+    Alu(u8, Src),
+    Inc,
+    Dec,
+    Xadd,
+    Xchg,
+    Cmpxchg,
+    /// bts, btr or btc (`BIT_SET`, `BIT_RESET`, 3) with an immediate bit offset, masked to the
+    /// width
+    BitTest(u8, u32),
 }
 
 #[derive(Clone, Copy)]
@@ -708,10 +777,25 @@ impl<'a> Gen<'a> {
     fn helper(&mut self, insn_index: usize, rip: u64, terminal: bool) {
         self.flush_flags();
         let insn = &self.insns[insn_index] as *const Insn as usize as i32;
-        // The run loop already counted one instruction for the block. The interpreter may read
-        // guest time (rdtsc, port I/O, a device load), which derives from `icount`, so add the
-        // ones before this now and tell `step_block` through `prepaid_icount` not to count them
-        // again.
+        self.prepay(insn_index);
+        self.c.local_get(CPU).i32_const(insn);
+        self.rip_to(rip);
+        self.c
+            .i32_const(self.addrs.exec as i32)
+            .call_indirect(EXEC_TYPE);
+        self.check_status(insn_index as u32, true);
+        if terminal {
+            self.exit_ok(insn_index as u32 + 1);
+        }
+        self.flags = None;
+    }
+
+    /// The run loop already counted one instruction for the block. The interpreter (or inline
+    /// rdtsc) may read guest time (rdtsc, port I/O, a device load), which derives from `icount`,
+    /// so this adds the ones before `insn_index` now and tells `step_block` through
+    /// `prepaid_icount` not to count them again. Only on a path every later instruction of the
+    /// block runs on: the prepayment is a translation-time fact from here on.
+    fn prepay(&mut self, insn_index: usize) {
         if insn_index as u32 > self.prepaid_insns {
             let owed = insn_index as u32 - self.prepaid_insns;
             self.c
@@ -724,16 +808,6 @@ impl<'a> Gen<'a> {
             self.store_cpu_u64(PREPAID_ICOUNT, insn_index as u64);
             self.prepaid_insns = insn_index as u32;
         }
-        self.c.local_get(CPU).i32_const(insn);
-        self.rip_to(rip);
-        self.c
-            .i32_const(self.addrs.exec as i32)
-            .call_indirect(EXEC_TYPE);
-        self.check_status(insn_index as u32, true);
-        if terminal {
-            self.exit_ok(insn_index as u32 + 1);
-        }
-        self.flags = None;
     }
 
     /// Runs instruction `insn_index` through the interpreter from inside a branch, as the slow
@@ -1722,11 +1796,6 @@ impl<'a> Gen<'a> {
         }
     }
 
-    /// Memory operands the inline path handles: 64-bit addressing, no lock prefix.
-    fn mem_ok(insn: &Insn) -> bool {
-        !insn.addr32 && !insn.lock
-    }
-
     /// Truncates the i64 on the stack to `size` bytes.
     fn mask_to(&mut self, size: u8) {
         if size < 8 {
@@ -2596,6 +2665,935 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// adcx (`overflow` false) and adox: ModRM.reg += r/m + CF (OF), and only that flag takes
+    /// the carry out. The other flags must survive, which only `Cpu::eflags` can hold, so the
+    /// lazy record is materialized there first (`helper_materialize_flags`, skipped when
+    /// `lazy_op` is already `Eflags`, as after the previous adcx or adox: bignum code interleaves
+    /// a chain of them) and the carry is then a bit of `eflags`. The caller has stored any
+    /// pending record (`keeps_pending_record` is false for this opcode), so the helper sees it.
+    fn add_carry_chain(&mut self, insn: &Insn, overflow: bool, next: u64, index: u32, rip: u64) {
+        // The 66 or F3 is part of the opcode, so `opsize` may say 2: the size is 8 or 4.
+        let size = if insn.opsize == 8 { 8 } else { 4 };
+        let chain_bit = if overflow { OF } else { CF }.trailing_zeros() as i64;
+        // The source first: a faulting load leaves the record as it was.
+        if insn.md == MODRM_MOD_REGISTER {
+            self.read_reg(insn.rm, false, size);
+        } else {
+            self.ea(insn, next);
+            self.mem_load(size, false, index, rip, false);
+        }
+        self.c.local_set(VALUE);
+        self.materialize_eflags();
+        // SCRATCH = eflags, CARRY = the chain flag's bit.
+        self.c
+            .local_get(CPU)
+            .mem(op::I64_LOAD, EFLAGS)
+            .local_tee(SCRATCH)
+            .i64_const(chain_bit)
+            .op(op::I64_SHR_U)
+            .i64_const(1)
+            .op(op::I64_AND)
+            .local_set(CARRY);
+        if size == 8 {
+            // SCRATCH_B = dst + src, which wrapped exactly when it is below src; adding the
+            // carry-in wraps it again only from all ones, and the two never both wrap.
+            self.read_reg(insn.reg, false, 8);
+            self.c
+                .local_get(VALUE)
+                .op(op::I64_ADD)
+                .local_tee(SCRATCH_B)
+                .local_get(VALUE)
+                .op(op::I64_LT_U)
+                .local_get(SCRATCH_B)
+                .local_get(CARRY)
+                .op(op::I64_ADD)
+                .local_tee(VALUE)
+                .local_get(SCRATCH_B)
+                .op(op::I64_LT_U)
+                .op(op::I32_OR)
+                .op(op::I64_EXTEND_I32_U)
+                .local_set(CARRY);
+        } else {
+            // Zero-extended 32-bit operands sum exactly in 64 bits; bit 32 is the carry out.
+            self.read_reg(insn.reg, false, 4);
+            self.c
+                .local_get(VALUE)
+                .op(op::I64_ADD)
+                .local_get(CARRY)
+                .op(op::I64_ADD)
+                .local_tee(SCRATCH_B)
+                .i64_const(LIMB_BITS)
+                .op(op::I64_SHR_U)
+                .local_set(CARRY);
+            self.c
+                .local_get(SCRATCH_B)
+                .i64_const(LOW_DWORD)
+                .op(op::I64_AND)
+                .local_set(VALUE);
+        }
+        // A 32-bit destination is zero-extended, so both sizes store all 64 bits.
+        self.write_reg(insn.reg, false, 8, VALUE);
+        self.c
+            .local_get(CPU)
+            .local_get(SCRATCH)
+            .i64_const(!(1i64 << chain_bit))
+            .op(op::I64_AND)
+            .local_get(CARRY)
+            .i64_const(chain_bit)
+            .op(op::I64_SHL)
+            .op(op::I64_OR)
+            .mem(op::I64_STORE, EFLAGS);
+        self.flags = None;
+    }
+
+    /// Makes `Cpu::eflags` hold the arithmetic flags (`helper_materialize_flags`) unless they
+    /// already do (`lazy_op` is `Eflags`), for code that reads or replaces single flags there.
+    /// The helper reads the record from `Cpu`, so a pending one must have been stored first
+    /// (`try_inline` does that for everything `keeps_pending_record` does not list).
+    fn materialize_eflags(&mut self) {
+        debug_assert!(self.pending_record.is_none());
+        self.c
+            .local_get(CPU)
+            .mem(op::I32_LOAD8_U, LAZY_OP)
+            .begin_if(BLOCK_VOID);
+        self.c
+            .local_get(CPU)
+            .i64_const(0)
+            .i32_const(self.addrs.materialize_flags as i32)
+            .call_indirect(COND_TYPE)
+            .op(op::DROP);
+        self.end();
+    }
+
+    /// Replaces the single-bit flag `flag` of `Cpu::eflags` with local `value` (0 or 1). The
+    /// flags must be materialized (`materialize_eflags`).
+    fn set_eflags_bit(&mut self, flag: u64, value: u32) {
+        self.c
+            .local_get(CPU)
+            .local_get(CPU)
+            .mem(op::I64_LOAD, EFLAGS)
+            .i64_const(!flag as i64)
+            .op(op::I64_AND)
+            .local_get(value)
+            .i64_const(flag.trailing_zeros() as i64)
+            .op(op::I64_SHL)
+            .op(op::I64_OR)
+            .mem(op::I64_STORE, EFLAGS);
+    }
+
+    /// Pushes an i32 1 while an SVM guest runs (its host may intercept the instruction, which
+    /// the interpreter then handles), else 0.
+    fn svm_guest_running(&mut self) {
+        self.c
+            .local_get(CPU)
+            .mem(op::I32_LOAD, SVM_GUEST)
+            .op(op::I32_EQZ)
+            .op(op::I32_EQZ);
+    }
+
+    /// Pushes an i32 1 when the CPL is not 0.
+    fn above_ring0(&mut self) {
+        self.c
+            .local_get(CPU)
+            .mem(op::I32_LOAD8_U, CPL)
+            .op(op::I32_EQZ)
+            .op(op::I32_EQZ);
+    }
+
+    /// Stores the low `size` bytes of local `value` at the host address in `SLOT`.
+    fn store_to_slot(&mut self, size: u8, value: u32) {
+        self.c
+            .local_get(SLOT)
+            .local_get(value)
+            .mem(memory_store_opcode(size), 0);
+    }
+
+    /// What `memory_rmw` does for `insn`, if it is one of the read-modify-writes it handles (at
+    /// any prefix: the caller checks LOCK, the operand size and that the operand is memory).
+    fn memory_rmw_op(insn: &Insn) -> Option<RmwOp> {
+        let alu = |alu_op: u8| matches!(alu_op, ALU_ADD | ALU_OR | ALU_AND | ALU_SUB | ALU_XOR);
+        match insn.op {
+            // add/or/and/sub/xor r/m, r
+            0x01 | 0x09 | 0x21 | 0x29 | 0x31 => {
+                Some(RmwOp::Alu((insn.op >> 3) as u8, Src::Reg(insn.reg, false)))
+            }
+            0x81 | 0x83 if alu(insn.reg & 7) => Some(RmwOp::Alu(
+                insn.reg & 7,
+                Src::Imm(Self::imm_for(insn.opsize, insn.imm)),
+            )),
+            0xff if insn.reg & 7 == 0 => Some(RmwOp::Inc),
+            0xff if insn.reg & 7 == 1 => Some(RmwOp::Dec),
+            0x1c1 => Some(RmwOp::Xadd),
+            0x87 => Some(RmwOp::Xchg),
+            0x1b1 => Some(RmwOp::Cmpxchg),
+            BIT_TEST_IMMEDIATE if insn.reg & 7 > GROUP8_FIRST_BIT_OP => Some(RmwOp::BitTest(
+                (insn.reg & 7) - GROUP8_FIRST_BIT_OP,
+                insn.imm as u32 & (8 * insn.opsize as u32 - 1),
+            )),
+            _ => None,
+        }
+    }
+
+    /// A read-modify-write of the 4- or 8-byte memory operand of `insn`: a locked one, xchg with
+    /// memory, or cmpxchg/xadd. The vCPUs of the web build take turns on one thread (no
+    /// `thread_spawner`, `crates/uemulator-web`), so a plain load and store are atomic already
+    /// and LOCK changes nothing here; were the build to get threads, this would need wasm's
+    /// atomic read-modify-writes. A misaligned operand (a split lock, which raises #DB under
+    /// DEBUGCTL.BLD, as Linux sets it) and a write-TLB miss go to the interpreter, which does the
+    /// locked access its own way. The fast path stores its flag record at once: the interpreter
+    /// path writes its own, so none can stay pending across the merge.
+    fn memory_rmw(&mut self, insn: &Insn, operation: RmwOp, next: u64, index: u32, rip: u64) {
+        let size = insn.opsize;
+        if matches!(operation, RmwOp::BitTest(..)) {
+            // Only CF changes, in `Cpu::eflags` (see `bit_test`).
+            self.materialize_eflags();
+        }
+        self.ea(insn, next);
+        self.c
+            .local_get(ADDR)
+            .i64_const(size as i64 - 1)
+            .op(op::I64_AND)
+            .op(op::I64_EQZ);
+        self.tlb_probe(size, TLB_TAG_WRITE);
+        self.c.op(op::I32_AND).begin_if(BLOCK_VOID);
+        self.host_address();
+        self.c.local_set(SLOT);
+        self.c
+            .local_get(SLOT)
+            .mem(load_opcode(size, false), 0)
+            .local_set(LHS);
+        match operation {
+            RmwOp::Alu(alu_op, source) => {
+                match source {
+                    Src::Reg(reg, high) => self.read_reg(reg, high, size),
+                    Src::Imm(value) => {
+                        self.c.i64_const(value as i64);
+                    }
+                    Src::Mem => unreachable!("an ALU source of a memory destination is not memory"),
+                }
+                self.c.local_set(RHS).local_get(LHS).local_get(RHS);
+                let lazy = match alu_op {
+                    ALU_ADD => {
+                        self.c.op(op::I64_ADD);
+                        LazyFlagsOp::Add
+                    }
+                    ALU_SUB => {
+                        self.c.op(op::I64_SUB);
+                        LazyFlagsOp::Sub
+                    }
+                    ALU_OR => {
+                        self.c.op(op::I64_OR);
+                        LazyFlagsOp::Logic
+                    }
+                    ALU_AND => {
+                        self.c.op(op::I64_AND);
+                        LazyFlagsOp::Logic
+                    }
+                    _ => {
+                        self.c.op(op::I64_XOR);
+                        LazyFlagsOp::Logic
+                    }
+                };
+                self.mask_to(size);
+                self.c.local_set(RES);
+                self.store_to_slot(size, RES);
+                self.store_lazy(lazy, size, RHS);
+            }
+            RmwOp::Inc | RmwOp::Dec => {
+                // The CF they keep goes into the record as its second operand, as in `inc_dec`.
+                self.condition(CONDITION_BELOW);
+                self.c.op(op::I64_EXTEND_I32_U).local_set(CARRY);
+                let decrement = matches!(operation, RmwOp::Dec);
+                self.c.local_get(LHS).i64_const(1).op(if decrement {
+                    op::I64_SUB
+                } else {
+                    op::I64_ADD
+                });
+                self.mask_to(size);
+                self.c.local_set(RES);
+                self.store_to_slot(size, RES);
+                let lazy = if decrement {
+                    LazyFlagsOp::Dec
+                } else {
+                    LazyFlagsOp::Inc
+                };
+                self.store_lazy(lazy, size, CARRY);
+            }
+            RmwOp::Xadd => {
+                self.read_reg(insn.reg, false, size);
+                self.c.local_tee(RHS).local_get(LHS).op(op::I64_ADD);
+                self.mask_to(size);
+                self.c.local_set(RES);
+                self.store_to_slot(size, RES);
+                // The old value is zero-extended, as a 32-bit register write is.
+                self.write_reg(insn.reg, false, 8, LHS);
+                self.store_lazy(LazyFlagsOp::Add, size, RHS);
+            }
+            RmwOp::Xchg => {
+                self.read_reg(insn.reg, false, size);
+                self.c.local_set(RHS);
+                self.store_to_slot(size, RHS);
+                self.write_reg(insn.reg, false, 8, LHS);
+            }
+            RmwOp::Cmpxchg => {
+                // The flags of `cmp accumulator, old`.
+                self.read_reg(GUEST_RAX, false, size);
+                self.c.local_get(LHS).op(op::I64_SUB);
+                self.mask_to(size);
+                self.c.local_set(RES);
+                self.store_lazy(LazyFlagsOp::Sub, size, LHS);
+                // Equal, the source is stored; else the accumulator takes the old value and
+                // nothing is stored (writing the old value back, as hardware does, would only
+                // matter for a write fault, which the write-tag probe already ruled out).
+                self.c.local_get(RES).op(op::I64_EQZ).begin_if(BLOCK_VOID);
+                self.read_reg(insn.reg, false, size);
+                self.c.local_set(RHS);
+                self.store_to_slot(size, RHS);
+                self.c.op(op::ELSE);
+                self.write_reg(GUEST_RAX, false, 8, LHS);
+                self.end();
+            }
+            RmwOp::BitTest(operation, bit) => {
+                self.c
+                    .local_get(LHS)
+                    .i64_const(bit as i64)
+                    .op(op::I64_SHR_U)
+                    .i64_const(1)
+                    .op(op::I64_AND)
+                    .local_set(CARRY);
+                self.c.local_get(LHS);
+                self.bit_update(operation, |generator| {
+                    generator.c.i64_const(1 << bit);
+                });
+                self.c.local_set(RES);
+                self.store_to_slot(size, RES);
+                self.set_eflags_bit(CF, CARRY);
+            }
+        }
+        self.c.op(op::ELSE);
+        self.helper_in_branch(index as usize, rip);
+        self.end();
+        self.flags = None;
+    }
+
+    /// With the operand on the stack, applies bts (`BIT_SET`), btr (`BIT_RESET`) or btc to it
+    /// with the single-bit mask `push_mask` pushes.
+    fn bit_update(&mut self, operation: u8, push_mask: impl Fn(&mut Self)) {
+        push_mask(self);
+        match operation {
+            BIT_SET => {
+                self.c.op(op::I64_OR);
+            }
+            BIT_RESET => {
+                self.c.i64_const(-1).op(op::I64_XOR).op(op::I64_AND);
+            }
+            _ => {
+                self.c.op(op::I64_XOR);
+            }
+        }
+    }
+
+    /// bt, bts, btr and btc (`operation` 0..3) at 32 and 64 bits without LOCK: CF takes the
+    /// selected bit, which the last three then set, clear or flip; every other flag stays (the
+    /// interpreter keeps them; the architecture leaves OF/SF/AF/PF undefined and ZF alone), so
+    /// the flags are materialized first and CF is replaced in `Cpu::eflags` once the store has
+    /// succeeded. With a register offset into memory the operand is the operand-size word at the
+    /// address plus the sign-extended offset divided by the width, rounded down, as for a bit
+    /// string. Returns true for a store to memory.
+    #[allow(clippy::too_many_arguments)]
+    fn bit_test(
+        &mut self,
+        insn: &Insn,
+        operation: u8,
+        immediate_offset: Option<u32>,
+        next: u64,
+        index: u32,
+        rip: u64,
+    ) -> bool {
+        let size = insn.opsize;
+        let bits = 8 * size as i64;
+        let memory = insn.md != MODRM_MOD_REGISTER;
+        self.materialize_eflags();
+        // SCRATCH = the bit offset, sign-extended
+        match immediate_offset {
+            Some(offset) => {
+                self.c.i64_const(offset as i64);
+            }
+            None => {
+                self.read_reg(insn.reg, false, size);
+                if size == 4 {
+                    self.c.op(op::I64_EXTEND32_S);
+                }
+            }
+        }
+        self.c.local_set(SCRATCH);
+        if memory {
+            self.ea(insn, next);
+            if immediate_offset.is_none() {
+                self.c
+                    .local_get(ADDR)
+                    .local_get(SCRATCH)
+                    .i64_const(bits.trailing_zeros() as i64)
+                    .op(op::I64_SHR_S)
+                    .i64_const(size.trailing_zeros() as i64)
+                    .op(op::I64_SHL)
+                    .op(op::I64_ADD)
+                    .local_set(ADDR);
+            }
+            self.mem_load(size, false, index, rip, false);
+        } else {
+            self.read_reg(insn.rm, false, size);
+        }
+        self.c.local_set(VALUE);
+        self.c
+            .local_get(SCRATCH)
+            .i64_const(bits - 1)
+            .op(op::I64_AND)
+            .local_set(SCRATCH);
+        self.c
+            .local_get(VALUE)
+            .local_get(SCRATCH)
+            .op(op::I64_SHR_U)
+            .i64_const(1)
+            .op(op::I64_AND)
+            .local_set(CARRY);
+        let mut stored = false;
+        if operation != 0 {
+            self.c.local_get(VALUE);
+            self.bit_update(operation, |generator| {
+                generator.c.i64_const(1).local_get(SCRATCH).op(op::I64_SHL);
+            });
+            self.c.local_set(SCRATCH_B);
+            if memory {
+                self.mem_store(size, SCRATCH_B, index, rip, false);
+                stored = true;
+            } else {
+                // A 32-bit result is zero-extended into the register.
+                self.write_reg(insn.rm, false, 8, SCRATCH_B);
+            }
+        }
+        self.set_eflags_bit(CF, CARRY);
+        self.flags = None;
+        stored
+    }
+
+    /// div and idiv r/m at 32 and 64 bits: rdx:rax (edx:eax) by r/m, quotient to rax and
+    /// remainder to rdx; the flags stay as they are (the interpreter leaves them alone, which
+    /// the architecture allows: they are undefined), and so do the fused locals, which this
+    /// does not touch. A zero divisor and a quotient that does not fit raise #DE, which the
+    /// interpreter does; so does a 64-bit form whose dividend needs 128 bits (rdx not zero for
+    /// div, not the sign of rax for idiv), which wasm cannot divide and which compiled code does
+    /// not produce (`xor edx, edx` and `cqo` come first). wasm's division traps on a zero
+    /// divisor and on `i64::MIN / -1`, which would take the emulator down, so the division
+    /// runs with 1 in their place and the result is only kept when neither was the case.
+    fn divide(&mut self, insn: &Insn, signed: bool, next: u64, index: u32, rip: u64) {
+        let size = insn.opsize;
+        let wide = size == 8;
+        // VALUE = divisor (a 32-bit idiv's sign-extended), SCRATCH = dividend (the low 64 bits),
+        // ADDR = rdx (the high half of the 64-bit forms), SLOT = whether the division would trap
+        if insn.md == MODRM_MOD_REGISTER {
+            self.read_reg(insn.rm, false, size);
+        } else {
+            self.ea(insn, next);
+            self.mem_load(size, false, index, rip, false);
+        }
+        if signed && !wide {
+            self.c.op(op::I64_EXTEND32_S);
+        }
+        self.c.local_set(VALUE);
+        if wide {
+            self.read_reg(GUEST_RAX, false, 8);
+            self.c.local_set(SCRATCH);
+            self.read_reg(GUEST_RDX, false, 8);
+            self.c.local_set(ADDR);
+        } else {
+            self.read_reg(GUEST_RDX, false, 4);
+            self.c.i64_const(LIMB_BITS).op(op::I64_SHL);
+            self.read_reg(GUEST_RAX, false, 4);
+            self.c.op(op::I64_OR).local_set(SCRATCH);
+        }
+        self.c.local_get(VALUE).op(op::I64_EQZ);
+        if signed {
+            self.c
+                .local_get(SCRATCH)
+                .i64_const(i64::MIN)
+                .op(op::I64_EQ)
+                .local_get(VALUE)
+                .i64_const(-1)
+                .op(op::I64_EQ)
+                .op(op::I32_AND)
+                .op(op::I32_OR);
+        }
+        self.c.local_set(SLOT);
+        // SCRATCH_B = quotient
+        self.c
+            .local_get(SCRATCH)
+            .i64_const(1)
+            .local_get(VALUE)
+            .local_get(SLOT)
+            .op(op::SELECT)
+            .op(if signed { op::I64_DIV_S } else { op::I64_DIV_U })
+            .local_set(SCRATCH_B);
+        self.c.local_get(SLOT).op(op::I32_EQZ);
+        if wide {
+            self.c.local_get(ADDR);
+            if signed {
+                self.c
+                    .local_get(SCRATCH)
+                    .i64_const(SIGN_FILL_SHIFT)
+                    .op(op::I64_SHR_S);
+            } else {
+                self.c.i64_const(0);
+            }
+            self.c.op(op::I64_EQ);
+        } else if signed {
+            self.c
+                .local_get(SCRATCH_B)
+                .op(op::I64_EXTEND32_S)
+                .local_get(SCRATCH_B)
+                .op(op::I64_EQ);
+        } else {
+            self.c
+                .local_get(SCRATCH_B)
+                .i64_const(LIMB_BITS)
+                .op(op::I64_SHR_U)
+                .op(op::I64_EQZ);
+        }
+        self.c.op(op::I32_AND).begin_if(BLOCK_VOID);
+        // remainder = dividend - quotient * divisor, exact in wrapping arithmetic
+        self.c
+            .local_get(SCRATCH)
+            .local_get(SCRATCH_B)
+            .local_get(VALUE)
+            .op(op::I64_MUL)
+            .op(op::I64_SUB);
+        if !wide {
+            self.c.i64_const(LOW_DWORD).op(op::I64_AND);
+            self.c
+                .local_get(SCRATCH_B)
+                .i64_const(LOW_DWORD)
+                .op(op::I64_AND)
+                .local_set(SCRATCH_B);
+        }
+        self.c.local_set(SCRATCH);
+        self.write_reg(GUEST_RAX, false, 8, SCRATCH_B);
+        self.write_reg(GUEST_RDX, false, 8, SCRATCH);
+        self.c.op(op::ELSE);
+        self.helper_in_branch(index as usize, rip);
+        self.end();
+    }
+
+    /// pause: nothing with one vCPU; with more, `helper_pause`, which may ask the block to end
+    /// (so the exit check follows). In an SVM guest the interpreter runs it: the intercept and
+    /// its pause filter. Touches neither the flags nor the fused locals.
+    fn pause(&mut self, index: u32, next: u64, rip: u64) {
+        self.svm_guest_running();
+        self.c.begin_if(BLOCK_VOID);
+        self.helper_in_branch(index as usize, rip);
+        self.c.op(op::ELSE);
+        self.c
+            .local_get(CPU)
+            .mem(op::I32_LOAD8_U, MULTI)
+            .begin_if(BLOCK_VOID);
+        self.c
+            .local_get(CPU)
+            .i64_const(0)
+            .i32_const(self.addrs.pause as i32)
+            .call_indirect(COND_TYPE)
+            .op(op::DROP);
+        self.end();
+        self.end();
+        self.smc_check(index, next);
+    }
+
+    /// rdtsc, and rdtscp (`with_aux`, which also loads IA32_TSC_AUX into ecx): edx:eax = the TSC
+    /// from `helper_rdtsc`, after paying the block's instructions so far (the virtual clock is
+    /// the instruction count). CR4.TSD above CPL 0 (#GP) and an SVM guest go to the interpreter.
+    fn rdtsc(&mut self, index: usize, with_aux: bool, rip: u64) {
+        self.prepay(index);
+        self.svm_guest_running();
+        self.c
+            .local_get(CPU)
+            .mem(op::I64_LOAD, CR4)
+            .i64_const(CR4_TSD)
+            .op(op::I64_AND)
+            .op(op::I64_EQZ)
+            .op(op::I32_EQZ);
+        self.above_ring0();
+        self.c.op(op::I32_AND).op(op::I32_OR).begin_if(BLOCK_VOID);
+        self.helper_in_branch(index, rip);
+        self.c.op(op::ELSE);
+        self.c
+            .local_get(CPU)
+            .i64_const(0)
+            .i32_const(self.addrs.rdtsc as i32)
+            .call_indirect(COND_TYPE)
+            .local_tee(SCRATCH)
+            .i64_const(LOW_DWORD)
+            .op(op::I64_AND)
+            .local_set(VALUE);
+        self.write_reg(GUEST_RAX, false, 8, VALUE);
+        self.c
+            .local_get(SCRATCH)
+            .i64_const(LIMB_BITS)
+            .op(op::I64_SHR_U)
+            .local_set(VALUE);
+        self.write_reg(GUEST_RDX, false, 8, VALUE);
+        if with_aux {
+            self.c
+                .local_get(CPU)
+                .mem(op::I64_LOAD32_U, TSC_AUX)
+                .local_set(VALUE);
+            self.write_reg(GUEST_RCX, false, 8, VALUE);
+        }
+        self.end();
+    }
+
+    /// rdpkru: eax = PKRU, edx = 0. Without CR4.PKE (#UD) or with ecx not zero (#GP) the
+    /// interpreter runs it.
+    fn rdpkru(&mut self, index: usize, rip: u64) {
+        self.c
+            .local_get(CPU)
+            .mem(op::I64_LOAD, CR4)
+            .i64_const(CR4_PKE)
+            .op(op::I64_AND)
+            .op(op::I64_EQZ)
+            .op(op::I32_EQZ);
+        self.read_reg(GUEST_RCX, false, 4);
+        self.c.op(op::I64_EQZ).op(op::I32_AND).begin_if(BLOCK_VOID);
+        self.c
+            .local_get(CPU)
+            .mem(op::I64_LOAD32_U, PKRU)
+            .local_set(VALUE);
+        self.write_reg(GUEST_RAX, false, 8, VALUE);
+        self.c.i64_const(0).local_set(VALUE);
+        self.write_reg(GUEST_RDX, false, 8, VALUE);
+        self.c.op(op::ELSE);
+        self.helper_in_branch(index, rip);
+        self.end();
+    }
+
+    /// pushf: the flags with RF and VM clear, pushed as 8 bytes, the arithmetic ones
+    /// materialized first. An SVM guest goes to the interpreter (its host may intercept pushf).
+    fn pushf(&mut self, index: u32, rip: u64) {
+        self.svm_guest_running();
+        self.c.begin_if(BLOCK_VOID);
+        self.helper_in_branch(index as usize, rip);
+        self.c.op(op::ELSE);
+        self.materialize_eflags();
+        self.c
+            .local_get(CPU)
+            .mem(op::I64_LOAD, EFLAGS)
+            .i64_const(!PUSHF_CLEARED as i64)
+            .op(op::I64_AND)
+            .local_set(VALUE);
+        self.push_value(index, rip);
+        self.end();
+        self.flags = None;
+    }
+
+    /// sti at CPL <= IOPL: IF set, and the one-instruction interrupt shadow opened when IF was
+    /// clear. Above IOPL (#GP, or VME/PVI's virtual flag) the interpreter runs it. sti ends its
+    /// block (`ends_block`), which `compile` does with an exit to the run loop, where a pending
+    /// interrupt is taken once the shadow has passed.
+    fn sti(&mut self, index: u32, rip: u64) {
+        self.c
+            .local_get(CPU)
+            .mem(op::I64_LOAD, EFLAGS)
+            .local_set(VALUE);
+        self.c.local_get(CPU).mem(op::I32_LOAD8_U, CPL);
+        self.c
+            .local_get(VALUE)
+            .i64_const(IOPL_SHIFT)
+            .op(op::I64_SHR_U)
+            .i64_const(IOPL_MASK)
+            .op(op::I64_AND)
+            .op(op::I32_WRAP_I64)
+            .op(op::I32_LE_U)
+            .begin_if(BLOCK_VOID);
+        self.c
+            .local_get(VALUE)
+            .i64_const(IF as i64)
+            .op(op::I64_AND)
+            .op(op::I64_EQZ)
+            .begin_if(BLOCK_VOID);
+        self.c
+            .local_get(CPU)
+            .i64_const(1)
+            .mem(op::I64_STORE8, INTERRUPT_SHADOW);
+        self.c
+            .local_get(CPU)
+            .local_get(VALUE)
+            .i64_const(IF as i64)
+            .op(op::I64_OR)
+            .mem(op::I64_STORE, EFLAGS);
+        self.end();
+        self.c.op(op::ELSE);
+        self.helper_in_branch(index as usize, rip);
+        self.end();
+    }
+
+    /// swapgs, clac, stac or cli, inline at CPL 0. At any other CPL (or, for cli, CPL > IOPL,
+    /// which CPL 0 never is) the interpreter raises #GP or #UD. None of the four can be
+    /// intercepted by an SVM guest's host, so a nested guest runs them here too.
+    fn ring0_system(&mut self, insn: &Insn, index: u32, rip: u64) {
+        const GS_BASE: u32 = SEG_BASE + SEG_SIZE * SEG_GS as u32;
+        self.above_ring0();
+        self.c.op(op::I32_EQZ).begin_if(BLOCK_VOID);
+        if insn.op == 0x101 && insn.modrm == MODRM_SWAPGS {
+            self.c
+                .local_get(CPU)
+                .mem(op::I64_LOAD, GS_BASE)
+                .local_set(VALUE);
+            self.c
+                .local_get(CPU)
+                .local_get(CPU)
+                .mem(op::I64_LOAD, KGSBASE)
+                .mem(op::I64_STORE, GS_BASE);
+            self.c
+                .local_get(CPU)
+                .local_get(VALUE)
+                .mem(op::I64_STORE, KGSBASE);
+        } else {
+            self.c
+                .local_get(CPU)
+                .local_get(CPU)
+                .mem(op::I64_LOAD, EFLAGS);
+            match (insn.op, insn.modrm) {
+                (0xfa, _) => self.c.i64_const(!IF as i64).op(op::I64_AND),
+                (_, MODRM_CLAC) => self.c.i64_const(!AC as i64).op(op::I64_AND),
+                _ => self.c.i64_const(AC as i64).op(op::I64_OR),
+            };
+            self.c.mem(op::I64_STORE, EFLAGS);
+        }
+        self.c.op(op::ELSE);
+        self.helper_in_branch(index as usize, rip);
+        self.end();
+    }
+
+    /// kortest (`or`) and ktest k1, k2 at 8, 16, 32 or 64 bits (66 and VEX.W pick the width):
+    /// ZF and CF from the opmask registers, the other arithmetic flags clear, written straight
+    /// into `Cpu::eflags` with `lazy_op` set to `Eflags`. Behind the AVX-512 state gate.
+    fn opmask_test(&mut self, insn: &Insn, or: bool, index: usize, rip: u64) {
+        let bits = match (insn.p66, insn.opsize == 8) {
+            (true, false) => 8,
+            (false, false) => 16,
+            (true, true) => 32,
+            (false, true) => 64,
+        };
+        let full = if bits == 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        } as i64;
+        let gated = self.vector_gate(Some(VectorGate::Avx512));
+        if gated {
+            self.c.begin_if(BLOCK_VOID);
+        }
+        let opmask = |register: u8| OPMASK + OPMASK_SIZE * (register & OPMASK_REGISTER_MASK) as u32;
+        self.c
+            .local_get(CPU)
+            .mem(op::I64_LOAD, opmask(insn.reg))
+            .i64_const(full)
+            .op(op::I64_AND)
+            .local_set(VALUE);
+        self.c
+            .local_get(CPU)
+            .mem(op::I64_LOAD, opmask(insn.rm))
+            .i64_const(full)
+            .op(op::I64_AND)
+            .local_set(SCRATCH);
+        // SCRATCH_B = ZF, CARRY = CF
+        if or {
+            // ZF: k1 | k2 is zero; CF: it is all ones
+            self.c
+                .local_get(VALUE)
+                .local_get(SCRATCH)
+                .op(op::I64_OR)
+                .local_tee(SCRATCH_B)
+                .i64_const(full)
+                .op(op::I64_EQ)
+                .op(op::I64_EXTEND_I32_U)
+                .local_set(CARRY);
+            self.c
+                .local_get(SCRATCH_B)
+                .op(op::I64_EQZ)
+                .op(op::I64_EXTEND_I32_U)
+                .local_set(SCRATCH_B);
+        } else {
+            // ZF: k1 & k2 is zero; CF: !k1 & k2 is
+            self.c
+                .local_get(VALUE)
+                .local_get(SCRATCH)
+                .op(op::I64_AND)
+                .op(op::I64_EQZ)
+                .op(op::I64_EXTEND_I32_U)
+                .local_set(SCRATCH_B);
+            self.c
+                .local_get(VALUE)
+                .i64_const(-1)
+                .op(op::I64_XOR)
+                .local_get(SCRATCH)
+                .op(op::I64_AND)
+                .op(op::I64_EQZ)
+                .op(op::I64_EXTEND_I32_U)
+                .local_set(CARRY);
+        }
+        self.c
+            .local_get(CPU)
+            .local_get(CPU)
+            .mem(op::I64_LOAD, EFLAGS)
+            .i64_const(!ARITH as i64)
+            .op(op::I64_AND)
+            .local_get(SCRATCH_B)
+            .i64_const(ZF.trailing_zeros() as i64)
+            .op(op::I64_SHL)
+            .op(op::I64_OR)
+            .local_get(CARRY)
+            .i64_const(CF.trailing_zeros() as i64)
+            .op(op::I64_SHL)
+            .op(op::I64_OR)
+            .mem(op::I64_STORE, EFLAGS);
+        self.c
+            .local_get(CPU)
+            .i64_const(LazyFlagsOp::Eflags as i64)
+            .mem(op::I64_STORE8, LAZY_OP);
+        if gated {
+            self.c.op(op::ELSE);
+            self.helper_in_branch(index, rip);
+            self.end();
+        }
+        self.flags = None;
+    }
+
+    /// vzeroupper (`all` false: bits 511:128 of zmm0-15) and vzeroall (all of them), behind the
+    /// AVX state gate.
+    fn vzero(&mut self, all: bool, index: usize, rip: u64) {
+        let gated = self.vector_gate(Some(VectorGate::Avx));
+        if gated {
+            self.c.begin_if(BLOCK_VOID);
+        }
+        let first_lane = if all { 0 } else { 1 };
+        for register in 0..VZERO_REGISTERS {
+            for lane in first_lane..VECTOR_LANES {
+                for half in [0, HALF_LANE_BYTES] {
+                    self.c.local_get(CPU).i64_const(0).mem(
+                        op::I64_STORE,
+                        vector_lane_offset(register, lane) as u32 + half,
+                    );
+                }
+            }
+        }
+        if gated {
+            self.c.op(op::ELSE);
+            self.helper_in_branch(index, rip);
+            self.end();
+        }
+    }
+
+    /// cmpxchg16b, with or without LOCK (the vCPUs take turns on one thread: see `memory_rmw`):
+    /// rdx:rax against the 16 aligned bytes; equal, they become rcx:rbx and ZF is set, else
+    /// rdx:rax takes them and ZF is clear (the only flag that changes, so the flags are
+    /// materialized first). A misaligned operand (#GP) and a write-TLB miss go to the
+    /// interpreter.
+    fn cmpxchg16b(&mut self, insn: &Insn, next: u64, index: u32, rip: u64) {
+        self.materialize_eflags();
+        self.ea(insn, next);
+        self.c
+            .local_get(ADDR)
+            .i64_const(DOUBLE_QUADWORD_BYTES as i64 - 1)
+            .op(op::I64_AND)
+            .op(op::I64_EQZ);
+        // An aligned 16-byte access never crosses a page, so the probe's one entry covers it.
+        self.tlb_probe(DOUBLE_QUADWORD_BYTES, TLB_TAG_WRITE);
+        self.c.op(op::I32_AND).begin_if(BLOCK_VOID);
+        self.host_address();
+        self.c.local_set(SLOT);
+        self.c.local_get(SLOT).mem(op::I64_LOAD, 0).local_set(LHS);
+        self.c
+            .local_get(SLOT)
+            .mem(op::I64_LOAD, HALF_LANE_BYTES)
+            .local_set(RHS);
+        self.c.local_get(LHS);
+        self.read_reg(GUEST_RAX, false, 8);
+        self.c.op(op::I64_EQ).local_get(RHS);
+        self.read_reg(GUEST_RDX, false, 8);
+        self.c
+            .op(op::I64_EQ)
+            .op(op::I32_AND)
+            .op(op::I64_EXTEND_I32_U)
+            .local_tee(CARRY)
+            .op(op::I32_WRAP_I64)
+            .begin_if(BLOCK_VOID);
+        self.c.local_get(SLOT);
+        self.read_reg(GUEST_RBX, false, 8);
+        self.c.mem(op::I64_STORE, 0).local_get(SLOT);
+        self.read_reg(GUEST_RCX, false, 8);
+        self.c.mem(op::I64_STORE, HALF_LANE_BYTES);
+        self.c.op(op::ELSE);
+        self.write_reg(GUEST_RAX, false, 8, LHS);
+        self.write_reg(GUEST_RDX, false, 8, RHS);
+        self.end();
+        self.set_eflags_bit(ZF, CARRY);
+        self.c.op(op::ELSE);
+        self.helper_in_branch(index as usize, rip);
+        self.end();
+        self.flags = None;
+    }
+
+    /// A `PartialMove`: 4 or 8 bytes between part of an xmm register and memory (one access
+    /// through the TLB probe, at any alignment that stays in the page) or another xmm register,
+    /// behind the SSE gate. Returns true for a store to memory.
+    fn partial_move(
+        &mut self,
+        insn: &Insn,
+        form: PartialMove,
+        next: u64,
+        index: usize,
+        rip: u64,
+    ) -> bool {
+        let xmm = |register: u8| vector_lane_offset(register, 0) as u32;
+        let memory = insn.md != MODRM_MOD_REGISTER;
+        let bytes = form.bytes;
+        let part = xmm(insn.reg) + form.offset as u32;
+        let opened =
+            self.begin_vector_access(insn, bytes as u32, false, form.from_register, None, next);
+        if form.from_register {
+            if memory {
+                self.c.local_get(SLOT);
+            } else {
+                self.c.local_get(CPU);
+            }
+            self.c.local_get(CPU).mem(load_opcode(bytes, false), part);
+            let at = if memory { 0 } else { xmm(insn.rm) };
+            self.c.mem(memory_store_opcode(bytes), at);
+        } else {
+            self.c.local_get(CPU);
+            if memory {
+                self.c.local_get(SLOT).mem(load_opcode(bytes, false), 0);
+            } else {
+                self.c
+                    .local_get(CPU)
+                    .mem(load_opcode(bytes, false), xmm(insn.rm));
+            }
+            self.c.mem(memory_store_opcode(bytes), part);
+            if form.zero_rest {
+                if bytes == 4 {
+                    self.c
+                        .local_get(CPU)
+                        .i64_const(0)
+                        .mem(memory_store_opcode(4), part + 4);
+                }
+                self.c
+                    .local_get(CPU)
+                    .i64_const(0)
+                    .mem(op::I64_STORE, xmm(insn.reg) + HALF_LANE_BYTES);
+            }
+        }
+        self.end_vector_access(opened, index, rip);
+        memory && form.from_register
+    }
+
     /// Pushes the r/m operand of a BMI-style instruction at its operand size, zero-extended.
     fn bmi_source(&mut self, insn: &Insn, next: u64, index: u32, rip: u64) {
         if insn.md == MODRM_MOD_REGISTER {
@@ -3163,11 +4161,155 @@ impl<'a> Gen<'a> {
         let k = index as u32;
         let retired = k + 1;
         let osz = insn.opsize;
-        let wide = !insn.addr32 && !insn.lock && !insn.p66 && (osz == 4 || osz == 8);
         let is_mem = insn.md != MODRM_MOD_REGISTER;
-        let plain = Self::mem_ok(&insn);
+        // A 67 prefix only changes how a memory operand's address is formed, so a register form
+        // with one (compilers pad with it) is the same instruction.
+        let register_form = insn.has_modrm && !is_mem;
+        let addressing_ok = !insn.addr32 || register_form;
+        // No LOCK, 66 or effective 67 prefix and a 32- or 64-bit operand size.
+        let wide = addressing_ok && !insn.lock && !insn.p66 && (osz == 4 || osz == 8);
+        // No LOCK prefix, nor a 67 one on a memory operand: memory operands can use the inline
+        // access path.
+        let plain = addressing_ok && !insn.lock;
         let mut store = false;
         match insn.op {
+            // Memory read-modify-writes with LOCK (add/or/and/sub/xor, inc/dec, xadd, cmpxchg,
+            // bts/btr/btc with an immediate), xchg with memory (always locked), and cmpxchg/xadd
+            // with memory without one, at 32 and 64 bits
+            _ if is_mem
+                && !insn.addr32
+                && !insn.p66
+                && matches!(osz, 4 | 8)
+                && Self::memory_rmw_op(&insn).is_some_and(|operation| {
+                    insn.lock || matches!(operation, RmwOp::Xadd | RmwOp::Xchg | RmwOp::Cmpxchg)
+                }) =>
+            {
+                let operation = Self::memory_rmw_op(&insn).unwrap();
+                self.memory_rmw(&insn, operation, next, k, rip);
+                store = true;
+            }
+            // cmpxchg16b m128 (REX.W 0f c7 /1), with or without LOCK
+            0x1c7 if is_mem && insn.reg & 7 == 1 && osz == 8 && !insn.addr32 => {
+                self.cmpxchg16b(&insn, next, k, rip);
+                store = true;
+            }
+            // group 3 /6 div and /7 idiv r/m at 32 and 64 bits
+            0xf7 if wide && plain && matches!(insn.reg & 7, GROUP3_DIV | GROUP3_IDIV) => {
+                self.divide(&insn, insn.reg & 7 == GROUP3_IDIV, next, k, rip);
+            }
+            // bt/bts/btr/btc r/m, r and r/m, imm8 at 32 and 64 bits
+            0x1a3 | 0x1ab | 0x1b3 | 0x1bb if wide && plain => {
+                let operation = BIT_TEST_REGISTER_OFFSET
+                    .iter()
+                    .position(|&op| op == insn.op)
+                    .unwrap() as u8;
+                store = self.bit_test(&insn, operation, None, next, k, rip);
+            }
+            BIT_TEST_IMMEDIATE if wide && plain && insn.reg & 7 >= GROUP8_FIRST_BIT_OP => {
+                let operation = (insn.reg & 7) - GROUP8_FIRST_BIT_OP;
+                let offset = insn.imm as u32 & (8 * osz as u32 - 1);
+                store = self.bit_test(&insn, operation, Some(offset), next, k, rip);
+            }
+            // leave: rsp = rbp, then pop rbp. The load comes first, so a faulting one changes
+            // neither register.
+            0xc9 if !insn.p66 => {
+                self.read_reg(GUEST_RBP, false, 8);
+                self.c.local_set(ADDR);
+                self.mem_load(8, false, k, rip, true);
+                self.c.local_set(VALUE);
+                self.c
+                    .local_get(CPU)
+                    .local_get(ADDR)
+                    .i64_const(PUSH_POP_SIZE)
+                    .op(op::I64_ADD)
+                    .mem(op::I64_STORE, register_offset(GUEST_RSP, false));
+                self.write_reg(GUEST_RBP, false, 8, VALUE);
+            }
+            // xchg r, r (87 register form) and xchg rax, r (91..97, or 90 with REX.B) at 32 and
+            // 64 bits; a 32-bit one zero-extends both, even `xchg eax, eax`. The memory form is
+            // `memory_rmw`'s. Neither touches the fused locals (90 keeps a pending record).
+            0x87 | 0x90..=0x97
+                if wide
+                    && (insn.op != 0x87 || !is_mem)
+                    && (insn.op != 0x90 || insn.rex & GUEST_REX_B != 0 && insn.rep == 0) =>
+            {
+                let (first, second) = if insn.op == 0x87 {
+                    (insn.reg, insn.rm)
+                } else {
+                    (GUEST_RAX, opcode_register(&insn))
+                };
+                self.read_reg(first, false, osz);
+                self.c.local_set(VALUE);
+                self.read_reg(second, false, osz);
+                self.c.local_set(SCRATCH);
+                self.write_reg(first, false, 8, SCRATCH);
+                self.write_reg(second, false, 8, VALUE);
+            }
+            // pause (f3 90)
+            0x90 if insn.rep == PREFIX_F3 && insn.rex & GUEST_REX_B == 0 && !insn.p66 => {
+                self.pause(k, next, rip);
+            }
+            // rdtsc, and rdtscp, which also reads IA32_TSC_AUX into ecx
+            0x131 => self.rdtsc(index, false, rip),
+            0x101 if insn.modrm == MODRM_RDTSCP && !insn.lock => self.rdtsc(index, true, rip),
+            0x101 if insn.modrm == MODRM_RDPKRU && !insn.lock => self.rdpkru(index, rip),
+            // swapgs, clac and stac (0f 01 f8, ca, cb) and cli: the kernel's syscall entry and
+            // exit
+            0x101 if !insn.lock && matches!(insn.modrm, MODRM_SWAPGS | MODRM_CLAC | MODRM_STAC) => {
+                self.ring0_system(&insn, k, rip)
+            }
+            0xfa if !insn.lock => self.ring0_system(&insn, k, rip),
+            // pushf (64-bit operand)
+            0x9c if !insn.p66 => {
+                self.pushf(k, rip);
+                store = true;
+            }
+            0xfb if !insn.lock => self.sti(k, rip),
+            // cld / std: only DF changes; the string instructions read it from `Cpu::eflags`
+            0xfc | 0xfd if !insn.lock => {
+                self.c
+                    .local_get(CPU)
+                    .local_get(CPU)
+                    .mem(op::I64_LOAD, EFLAGS);
+                if insn.op == 0xfc {
+                    self.c.i64_const(!DF as i64).op(op::I64_AND);
+                } else {
+                    self.c.i64_const(DF as i64).op(op::I64_OR);
+                }
+                self.c.mem(op::I64_STORE, EFLAGS);
+            }
+            // mov r/m, sreg: the selector, into a register at the operand size (zero-extended at
+            // 32 and 64 bits, merged at 16) or 2 bytes of memory
+            0x8c if insn.reg & 7 <= SEG_GS as u8 && plain => {
+                const SELECTOR_BYTES: u8 = 2;
+                self.c
+                    .local_get(CPU)
+                    .mem(
+                        op::I64_LOAD16_U,
+                        SEG_SELECTOR + SEG_SIZE * (insn.reg & 7) as u32,
+                    )
+                    .local_set(VALUE);
+                if is_mem {
+                    self.ea(&insn, next);
+                    self.mem_store(SELECTOR_BYTES, VALUE, k, rip, false);
+                    store = true;
+                } else {
+                    let size = if osz == SELECTOR_BYTES {
+                        SELECTOR_BYTES
+                    } else {
+                        8
+                    };
+                    self.write_reg(insn.rm, false, size, VALUE);
+                }
+            }
+            // vzeroupper / vzeroall
+            VZERO if insn.vex && insn.rep == 0 && !insn.p66 && insn.vex_v == 0 => {
+                self.vzero(insn.vex_l, index, rip);
+            }
+            // kortest and ktest k, k
+            KORTEST | KTEST if insn.vex && insn.rep == 0 && !insn.vex_l && !is_mem => {
+                self.opmask_test(&insn, insn.op == KORTEST, index, rip);
+            }
             0x00..=0x3f if insn.op & 7 < 6 && plain => {
                 let alu_op = ((insn.op >> 3) & 7) as u8;
                 let form = insn.op & 7;
@@ -3459,6 +4601,15 @@ impl<'a> Gen<'a> {
                     _ => return false,
                 }
             }
+            // adcx (66) and adox (F3) r, r/m at 32 and 64 bits
+            ADCX_ADOX
+                if !insn.vex
+                    && !insn.evex
+                    && plain
+                    && matches!((insn.p66, insn.rep), (true, 0) | (false, PREFIX_F3)) =>
+            {
+                self.add_carry_chain(&insn, insn.rep == PREFIX_F3, next, k, rip);
+            }
             // bsf/bsr (no prefix) and tzcnt/lzcnt (F3) at 32 and 64 bits
             0x1bc | 0x1bd if wide && matches!(insn.rep, 0 | 1) => {
                 let scan = match (insn.op, insn.rep) {
@@ -3470,10 +4621,10 @@ impl<'a> Gen<'a> {
                 self.bit_scan(&insn, scan, next, k, rip);
             }
             // movups/movupd, movaps/movapd, movdqu/movdqa
-            0x110 | 0x111 | 0x128 | 0x129 | 0x16f | 0x17f if plain => {
-                let Some(form) = vector_move(&insn) else {
-                    return false;
-                };
+            0x110 | 0x111 | 0x128 | 0x129 | 0x16f | 0x17f
+                if plain && vector_move(&insn).is_some() =>
+            {
+                let form = vector_move(&insn).unwrap();
                 store =
                     self.vector_move(&insn, form.load, form.aligned, 16, None, next, index, rip);
             }
@@ -3488,15 +4639,14 @@ impl<'a> Gen<'a> {
             | 0x1ef
             | 0x174..=0x176
             | 0x1f8..=0x1fe
-                if plain && self.addrs.simd =>
+                if plain
+                    && self.addrs.simd
+                    // pmovmskb has no memory form (the decoder-level #UD stays with the
+                    // interpreter); what `vector_alu` leaves may be `whole_vector`'s
+                    && vector_alu(&insn)
+                        .is_some_and(|form| form.op != VectorOp::MoveMask || !is_mem) =>
             {
-                let Some(form) = vector_alu(&insn) else {
-                    return false;
-                };
-                // pmovmskb has no memory form (the decoder-level #UD stays with the interpreter)
-                if form.op == VectorOp::MoveMask && is_mem {
-                    return false;
-                }
+                let form = vector_alu(&insn).unwrap();
                 self.legacy_vector_alu(&insn, form, next, index, rip);
             }
             // psrlq/psllq/psrldq/pslldq xmm, imm8 (66 0f 73 /2 /6 /3 /7)
@@ -3724,12 +4874,15 @@ impl<'a> Gen<'a> {
                 self.inlined += 1;
                 return true;
             }
-            // The SHA extensions (no prefix), pshufd, palignr and pshufb (66 prefix): see
-            // `whole_vector`
-            0x170 | 0x200 | 0x30f | 0x2c8..=0x2cd | 0x3cc if plain => {
-                let Some(form) = whole_vector(&insn) else {
-                    return false;
-                };
+            // movss/movsd, movlps/movlpd, movhps/movhpd and movq xmm, xmm/m64 (`partial_move`)
+            _ if plain && partial_move(&insn).is_some() => {
+                let form = partial_move(&insn).unwrap();
+                store = self.partial_move(&insn, form, next, index, rip);
+            }
+            // The SHA extensions, pshufd, palignr, pshufb, the SSE2 integer instructions that
+            // `vector_alu` leaves, pshuflw/pshufhw, pblendw, movhlps/movlhps: see `whole_vector`
+            _ if plain && whole_vector(&insn).is_some() => {
+                let form = whole_vector(&insn).unwrap();
                 self.whole_vector(&insn, form, next, k, rip);
             }
             _ => return false,
@@ -3860,6 +5013,16 @@ impl<'a> Gen<'a> {
                     self.finish();
                     return;
                 }
+                if terminal && !is_inline_terminator(&self.insns[index]) {
+                    // An inline instruction the run loop must see the effect of (sti): back to
+                    // it, not on to the next block. (A jcc is terminal too, but one that is not
+                    // the block's last is a side exit, after which the block goes on.)
+                    self.flush_flags();
+                    self.store_rip(next);
+                    self.exit_ok(index as u32 + 1);
+                    self.finish();
+                    return;
+                }
                 continue;
             }
             self.helper(index, rip, terminal);
@@ -3939,6 +5102,8 @@ fn keeps_pending_record(insn: &Insn) -> bool {
         | 0x1c8..=0x1cf
         | VEX_BMI_SHIFT_OR_BEXTR => true,
         VEX_BMI_MULX => insn.rep == PREFIX_F2,
+        // they write `Cpu::eflags` and set `lazy_op` to `Eflags` directly
+        KORTEST | KTEST => false,
         // the vector moves and integer instructions, legacy, VEX and EVEX, movd/movq and kmov
         0x110 | 0x111 | 0x128 | 0x129 | 0x16f | 0x17f | MOVD_TO_VECTOR | MOVD_FROM_VECTOR => true,
         PSHIFT_QUADWORD_IMMEDIATE | MOVQ_STORE => true,

@@ -111,6 +111,31 @@ fn merge_rotate_flags(cpu: &mut Cpu, packed: u64) {
     cpu.set_eflags_arith(flags);
 }
 
+/// Resolves the lazy flag record into `Cpu::eflags` (`lazy_op` becomes `Eflags`), for inline code
+/// that reads or replaces single flags: adcx and adox, pushf, the bit tests. Until the next
+/// lazy record, generated code may then read and update bits of `eflags` directly. In the
+/// `(cpu, u64) -> u64` shape of `helper_cond` so the WebAssembly blocks call it through a type
+/// they already declare (`wasm_encode::COND_TYPE`); the argument and the result mean nothing.
+pub(crate) extern "C" fn helper_materialize_flags(cpu: &mut Cpu, _unused: u64) -> u64 {
+    cpu.materialize_lazy_flags();
+    0
+}
+
+/// rdtsc for generated code that already checked CR4.TSD and that no SVM guest runs (whose host
+/// may intercept it or scale the TSC its own way: those go through the interpreter), and paid
+/// the instructions before it into `Cpu::icount`, which the virtual clock counts. Returns the
+/// TSC; `(cpu, u64) -> u64` like `helper_cond`.
+pub(crate) extern "C" fn helper_rdtsc(cpu: &mut Cpu, _unused: u64) -> u64 {
+    cpu.tsc()
+}
+
+/// pause on a machine with more than one vCPU and no SVM guest running: what the interpreter
+/// does for it (`Cpu::pause_hint`), which may ask the block to end (`block_exit_requested`).
+pub(crate) extern "C" fn helper_pause(cpu: &mut Cpu, _unused: u64) -> u64 {
+    cpu.pause_hint();
+    0
+}
+
 /// Runs a slow-path memory access with `Cpu::slow_access_insn` set by the thunk, and clears it
 /// afterwards so no later clock read sees it (`Cpu::now_ns`).
 fn slow_access<T>(cpu: &mut Cpu, access: impl FnOnce(&mut Cpu) -> T) -> T {
@@ -326,6 +351,7 @@ pub(crate) const MODRM_SWAPGS: u8 = 0xf8;
 pub(crate) const MODRM_RDTSCP: u8 = 0xf9;
 pub(crate) const MODRM_CLAC: u8 = 0xca;
 pub(crate) const MODRM_STAC: u8 = 0xcb;
+pub(crate) const MODRM_RDPKRU: u8 = 0xee;
 
 /// True if the block must end after `insn`. The set is an allow-list of what the block compilers
 /// cannot continue past: control transfers; string and I/O instructions (they loop on `rep` or
@@ -357,7 +383,7 @@ pub(crate) fn ends_block(insn: &Insn) -> bool {
         // way, and otherwise the block runs on (the kernel's clear_page and memcpy are rep stos
         // and rep movs, and each used to cost a trip through the run loop).
         0x6c..=0x6f | 0xe4..=0xe7 | 0xec..=0xef | 0xfb | 0x9d | 0x8e => true,
-        // swapgs, rdtscp, clac and stac change nothing a block caches: generated code reads the
+        // swapgs, rdtscp, clac, stac and rdpkru change nothing a block caches: generated code reads the
         // GS base from `Cpu` on every access, and the soft TLB never caches a supervisor access
         // to a user page while SMAP is on (`Cpu::translate`), so AC is looked at afresh. They
         // sit on the syscall entry and exit paths, where ending a block at each one costs a
@@ -365,7 +391,7 @@ pub(crate) fn ends_block(insn: &Insn) -> bool {
         0x101
             if matches!(
                 insn.modrm,
-                MODRM_SWAPGS | MODRM_RDTSCP | MODRM_CLAC | MODRM_STAC
+                MODRM_SWAPGS | MODRM_RDTSCP | MODRM_CLAC | MODRM_STAC | MODRM_RDPKRU
             ) =>
         {
             false
@@ -701,11 +727,24 @@ pub(crate) enum WholeVectorOp {
     /// pshufb (66 prefix): each result byte is the destination byte the source byte selects, or
     /// zero where the source byte has its top bit set.
     ShuffleBytes,
+    /// The SSE2 integer instructions on xmm (66 0f 60..6d, 74..76, d1..fe: unpacks, packs,
+    /// compares, shifts by a register count, arithmetic and logic), the opcode byte in the
+    /// immediate's place: `cpu::integer_op`.
+    SseInteger,
+    /// pshuflw (F2) and pshufhw (F3): four words of one half picked by the immediate.
+    ShuffleLowWords,
+    ShuffleHighWords,
+    /// pblendw (66 0f3a 0e): each word from the source where the immediate's bit is set.
+    BlendWords,
+    /// movhlps and movlhps (register forms only: with memory they are movlps and movhps, 8-byte
+    /// accesses): one quadword of the source into the other half of the destination.
+    MoveHighToLow,
+    MoveLowToHigh,
 }
 
 impl WholeVectorOp {
     /// Indexed by the discriminant, which is how `helper_whole_vector` gets the operation back.
-    const ALL: [WholeVectorOp; 10] = [
+    const ALL: [WholeVectorOp; 16] = [
         WholeVectorOp::Sha1Rounds4,
         WholeVectorOp::Sha1NextE,
         WholeVectorOp::Sha1Message1,
@@ -716,6 +755,12 @@ impl WholeVectorOp {
         WholeVectorOp::ShuffleDwords,
         WholeVectorOp::AlignRight,
         WholeVectorOp::ShuffleBytes,
+        WholeVectorOp::SseInteger,
+        WholeVectorOp::ShuffleLowWords,
+        WholeVectorOp::ShuffleHighWords,
+        WholeVectorOp::BlendWords,
+        WholeVectorOp::MoveHighToLow,
+        WholeVectorOp::MoveLowToHigh,
     ];
 }
 
@@ -744,9 +789,11 @@ impl WholeVector {
     /// The new destination, as the interpreter computes it.
     pub fn apply(self, destination: u128, source: u128, xmm0: u128) -> u128 {
         use crate::cpu::{
-            palignr, pshufb, sha1_four_rounds, sha1_message_1, sha1_message_2, sha1_next_e,
-            sha256_message_1, sha256_message_2, sha256_two_rounds, shuffle_dwords,
+            integer_op, palignr, pblendw, pshufb, sha1_four_rounds, sha1_message_1, sha1_message_2,
+            sha1_next_e, sha256_message_1, sha256_message_2, sha256_two_rounds, shuffle_dwords,
+            shuffle_high_words, shuffle_low_words,
         };
+        const LOW_QUADWORD: u128 = u64::MAX as u128;
         match self.op {
             WholeVectorOp::Sha1Rounds4 => sha1_four_rounds(destination, source, self.imm),
             WholeVectorOp::Sha1NextE => sha1_next_e(destination, source),
@@ -758,6 +805,12 @@ impl WholeVector {
             WholeVectorOp::ShuffleDwords => shuffle_dwords(source, self.imm),
             WholeVectorOp::AlignRight => palignr(destination, source, self.imm),
             WholeVectorOp::ShuffleBytes => pshufb(destination, source),
+            WholeVectorOp::SseInteger => integer_op(self.imm, destination, source),
+            WholeVectorOp::ShuffleLowWords => shuffle_low_words(source, self.imm),
+            WholeVectorOp::ShuffleHighWords => shuffle_high_words(source, self.imm),
+            WholeVectorOp::BlendWords => pblendw(destination, source, self.imm),
+            WholeVectorOp::MoveHighToLow => destination & !LOW_QUADWORD | source >> u64::BITS,
+            WholeVectorOp::MoveLowToHigh => destination & LOW_QUADWORD | source << u64::BITS,
         }
     }
 }
@@ -772,13 +825,46 @@ pub(crate) fn whole_vector(insn: &Insn) -> Option<WholeVector> {
     const OPCODE_MAP_0F3A: u16 = 3 << 8;
     const OPCODE_MASK: u16 = 0xff;
     const SHA1_ROUND_FUNCTION_MASK: i64 = 3;
-    if insn.rep != 0 {
-        return None;
-    }
+    const PREFIX_F3: u8 = 1;
+    const PREFIX_F2: u8 = 2;
     let imm = insn.imm as u8;
     // The map is the high byte; a VEX or EVEX flag there makes it match none of these.
     let (map, opcode) = (insn.op & !OPCODE_MASK, (insn.op & OPCODE_MASK) as u8);
+    let register = insn.md == 3;
+    // pshuflw and pshufhw are spelled with F2 and F3 (and no 66, which the interpreter would let
+    // F2/F3 override); everything else here with none.
+    match (map, opcode, insn.rep, insn.p66) {
+        (OPCODE_MAP_0F, 0x70, PREFIX_F2, false) => {
+            return Some(WholeVector {
+                op: WholeVectorOp::ShuffleLowWords,
+                imm,
+            });
+        }
+        (OPCODE_MAP_0F, 0x70, PREFIX_F3, false) => {
+            return Some(WholeVector {
+                op: WholeVectorOp::ShuffleHighWords,
+                imm,
+            });
+        }
+        (_, _, 0, _) => {}
+        _ => return None,
+    }
     let (op, imm) = match (map, opcode, insn.p66) {
+        (
+            OPCODE_MAP_0F,
+            0x60..=0x6d
+            | 0x74..=0x76
+            | 0xd1..=0xd5
+            | 0xd8..=0xdf
+            | 0xe0..=0xe5
+            | 0xe8..=0xef
+            | 0xf1..=0xf6
+            | 0xf8..=0xfe,
+            true,
+        ) => (WholeVectorOp::SseInteger, opcode),
+        (OPCODE_MAP_0F3A, 0x0e, true) => (WholeVectorOp::BlendWords, imm),
+        (OPCODE_MAP_0F, 0x12, false) if register => (WholeVectorOp::MoveHighToLow, 0),
+        (OPCODE_MAP_0F, 0x16, false) if register => (WholeVectorOp::MoveLowToHigh, 0),
         (OPCODE_MAP_0F3A, 0xcc, false) => (
             WholeVectorOp::Sha1Rounds4,
             (insn.imm & SHA1_ROUND_FUNCTION_MASK) as u8,
@@ -795,6 +881,61 @@ pub(crate) fn whole_vector(insn: &Insn) -> Option<WholeVector> {
         _ => return None,
     };
     Some(WholeVector { op, imm })
+}
+
+/// A legacy SSE move of 4 or 8 bytes between part of an xmm register and memory or another xmm
+/// register: movss/movsd (F3/F2 0f 10, 11), movlps/movlpd and movhps/movhpd (0f 12, 13, 16, 17
+/// with memory), and movq xmm, xmm/m64 (F3 0f 7e). None of them needs an aligned operand.
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "x86_64",
+    target_arch = "wasm32"
+))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PartialMove {
+    /// 4 or 8.
+    pub bytes: u8,
+    /// Where in the xmm register (ModRM.reg) the moved bytes are: 0 or 8.
+    pub offset: u8,
+    /// The xmm register is the source: memory, or the register ModRM.rm names, is written.
+    pub from_register: bool,
+    /// Bits `offset + 8 * bytes` to 127 of the destination register become zero (movss and movsd
+    /// from memory, movq); otherwise they stay.
+    pub zero_rest: bool,
+}
+
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "x86_64",
+    target_arch = "wasm32"
+))]
+pub(crate) fn partial_move(insn: &Insn) -> Option<PartialMove> {
+    const MAP_0F: u16 = 1 << 8;
+    const PREFIX_F3: u8 = 1;
+    const PREFIX_F2: u8 = 2;
+    if insn.op >> 8 != MAP_0F >> 8 || insn.lock {
+        return None;
+    }
+    let memory = insn.md != 3;
+    let opcode = insn.op as u8;
+    let (bytes, offset, from_register, zero_rest) = match (opcode, insn.rep, insn.p66, memory) {
+        (0x10, PREFIX_F3, false, _) => (4, 0, false, memory),
+        (0x10, PREFIX_F2, false, _) => (8, 0, false, memory),
+        (0x11, PREFIX_F3, false, _) => (4, 0, true, false),
+        (0x11, PREFIX_F2, false, _) => (8, 0, true, false),
+        (0x12, 0, _, true) => (8, 0, false, false),
+        (0x13, 0, _, true) => (8, 0, true, false),
+        (0x16, 0, _, true) => (8, 8, false, false),
+        (0x17, 0, _, true) => (8, 8, true, false),
+        (0x7e, PREFIX_F3, false, _) => (8, 0, false, true),
+        _ => return None,
+    };
+    Some(PartialMove {
+        bytes,
+        offset,
+        from_register,
+        zero_rest,
+    })
 }
 
 /// The byte permutation pshufd with immediate `order` applies, as a byte-shuffle index vector

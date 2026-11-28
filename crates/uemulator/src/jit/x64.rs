@@ -109,10 +109,30 @@ const UNARY_NOT: u8 = 2;
 const UNARY_NEG: u8 = 3;
 const UNARY_MUL: u8 = 4;
 const UNARY_IMUL: u8 = 5;
+const UNARY_DIV: u8 = 6;
+const UNARY_IDIV: u8 = 7;
 const UNARY_INC: u8 = 0;
 const UNARY_DEC: u8 = 1;
 /// ModRM.reg extension of `bt r/m, imm8` (`0f ba`).
 const BT_IMMEDIATE: u8 = 4;
+/// `bit_op_rr` operations, in the order of their opcodes: bt (0f a3), bts (ab), btr (b3) and
+/// btc (bb), eight apart.
+pub const BIT_TEST: u8 = 0;
+pub const BIT_SET: u8 = 1;
+pub const BIT_RESET: u8 = 2;
+pub const BIT_COMPLEMENT: u8 = 3;
+const OPCODE_BT_REGISTER: u8 = 0xa3;
+const BIT_OP_OPCODE_STRIDE_SHIFT: u8 = 3;
+/// `bswap r` is `0f c8+r`.
+const OPCODE_BSWAP: u8 = 0xc8;
+/// Makes the next instruction atomic; it goes before REX.
+const LOCK_PREFIX: u8 = 0xf0;
+const OPCODE_CMPXCHG: u8 = 0xb1;
+const OPCODE_XADD: u8 = 0xc1;
+const OPCODE_XCHG: u8 = 0x87;
+/// `0f c7 /1` with REX.W: cmpxchg16b.
+const OPCODE_GROUP9: u8 = 0xc7;
+const GROUP9_CMPXCHG16B: u8 = 1;
 
 /// A memory operand `[base + index << scale + disp]`.
 #[derive(Clone, Copy)]
@@ -487,8 +507,46 @@ impl Asm {
 
     /// `bt r, imm8`: CF = bit `bit` of `r`. The other flags are undefined.
     pub fn bt_ri(&mut self, r: u8, bit: u8, w: bool) {
-        self.op_rr(false, w, false, &[0x0f, 0xba], BT_IMMEDIATE, r);
+        self.bit_op_ri(BIT_TEST, r, bit, w);
+    }
+
+    /// bt, bts, btr or btc (`operation`) of `r` at the immediate bit `bit`: group 8's /4../7.
+    /// CF = the bit before it changes; the other flags are undefined.
+    pub fn bit_op_ri(&mut self, operation: u8, r: u8, bit: u8, w: bool) {
+        self.op_rr(false, w, false, &[0x0f, 0xba], BT_IMMEDIATE + operation, r);
         self.code.push(bit);
+    }
+
+    /// `lock cmpxchg [m], r` at 32 bits or, with `w`, 64: if rAX equals the memory operand it
+    /// becomes `r` and ZF is set, else rAX takes it (32-bit: zero-extended) and ZF is clear.
+    pub fn lock_cmpxchg_mr(&mut self, m: Mem, r: u8, w: bool) {
+        self.code.push(LOCK_PREFIX);
+        self.op_rm(false, w, false, &[TWO_BYTE_OPCODE, OPCODE_CMPXCHG], r, m);
+    }
+
+    /// `lock xadd [m], r`: the memory operand becomes the sum and `r` its old value.
+    pub fn lock_xadd_mr(&mut self, m: Mem, r: u8, w: bool) {
+        self.code.push(LOCK_PREFIX);
+        self.op_rm(false, w, false, &[TWO_BYTE_OPCODE, OPCODE_XADD], r, m);
+    }
+
+    /// `xchg [m], r`, atomic without a LOCK prefix. No flags.
+    pub fn xchg_mr(&mut self, m: Mem, r: u8, w: bool) {
+        self.op_rm(false, w, false, &[OPCODE_XCHG], r, m);
+    }
+
+    /// `lock cmpxchg16b [m]`: rdx:rax against the 16 bytes at `m` (which must be 16-byte
+    /// aligned, else #GP); equal, they become rcx:rbx and ZF is set, else rdx:rax takes them.
+    pub fn lock_cmpxchg16b(&mut self, m: Mem) {
+        self.code.push(LOCK_PREFIX);
+        self.op_rm(
+            false,
+            true,
+            false,
+            &[TWO_BYTE_OPCODE, OPCODE_GROUP9],
+            GROUP9_CMPXCHG16B,
+            m,
+        );
     }
 
     /// `d = d * s` truncated, signed. CF and OF are set when the full product does not fit; the
@@ -515,6 +573,33 @@ impl Asm {
     /// One-operand `imul r`: the signed `mul_r`. CF = OF = the product does not fit the low half.
     pub fn imul_r(&mut self, r: u8, w: bool) {
         self.op_rr(false, w, false, &[0xf7], UNARY_IMUL, r);
+    }
+
+    /// One-operand `div r`: rDX:rAX / r, quotient to rAX and remainder to rDX (EDX:EAX without
+    /// `w`, both zero-extended). Raises #DE on a zero divisor or a quotient that does not fit,
+    /// which generated code must rule out first. The flags are undefined.
+    pub fn div_r(&mut self, r: u8, w: bool) {
+        self.op_rr(false, w, false, &[0xf7], UNARY_DIV, r);
+    }
+
+    /// The signed `div_r`, with the same #DE cases (including the most negative dividend by -1).
+    pub fn idiv_r(&mut self, r: u8, w: bool) {
+        self.op_rr(false, w, false, &[0xf7], UNARY_IDIV, r);
+    }
+
+    /// Reverses the bytes of `r` (the 32-bit form zero-extends). No flags.
+    pub fn bswap_r(&mut self, r: u8, w: bool) {
+        self.rex(w, 0, 0, r, false);
+        self.code
+            .extend_from_slice(&[TWO_BYTE_OPCODE, OPCODE_BSWAP | (r & 7)]);
+    }
+
+    /// bt, bts, btr or btc (`operation`, `BIT_TEST`..`BIT_COMPLEMENT`) of register `r` at the
+    /// bit `bit` names, modulo the width: CF = the bit before it is set, cleared or flipped. The
+    /// other flags are undefined.
+    pub fn bit_op_rr(&mut self, operation: u8, r: u8, bit: u8, w: bool) {
+        let opcode = OPCODE_BT_REGISTER | operation << BIT_OP_OPCODE_STRIDE_SHIFT;
+        self.op_rr(false, w, false, &[TWO_BYTE_OPCODE, opcode], bit, r);
     }
 
     /// `d = index of the lowest set bit of s`; ZF is set (and `d` undefined) when `s` is zero.
@@ -6263,6 +6348,25 @@ fn sized_unary_and_conditional_forms_match_the_assembler() {
         ("imul ecx", |a| a.imul_r(RCX, false), &[0xf7, 0xe9]),
         ("mul r9", |a| a.mul_r(R9, true), &[0x49, 0xf7, 0xe1]),
         ("imul r9d", |a| a.imul_r(R9, false), &[0x41, 0xf7, 0xe9]),
+        ("div rcx", |a| a.div_r(RCX, true), &[0x48, 0xf7, 0xf1]),
+        ("bts r9, 5", |a| a.bit_op_ri(BIT_SET, R9, 5, true), &[0x49, 0x0f, 0xba, 0xe9, 0x05]),
+        ("btr eax, 31", |a| a.bit_op_ri(BIT_RESET, RAX, 31, false), &[0x0f, 0xba, 0xf0, 0x1f]),
+        ("btc rdx, 63", |a| a.bit_op_ri(BIT_COMPLEMENT, RDX, 63, true), &[0x48, 0x0f, 0xba, 0xfa, 0x3f]),
+        ("lock cmpxchg [rdi], r9", |a| a.lock_cmpxchg_mr(mem(RDI, 0), R9, true), &[0xf0, 0x4c, 0x0f, 0xb1, 0x0f]),
+        ("lock cmpxchg [rdi], ecx", |a| a.lock_cmpxchg_mr(mem(RDI, 0), RCX, false), &[0xf0, 0x0f, 0xb1, 0x0f]),
+        ("lock xadd [rdi], rcx", |a| a.lock_xadd_mr(mem(RDI, 0), RCX, true), &[0xf0, 0x48, 0x0f, 0xc1, 0x0f]),
+        ("xchg [rdi], ecx", |a| a.xchg_mr(mem(RDI, 0), RCX, false), &[0x87, 0x0f]),
+        ("lock cmpxchg16b [rdi]", |a| a.lock_cmpxchg16b(mem(RDI, 0)), &[0xf0, 0x48, 0x0f, 0xc7, 0x0f]),
+        ("div ecx", |a| a.div_r(RCX, false), &[0xf7, 0xf1]),
+        ("idiv r9d", |a| a.idiv_r(R9, false), &[0x41, 0xf7, 0xf9]),
+        ("idiv rcx", |a| a.idiv_r(RCX, true), &[0x48, 0xf7, 0xf9]),
+        ("bswap eax", |a| a.bswap_r(RAX, false), &[0x0f, 0xc8]),
+        ("bswap r9", |a| a.bswap_r(R9, true), &[0x49, 0x0f, 0xc9]),
+        ("bswap r10d", |a| a.bswap_r(R10, false), &[0x41, 0x0f, 0xca]),
+        ("bt rax, rcx", |a| a.bit_op_rr(BIT_TEST, RAX, RCX, true), &[0x48, 0x0f, 0xa3, 0xc8]),
+        ("bts r9d, edx", |a| a.bit_op_rr(BIT_SET, R9, RDX, false), &[0x41, 0x0f, 0xab, 0xd1]),
+        ("btr rax, r9", |a| a.bit_op_rr(BIT_RESET, RAX, R9, true), &[0x4c, 0x0f, 0xb3, 0xc8]),
+        ("btc ecx, eax", |a| a.bit_op_rr(BIT_COMPLEMENT, RCX, RAX, false), &[0x0f, 0xbb, 0xc1]),
         ("bsf rax, r9", |a| a.bsf_rr(RAX, R9, true), &[0x49, 0x0f, 0xbc, 0xc1]),
         ("bsf r10d, edx", |a| a.bsf_rr(R10, RDX, false), &[0x44, 0x0f, 0xbc, 0xd2]),
         ("bsr rax, r9", |a| a.bsr_rr(RAX, R9, true), &[0x49, 0x0f, 0xbd, 0xc1]),
