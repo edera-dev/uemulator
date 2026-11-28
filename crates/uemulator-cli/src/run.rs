@@ -1,4 +1,6 @@
 use std::io::{IsTerminal, Read, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use uemulator::{
@@ -13,6 +15,7 @@ use crate::args::{
 use crate::checkpoints::{self, MachineFiles};
 use crate::frontend::web::WebViewer;
 use crate::frontend::{Frontend, Screen};
+use crate::input::TerminalInput;
 use crate::netgw;
 use crate::term::{stty, term_size};
 
@@ -21,7 +24,6 @@ pub(crate) const GUEST_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 pub(crate) const DEFAULT_MEMORY_MIB: usize = 2048;
 /// Ctrl-] (GS). Raw mode passes Ctrl-C and friends to the guest, so this is the host's escape.
 const ESCAPE_BYTE: u8 = 0x1d;
-const STDIN_CHUNK_LEN: usize = 256;
 /// Polled rather than signal driven (SIGWINCH has no portable path here).
 const TERM_SIZE_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const UDP_MAX_DATAGRAM: usize = 65536;
@@ -561,35 +563,33 @@ fn run_config(
         let files = files.clone();
         move |handle: &StopHandle| checkpoints::take(handle, &directory, &files)
     });
-    std::thread::spawn(move || {
-        let mut buf = [0u8; STDIN_CHUNK_LEN];
-        let mut pending = false;
-        while let Ok(n) = std::io::stdin().read(&mut buf) {
-            if n == 0 {
-                break;
+    // Set once the machine has ended, so that the next machine of this process (a bootstrap's
+    // installed system) gets the terminal.
+    let ended = Arc::new(AtomicBool::new(false));
+    let mut pending = false;
+    TerminalInput::stdin().attach(ended.clone(), move |chunk| {
+        let Some(checkpoint) = &checkpoint else {
+            if contains_escape(chunk) {
+                end(&stopper);
+                return false;
             }
-            let Some(checkpoint) = &checkpoint else {
-                if contains_escape(&buf[..n]) {
+            input.write(chunk);
+            return true;
+        };
+        for action in read_escape(chunk, &mut pending) {
+            match action {
+                Escape::Forward(bytes) => input.write(&bytes),
+                Escape::Checkpoint => checkpoint(&stopper),
+                Escape::Stop => {
                     end(&stopper);
-                    break;
+                    return false;
                 }
-                input.write(&buf[..n]);
-                continue;
-            };
-            for action in read_escape(&buf[..n], &mut pending) {
-                match action {
-                    Escape::Forward(bytes) => input.write(&bytes),
-                    Escape::Checkpoint => checkpoint(&stopper),
-                    Escape::Stop => {
-                        end(&stopper);
-                        return;
-                    }
-                }
-            }
-            if pending {
-                eprint!("\r\n[c: checkpoint, any other key: stop]\r\n");
             }
         }
+        if pending {
+            eprint!("\r\n[c: checkpoint, any other key: stop]\r\n");
+        }
+        true
     });
     if let (Some(secs), Some(directory)) = (runtime.checkpoint_every, checkpoint_dir) {
         let handle = machine.stop_handle();
@@ -611,6 +611,7 @@ fn run_config(
 
     let started = machine.start().map_err(|e| e.to_string());
     let reason = started.map(|()| machine.wait());
+    ended.store(true, Ordering::Release);
     // Restore before `reason?` so a failed start does not leave the terminal raw.
     if let Some(saved) = saved_tty {
         stty(&[&saved]);
@@ -1254,7 +1255,7 @@ mod tests {
         assert!(!contains_escape(&[]));
         assert!(!contains_escape(b"ls -l\r"));
         assert!(!contains_escape(&[0x03, 0x1c, 0x1e, 0x04]));
-        assert!(!contains_escape(&[0xff; STDIN_CHUNK_LEN]));
+        assert!(!contains_escape(&[0xff; crate::input::READ_CHUNK_LEN]));
     }
 
     #[test]
