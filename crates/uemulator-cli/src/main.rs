@@ -1,4 +1,5 @@
 mod args;
+mod bootstrap;
 mod checkpoints;
 mod firmware;
 mod frontend;
@@ -12,6 +13,7 @@ mod term;
 mod test_support;
 mod usernet;
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -19,8 +21,8 @@ use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand};
 use uemulator::ExitReason;
 
 use args::{
-    BootSourceArgs, FirmwareArgs, HardwareArgs, LinuxArgs, NewDiskArgs, RemoveArgs, RuntimeArgs,
-    Settings, UefiBootArgs, attach_only,
+    BootSourceArgs, BootstrapArgs, FirmwareArgs, HardwareArgs, LinuxArgs, NewDiskArgs, RemoveArgs,
+    RuntimeArgs, Settings, UefiBootArgs, attach_only,
 };
 use quick::Distro;
 
@@ -157,6 +159,35 @@ enum QuickCmd {
         /// Boot the machine once it is created
         #[arg(long)]
         boot: bool,
+    },
+    /// Create a machine and install its distro unattended with these answers, then boot the
+    /// installed system
+    ///
+    /// The machine is `quick create`'s, with the answers saved (never a password) for `quick
+    /// reinstall` to repeat. --firmware none and --hypervisor are refused: neither can boot the
+    /// installed disk.
+    #[command(mut_arg("user", |user| user.required(true)))]
+    Bootstrap {
+        /// Machine name: letters, digits, '.', '_' and '-'
+        name: String,
+        /// The distro to install
+        #[arg(long, value_name = "DISTRO")]
+        install: Distro,
+        #[command(flatten)]
+        hardware: HardwareArgs,
+        #[command(flatten)]
+        new_disks: NewDiskArgs,
+        #[command(flatten)]
+        linux: LinuxArgs,
+        #[command(flatten)]
+        firmware: FirmwareArgs,
+        /// Boxed, as `runtime` is: together they would make this variant the size of the enum.
+        #[command(flatten)]
+        bootstrap: Box<BootstrapArgs>,
+        #[command(flatten)]
+        uefi: UefiBootArgs,
+        #[command(flatten)]
+        runtime: Box<RuntimeArgs>,
     },
     /// Change a machine's saved configuration
     ///
@@ -296,6 +327,7 @@ impl Cmd {
             Cmd::Quick {
                 cmd:
                     QuickCmd::Create { hardware, .. }
+                    | QuickCmd::Bootstrap { hardware, .. }
                     | QuickCmd::Edit { hardware, .. }
                     | QuickCmd::Boot { hardware, .. },
             }
@@ -404,6 +436,7 @@ fn quick_command(cmd: QuickCmd) -> Result<Option<ExitReason>, String> {
                 &linux,
                 source.boot_from,
                 firmware.firmware,
+                None,
             )?;
             machines::fetch_artifacts(&machine, quick::download).map_err(|e| {
                 format!("{e}\nmachine {name} was created; `quick boot {name}` retries the download")
@@ -422,6 +455,42 @@ fn quick_command(cmd: QuickCmd) -> Result<Option<ExitReason>, String> {
                 quick::download,
             )?;
             boot_launch(launch, &UefiBootArgs::default(), &RuntimeArgs::default()).map(Some)
+        }
+        QuickCmd::Bootstrap {
+            name,
+            install,
+            hardware,
+            new_disks: _,
+            linux,
+            firmware,
+            bootstrap: bootstrap_args,
+            uefi: _,
+            runtime: _,
+        } => {
+            bootstrap::refuse_unbootable(firmware.firmware, &linux.hypervisor)?;
+            // Before the machine exists, so a mistyped password or a missing key file leaves
+            // nothing behind.
+            let (_answers, record) = bootstrap::resolve_answers(
+                &bootstrap_args,
+                None,
+                &name,
+                std::io::stdin().is_terminal(),
+                bootstrap::read_secret_from_terminal,
+            )?;
+            let machine = machines::create(
+                &home,
+                &name,
+                install,
+                &hardware,
+                &linux,
+                None,
+                firmware.firmware,
+                Some(record),
+            )?;
+            eprint!("{}", machines::describe(&machine));
+            // Task 6's run loop takes over here: it boots the installer with the answers and
+            // then the installed disk.
+            Ok(None)
         }
         QuickCmd::Edit {
             name,
@@ -1084,6 +1153,142 @@ mod tests {
             ]),
             ErrorKind::UnknownArgument
         );
+    }
+
+    fn bootstrap_parse(extra: &[&str]) -> Result<Cli, clap::Error> {
+        let mut args = vec!["quick", "bootstrap", "m", "--install", "debian"];
+        args.extend_from_slice(extra);
+        parse(&args)
+    }
+
+    #[test]
+    fn quick_bootstrap_takes_the_answers_and_quick_creates_options() {
+        let cli = bootstrap_parse(&[
+            "--user",
+            "alex",
+            "--password-file",
+            "pw",
+            "--root-password",
+            "toor",
+            "--hostname",
+            "box",
+            "--ssh-key",
+            "a.pub",
+            "--ssh-key",
+            "b.pub",
+            "--timezone",
+            "Europe/Berlin",
+            "--locale",
+            "de_DE.UTF-8",
+            "--keymap",
+            "de",
+            "--package",
+            "vim",
+            "--package",
+            "git",
+            "--memory",
+            "4096",
+            "--create-disk",
+            "65536",
+            "--firmware",
+            "bios",
+            "--timeout",
+            "5",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::Quick {
+                cmd:
+                    QuickCmd::Bootstrap {
+                        name,
+                        install,
+                        hardware,
+                        firmware,
+                        bootstrap,
+                        runtime,
+                        ..
+                    },
+            } => {
+                assert_eq!(name, "m");
+                assert_eq!(install, Distro::Debian);
+                assert_eq!(hardware.memory, Some(4096));
+                assert_eq!(hardware.disk_steps.len(), 1);
+                assert_eq!(firmware.firmware, Some(args::Firmware::Bios));
+                assert_eq!(runtime.timeout, Some(5));
+                assert_eq!(bootstrap.user.as_deref(), Some("alex"));
+                assert_eq!(bootstrap.password_file, Some(PathBuf::from("pw")));
+                assert_eq!(bootstrap.root_password.as_deref(), Some("toor"));
+                assert_eq!(bootstrap.hostname.as_deref(), Some("box"));
+                assert_eq!(
+                    bootstrap.ssh_key,
+                    vec![PathBuf::from("a.pub"), PathBuf::from("b.pub")]
+                );
+                assert_eq!(bootstrap.timezone.as_deref(), Some("Europe/Berlin"));
+                assert_eq!(bootstrap.locale.as_deref(), Some("de_DE.UTF-8"));
+                assert_eq!(bootstrap.keymap.as_deref(), Some("de"));
+                assert_eq!(bootstrap.package, vec!["vim", "git"]);
+            }
+            _ => panic!("expected quick bootstrap"),
+        }
+    }
+
+    #[test]
+    fn quick_bootstrap_needs_a_user_and_a_distro() {
+        assert_eq!(
+            bootstrap_parse(&["--password", "x"]).err().unwrap().kind(),
+            ErrorKind::MissingRequiredArgument
+        );
+        assert_eq!(
+            error_kind(&["quick", "bootstrap", "m", "--user", "alex"]),
+            ErrorKind::MissingRequiredArgument
+        );
+        assert!(bootstrap_parse(&["--user", "alex", "--ask-password"]).is_ok());
+    }
+
+    #[test]
+    fn quick_bootstrap_takes_at_most_one_form_of_each_password() {
+        for pair in [
+            ["--password=x", "--ask-password"],
+            ["--password=x", "--password-file=f"],
+            ["--ask-password", "--password-file=f"],
+            ["--root-password=x", "--ask-root-password"],
+            ["--root-password=x", "--root-password-file=f"],
+            ["--ask-root-password", "--root-password-file=f"],
+        ] {
+            let mut args = vec!["--user", "alex"];
+            args.extend(pair);
+            assert_eq!(
+                bootstrap_parse(&args).err().map(|e| e.kind()),
+                Some(ErrorKind::ArgumentConflict),
+                "{pair:?}"
+            );
+        }
+        assert!(
+            bootstrap_parse(&["--user", "alex", "--ask-password", "--ask-root-password"]).is_ok()
+        );
+    }
+
+    #[test]
+    fn quick_bootstrap_refuses_firmware_none_and_a_hypervisor() {
+        let refusal = |extra: &[&str]| {
+            let mut args = vec!["--user", "alex", "--ask-password"];
+            args.extend_from_slice(extra);
+            match bootstrap_parse(&args).unwrap().cmd {
+                Cmd::Quick {
+                    cmd:
+                        QuickCmd::Bootstrap {
+                            firmware, linux, ..
+                        },
+                } => bootstrap::refuse_unbootable(firmware.firmware, &linux.hypervisor),
+                _ => unreachable!(),
+            }
+        };
+        assert!(refusal(&[]).is_ok());
+        assert!(refusal(&["--firmware", "bios"]).is_ok());
+        let error = refusal(&["--firmware", "none"]).unwrap_err();
+        assert!(error.starts_with("--firmware none"), "{error}");
+        let error = refusal(&["--hypervisor", "xen.gz"]).unwrap_err();
+        assert!(error.starts_with("--hypervisor"), "{error}");
     }
 
     #[test]
@@ -1909,6 +2114,7 @@ mod tests {
             &linux,
             None,
             None,
+            None,
         )
         .unwrap();
         let error = quick_command(QuickCmd::Delete {
@@ -2023,6 +2229,7 @@ mod tests {
     fn every_option_a_command_takes_is_documented() {
         for path in [
             &["quick", "create"][..],
+            &["quick", "bootstrap"],
             &["quick", "edit"],
             &["quick", "boot"],
             &["quick", "reinstall"],

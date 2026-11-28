@@ -1,6 +1,7 @@
 //! Named machines, kept under `<home>/machines/<name>/`:
 //!
-//! - `machine.toml`: the distro it installs and its `Settings`
+//! - `machine.toml`: the distro it installs and its `Settings`, and for a machine `quick bootstrap`
+//!   installs, the answers under `[bootstrap]` (never a password or its hash)
 //! - `nvram.kv`: the UEFI firmware's variables, for a machine whose firmware is `uefi`; created by
 //!   its first boot and removed with the directory
 //! - `artifacts/`: the distro's netboot kernel and initramfs, which `reinstall` throws away and
@@ -21,6 +22,7 @@ use crate::args::{
     BootSource, ConsoleArg, DiskSpec, DiskStep, DisplayArg, Firmware, HardwareArgs, HypervisorArgs,
     LinuxArgs, NetLink, NetModel, Nic, RemoveArgs, Settings, attach_only, set_or_clear,
 };
+use crate::bootstrap::BootstrapRecord;
 use crate::checkpoints;
 use crate::images;
 use crate::quick::{Artifacts, Distro, artifacts_present, ensure_in, write_atomically};
@@ -85,6 +87,9 @@ struct MachineFile {
     hypervisor_cmdline: Option<String>,
     #[serde(flatten)]
     settings: Settings,
+    /// After `settings`: toml writes tables after plain keys, and `[bootstrap]` is a table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bootstrap: Option<BootstrapRecord>,
 }
 
 pub struct Machine {
@@ -96,6 +101,8 @@ pub struct Machine {
     /// What installer boots run under; its image is `hypervisor_path`.
     pub hypervisor: Option<SavedHypervisor>,
     pub settings: Settings,
+    /// The answers of `quick bootstrap`, for `quick reinstall` to repeat.
+    pub bootstrap: Option<BootstrapRecord>,
 }
 
 pub struct SavedHypervisor {
@@ -130,6 +137,7 @@ impl Machine {
             hypervisor: self.hypervisor.as_ref().map(|h| h.source_name.clone()),
             hypervisor_cmdline: self.hypervisor.as_ref().and_then(|h| h.cmdline.clone()),
             settings: self.settings.clone(),
+            bootstrap: self.bootstrap.clone(),
         };
         let text =
             toml::to_string_pretty(&file).map_err(|e| format!("encode {}: {e}", self.name))?;
@@ -162,6 +170,7 @@ pub fn load(home: &Path, name: &str) -> Result<Machine, String> {
             cmdline: file.hypervisor_cmdline,
         }),
         settings: file.settings,
+        bootstrap: file.bootstrap,
     })
 }
 
@@ -278,7 +287,9 @@ fn persist_disks(dir: &Path, steps: &[DiskStep]) -> Result<Vec<DiskSpec>, String
 
 /// A new machine. Whatever the command line leaves out gets the `quick` defaults, saved so that
 /// `edit` can change them: one 8 GiB disk, one NAT NIC (the installers fetch packages over the
-/// network), one virtio console. Nothing is left behind if it fails.
+/// network), one virtio console. Nothing is left behind if it fails. `bootstrap` is the record
+/// of a machine `quick bootstrap` installs.
+#[allow(clippy::too_many_arguments)]
 pub fn create(
     home: &Path,
     name: &str,
@@ -287,6 +298,7 @@ pub fn create(
     linux: &LinuxArgs,
     boot_from: Option<BootSource>,
     firmware: Option<Firmware>,
+    bootstrap: Option<BootstrapRecord>,
 ) -> Result<Machine, String> {
     validate_name(name)?;
     let machines = home.join(MACHINES_DIR);
@@ -324,6 +336,7 @@ pub fn create(
             firmware: firmware.unwrap_or_default(),
             hypervisor: None,
             settings,
+            bootstrap,
         };
         if let Some(source) = change_hypervisor(&mut machine, &linux.hypervisor, false)? {
             install_hypervisor(&machine, &source)?;
@@ -868,7 +881,17 @@ mod tests {
 
     fn create_machine(home: &Path, extra: &[&str]) -> Machine {
         let (hardware, linux) = create_args(extra);
-        create(home, "m", Distro::Alpine, &hardware, &linux, None, None).unwrap()
+        create(
+            home,
+            "m",
+            Distro::Alpine,
+            &hardware,
+            &linux,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
     }
 
     /// Records every requested URL and writes the URL itself as the file contents.
@@ -1032,6 +1055,7 @@ mod tests {
             &linux,
             None,
             None,
+            None,
         )
         .err()
         .unwrap();
@@ -1053,6 +1077,7 @@ mod tests {
             Distro::Alpine,
             &hardware,
             &linux,
+            None,
             None,
             None,
         )
@@ -1416,6 +1441,7 @@ mod tests {
             &LinuxArgs::default(),
             None,
             None,
+            None,
         )
         .unwrap();
         finish_install(&fedora);
@@ -1636,6 +1662,7 @@ mod tests {
             &hardware,
             &linux,
             Some(BootSource::Disk),
+            None,
             None,
         )
         .unwrap();
@@ -1872,6 +1899,7 @@ mod tests {
                 &linux,
                 None,
                 None,
+                None,
             )
             .unwrap();
         }
@@ -1896,6 +1924,7 @@ mod tests {
             Distro::Fedora,
             &hardware,
             &linux,
+            None,
             None,
             None,
         )
@@ -2017,6 +2046,71 @@ mod tests {
         }
     }
 
+    fn bootstrap_record() -> BootstrapRecord {
+        BootstrapRecord {
+            user: "alex".into(),
+            hostname: "box".into(),
+            ssh_keys: vec!["ssh-ed25519 AAAAkey alex@laptop".into()],
+            timezone: "Europe/Berlin".into(),
+            locale: "de_DE.UTF-8".into(),
+            keymap: "de".into(),
+            packages: vec!["vim".into(), "git".into()],
+            root_password: true,
+        }
+    }
+
+    #[test]
+    fn machine_toml_bootstrap_round_trip() {
+        let home = TempDir::new("machines-bootstrap-record");
+        let (hardware, linux) = create_args(&[]);
+        let record = bootstrap_record();
+        let machine = create(
+            home.path(),
+            "m",
+            Distro::Fedora,
+            &hardware,
+            &linux,
+            None,
+            None,
+            Some(record.clone()),
+        )
+        .unwrap();
+        assert_eq!(machine.bootstrap.as_ref(), Some(&record));
+        let text = fs::read_to_string(home.path().join("machines/m/machine.toml")).unwrap();
+        assert!(text.contains("[bootstrap]"), "{text}");
+        assert!(text.contains("user = \"alex\""), "{text}");
+        assert!(!text.contains("$6$"), "{text}");
+        let password_lines: Vec<&str> = text
+            .lines()
+            .filter(|line| line.to_lowercase().contains("password"))
+            .collect();
+        assert_eq!(password_lines, ["root_password = true"], "{text}");
+        let loaded = load(home.path(), "m").unwrap();
+        assert_eq!(loaded.bootstrap, Some(record));
+        assert_eq!(loaded.settings, machine.settings);
+        // Saving again (as `edit` does) keeps it.
+        let (hardware, linux, remove) = edit_args(&["--memory", "4096"]);
+        edit(home.path(), "m", &hardware, &linux, &remove, None, None).unwrap();
+        assert_eq!(
+            load(home.path(), "m").unwrap().bootstrap,
+            Some(bootstrap_record())
+        );
+    }
+
+    #[test]
+    fn old_machine_toml_without_bootstrap_loads_with_none() {
+        let home = TempDir::new("machines-bootstrap-old");
+        let machine = create_machine(home.path(), &[]);
+        assert_eq!(machine.bootstrap, None);
+        let path = home.path().join("machines/m/machine.toml");
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("[bootstrap]"), "{text}");
+        fs::write(&path, "install = \"alpine\"\nmemory = 1024\n").unwrap();
+        let loaded = load(home.path(), "m").unwrap();
+        assert_eq!(loaded.bootstrap, None);
+        assert_eq!(loaded.settings.memory, Some(1024));
+    }
+
     #[test]
     fn firmware_is_saved_by_create_and_changed_by_edit() {
         let home = TempDir::new("machines-firmware-edit");
@@ -2029,6 +2123,7 @@ mod tests {
             &linux,
             None,
             Some(Firmware::Uefi),
+            None,
         )
         .unwrap();
         let text = fs::read_to_string(home.path().join("machines/m/machine.toml")).unwrap();
@@ -2236,6 +2331,7 @@ mod tests {
             &linux,
             None,
             Some(Firmware::Bios),
+            None,
         )
         .err()
         .expect("a bios machine cannot boot a hypervisor");

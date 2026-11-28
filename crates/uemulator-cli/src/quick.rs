@@ -50,6 +50,17 @@ impl Distro {
     }
 }
 
+/// The bootstrap crate has its own copy of the three, so it needs nothing from the CLI.
+impl From<Distro> for uemulator_bootstrap::Distro {
+    fn from(distro: Distro) -> Self {
+        match distro {
+            Distro::Debian => uemulator_bootstrap::Distro::Debian,
+            Distro::Alpine => uemulator_bootstrap::Distro::Alpine,
+            Distro::Fedora => uemulator_bootstrap::Distro::Fedora,
+        }
+    }
+}
+
 pub struct Artifacts {
     pub kernel: PathBuf,
     pub initramfs: PathBuf,
@@ -205,6 +216,16 @@ mod tests {
     use crate::test_support::TempDir;
 
     const ALL_DISTROS: [Distro; 3] = [Distro::Debian, Distro::Alpine, Distro::Fedora];
+
+    #[test]
+    fn each_distro_is_the_bootstrap_crates_of_the_same_name() {
+        use uemulator_bootstrap::Distro as Bootstrap;
+        let converted: Vec<Bootstrap> = ALL_DISTROS.into_iter().map(Bootstrap::from).collect();
+        assert_eq!(
+            converted,
+            [Bootstrap::Debian, Bootstrap::Alpine, Bootstrap::Fedora]
+        );
+    }
 
     /// The release component of `.../releases/<n>/...`.
     fn release_in(url: &str) -> &str {
