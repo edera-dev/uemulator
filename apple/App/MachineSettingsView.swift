@@ -168,7 +168,7 @@ struct MachineSettingsView: View {
             }
             if let record = draft.bootstrap { BootstrapRecordRows(record: record) }
             Button("Reinstall…", role: .destructive) { reinstalling = true }
-                .disabled(model.isRunning)
+                .disabled(model.isRunning || reinstallRefusal != nil)
         } header: {
             Text(distro.title)
         } footer: {
@@ -178,7 +178,19 @@ struct MachineSettingsView: View {
 
     private func installFooter(_ distro: Distro) -> String {
         if model.isRunning { return "Stop the machine to reinstall it." }
+        if let reinstallRefusal { return reinstallRefusal }
         return "Reinstall… erases the disk and installs \(distro.title) again without questions, then saves these settings and starts the machine."
+    }
+
+    // `MachineModel.reinstall` refuses these too, once the draft is saved; an ISO picked here is
+    // imported in front of the disks, so it counts as the first disk already.
+    private var reinstallRefusal: String? {
+        if let iso = newISOs.first {
+            return "The install erases the first disk, and \(iso.lastPathComponent), picked here, would be attached first and read-only: reinstall without it."
+        }
+        var saved = draft
+        if let newHypervisor { saved.hypervisor = newHypervisor.lastPathComponent }
+        return MachineModel.reinstallRefusal(saved)
     }
 
     private var disksSection: some View {
