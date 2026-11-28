@@ -1,0 +1,21 @@
+# uemulator quick bootstrap: setup-alpine answers, sourced by setup-alpine -e -f from
+# /etc/local.d/bootstrap.start. The disk and the user are set up by that script instead.
+KEYMAPOPTS="de de"
+HOSTNAMEOPTS="devbox"
+DEVDOPTS="mdev"
+INTERFACESOPTS="auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet dhcp
+	hostname devbox
+"
+TIMEZONEOPTS="Europe/Berlin"
+PROXYOPTS="none"
+APKREPOSOPTS="-1 -c"
+USEROPTS="none"
+SSHDOPTS="none"
+NTPOPTS="busybox"
+DISKOPTS="none"
+LBUOPTS="none"
+APKCACHEOPTS="none"

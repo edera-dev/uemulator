@@ -1,0 +1,33 @@
+#!/bin/sh
+# uemulator quick bootstrap: the netboot system's local service runs this once. It installs
+# Alpine Linux to /dev/vda, sets up the user on the installed system and reboots into it.
+set -e
+exec > /dev/console 2>&1
+
+apk add alpine-conf e2fsprogs
+setup-alpine -e -f /etc/bootstrap/answers
+apk add doas
+ERASE_DISKS=/dev/vda setup-disk -m sys /dev/vda
+
+# setup-disk unmounts the new system when it is done; its root is the partition with
+# /etc/alpine-release (the others are the boot or EFI partition and swap).
+for partition in /dev/vda?*; do
+	mount "$partition" /mnt 2>/dev/null || continue
+	[ -f /mnt/etc/alpine-release ] && break
+	umount /mnt
+done
+[ -f /mnt/etc/alpine-release ]
+
+chroot /mnt adduser -D alex
+chroot /mnt addgroup alex wheel
+mkdir -p /mnt/etc/doas.d
+printf '%s\n' 'permit persist :wheel' > /mnt/etc/doas.d/20-wheel.conf
+printf '%s\n' 'alex:$6$testsalt$fakeuserhash' | chroot /mnt chpasswd -e
+chroot /mnt passwd -l root
+
+# setup-disk copied the live /etc, this script and its runlevel link included: without this the
+# installed system would install itself again on every boot.
+rm -rf /mnt/etc/local.d/bootstrap.start /mnt/etc/runlevels/default/local /mnt/etc/bootstrap
+umount /mnt
+printf '%s: %s\n' uemulator-bootstrap installed > /dev/console
+reboot
