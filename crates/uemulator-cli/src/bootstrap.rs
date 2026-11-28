@@ -438,6 +438,28 @@ pub fn refuse_unbootable(
     Ok(())
 }
 
+/// `refuse_unbootable` for `quick reinstall`, whose machine already has its firmware and
+/// hypervisor: the way out is `quick edit`, not another option.
+pub fn refuse_unbootable_machine(
+    firmware: Firmware,
+    has_hypervisor: bool,
+    name: &str,
+) -> Result<(), String> {
+    if firmware == Firmware::None {
+        return Err(format!(
+            "{name} has firmware none, which cannot boot the disk the install writes: `uemulator \
+             quick edit {name} --firmware uefi` first"
+        ));
+    }
+    if has_hypervisor {
+        return Err(format!(
+            "{name} runs its installer under a hypervisor, and the installed disk's boot loader \
+             cannot start under it: `uemulator quick edit {name} --remove-hypervisor` first"
+        ));
+    }
+    Ok(())
+}
+
 const CTRL_C: u8 = 0x03;
 const CTRL_D: u8 = 0x04;
 const BACKSPACE: u8 = 0x08;

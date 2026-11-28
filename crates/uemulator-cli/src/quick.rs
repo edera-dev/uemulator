@@ -86,6 +86,15 @@ impl Distro {
         }
     }
 
+    /// The name in prose, as `quick reinstall`'s erase question uses it.
+    pub fn title(self) -> &'static str {
+        match self {
+            Distro::Debian => "Debian",
+            Distro::Alpine => "Alpine",
+            Distro::Fedora => "Fedora",
+        }
+    }
+
     /// The kernel and initramfs URLs, for tests that check what was fetched.
     #[cfg(test)]
     pub fn source_urls(self) -> (&'static str, &'static str) {
