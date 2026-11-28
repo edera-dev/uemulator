@@ -35,6 +35,9 @@ pub struct NetOffloads {
 pub(crate) struct HostFrame {
     pub bytes: Vec<u8>,
     pub tcp_segment_size: Option<u16>,
+    /// A copy already went to the `--verify` twin (`NetState::mirror`), the first time the
+    /// device took the frame: one it puts back for lack of room is not copied again.
+    mirrored: bool,
 }
 
 #[derive(Default)]
@@ -51,6 +54,12 @@ struct NetState {
     wake_devices: Option<Notify>,
     /// Set by the host (`on_guest_frame`) when it waits on more than the condvar.
     wake_host: Option<Notify>,
+    /// The `--verify` twin's handle: every frame the device takes from here is queued there
+    /// too, so the twin's NIC sees the same frames. Copied when taken, not when the host sends
+    /// them: the main CPU always services its devices before the twin in lockstep, so the copy
+    /// is there by the time the twin's device looks, and a frame the main device has not taken
+    /// yet must not reach the twin early.
+    mirror: Option<NetHandle>,
 }
 
 /// Ethernet frames between the host and the virtio-net device, shared by clones. One lock covers
@@ -66,6 +75,7 @@ impl NetHandle {
         self.queue_for_guest(HostFrame {
             bytes: frame.to_vec(),
             tcp_segment_size: None,
+            mirrored: false,
         })
     }
 
@@ -79,6 +89,7 @@ impl NetHandle {
         self.queue_for_guest(HostFrame {
             bytes: frame.to_vec(),
             tcp_segment_size: Some(segment_size),
+            mirrored: false,
         })
     }
 
@@ -168,7 +179,30 @@ impl NetHandle {
     }
 
     pub(crate) fn guest_recv(&self) -> Option<HostFrame> {
-        self.inner.0.lock().unwrap().to_guest.pop_front()
+        let (mut frame, mirror) = {
+            let mut state = self.inner.0.lock().unwrap();
+            let frame = state.to_guest.pop_front()?;
+            (frame, state.mirror.clone())
+        };
+        if let Some(mirror) = mirror.filter(|_| !frame.mirrored) {
+            mirror.queue_for_guest(HostFrame {
+                bytes: frame.bytes.clone(),
+                tcp_segment_size: frame.tcp_segment_size,
+                mirrored: false,
+            });
+            frame.mirrored = true;
+        }
+        Some(frame)
+    }
+
+    /// A handle for the `--verify` twin's NIC that offers the guest what this one does and gets
+    /// a copy of every frame this one's device takes (`NetState::mirror`). Replaces the twin of
+    /// an earlier boot.
+    pub(crate) fn verify_twin(&self) -> NetHandle {
+        let twin = NetHandle::default();
+        twin.set_offloads(self.offloads());
+        self.inner.0.lock().unwrap().mirror = Some(twin.clone());
+        twin
     }
 
     /// Puts back a frame `guest_recv` took that the guest had no room for yet, ahead of the rest
