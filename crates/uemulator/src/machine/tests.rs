@@ -390,6 +390,17 @@ mod twin_devices {
     }
 
     #[test]
+    fn a_main_nic_stops_copying_frames_once_its_twin_is_let_go() {
+        let mut main = full_config(false);
+        let twin = mirrored(&mut main);
+        let (main_net, twin_net) = (&main.nets[0].1, &twin.nets[0].1);
+        main_net.stop_mirroring();
+        main_net.send_frame(b"after");
+        assert!(main_net.guest_recv().is_some());
+        assert!(!twin_net.has_pending());
+    }
+
+    #[test]
     fn mirror_has_the_same_virtio_functions_in_the_same_slots() {
         let mut main = full_config(false);
         let mut mirror = Devices::new(ConsoleHandle::default(), mirrored(&mut main));

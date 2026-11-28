@@ -476,10 +476,14 @@ pub fn prepare_boot(
     settings.remove_devices(remove)?;
     settings.add(hardware, linux, attach_only(&hardware.disk_steps)?);
     let nvram = (machine.firmware == Firmware::Uefi).then(|| machine.nvram_path());
+    // Every refusal that does not need the restored disk comes before the restore, which
+    // replaces the live disks: a resume that fails after it has thrown away their writes since
+    // the checkpoint for nothing. `run::build_config` opens the chain again for the resume itself.
+    let hypervisor = boot_hypervisor(machine, &linux.hypervisor, remove.remove_hypervisor)?;
     if let Some(checkpoint) = resume_from.filter(|path| checkpoints::is_checkpoint(path)) {
+        checkpoints::sources(checkpoint)?;
         machine_files(&settings, nvram.as_deref()).restore_from(checkpoint)?;
     }
-    let hypervisor = boot_hypervisor(machine, &linux.hypervisor, remove.remove_hypervisor)?;
     let installed = match (
         boot_from.unwrap_or(machine.boot_from),
         settings.disks.first(),
@@ -1435,7 +1439,7 @@ mod tests {
         let checkpoints = home.path().join("checkpoints");
         fs::create_dir(&checkpoints).unwrap();
         let checkpoint = checkpoints.join("0001.checkpoint");
-        fs::write(&checkpoint, b"snapshot").unwrap();
+        write_snapshot_header(&checkpoint);
         fs::copy(
             &machine.settings.disks[0].path,
             checkpoint.with_extension("disk-0"),
@@ -1459,6 +1463,44 @@ mod tests {
         // A guest reboot after the resume goes where the resumed guest expects: the installer.
         assert_eq!(launch.source, BootSource::Installer);
         assert!(disk_is_blank(&machine.settings.disks[0].path).unwrap());
+    }
+
+    /// What `read_snapshot_info` accepts as a full snapshot: the magic and format version 1.
+    fn write_snapshot_header(path: &Path) {
+        let mut header = b"UEMUSNAP".to_vec();
+        header.extend_from_slice(&1u32.to_le_bytes());
+        fs::write(path, header).unwrap();
+    }
+
+    #[test]
+    fn a_checkpoint_that_cannot_be_resumed_leaves_the_live_disks_alone() {
+        let home = TempDir::new("machines-resume-broken-chain");
+        let machine = create_machine(home.path(), &[]);
+        let checkpoints = home.path().join("checkpoints");
+        fs::create_dir(&checkpoints).unwrap();
+        let checkpoint = checkpoints.join("0001.checkpoint");
+        fs::write(&checkpoint, b"not a snapshot").unwrap();
+        let disk = &machine.settings.disks[0].path;
+        fs::copy(disk, checkpoint.with_extension("disk-0")).unwrap();
+        fs::write(checkpoint.with_extension("nvram"), b"").unwrap();
+        finish_install(&machine);
+        let installed = fs::read(disk).unwrap();
+
+        let (hardware, linux, remove) = boot_args(&[]);
+        let fetcher = FakeFetcher::new();
+        let error = prepare_boot(
+            &machine,
+            &hardware,
+            &linux,
+            &remove,
+            None,
+            Some(&checkpoint),
+            |u, d| fetcher.fetch(u, d),
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert!(error.contains("0001.checkpoint"), "{error}");
+        assert_eq!(fs::read(disk).unwrap(), installed);
     }
 
     #[test]

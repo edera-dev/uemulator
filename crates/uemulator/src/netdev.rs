@@ -205,6 +205,12 @@ impl NetHandle {
         twin
     }
 
+    /// Ends `verify_twin`'s copying. A host keeps this handle past the run, so a mirror left in
+    /// place would copy every later frame into a queue nothing reads.
+    pub(crate) fn stop_mirroring(&self) {
+        self.inner.0.lock().unwrap().mirror = None;
+    }
+
     /// Puts back a frame `guest_recv` took that the guest had no room for yet, ahead of the rest
     /// and regardless of the queue limit (it held that place already).
     pub(crate) fn guest_unrecv(&self, frame: HostFrame) {

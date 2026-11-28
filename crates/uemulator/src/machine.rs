@@ -1406,6 +1406,17 @@ impl Vcpu {
                 self.unix_time.unwrap_or_else(host_unix_time),
             )
         });
+        // `mirrored_devices` linked these to the twin's NICs before it is known whether a twin
+        // runs (it needs generated code); every way out of the run unlinks them.
+        let mirrored_nets: Vec<NetHandle> = if verify_twin.is_some() {
+            self.devcfg
+                .nets
+                .iter()
+                .map(|(_, net)| net.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
         let ram = core::mem::take(&mut self.ram);
         // This thread runs the devices from here on: the vCPU of a one-processor machine (its
         // idle wait parks) or the device thread of a threaded one (`run_threaded`). A frame from
@@ -1616,6 +1627,9 @@ impl Vcpu {
                 reason
             }
         };
+        for net in &mirrored_nets {
+            net.stop_mirroring();
+        }
         if let (Some(l), true) = (
             &self.log,
             self.debug || matches!(reason, ExitReason::TripleFault | ExitReason::Internal(_)),
