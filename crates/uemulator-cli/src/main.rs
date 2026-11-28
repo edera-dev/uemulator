@@ -139,7 +139,7 @@ enum DiskCmd {
 enum QuickCmd {
     /// Create a machine, downloading its kernel and initramfs
     ///
-    /// Without --disk or --create-disk the machine gets an 8 GiB disk, without --network a
+    /// Without --disk or --create-disk the machine gets a 64 GiB (sparse) disk, without --network a
     /// NIC linked with user-mode NAT, and without --console a virtio console.
     Create {
         /// Machine name: letters, digits, '.', '_' and '-'
@@ -473,6 +473,10 @@ fn run_bootstrap(
 ) -> Result<ExitReason, String> {
     // Before the install, which takes a while, rather than at the disk boot after it.
     refuse_uefi_args(uefi, machine.firmware)?;
+    // A new machine is made `auto`, which would boot a disk the installer partitioned and then
+    // failed on (seen with Debian on a disk too small for its recipe): until the marker, the
+    // machine stays on its installer, as a reinstall already leaves it.
+    machine.set_boot_from(args::BootSource::Installer)?;
     let launch = machines::bootstrap_launch(machine, answers, quick::download)?;
     let watch = bootstrap::MarkerWatch::default();
     runtime.marker_watch = Some(watch.clone());
@@ -690,6 +694,14 @@ fn quick_command(cmd: QuickCmd) -> Result<Option<ExitReason>, String> {
                 return Err(format!(
                     "--resume-from: bootstrap makes a new machine; resume one with `uemulator \
                      quick boot {name} --resume-from FILE`"
+                ));
+            }
+            // Before the password is asked for, which would be wasted. `machines::create` still
+            // refuses a name that turns up meanwhile.
+            if machines::exists(&home, &name) {
+                return Err(format!(
+                    "machine {name} already exists: `uemulator quick reinstall {name} --install \
+                     DISTRO --user USER` installs it again unattended, erasing its disk"
                 ));
             }
             // Before the machine exists, so a mistyped password or a missing key file leaves
@@ -1599,6 +1611,21 @@ mod tests {
                 "{extra:?} left a machine behind"
             );
         }
+    }
+
+    /// Spec, "Left to the builder": an existing name suggests `reinstall`, before any password
+    /// is asked for.
+    #[test]
+    fn bootstrap_of_an_existing_machine_suggests_reinstall() {
+        let home = crate::test_support::TempDir::new("main-bootstrap-exists");
+        let home_text = home.path().to_str().unwrap().to_string();
+        let _env = crate::test_support::EnvGuard::set(&[("UEMULATOR_HOME", Some(&home_text))]);
+        std::fs::create_dir_all(home.path().join("machines/m")).unwrap();
+        let error = match execute(bootstrap_parse(&["--user", "alex", "--ask-password"]).unwrap()) {
+            Err(error) => error,
+            Ok(_) => panic!("an existing machine was bootstrapped"),
+        };
+        assert!(error.contains("uemulator quick reinstall m"), "{error}");
     }
 
     #[test]
@@ -2807,7 +2834,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             prompts,
-            vec!["Erase disk-0.udisk (8 GiB) and install Fedora? [y/N]"]
+            vec!["Erase disk-0.udisk (64 GiB) and install Fedora? [y/N]"]
         );
     }
 
@@ -3154,7 +3181,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             questions,
-            vec!["Erase disk-0.udisk (8 GiB) and install Fedora? [y/N]"]
+            vec!["Erase disk-0.udisk (64 GiB) and install Fedora? [y/N]"]
         );
         assert_eq!(
             machines::load(home.path(), "m").unwrap().install,
