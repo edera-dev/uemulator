@@ -4,6 +4,7 @@ mod checkpoints;
 mod firmware;
 mod frontend;
 mod images;
+mod input;
 mod machines;
 mod netgw;
 mod quick;
