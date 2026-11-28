@@ -405,6 +405,10 @@ final class MachineStore: ObservableObject {
             case .install(let distro, let request):
                 definition.install = distro
                 definition.bootstrap = request?.record
+                // An unattended install stays on its installer until the completion marker
+                // (`settleBootstrap` then saves `auto`), as the CLI's does: `auto` would boot a
+                // disk the installer partitioned and then failed on.
+                if request != nil { definition.bootFrom = .installer }
                 // The installer talks on the terminal (the console stays there), and the screen is
                 // there for what the installed system draws. The demos stay terminal only.
                 definition.display = .both
