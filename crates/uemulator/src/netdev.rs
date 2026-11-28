@@ -3,7 +3,7 @@ use crate::prelude::*;
 use alloc::collections::VecDeque;
 use core::time::Duration;
 
-use crate::sync::{Arc, Condvar, Mutex};
+use crate::sync::{Arc, Condvar, Mutex, Weak};
 
 /// Frames queued per direction. The two directions differ on overflow: a full host-to-guest queue
 /// rejects the new frame (the sender can retry in order), a full guest-to-host queue drops the
@@ -58,8 +58,10 @@ struct NetState {
     /// too, so the twin's NIC sees the same frames. Copied when taken, not when the host sends
     /// them: the main CPU always services its devices before the twin in lockstep, so the copy
     /// is there by the time the twin's device looks, and a frame the main device has not taken
-    /// yet must not reach the twin early.
-    mirror: Option<NetHandle>,
+    /// yet must not reach the twin early. Weak: the twin goes away without telling this handle
+    /// (at once under `--verify` without generated code, else when the lockstep run ends), and
+    /// a dead link is dropped at the next frame instead of filling a queue nobody reads.
+    mirror: Option<Weak<(Mutex<NetState>, Condvar)>>,
 }
 
 /// Ethernet frames between the host and the virtio-net device, shared by clones. One lock covers
@@ -182,7 +184,11 @@ impl NetHandle {
         let (mut frame, mirror) = {
             let mut state = self.inner.0.lock().unwrap();
             let frame = state.to_guest.pop_front()?;
-            (frame, state.mirror.clone())
+            let mirror = state.mirror.as_ref().and_then(Weak::upgrade);
+            if mirror.is_none() {
+                state.mirror = None;
+            }
+            (frame, mirror.map(|inner| NetHandle { inner }))
         };
         if let Some(mirror) = mirror.filter(|_| !frame.mirrored) {
             mirror.queue_for_guest(HostFrame {
@@ -201,7 +207,7 @@ impl NetHandle {
     pub(crate) fn verify_twin(&self) -> NetHandle {
         let twin = NetHandle::default();
         twin.set_offloads(self.offloads());
-        self.inner.0.lock().unwrap().mirror = Some(twin.clone());
+        self.inner.0.lock().unwrap().mirror = Some(Arc::downgrade(&twin.inner));
         twin
     }
 
@@ -233,6 +239,18 @@ mod tests {
 
     fn id_of(frame: &[u8]) -> usize {
         ((frame[0] as usize) << 8) | frame[1] as usize
+    }
+
+    #[test]
+    fn a_verify_twin_that_is_gone_gets_no_more_copies() {
+        // `--verify` without generated code drops the twin at once, and a lockstep run drops it
+        // when it ends; the host's handle must not keep copying frames into a queue nobody reads.
+        let net = NetHandle::default();
+        let twin = net.verify_twin();
+        drop(twin);
+        net.send_frame(b"frame");
+        assert_eq!(net.guest_recv_bytes().as_deref(), Some(&b"frame"[..]));
+        assert!(net.inner.0.lock().unwrap().mirror.is_none());
     }
 
     mod host_to_guest {
