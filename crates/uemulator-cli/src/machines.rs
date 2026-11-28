@@ -477,13 +477,15 @@ pub fn prepare_boot(
     settings.remove_devices(remove)?;
     settings.add(hardware, linux, attach_only(&hardware.disk_steps)?);
     let nvram = (machine.firmware == Firmware::Uefi).then(|| machine.nvram_path());
+    // Every refusal that does not need the restored disk comes before the restore, which
+    // replaces the live disks: a resume that fails after it has thrown away their writes since
+    // the checkpoint for nothing. The run's own refusals (`run::refuse_runtime_conflicts`) the
+    // caller has made already; `run::build_config` opens the chain again for the resume itself.
+    let hypervisor = boot_hypervisor(machine, &linux.hypervisor, remove.remove_hypervisor)?;
     if let Some(checkpoint) = resume_from.filter(|path| checkpoints::is_checkpoint(path)) {
-        // The chain is checked first, as the run does: a resume that cannot happen must leave
-        // the disks as they are.
         checkpoints::sources(checkpoint)?;
         machine_files(&settings, nvram.as_deref()).restore_from(checkpoint)?;
     }
-    let hypervisor = boot_hypervisor(machine, &linux.hypervisor, remove.remove_hypervisor)?;
     let installed = match (
         boot_from.unwrap_or(machine.boot_from),
         settings.disks.first(),
