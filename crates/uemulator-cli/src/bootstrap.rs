@@ -572,8 +572,6 @@ impl MarkerWatch {
         state.tail = window.split_off(start);
     }
 
-    // Only the tests read it until the install run stops on the marker.
-    #[allow(dead_code)]
     pub fn seen(&self) -> bool {
         self.0
             .lock()
@@ -1198,6 +1196,28 @@ mod tests {
         watch.feed(&COMPLETION_MARKER.as_bytes()[..COMPLETION_MARKER.len() - 1]);
         watch.feed(b"\r\nsomething else\r\n");
         assert!(!watch.seen());
+    }
+
+    /// A false start that shares the marker's first bytes must not throw away the real marker
+    /// that follows it, wherever the chunks split.
+    #[test]
+    fn marker_after_a_repeated_prefix() {
+        let text = format!("uemulator-b{COMPLETION_MARKER}\r\n").into_bytes();
+        for split in 0..=text.len() {
+            let watch = MarkerWatch::default();
+            watch.feed(&text[..split]);
+            watch.feed(&text[split..]);
+            assert!(watch.seen(), "split at {split}");
+        }
+        for first in 0..=text.len() {
+            for second in first..=text.len() {
+                let watch = MarkerWatch::default();
+                watch.feed(&text[..first]);
+                watch.feed(&text[first..second]);
+                watch.feed(&text[second..]);
+                assert!(watch.seen(), "split at {first} and {second}");
+            }
+        }
     }
 
     #[test]

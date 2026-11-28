@@ -17,6 +17,7 @@ use std::io::{self, Cursor};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use uemulator_bootstrap::{Answers, append_to_initramfs, render};
 
 use crate::args::{
     BootSource, ConsoleArg, DiskSpec, DiskStep, DisplayArg, Firmware, HardwareArgs, HypervisorArgs,
@@ -127,6 +128,14 @@ impl Machine {
 
     pub fn hypervisor_path(&self) -> PathBuf {
         self.dir.join(HYPERVISOR_FILE)
+    }
+
+    /// Saves the new choice right away: `quick bootstrap` sets `auto` once the install has
+    /// finished, before it boots the disk, so a disk boot that is stopped still left the machine
+    /// pointing at its install.
+    pub fn set_boot_from(&mut self, boot_from: BootSource) -> Result<(), String> {
+        self.boot_from = boot_from;
+        self.save()
     }
 
     fn save(&self) -> Result<(), String> {
@@ -559,6 +568,39 @@ pub fn prepare_boot(
         },
         settings: with_distro_defaults(settings, machine.install),
     })
+}
+
+/// The installer boot of `quick bootstrap`: `prepare_boot`'s installer with the rendered answer
+/// files appended to its initramfs and their kernel arguments after the distro's and the user's.
+/// The appended initramfs (which holds the password hashes) lives only in memory.
+///
+/// The library's reboot restarts in place with the same kernel and initramfs, which would run the
+/// installer again: the run is ended at the reset instead, and `main` boots the disk itself once
+/// the install has printed its completion marker.
+pub fn bootstrap_launch(
+    machine: &Machine,
+    answers: &Answers,
+    fetch: impl FnMut(&str, &Path) -> Result<(), String>,
+) -> Result<Launch, String> {
+    let payload = render(machine.install.into(), answers)?;
+    let mut launch = prepare_boot(
+        machine,
+        &HardwareArgs::default(),
+        &LinuxArgs::default(),
+        &RemoveArgs::default(),
+        Some(BootSource::Installer),
+        None,
+        fetch,
+    )?;
+    let base = launch.initramfs.take().unwrap_or_default();
+    launch.initramfs = Some(append_to_initramfs(&base, &payload.files));
+    let settings = &mut launch.settings;
+    settings.append = Some(match settings.append.take() {
+        Some(before) => format!("{before} {}", payload.cmdline),
+        None => payload.cmdline,
+    });
+    settings.no_reboot = true;
+    Ok(launch)
 }
 
 /// Fetches what is missing, for a machine that is not about to boot.
@@ -2109,6 +2151,174 @@ mod tests {
         let loaded = load(home.path(), "m").unwrap();
         assert_eq!(loaded.bootstrap, None);
         assert_eq!(loaded.settings.memory, Some(1024));
+    }
+
+    fn bootstrap_answers() -> Answers {
+        Answers {
+            user: "alex".into(),
+            password_hash: "$6$testsalt$fakeuserhash".into(),
+            root_password_hash: None,
+            hostname: "box".into(),
+            ssh_keys: Vec::new(),
+            timezone: "UTC".into(),
+            locale: "en_US.UTF-8".into(),
+            keymap: "us".into(),
+            packages: Vec::new(),
+        }
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    #[test]
+    fn bootstrap_launch_appends_payload_and_disables_reboot() {
+        let home = TempDir::new("machines-bootstrap-launch");
+        let (hardware, linux) = create_args(&["--append", "quiet"]);
+        let machine = create(
+            home.path(),
+            "m",
+            Distro::Debian,
+            &hardware,
+            &linux,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let fetcher = FakeFetcher::new();
+        let launch =
+            bootstrap_launch(&machine, &bootstrap_answers(), |u, d| fetcher.fetch(u, d)).unwrap();
+        assert_eq!(launch.source, BootSource::Installer);
+        let artifact = Distro::Debian.source_urls().1;
+        let initramfs = launch.initramfs.unwrap();
+        assert!(initramfs.starts_with(artifact.as_bytes()));
+        assert!(contains(&initramfs, b"preseed.cfg"));
+        assert_eq!(
+            launch.settings.append.as_deref(),
+            Some("quiet auto=true priority=critical")
+        );
+        assert!(launch.settings.no_reboot);
+        // Nothing of the answers reaches the saved machine or its artifacts.
+        let saved = load(home.path(), "m").unwrap();
+        assert!(!saved.settings.no_reboot);
+        assert_eq!(saved.settings.append.as_deref(), Some("quiet"));
+        for entry in fs::read_dir(machine.artifacts_dir()).unwrap() {
+            let bytes = fs::read(entry.unwrap().path()).unwrap();
+            assert!(!contains(&bytes, b"preseed.cfg"));
+        }
+    }
+
+    #[test]
+    fn bootstrap_launch_puts_the_payload_after_the_distro_arguments() {
+        let home = TempDir::new("machines-bootstrap-alpine");
+        let machine = create_machine(home.path(), &["--append", "quiet"]);
+        let fetcher = FakeFetcher::new();
+        let launch =
+            bootstrap_launch(&machine, &bootstrap_answers(), |u, d| fetcher.fetch(u, d)).unwrap();
+        assert_eq!(
+            launch.settings.append,
+            Some(format!(
+                "{} quiet apkovl=/bootstrap.apkovl.tar.gz",
+                Distro::Alpine.cmdline()
+            ))
+        );
+    }
+
+    #[test]
+    fn bootstrap_launch_refuses_invalid_answers() {
+        let home = TempDir::new("machines-bootstrap-invalid");
+        let machine = create_machine(home.path(), &[]);
+        let mut answers = bootstrap_answers();
+        answers.user = "Not A User".into();
+        let fetcher = FakeFetcher::new();
+        assert!(bootstrap_launch(&machine, &answers, |u, d| fetcher.fetch(u, d)).is_err());
+    }
+
+    #[test]
+    fn bootstrap_create_saves_record_without_secrets() {
+        let home = TempDir::new("machines-bootstrap-secrets");
+        const PASSWORD: &str = "hunter2-user";
+        const ROOT_PASSWORD: &str = "hunter2-root";
+        let mut argv = vec![
+            "uemulator",
+            "quick",
+            "bootstrap",
+            "m",
+            "--install",
+            "debian",
+        ];
+        argv.extend_from_slice(&[
+            "--user",
+            "alex",
+            "--password",
+            PASSWORD,
+            "--root-password",
+            ROOT_PASSWORD,
+        ]);
+        let (hardware, linux, bootstrap_args) = match parse_cli(argv).unwrap().cmd {
+            Cmd::Quick {
+                cmd:
+                    QuickCmd::Bootstrap {
+                        hardware,
+                        linux,
+                        bootstrap,
+                        ..
+                    },
+            } => (hardware, linux, bootstrap),
+            _ => unreachable!(),
+        };
+        let (answers, record) =
+            crate::bootstrap::resolve_answers(&bootstrap_args, None, "m", false, |_| {
+                unreachable!("no prompt with --password")
+            })
+            .unwrap();
+        let machine = create(
+            home.path(),
+            "m",
+            Distro::Debian,
+            &hardware,
+            &linux,
+            None,
+            None,
+            Some(record.clone()),
+        )
+        .unwrap();
+        let fetcher = FakeFetcher::new();
+        bootstrap_launch(&machine, &answers, |u, d| fetcher.fetch(u, d)).unwrap();
+        let mut machine = load(home.path(), "m").unwrap();
+        machine.set_boot_from(BootSource::Auto).unwrap();
+        assert_eq!(load(home.path(), "m").unwrap().boot_from, BootSource::Auto);
+        let mut written = Vec::new();
+        let mut directories = vec![machine.dir.clone()];
+        while let Some(dir) = directories.pop() {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    directories.push(path);
+                } else {
+                    written.push(path);
+                }
+            }
+        }
+        for path in written {
+            let bytes = fs::read(&path).unwrap();
+            for secret in [
+                PASSWORD,
+                ROOT_PASSWORD,
+                "$6$",
+                answers.password_hash.as_str(),
+            ] {
+                assert!(
+                    !contains(&bytes, secret.as_bytes()),
+                    "{} holds {secret:?}",
+                    path.display()
+                );
+            }
+        }
+        assert_eq!(load(home.path(), "m").unwrap().bootstrap, Some(record));
     }
 
     #[test]

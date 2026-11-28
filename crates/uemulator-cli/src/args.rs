@@ -448,8 +448,9 @@ pub struct RuntimeArgs {
     /// copy them a second time.
     #[arg(skip)]
     pub checkpoint_files_restored: bool,
-    /// Set by `quick` for a bootstrapped install: the console sink feeds it, and the run ends
-    /// when the installer's completion marker shows up.
+    /// Set by `quick bootstrap` for its installer run: the console sink feeds it, and it records
+    /// whether the installer's completion marker showed up. The run goes on regardless; the run
+    /// loop reads it after the reset to choose between booting the disk and an error.
     #[arg(skip)]
     pub marker_watch: Option<crate::bootstrap::MarkerWatch>,
     /// Take checkpoints of the running machine into DIR: Ctrl-] then c takes one (Ctrl-] then any

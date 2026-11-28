@@ -353,14 +353,19 @@ fn settings_of(hardware: &HardwareArgs, linux: &LinuxArgs) -> Result<Settings, S
     Ok(settings)
 }
 
+fn refuse_uefi_args(uefi: &UefiBootArgs, firmware: args::Firmware) -> Result<(), String> {
+    if uefi.any() && firmware != args::Firmware::Uefi {
+        return Err("--boot-menu and --boot-timeout need a machine with --firmware uefi".into());
+    }
+    Ok(())
+}
+
 fn boot_launch(
     launch: machines::Launch,
     uefi: &UefiBootArgs,
     runtime: &RuntimeArgs,
 ) -> Result<ExitReason, String> {
-    if uefi.any() && launch.firmware != args::Firmware::Uefi {
-        return Err("--boot-menu and --boot-timeout need a machine with --firmware uefi".into());
-    }
+    refuse_uefi_args(uefi, launch.firmware)?;
     let nvram_setup = firmware::NvramSetup {
         boot_entry: None,
         boot_menu: uefi.boot_menu,
@@ -414,6 +419,72 @@ fn boot_launch(
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum AfterInstaller {
+    /// The install finished and the guest rebooted: boot the disk it wrote.
+    BootDisk,
+    /// The guest reset before the install said it had finished.
+    Failed,
+    /// The run is over: the host stopped or suspended it (Ctrl-], `--timeout`), or the guest
+    /// powered off or failed. The machine stays on its installer.
+    Done,
+}
+
+/// What `quick bootstrap` does once its installer run has ended. The answer files print the
+/// marker and then reboot, and the run has `no_reboot` set, so only a reset is the install's own
+/// end; any other reason is reported as `quick boot` would, marker or not.
+fn after_installer(reason: &ExitReason, marker_seen: bool) -> AfterInstaller {
+    match reason {
+        ExitReason::Reset if marker_seen => AfterInstaller::BootDisk,
+        ExitReason::Reset => AfterInstaller::Failed,
+        _ => AfterInstaller::Done,
+    }
+}
+
+/// Installs `machine` unattended with `answers`, then boots the installed disk
+/// (`docs/plans/35-quick-bootstrap.md`, "After the install"). The disk boot is `quick boot`'s:
+/// the user's own reboot setting, `uefi`'s boot menu and timeout, and no marker watch.
+fn run_bootstrap(
+    machine: &mut machines::Machine,
+    answers: &uemulator_bootstrap::Answers,
+    uefi: &UefiBootArgs,
+    runtime: &mut RuntimeArgs,
+) -> Result<ExitReason, String> {
+    // Before the install, which takes a while, rather than at the disk boot after it.
+    refuse_uefi_args(uefi, machine.firmware)?;
+    let launch = machines::bootstrap_launch(machine, answers, quick::download)?;
+    let watch = bootstrap::MarkerWatch::default();
+    runtime.marker_watch = Some(watch.clone());
+    // `--boot-menu` is refused for an installer boot; it is for the disk boot that follows.
+    let installed = boot_launch(launch, &UefiBootArgs::default(), runtime);
+    runtime.marker_watch = None;
+    let reason = installed?;
+    let name = machine.name.clone();
+    match after_installer(&reason, watch.seen()) {
+        AfterInstaller::Done => Ok(reason),
+        AfterInstaller::Failed => Err(format!(
+            "the installer of {name} reset before it finished: run `uemulator quick reinstall \
+             {name}` to try again"
+        )),
+        AfterInstaller::BootDisk => {
+            // Saved before the disk boot starts: stopping that boot must not leave the machine
+            // to run its installer again on the next `quick boot`.
+            machine.set_boot_from(args::BootSource::Auto)?;
+            eprintln!("installed; booting {name} from its disk");
+            let launch = machines::prepare_boot(
+                machine,
+                &HardwareArgs::default(),
+                &LinuxArgs::default(),
+                &RemoveArgs::default(),
+                None,
+                None,
+                quick::download,
+            )?;
+            boot_launch(launch, uefi, runtime)
+        }
+    }
+}
+
 /// `None` is a command that did not run a machine.
 fn quick_command(cmd: QuickCmd) -> Result<Option<ExitReason>, String> {
     let home = machines::home()?;
@@ -464,20 +535,27 @@ fn quick_command(cmd: QuickCmd) -> Result<Option<ExitReason>, String> {
             linux,
             firmware,
             bootstrap: bootstrap_args,
-            uefi: _,
-            runtime: _,
+            uefi,
+            mut runtime,
         } => {
             bootstrap::refuse_unbootable(firmware.firmware, &linux.hypervisor)?;
+            run::refuse_runtime_conflicts(&runtime)?;
+            if runtime.resume_from.is_some() {
+                return Err(format!(
+                    "--resume-from: bootstrap makes a new machine; resume one with `uemulator \
+                     quick boot {name} --resume-from FILE`"
+                ));
+            }
             // Before the machine exists, so a mistyped password or a missing key file leaves
             // nothing behind.
-            let (_answers, record) = bootstrap::resolve_answers(
+            let (answers, record) = bootstrap::resolve_answers(
                 &bootstrap_args,
                 None,
                 &name,
                 std::io::stdin().is_terminal(),
                 bootstrap::read_secret_from_terminal,
             )?;
-            let machine = machines::create(
+            let mut machine = machines::create(
                 &home,
                 &name,
                 install,
@@ -487,10 +565,13 @@ fn quick_command(cmd: QuickCmd) -> Result<Option<ExitReason>, String> {
                 firmware.firmware,
                 Some(record),
             )?;
+            machines::fetch_artifacts(&machine, quick::download).map_err(|e| {
+                format!(
+                    "{e}\nmachine {name} was created; `quick reinstall {name}` retries the download"
+                )
+            })?;
             eprint!("{}", machines::describe(&machine));
-            // Task 6's run loop takes over here: it boots the installer with the answers and
-            // then the installed disk.
-            Ok(None)
+            run_bootstrap(&mut machine, &answers, &uefi, &mut runtime).map(Some)
         }
         QuickCmd::Edit {
             name,
@@ -1266,6 +1347,62 @@ mod tests {
         assert!(
             bootstrap_parse(&["--user", "alex", "--ask-password", "--ask-root-password"]).is_ok()
         );
+    }
+
+    #[test]
+    fn after_installer_boots_the_disk_only_after_a_finished_install() {
+        assert_eq!(
+            after_installer(&ExitReason::Reset, true),
+            AfterInstaller::BootDisk
+        );
+        assert_eq!(
+            after_installer(&ExitReason::Reset, false),
+            AfterInstaller::Failed
+        );
+        // Ctrl-], --timeout and --suspend-to end the run as they would any other, marker or
+        // not: the machine stays on its installer.
+        let others = [
+            ExitReason::Shutdown,
+            ExitReason::Stopped,
+            ExitReason::Suspended,
+            ExitReason::SuspendFailed("x".into()),
+            ExitReason::ResumeFailed("x".into()),
+            ExitReason::TripleFault,
+            ExitReason::Internal("x".into()),
+        ];
+        for reason in &others {
+            for marker_seen in [false, true] {
+                assert_eq!(
+                    after_installer(reason, marker_seen),
+                    AfterInstaller::Done,
+                    "{reason:?} marker {marker_seen}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bootstrap_refuses_firmware_none_hypervisor_and_resume_before_creating() {
+        let home = crate::test_support::TempDir::new("main-bootstrap-refused");
+        let home_text = home.path().to_str().unwrap().to_string();
+        let _env = crate::test_support::EnvGuard::set(&[("UEMULATOR_HOME", Some(&home_text))]);
+        for extra in [
+            &["--firmware", "none"][..],
+            &["--hypervisor", "xen.gz"][..],
+            &["--resume-from", "old.snapshot"][..],
+        ] {
+            let mut args = vec!["--user", "alex", "--password", "pw"];
+            args.extend_from_slice(extra);
+            let error = match execute(bootstrap_parse(&args).unwrap()) {
+                Err(error) => error,
+                Ok(_) => panic!("{extra:?} was not refused"),
+            };
+            assert!(error.starts_with(extra[0]), "{error}");
+            assert!(
+                !home.path().join("machines/m").exists(),
+                "{extra:?} left a machine behind"
+            );
+        }
     }
 
     #[test]
