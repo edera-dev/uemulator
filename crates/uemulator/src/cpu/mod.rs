@@ -89,8 +89,8 @@ pub(crate) use sse::{
         sha1_four_rounds, sha1_message_1, sha1_message_2, sha1_next_e, sha256_message_1,
         sha256_message_2, sha256_two_rounds,
     },
-    ext::{palignr, pshufb},
-    shuffle_dwords,
+    ext::{palignr, pblendw, pshufb},
+    integer_op, shuffle_dwords, shuffle_high_words, shuffle_low_words,
 };
 #[cfg(all(
     feature = "jit",
@@ -1780,7 +1780,12 @@ impl Cpu {
             let mut counts: Vec<_> = histogram.iter().collect();
             counts.sort_by_key(|&(_, count)| core::cmp::Reverse(*count));
             let total: u64 = counts.iter().map(|&(_, count)| *count).sum();
-            s += &format!("instructions through the interpreter: {total}\n");
+            // icount includes the instructions run while the block cache was cold (those never
+            // reach helper_exec), so this is the share of the JIT's fallbacks in everything run.
+            let per_million = total.saturating_mul(1_000_000) / self.icount.max(1);
+            s += &format!(
+                "instructions through the interpreter: {total} ({per_million} per million retired)\n"
+            );
             for (key, count) in counts.into_iter().take(HISTOGRAM_DUMP_ENTRIES) {
                 s += &format!("  {count:>12}  {}\n", decode::histogram_label(*key));
             }

@@ -77,6 +77,8 @@ const IMMS_SHIFT: u32 = 10;
 const BITMASK_IMM_SHIFT: u32 = 10;
 /// Load/store pair: second register and the signed 7-bit offset, scaled by 8.
 const RT2_SHIFT: u32 = 10;
+/// The addend of `madd`/`msub`, in the same field as `RT2_SHIFT`.
+const RA_SHIFT: u32 = 10;
 const IMM7_SHIFT: u32 = 15;
 const IMM7_MASK: u32 = 0x7f;
 const PAIR_OFFSET_SCALE: i32 = 8;
@@ -582,6 +584,27 @@ impl Asm {
         let sf = if is64 { SF } else { 0 };
         self.put(sf | 0x5ac0_0000 | rn << RN_SHIFT | rd, Writes::Gp(rd));
     }
+    /// Byte-reverses the 32- or 64-bit operand (a 32-bit `rev` zero-extends).
+    pub fn rev(&mut self, rd: u32, rn: u32, is64: bool) {
+        let word = if is64 { 0xdac0_0c00 } else { 0x5ac0_0800 };
+        self.put(word | rn << RN_SHIFT | rd, Writes::Gp(rd));
+    }
+    /// Unsigned and signed division, rounding toward zero; a zero divisor gives 0 and
+    /// `MIN / -1` gives `MIN`, without a trap.
+    pub fn udiv(&mut self, rd: u32, rn: u32, rm: u32, is64: bool) {
+        self.reg3(0x1ac0_0800, rd, rn, rm, is64);
+    }
+    pub fn sdiv(&mut self, rd: u32, rn: u32, rm: u32, is64: bool) {
+        self.reg3(0x1ac0_0c00, rd, rn, rm, is64);
+    }
+    /// `rd = ra - rn * rm`.
+    pub fn msub(&mut self, rd: u32, rn: u32, rm: u32, ra: u32, is64: bool) {
+        let sf = if is64 { SF } else { 0 };
+        self.put(
+            sf | 0x1b00_8000 | rm << RM_SHIFT | ra << RA_SHIFT | rn << RN_SHIFT | rd,
+            Writes::Gp(rd),
+        );
+    }
     pub fn mul(&mut self, rd: u32, rn: u32, rm: u32, is64: bool) {
         self.reg3(0x1b00_7c00, rd, rn, rm, is64);
     }
@@ -838,6 +861,56 @@ impl Asm {
         self.put(base | rn << RN_SHIFT | rt, Writes::Gp(rt));
     }
 
+    /// Load-acquire exclusive of `size` bytes from `[rn]`, zero-extended (`ldaxrb`/`ldaxrh`/
+    /// `ldaxr`): opens the exclusive monitor for a `stlxr` to the same address. Naturally aligned
+    /// addresses only. Any size other than 1, 2 or 4 loads 8.
+    pub fn ldaxr(&mut self, rt: u32, rn: u32, size: u8) {
+        let base = match size {
+            1 => 0x085f_fc00,
+            2 => 0x485f_fc00,
+            4 => 0x885f_fc00,
+            _ => 0xc85f_fc00,
+        };
+        self.put(base | rn << RN_SHIFT | rt, Writes::Gp(rt));
+    }
+
+    /// Store-release exclusive of the low `size` bytes of `rt` to `[rn]`; `status` becomes 0 if
+    /// the store happened and 1 if the monitor was lost (another agent wrote the location).
+    pub fn stlxr(&mut self, status: u32, rt: u32, rn: u32, size: u8) {
+        let base = match size {
+            1 => 0x0800_fc00,
+            2 => 0x4800_fc00,
+            4 => 0x8800_fc00,
+            _ => 0xc800_fc00,
+        };
+        self.put(
+            base | status << RM_SHIFT | rn << RN_SHIFT | rt,
+            Writes::Gp(status),
+        );
+    }
+
+    /// Load-acquire exclusive pair: 16 bytes from `[rn]` (16-byte aligned) into `rt` (low) and
+    /// `rt2`, opening the monitor for `stlxp`.
+    pub fn ldaxp(&mut self, rt: u32, rt2: u32, rn: u32) {
+        self.put(
+            0xc87f_8000 | rt2 << RT2_SHIFT | rn << RN_SHIFT | rt,
+            Writes::GpPair(rt, rt2),
+        );
+    }
+
+    /// Store-release exclusive pair of `rt` (low) and `rt2` to `[rn]`; `status` as for `stlxr`.
+    pub fn stlxp(&mut self, status: u32, rt: u32, rt2: u32, rn: u32) {
+        self.put(
+            0xc820_8000 | status << RM_SHIFT | rt2 << RT2_SHIFT | rn << RN_SHIFT | rt,
+            Writes::Gp(status),
+        );
+    }
+
+    /// `clrex`: drops an open exclusive monitor (a compare-exchange that found another value).
+    pub fn clrex(&mut self) {
+        self.put(0xd503_3f5f, Writes::Nothing);
+    }
+
     /// Store-release of the low `size` bytes of `rt` to `[rn]`; the counterpart of `ldar`.
     pub fn stlr(&mut self, rt: u32, rn: u32, size: u8) {
         let base = match size {
@@ -1047,6 +1120,12 @@ impl Asm {
     pub fn dmb_ishld(&mut self) {
         self.put(0xd503_39bf, Writes::Nothing);
     }
+
+    /// `dmb ish`: every access before it completes before any after it. This plus a plain pair
+    /// or vector store is a release, at any alignment (`stlr` needs a natural one).
+    pub fn dmb_ish(&mut self) {
+        self.put(0xd503_3bbf, Writes::Nothing);
+    }
 }
 
 #[cfg(all(test, target_arch = "aarch64"))]
@@ -1064,6 +1143,55 @@ mod tests {
         m.write(0, &a.code);
         let fun: extern "C" fn(u64, u64) -> u64 = unsafe { std::mem::transmute(m.base() as usize) };
         fun(a0, a1)
+    }
+
+    /// The words clang produces for the division, byte-reverse and exclusive-access encodings.
+    #[test]
+    fn division_reverse_and_exclusives_encode_like_the_assembler() {
+        let mut a = Asm::new(0);
+        a.rev(0, 1, true);
+        a.rev(2, 3, false);
+        a.udiv(4, 5, 6, true);
+        a.udiv(4, 5, 6, false);
+        a.sdiv(7, 8, 9, true);
+        a.msub(1, 2, 3, 4, true);
+        a.msub(1, 2, 3, 4, false);
+        a.ldaxr(0, 1, 8);
+        a.ldaxr(0, 1, 4);
+        a.ldaxr(2, 3, 2);
+        a.ldaxr(2, 3, 1);
+        a.stlxr(5, 0, 1, 8);
+        a.stlxr(5, 0, 1, 4);
+        a.stlxr(6, 2, 3, 2);
+        a.stlxr(6, 2, 3, 1);
+        a.clrex();
+        a.dmb_ish();
+        a.ldaxp(2, 3, 4);
+        a.stlxp(7, 11, 9, 4);
+        assert_eq!(
+            a.code,
+            [
+                0xdac0_0c20,
+                0x5ac0_0862,
+                0x9ac6_08a4,
+                0x1ac6_08a4,
+                0x9ac9_0d07,
+                0x9b03_9041,
+                0x1b03_9041,
+                0xc85f_fc20,
+                0x885f_fc20,
+                0x485f_fc62,
+                0x085f_fc62,
+                0xc805_fc20,
+                0x8805_fc20,
+                0x4806_fc62,
+                0x0806_fc62,
+                0xd503_3f5f,
+                0xd503_3bbf,
+                0xc87f_8c82,
+                0xc827_a48b,
+            ]
+        );
     }
 
     /// The words clang produces for the same instructions.

@@ -157,6 +157,12 @@ pub(crate) fn prologue(base: u64) -> Prologue {
             &mut asm,
             helpers::helper_whole_vector as *const () as usize as u64,
         ),
+        materialize_flags: helper_stub(
+            &mut asm,
+            helpers::helper_materialize_flags as *const () as usize as u64,
+        ),
+        rdtsc: helper_stub(&mut asm, helpers::helper_rdtsc as *const () as usize as u64),
+        pause: helper_stub(&mut asm, helpers::helper_pause as *const () as usize as u64),
         exit_ok,
         exit_fail,
         chain,

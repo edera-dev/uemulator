@@ -52,7 +52,7 @@ use super::helpers::*;
 use super::native::{LinkSite, ResolveTarget};
 use crate::cpu::cet::Cet;
 use crate::cpu::decode::{Insn, NO_REG, VEX_OP_FLAG};
-use crate::cpu::flags::{AC, CF, IF, LazyFlagsOp, SZP_CF_OF_SRC_CF_BIT};
+use crate::cpu::flags::{AC, ARITH, CF, DF, IF, LazyFlagsOp, OF, SZP_CF_OF_SRC_CF_BIT, ZF};
 use crate::cpu::xsave::{XCR0_AVX, XCR0_AVX512, XCR0_SSE};
 use crate::cpu::{CR0_EM, CR0_TS, CR4_OSFXSR, CR4_OSXSAVE};
 use crate::cpu::{Cpu, SEG_FS, SEG_GS, Seg, TLB_ENTRIES_PER_MODE, TLB_TAG_SHADOW_STACK, TlbEntry};
@@ -80,6 +80,8 @@ const CR0_OFFSET: u32 = offset_of!(Cpu, cr0) as u32;
 const CR4_OFFSET: u32 = offset_of!(Cpu, cr4) as u32;
 const XMM_OFFSET: u32 = offset_of!(Cpu, xmm) as u32;
 const OPMASK_OFFSET: u32 = offset_of!(Cpu, opmask) as u32;
+const YMM_HI_OFFSET: u32 = offset_of!(Cpu, ymm_hi) as u32;
+const ZMM_HI_OFFSET: u32 = offset_of!(Cpu, zmm_hi) as u32;
 const OPMASK_SIZE: u32 = size_of::<u64>() as u32;
 /// An opmask register number is the low three bits of its ModRM field.
 const OPMASK_REGISTER_MASK: u8 = 7;
@@ -118,9 +120,17 @@ const VECTOR_TEMPORARY: u32 = 2;
 const RCX_INDEX: u8 = 1;
 const SEG_BASE_OFFSET: u32 = (offset_of!(Cpu, seg) + offset_of!(Seg, base)) as u32;
 const SEG_STRIDE: u32 = size_of::<Seg>() as u32;
+const SEG_SELECTOR_OFFSET: u32 = (offset_of!(Cpu, seg) + offset_of!(Seg, sel)) as u32;
 const GS_BASE_OFFSET: u32 = SEG_BASE_OFFSET + SEG_STRIDE * SEG_GS as u32;
 const KGSBASE_OFFSET: u32 = offset_of!(Cpu, kgsbase) as u32;
 const CPL_OFFSET: u32 = offset_of!(Cpu, cpl) as u32;
+const INTERRUPT_SHADOW_OFFSET: u32 = offset_of!(Cpu, interrupt_shadow) as u32;
+const MULTI_OFFSET: u32 = offset_of!(Cpu, multi) as u32;
+const PKRU_OFFSET: u32 = offset_of!(Cpu, pkru) as u32;
+const TSC_AUX_OFFSET: u32 = offset_of!(Cpu, tsc_aux) as u32;
+/// `Svm::guest`, an `Option<Box<_>>`: zero exactly when no SVM guest runs, whose host could
+/// intercept pause, rdtsc and pushf.
+const SVM_GUEST_OFFSET: u32 = offset_of!(Cpu, svm.guest) as u32;
 const SHADOW_STACK_ON_OFFSET: u32 = offset_of!(Cpu, shadow_stack_on) as u32;
 const SSP_OFFSET: u32 = (offset_of!(Cpu, cet) + offset_of!(Cet, ssp)) as u32;
 // `ldrb` reaches 4 KiB, a scaled 64-bit `ldr`/`str` 32 KiB.
@@ -195,6 +205,8 @@ pub(super) const CALL_TARGET: u32 = 16;
 const RAX: u8 = 0;
 const RDX: u8 = 2;
 const RSP: u8 = 4;
+const RBP: u8 = 5;
+const RBX: u8 = 3;
 /// Without a REX prefix, byte-register numbers 4..=7 mean ah/ch/dh/bh (bits 15:8 of registers
 /// 0..=3); with one they mean spl/bpl/sil/dil.
 const FIRST_HIGH_BYTE_REG: u8 = 4;
@@ -228,6 +240,39 @@ const VEX_BMI_SHIFT_OR_BEXTR: u16 = VEX_OP_FLAG | 0x2f7;
 const VEX_BMI_BZHI_PEXT_PDEP: u16 = VEX_OP_FLAG | 0x2f5;
 const VEX_BMI_ANDN: u16 = VEX_OP_FLAG | 0x2f2;
 const VEX_BMI_GROUP17: u16 = VEX_OP_FLAG | 0x2f3;
+/// mulx (VEX F2 0f38 f6); without VEX the same opcode is adcx (66) and adox (F3).
+const VEX_BMI_MULX: u16 = VEX_OP_FLAG | 0x2f6;
+const ADCX_ADOX: u16 = 0x2f6;
+/// `Insn::rep` for an F3 and an F2 prefix (also the mandatory prefixes of SSE and VEX forms).
+const PREFIX_F3: u8 = 1;
+/// The widest access `ldar`/`stlr` make, so the widest that must be aligned with
+/// `Gen::ordered_memory`.
+const MAX_ORDERED_ACCESS_BYTES: u8 = 8;
+const PREFIX_F2: u8 = 2;
+/// movd/movq xmm, r/m (66 0f 6e) and r/m, xmm (66 0f 7e).
+const MOVD_TO_VECTOR: u16 = 0x16e;
+const MOVD_FROM_VECTOR: u16 = 0x17e;
+/// bt/bts/btr/btc r/m, r (0f a3, ab, b3, bb) and group 8 (0f ba /4../7) with an imm8 offset.
+const BIT_TEST_REGISTER_OFFSET: [u16; 4] = [0x1a3, 0x1ab, 0x1b3, 0x1bb];
+const BIT_TEST_IMMEDIATE: u16 = 0x1ba;
+/// Group 8's /4 is bt; /5, /6 and /7 are bts, btr and btc (/0../3 are #UD).
+const GROUP8_FIRST_BIT_OP: u8 = 4;
+/// Group 3 /6 and /7: div and idiv.
+const GROUP3_DIV: u8 = 6;
+const GROUP3_IDIV: u8 = 7;
+/// VEX 0f 98 kortest and 0f 99 ktest (the opmask register tests).
+const KORTEST: u16 = VEX_OP_FLAG | 0x198;
+const KTEST: u16 = VEX_OP_FLAG | 0x199;
+/// VEX 0f 77: vzeroupper (VEX.L 0) and vzeroall (VEX.L 1).
+const VZERO: u16 = VEX_OP_FLAG | 0x177;
+/// CR4.TSD: rdtsc above CPL 0 raises #GP.
+const CR4_TSD: u64 = 1 << 2;
+/// CR4.PKE: rdpkru and wrpkru exist.
+const CR4_PKE: u64 = 1 << 22;
+/// EFLAGS.IOPL (bits 13:12) and the flags pushf leaves out of its image.
+const IOPL_SHIFT: u32 = 12;
+const IOPL_BITS: u32 = 2;
+const PUSHF_CLEARED: u64 = crate::cpu::flags::RF | crate::cpu::flags::VM;
 const BMI_GROUP_BLSR: u8 = 1;
 const BMI_GROUP_BLSMSK: u8 = 2;
 const BMI_GROUP_BLSI: u8 = 3;
@@ -318,6 +363,20 @@ enum Src {
     Reg(u8, bool),
     Mem,
     Imm(u64),
+}
+
+/// The read-modify-write of a memory operand that `Gen::memory_rmw` makes atomic.
+#[derive(Clone, Copy)]
+enum RmwOp {
+    /// add, or, and, sub or xor (`ALU_*`) with a register or immediate operand
+    Alu(u8, Src),
+    Inc,
+    Dec,
+    Xadd,
+    Xchg,
+    Cmpxchg,
+    /// bts, btr or btc (1, 2, 3) with an immediate bit offset (masked to the width)
+    BitTest(u8, u32),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -464,6 +523,11 @@ pub(crate) struct Addrs {
     pub rotate_flags: Stub,
     /// The same for `helper_whole_vector(cpu, packed, source low, source high)`.
     pub whole_vector: Stub,
+    /// The same for `helper_materialize_flags(cpu)`.
+    pub materialize_flags: Stub,
+    /// The same for `helper_rdtsc(cpu)` and `helper_pause(cpu)`.
+    pub rdtsc: Stub,
+    pub pause: Stub,
     pub exit_ok: u64,
     pub exit_fail: u64,
     /// The block-to-block transfer stub (see `arch_a64::chain_stub`), or 0 when chaining is off
@@ -748,6 +812,26 @@ impl<'a> Gen<'a> {
         // Address of the decoded instruction, baked into the code: `Jit::translate` keeps the
         // owning slice alive in the `Block` for as long as this code can run.
         let insn = &self.insns[index] as *const Insn as u64;
+        self.prepay(index);
+        // helper_exec_pair(cpu, [insn, rip]) -> status
+        let pair = self.asm.literal_pair(insn, rip);
+        self.asm.mov(0, CPU);
+        self.asm.adr(1, pair);
+        self.call(self.addrs.exec);
+        let ok = self.asm.label();
+        self.asm.cbz(0, ok, true);
+        self.fail_exit(index as u32);
+        self.asm.bind(ok);
+        if terminal {
+            self.exit_ok(index as u32 + 1);
+        }
+        // The interpreter wrote its own flag state and the call clobbered host NZCV.
+        self.live = None;
+    }
+
+    /// Adds the instructions before `index` to `Cpu::icount` ahead of something that reads the
+    /// clock in the middle of the block (an interpreter helper, rdtsc).
+    fn prepay(&mut self, index: usize) {
         if index as u32 > self.prepaid_insns {
             // `Cpu::icount` is only advanced when the block exits, but the interpreter may read
             // the clock now (rdtsc, port I/O, a load from a device such as the HPET counter, which
@@ -764,20 +848,6 @@ impl<'a> Gen<'a> {
             self.asm.str(SCRATCH_B, CPU, PREPAID_ICOUNT_OFFSET);
             self.prepaid_insns = index as u32;
         }
-        // helper_exec_pair(cpu, [insn, rip]) -> status
-        let pair = self.asm.literal_pair(insn, rip);
-        self.asm.mov(0, CPU);
-        self.asm.adr(1, pair);
-        self.call(self.addrs.exec);
-        let ok = self.asm.label();
-        self.asm.cbz(0, ok, true);
-        self.fail_exit(index as u32);
-        self.asm.bind(ok);
-        if terminal {
-            self.exit_ok(index as u32 + 1);
-        }
-        // The interpreter wrote its own flag state and the call clobbered host NZCV.
-        self.live = None;
     }
 
     /// Computes the guest linear address of the memory operand into `dest` (the effective
@@ -853,6 +923,14 @@ impl<'a> Gen<'a> {
         self.tlb_probe_tagged(size, tag_offset, slow, 0);
     }
 
+    /// `tlb_probe` for an access that will not use `ldar`/`stlr`, which may then have any
+    /// alignment with `ordered_memory` too (see `partial_move`).
+    fn tlb_probe_any_alignment(&mut self, size: u8, tag_offset: u32, slow: Label) {
+        let ordered = std::mem::replace(&mut self.ordered_memory, false);
+        self.tlb_probe_tagged(size, tag_offset, slow, 0);
+        self.ordered_memory = ordered;
+    }
+
     /// `tlb_probe` for a tag that is the page plus `tag_bits` (`TLB_TAG_SHADOW_STACK`).
     fn tlb_probe_tagged(&mut self, size: u8, tag_offset: u32, slow: Label, tag_bits: u64) {
         let entry = SCRATCH_A;
@@ -874,9 +952,12 @@ impl<'a> Gen<'a> {
         }
         self.asm.eor(page, tag, page, true);
         self.asm.cbnz(page, slow, true);
-        if self.ordered_memory && size > 1 {
+        if self.ordered_memory && size > 1 && size <= MAX_ORDERED_ACCESS_BYTES {
             // `ldar` and `stlr` fault on a misaligned address, so such an access takes the slow
-            // path, where the interpreter's accessor copes with it.
+            // path, where the interpreter's accessor copes with it. Wider (vector) accesses are
+            // plain `ldr q`/`str q` with a barrier, which take any alignment: x86 does not make
+            // them atomic either, and glibc's string functions load unaligned vectors all the
+            // time (with threads every one of them went to the interpreter).
             self.and_constant(page, ADDRESS, size as u64 - 1);
             self.asm.cbnz(page, slow, true);
         }
@@ -1998,6 +2079,723 @@ impl<'a> Gen<'a> {
         self.live = None;
     }
 
+    /// What `memory_rmw` does for `insn`, if it is one of the read-modify-writes it handles (at
+    /// any prefix: the caller checks LOCK and the operand size).
+    fn memory_rmw_op(insn: &Insn) -> Option<RmwOp> {
+        let register = || {
+            let (reg, high) = Self::named_register(insn, insn.reg, insn.opsize);
+            Src::Reg(reg, high)
+        };
+        let alu = |alu_op: u8| matches!(alu_op, ALU_ADD | ALU_OR | ALU_AND | ALU_SUB | ALU_XOR);
+        match insn.op {
+            // add/or/and/sub/xor r/m, r
+            0x01 | 0x09 | 0x21 | 0x29 | 0x31 => Some(RmwOp::Alu((insn.op >> 3) as u8, register())),
+            0x81 | 0x83 if alu(insn.reg & 7) => Some(RmwOp::Alu(
+                insn.reg & 7,
+                Src::Imm(Self::immediate_for(insn.opsize, insn.imm)),
+            )),
+            0xff if insn.reg & 7 == 0 => Some(RmwOp::Inc),
+            0xff if insn.reg & 7 == 1 => Some(RmwOp::Dec),
+            0x1c1 => Some(RmwOp::Xadd),
+            0x87 => Some(RmwOp::Xchg),
+            0x1b1 => Some(RmwOp::Cmpxchg),
+            BIT_TEST_IMMEDIATE if insn.reg & 7 > GROUP8_FIRST_BIT_OP => Some(RmwOp::BitTest(
+                (insn.reg & 7) - GROUP8_FIRST_BIT_OP,
+                insn.imm as u32 & (8 * insn.opsize as u32 - 1),
+            )),
+            _ => None,
+        }
+    }
+
+    /// A read-modify-write of the 4- or 8-byte memory operand of `insn`, atomic when it has to
+    /// be. With threads (`ordered_memory`) the old value is loaded exclusively and the new one
+    /// stored only if nothing wrote the location in between, else it starts over; that is also
+    /// a full barrier, as a locked x86 instruction is. With one vCPU running at a time a plain
+    /// load and store are atomic already. A misaligned operand (a split lock, which raises #DB
+    /// under DEBUGCTL.BLD, as Linux sets it, and cannot be exclusive on the host) and a TLB
+    /// miss go to the interpreter, which does the locked access its own way.
+    fn memory_rmw(
+        &mut self,
+        insn: &Insn,
+        op: RmwOp,
+        next_rip: u64,
+        insn_index: u32,
+        rip: u64,
+    ) -> bool {
+        let size = insn.opsize;
+        let is64 = size == 8;
+        let (old, operand, host, status, accumulator) = (0, 1, SCRATCH_B, SCRATCH_A, ADDRESS);
+        let (slow, resume) = self.exec_fallback(insn_index, rip);
+        if matches!(op, RmwOp::BitTest(..)) {
+            // Only CF changes, in `Cpu::eflags` (see `bit_test`).
+            self.materialize_flags();
+        }
+        if matches!(op, RmwOp::Inc | RmwOp::Dec) {
+            // The CF they keep, into `SAVED_EXTRA`; it may call a helper, so it comes first.
+            match self.live {
+                Some(live) => self.carry_from_live_flags(SAVED_EXTRA, live),
+                None => self.carry_from_lazy_record(),
+            }
+        }
+        self.effective_address(insn, next_rip, ADDRESS);
+        self.and_constant(SCRATCH_A, ADDRESS, size as u64 - 1);
+        self.asm.cbnz(SCRATCH_A, slow, true);
+        self.tlb_probe(size, TLB_TAG_WRITE_OFFSET, slow);
+        self.asm.ldr(host, SCRATCH_A, TLB_ADDEND_OFFSET);
+        self.asm.add(host, ADDRESS, host, true);
+        match op {
+            RmwOp::Alu(_, Src::Imm(immediate)) => self.asm.mov_imm(operand, immediate),
+            RmwOp::Alu(_, Src::Reg(reg, high)) => self.read_reg(operand, reg, high),
+            RmwOp::Xadd | RmwOp::Xchg | RmwOp::Cmpxchg => self.load_gpr(operand, insn.reg),
+            _ => {}
+        }
+        if matches!(op, RmwOp::Cmpxchg) {
+            self.load_gpr(accumulator, RAX);
+        }
+        let (retry, mismatch, done) = (self.asm.label(), self.asm.label(), self.asm.label());
+        self.asm.bind(retry);
+        if self.ordered_memory {
+            self.asm.ldaxr(old, host, size);
+        } else if is64 {
+            self.asm.ldr(old, host, 0);
+        } else {
+            self.asm.ldr_w(old, host, 0);
+        }
+        // The new value into `VALUE`, the host flags as the instruction's (none for xchg).
+        let kind = match op {
+            RmwOp::Alu(alu_op, _) => match alu_op {
+                ALU_ADD => {
+                    self.asm.adds(VALUE, old, operand, is64);
+                    Some(FlagKind::Add)
+                }
+                ALU_SUB => {
+                    self.asm.subs(VALUE, old, operand, is64);
+                    Some(FlagKind::Sub)
+                }
+                ALU_AND => {
+                    self.asm.ands(VALUE, old, operand, is64);
+                    Some(FlagKind::Logic)
+                }
+                _ => {
+                    if alu_op == ALU_OR {
+                        self.asm.orr(VALUE, old, operand, is64);
+                    } else {
+                        self.asm.eor(VALUE, old, operand, is64);
+                    }
+                    self.asm.ands(XZR, VALUE, VALUE, is64);
+                    Some(FlagKind::Logic)
+                }
+            },
+            RmwOp::Inc => {
+                self.asm.adds_imm(VALUE, old, 1, is64);
+                Some(FlagKind::Inc)
+            }
+            RmwOp::Dec => {
+                self.asm.subs_imm(VALUE, old, 1, is64);
+                Some(FlagKind::Dec)
+            }
+            RmwOp::Xadd => {
+                self.asm.adds(VALUE, old, operand, is64);
+                Some(FlagKind::Add)
+            }
+            RmwOp::Xchg => {
+                self.asm.mov(VALUE, operand);
+                None
+            }
+            RmwOp::BitTest(operation, bit) => {
+                self.asm.mov_imm(SCRATCH_C, 1 << bit);
+                match operation {
+                    1 => self.asm.orr(VALUE, old, SCRATCH_C, true),
+                    2 => {
+                        self.asm.orr(VALUE, old, SCRATCH_C, true);
+                        self.asm.eor(VALUE, VALUE, SCRATCH_C, true);
+                    }
+                    _ => self.asm.eor(VALUE, old, SCRATCH_C, true),
+                }
+                None
+            }
+            RmwOp::Cmpxchg => {
+                self.asm.subs(SCRATCH_C, accumulator, old, is64);
+                self.asm.b_cond(NE, mismatch);
+                self.asm.mov(VALUE, operand);
+                Some(FlagKind::Sub)
+            }
+        };
+        if self.ordered_memory {
+            self.asm.stlxr(status, VALUE, host, size);
+            self.asm.cbnz(status, retry, false);
+        } else if is64 {
+            self.asm.str(VALUE, host, 0);
+        } else {
+            self.asm.str_w(VALUE, host, 0);
+        }
+        if matches!(op, RmwOp::Cmpxchg) {
+            self.asm.b(done);
+            // A failed compare stores nothing: the old value written back (what x86 does) would
+            // change nothing a reader could see.
+            self.asm.bind(mismatch);
+            if self.ordered_memory {
+                self.asm.clrex();
+            }
+            self.asm.bind(done);
+        }
+        // Flags and registers, all from the host flags and x0, VALUE and the operand.
+        match op {
+            RmwOp::Alu(..) => {
+                self.asm.mov(0, VALUE);
+            }
+            RmwOp::Inc | RmwOp::Dec => {
+                self.asm.mov(0, VALUE);
+                self.asm.mov(1, SAVED_EXTRA);
+            }
+            RmwOp::Xadd => {
+                self.store_gpr(insn.reg, old);
+                self.asm.mov(0, VALUE);
+            }
+            RmwOp::Xchg => self.store_gpr(insn.reg, old),
+            RmwOp::BitTest(_, bit) => {
+                self.asm.ubfx(SCRATCH_C, old, bit, 1, true);
+                self.asm.ldr(SCRATCH_A, CPU, EFLAGS_OFFSET);
+                self.asm
+                    .bfi(SCRATCH_A, SCRATCH_C, CF.trailing_zeros(), 1, true);
+                self.asm.str(SCRATCH_A, CPU, EFLAGS_OFFSET);
+            }
+            RmwOp::Cmpxchg => {
+                let equal = self.asm.label();
+                self.asm.b_cond(EQ, equal);
+                self.store_gpr(RAX, old);
+                self.asm.bind(equal);
+                self.asm.mov(1, old);
+                self.asm.mov(0, SCRATCH_C);
+            }
+        }
+        if let Some(kind) = kind {
+            self.store_lazy_op(kind, size);
+        }
+        self.asm.bind(resume);
+        // The interpreter fallback joins here with the host flags clobbered.
+        self.live = None;
+        true
+    }
+
+    /// Loads the `size`-byte field at `offset` in `Cpu` into `rd`, zero-extended, whether or not
+    /// the offset fits a load's immediate (`multi` and `svm` lie beyond it).
+    fn load_cpu_field(&mut self, rd: u32, offset: u32, size: u8) {
+        self.asm.mov_imm(rd, offset as u64);
+        self.asm.ldr_r(rd, CPU, rd, size, false);
+    }
+
+    /// Branches to `slow` while an SVM guest runs (its host may intercept the instruction).
+    fn exit_to_interpreter_in_svm_guest(&mut self, slow: Label) {
+        self.load_cpu_field(SCRATCH_A, SVM_GUEST_OFFSET, 8);
+        self.asm.cbnz(SCRATCH_A, slow, true);
+    }
+
+    /// pause: nothing with one vCPU; with more, `helper_pause` (which may ask the block to end,
+    /// so it is followed by the self-modifying-code exit check). In an SVM guest the interpreter
+    /// runs it: the intercept and its pause filter.
+    fn pause(&mut self, insn_index: u32, next_rip: u64, rip: u64) {
+        let (slow, resume) = self.exec_fallback(insn_index, rip);
+        self.exit_to_interpreter_in_svm_guest(slow);
+        self.load_cpu_field(SCRATCH_A, MULTI_OFFSET, 1);
+        self.asm.cbz(SCRATCH_A, resume, false);
+        self.asm.mov(0, CPU);
+        self.call(self.addrs.pause);
+        self.asm.bind(resume);
+        self.smc_check(insn_index, next_rip);
+        self.live = None;
+    }
+
+    /// rdtsc: edx:eax = the TSC, from `helper_rdtsc` after paying the block's instructions so
+    /// far (the virtual clock is the instruction count). CR4.TSD above CPL 0 (#GP) and an SVM
+    /// guest go to the interpreter.
+    fn rdtsc(&mut self, index: usize, with_aux: bool, insn_index: u32, rip: u64) {
+        self.prepay(index);
+        let (slow, resume) = self.exec_fallback(insn_index, rip);
+        let user = self.asm.label();
+        self.exit_to_interpreter_in_svm_guest(slow);
+        self.asm.ldr(SCRATCH_A, CPU, CR4_OFFSET);
+        self.and_constant(SCRATCH_A, SCRATCH_A, CR4_TSD);
+        self.asm.cbz(SCRATCH_A, user, true);
+        self.asm.ldrb(SCRATCH_A, CPU, CPL_OFFSET);
+        self.asm.cbnz(SCRATCH_A, slow, false);
+        self.asm.bind(user);
+        self.asm.mov(0, CPU);
+        self.call(self.addrs.rdtsc);
+        self.asm.uxtw(1, 0);
+        self.store_gpr(RAX, 1);
+        self.asm.lsr_imm(0, 0, 32);
+        self.store_gpr(RDX, 0);
+        if with_aux {
+            self.load_cpu_field(VALUE, TSC_AUX_OFFSET, 4);
+            self.store_gpr(RCX_INDEX, VALUE);
+        }
+        self.asm.bind(resume);
+        self.live = None;
+    }
+
+    /// pushf: the flags with RF and VM clear, pushed as 8 bytes. The arithmetic flags are
+    /// materialized first. An SVM guest goes to the interpreter (its host may intercept pushf).
+    fn pushf(&mut self, insn_index: u32, rip: u64) -> bool {
+        let (slow, resume) = self.exec_fallback(insn_index, rip);
+        self.exit_to_interpreter_in_svm_guest(slow);
+        self.materialize_flags();
+        self.load_gpr(ADDRESS, RSP);
+        self.asm.sub_imm(ADDRESS, ADDRESS, PUSH_POP_SIZE, true);
+        self.asm.ldr(VALUE, CPU, EFLAGS_OFFSET);
+        self.and_constant(VALUE, VALUE, !PUSHF_CLEARED);
+        self.stack_store(insn_index, rip);
+        self.store_gpr(RSP, ADDRESS);
+        self.asm.bind(resume);
+        self.live = None;
+        true
+    }
+
+    /// sti at CPL <= IOPL: IF set, and the one-instruction interrupt shadow opened when IF was
+    /// clear. Above IOPL (#GP, or VME/PVI's virtual flag) the interpreter runs it.
+    fn sti(&mut self, insn_index: u32, rip: u64) {
+        let (slow, resume) = self.exec_fallback(insn_index, rip);
+        let (flags, iopl, cpl) = (SCRATCH_A, SCRATCH_B, SCRATCH_C);
+        self.asm.ldr(flags, CPU, EFLAGS_OFFSET);
+        self.asm.ubfx(iopl, flags, IOPL_SHIFT, IOPL_BITS, true);
+        self.asm.ldrb(cpl, CPU, CPL_OFFSET);
+        self.asm.cmp(cpl, iopl, true);
+        self.asm.b_cond(HI, slow);
+        let was_set = self.asm.label();
+        self.and_constant(VALUE, flags, IF);
+        self.asm.cbnz(VALUE, was_set, true);
+        // `interrupt_shadow` lies beyond a store's immediate offset.
+        self.asm.mov_imm(VALUE, 1);
+        self.asm.mov_imm(SCRATCH_B, INTERRUPT_SHADOW_OFFSET as u64);
+        self.asm.str_r(VALUE, CPU, SCRATCH_B, 1);
+        self.asm.mov_imm(VALUE, IF);
+        self.asm.orr(flags, flags, VALUE, true);
+        self.asm.str(flags, CPU, EFLAGS_OFFSET);
+        self.asm.bind(was_set);
+        self.asm.bind(resume);
+        self.live = None;
+    }
+
+    /// kortest (`or`) and ktest k1, k2 at 8, 16, 32 or 64 bits (66 and VEX.W pick the width):
+    /// ZF and CF from the opmask registers, the other arithmetic flags clear, written straight
+    /// into `Cpu::eflags`. Behind the AVX-512 state gate.
+    fn opmask_test(&mut self, insn: &Insn, or: bool, insn_index: u32, rip: u64) {
+        let bits = match (insn.p66, insn.opsize == 8) {
+            (true, false) => 8,
+            (false, false) => 16,
+            (true, true) => 32,
+            (false, true) => 64,
+        };
+        let full = if bits == 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        // The gate's failure path is the only use of the fallback entry.
+        let (_, resume) = self.evex_entry(VectorGate::Avx512, insn_index, rip);
+        let (first, second, zero, carry, flags) = (0, 1, SCRATCH_A, SCRATCH_B, SCRATCH_C);
+        self.asm.ldr(
+            first,
+            CPU,
+            OPMASK_OFFSET + OPMASK_SIZE * (insn.reg & 7) as u32,
+        );
+        self.asm.ldr(
+            second,
+            CPU,
+            OPMASK_OFFSET + OPMASK_SIZE * (insn.rm & 7) as u32,
+        );
+        if bits < 64 {
+            self.and_constant(first, first, full);
+            self.and_constant(second, second, full);
+        }
+        if or {
+            // ZF: k1 | k2 is zero; CF: it is all ones
+            self.asm.orr(first, first, second, true);
+            self.asm.cmp_imm(first, 0, true);
+            self.asm.cset(zero, EQ);
+            self.asm.mov_imm(VALUE, full);
+            self.asm.cmp(first, VALUE, true);
+            self.asm.cset(carry, EQ);
+        } else {
+            // ZF: k1 & k2 is zero; CF: !k1 & k2 is
+            self.asm.and(VALUE, first, second, true);
+            self.asm.cmp_imm(VALUE, 0, true);
+            self.asm.cset(zero, EQ);
+            self.asm.orr(VALUE, first, second, true);
+            self.asm.eor(VALUE, VALUE, first, true);
+            self.asm.cmp_imm(VALUE, 0, true);
+            self.asm.cset(carry, EQ);
+        }
+        self.asm.ldr(flags, CPU, EFLAGS_OFFSET);
+        self.and_constant(flags, flags, !ARITH);
+        self.asm.add_lsl(flags, flags, zero, ZF.trailing_zeros());
+        self.asm.orr(flags, flags, carry, true);
+        self.asm.str(flags, CPU, EFLAGS_OFFSET);
+        self.asm.strb(XZR, CPU, LAZY_OP_OFFSET);
+        self.asm.bind(resume);
+        self.live = None;
+    }
+
+    /// cmpxchg16b: rdx:rax against the 16 aligned bytes; equal, they become rcx:rbx and ZF is
+    /// set, else rdx:rax takes them and ZF is clear (the only flag that changes, so the flags
+    /// are materialized first). Exclusive pair accesses with threads, as `memory_rmw`; a
+    /// misaligned operand (#GP) and a TLB miss go to the interpreter.
+    fn cmpxchg16b(&mut self, insn: &Insn, next_rip: u64, insn_index: u32, rip: u64) -> bool {
+        const OPERAND_BYTES: u8 = 16;
+        // The guest registers are read straight from their pinned host registers.
+        let (rax, rcx, rdx, rbx) = (
+            pinned_host(RAX).unwrap(),
+            pinned_host(RCX_INDEX).unwrap(),
+            pinned_host(RDX).unwrap(),
+            pinned_host(RBX).unwrap(),
+        );
+        let (low, high, host, status, zero) = (ADDRESS, SCRATCH_A, SCRATCH_B, SLOW_INFO, VALUE);
+        let (slow, resume) = self.exec_fallback(insn_index, rip);
+        self.materialize_flags();
+        self.effective_address(insn, next_rip, ADDRESS);
+        self.and_constant(SCRATCH_A, ADDRESS, OPERAND_BYTES as u64 - 1);
+        self.asm.cbnz(SCRATCH_A, slow, true);
+        self.tlb_probe(OPERAND_BYTES, TLB_TAG_WRITE_OFFSET, slow);
+        self.asm.ldr(host, SCRATCH_A, TLB_ADDEND_OFFSET);
+        self.asm.add(host, ADDRESS, host, true);
+        let (retry, mismatch, done) = (self.asm.label(), self.asm.label(), self.asm.label());
+        self.asm.bind(retry);
+        if self.ordered_memory {
+            self.asm.ldaxp(low, high, host);
+        } else {
+            self.asm.ldp_off(low, high, host, 0);
+        }
+        self.asm.eor(SCRATCH_C, low, rax, true);
+        self.asm.eor(zero, high, rdx, true);
+        self.asm.orr(SCRATCH_C, SCRATCH_C, zero, true);
+        self.asm.cbnz(SCRATCH_C, mismatch, true);
+        if self.ordered_memory {
+            self.asm.stlxp(status, rbx, rcx, host);
+            self.asm.cbnz(status, retry, false);
+        } else {
+            self.asm.stp_off(rbx, rcx, host, 0);
+        }
+        self.asm.mov_imm(zero, 1);
+        self.asm.b(done);
+        // No store when they differ: writing the old value back, as hardware does, would only
+        // matter for a write fault, which the write-tag probe already ruled out.
+        self.asm.bind(mismatch);
+        if self.ordered_memory {
+            self.asm.clrex();
+        }
+        self.store_gpr(RAX, low);
+        self.store_gpr(RDX, high);
+        self.asm.mov_imm(zero, 0);
+        self.asm.bind(done);
+        self.asm.ldr(SCRATCH_A, CPU, EFLAGS_OFFSET);
+        self.asm.bfi(SCRATCH_A, zero, ZF.trailing_zeros(), 1, true);
+        self.asm.str(SCRATCH_A, CPU, EFLAGS_OFFSET);
+        self.asm.bind(resume);
+        self.live = None;
+        true
+    }
+
+    /// Registers an out-of-line fallback that runs the instruction in the interpreter and comes
+    /// back to `resume` (bind it where the inline code ends). Nothing of the instruction may be
+    /// committed before a branch to the entry: the interpreter starts it over.
+    fn exec_fallback(&mut self, insn_index: u32, rip: u64) -> (Label, Label) {
+        let entry = self.asm.label();
+        let resume = self.asm.label();
+        self.slow_paths.push(SlowPath {
+            entry,
+            resume,
+            access: SlowAccess::Exec,
+            insn_index,
+            rip,
+        });
+        (entry, resume)
+    }
+
+    /// div and idiv r/m at 32 and 64 bits: rdx:rax (edx:eax) by r/m, quotient to rax and
+    /// remainder to rdx; the flags stay as they are (the interpreter leaves them alone, which
+    /// the architecture allows: they are undefined). A zero divisor and a quotient that does not
+    /// fit raise #DE, which the interpreter does: so does a 64-bit dividend that needs 128 bits
+    /// (rdx not zero for div, not the sign of rax for idiv), which the host cannot divide in one
+    /// instruction and which compiled code does not produce (`xor edx, edx` and `cqo` come first).
+    fn divide(&mut self, insn: &Insn, signed: bool, next_rip: u64, insn_index: u32, rip: u64) {
+        let is64 = insn.opsize == 8;
+        let (divisor, low, high, quotient, remainder) = (1, 0, SCRATCH_A, SCRATCH_B, SCRATCH_C);
+        if insn.md == MODRM_MOD_REGISTER {
+            self.load_gpr(divisor, insn.rm);
+        } else {
+            self.effective_address(insn, next_rip, ADDRESS);
+            self.mem_load(divisor, insn.opsize, false, insn_index, rip);
+        }
+        let (slow, resume) = self.exec_fallback(insn_index, rip);
+        self.load_gpr(low, RAX);
+        self.load_gpr(high, RDX);
+        if is64 {
+            self.asm.cbz(divisor, slow, true);
+            if signed {
+                self.asm.asr_imm(VALUE, low, 63);
+                self.asm.cmp(high, VALUE, true);
+                self.asm.b_cond(NE, slow);
+                // i64::MIN / -1 is the one quotient that overflows (the host gives i64::MIN).
+                let fits = self.asm.label();
+                self.asm.adds_imm(VALUE, divisor, 1, true);
+                self.asm.cbnz(VALUE, fits, true);
+                self.asm.mov_imm(VALUE, i64::MIN as u64);
+                self.asm.cmp(low, VALUE, true);
+                self.asm.b_cond(EQ, slow);
+                self.asm.bind(fits);
+                self.asm.sdiv(quotient, low, divisor, true);
+            } else {
+                self.asm.cbnz(high, slow, true);
+                self.asm.udiv(quotient, low, divisor, true);
+            }
+            self.asm.msub(remainder, quotient, divisor, low, true);
+        } else {
+            // The 64-bit dividend edx:eax fits a host register, so one 64-bit division gives the
+            // exact quotient, which must then fit 32 bits.
+            self.asm.uxtw(low, low);
+            self.asm.lsl_imm(high, high, 32);
+            self.asm.orr(low, low, high, true);
+            if signed {
+                self.asm.sxtw(divisor, divisor);
+                self.asm.cbz(divisor, slow, true);
+                self.asm.sdiv(quotient, low, divisor, true);
+                self.asm.sxtw(VALUE, quotient);
+            } else {
+                self.asm.uxtw(divisor, divisor);
+                self.asm.cbz(divisor, slow, true);
+                self.asm.udiv(quotient, low, divisor, true);
+                self.asm.uxtw(VALUE, quotient);
+            }
+            self.asm.cmp(VALUE, quotient, true);
+            self.asm.b_cond(NE, slow);
+            self.asm.msub(remainder, quotient, divisor, low, true);
+            self.asm.uxtw(quotient, quotient);
+            self.asm.uxtw(remainder, remainder);
+        }
+        self.store_gpr(RAX, quotient);
+        self.store_gpr(RDX, remainder);
+        self.asm.bind(resume);
+        self.live = None;
+    }
+
+    /// bt, bts, btr and btc (`operation` 0..3) at 32 and 64 bits: CF takes the selected bit,
+    /// which the last three then set, clear or flip; every other flag stays (the interpreter
+    /// keeps them; the architecture leaves OF/SF/AF/PF undefined and ZF alone), so the flags are
+    /// materialized first and CF is replaced in `Cpu::eflags` once the store has succeeded. With
+    /// a register offset into memory the operand is the `operand size` word at the address plus
+    /// the sign-extended offset divided by the width, rounded down, as for a bit string.
+    fn bit_test(
+        &mut self,
+        insn: &Insn,
+        operation: u8,
+        immediate_offset: Option<u32>,
+        next_rip: u64,
+        insn_index: u32,
+        rip: u64,
+    ) -> bool {
+        const BIT_TEST: u8 = 0;
+        const BIT_SET: u8 = 1;
+        const BIT_RESET: u8 = 2;
+        let size = insn.opsize;
+        let is64 = size == 8;
+        let bits = 8 * size as u32;
+        let (value, bit, carry, flags) = (0, 1, SCRATCH_A, SCRATCH_B);
+        self.materialize_flags();
+        let memory = insn.md != MODRM_MOD_REGISTER;
+        if memory {
+            self.effective_address(insn, next_rip, ADDRESS);
+            match immediate_offset {
+                Some(offset) => self.asm.mov_imm(SAVED_OPERAND, offset as u64),
+                None => {
+                    self.load_gpr(SAVED_OPERAND, insn.reg);
+                    if !is64 {
+                        self.asm.sxtw(SAVED_OPERAND, SAVED_OPERAND);
+                    }
+                    self.asm
+                        .asr_imm(SCRATCH_A, SAVED_OPERAND, bits.trailing_zeros());
+                    self.asm
+                        .add_lsl(ADDRESS, ADDRESS, SCRATCH_A, size.trailing_zeros());
+                }
+            }
+            // The load's slow path clobbers x0..x7; the offset waits in a callee-saved register.
+            self.mem_load(value, size, false, insn_index, rip);
+            self.asm.mov(bit, SAVED_OPERAND);
+        } else {
+            match immediate_offset {
+                Some(offset) => self.asm.mov_imm(bit, offset as u64),
+                None => self.load_gpr(bit, insn.reg),
+            }
+            self.load_gpr(value, insn.rm);
+        }
+        assert!(self.asm.and_imm(bit, bit, bits as u64 - 1, true));
+        self.asm.lsrv(carry, value, bit, true);
+        assert!(self.asm.and_imm(carry, carry, 1, true));
+        let mut stored = false;
+        if operation != BIT_TEST {
+            self.asm.mov_imm(SCRATCH_C, 1);
+            self.asm.lslv(SCRATCH_C, SCRATCH_C, bit, true);
+            match operation {
+                BIT_SET => self.asm.orr(value, value, SCRATCH_C, true),
+                BIT_RESET => {
+                    self.asm.orr(value, value, SCRATCH_C, true);
+                    self.asm.eor(value, value, SCRATCH_C, true);
+                }
+                _ => self.asm.eor(value, value, SCRATCH_C, true),
+            }
+            if !is64 {
+                self.asm.uxtw(value, value);
+            }
+            if memory {
+                // A slow-path store keeps x0 and x1, so the carry rides in x1.
+                self.asm.mov(bit, carry);
+                stored = self.store_dst(Dst::Mem, size, true, insn_index, rip);
+                self.asm.mov(carry, bit);
+            } else {
+                self.store_gpr(insn.rm, value);
+            }
+        }
+        self.asm.ldr(flags, CPU, EFLAGS_OFFSET);
+        self.asm.bfi(flags, carry, CF.trailing_zeros(), 1, true);
+        self.asm.str(flags, CPU, EFLAGS_OFFSET);
+        self.live = None;
+        stored
+    }
+
+    /// mulx: vvvv and ModRM.reg get the low and high halves of rdx times r/m, unsigned, flags
+    /// untouched (so is the host NZCV: `live` stays as it is). The high half is written last, so
+    /// it wins when both name the same register, as on hardware.
+    fn mulx(&mut self, insn: &Insn, next_rip: u64, insn_index: u32, rip: u64) {
+        let (low, high) = (2, 3);
+        self.bmi_source(insn, next_rip, insn_index, rip);
+        self.load_gpr(1, RDX);
+        if insn.opsize == 8 {
+            self.asm.mul(low, 0, 1, true);
+            self.asm.umulh(high, 0, 1);
+        } else {
+            // Two zero-extended 32-bit operands multiply exactly in 64 bits.
+            self.asm.uxtw(0, 0);
+            self.asm.uxtw(1, 1);
+            self.asm.mul(low, 0, 1, true);
+            self.asm.lsr_imm(high, low, 32);
+            self.asm.uxtw(low, low);
+        }
+        self.store_gpr(insn.vex_v, low);
+        self.store_gpr(insn.reg, high);
+    }
+
+    /// Makes `Cpu::eflags` hold the arithmetic flags (`helper_materialize_flags`), unless they
+    /// already do (`lazy_op` is `Eflags`, 0, as after the previous adcx). Clobbers x0..x7.
+    fn materialize_flags(&mut self) {
+        let done = self.asm.label();
+        self.asm.ldrb(SCRATCH_A, CPU, LAZY_OP_OFFSET);
+        self.asm.cbz(SCRATCH_A, done, false);
+        self.asm.mov(0, CPU);
+        self.call(self.addrs.materialize_flags);
+        self.asm.bind(done);
+        self.live = None;
+    }
+
+    /// adcx (`overflow` false) and adox: ModRM.reg += r/m + CF (OF), and only that flag takes
+    /// the carry out. With the flags in `Cpu::eflags` the carry is a bit there; a chain of these
+    /// (bignum code interleaves the two) pays for materializing the flags once.
+    fn add_carry_chain(
+        &mut self,
+        insn: &Insn,
+        overflow: bool,
+        next_rip: u64,
+        insn_index: u32,
+        rip: u64,
+    ) {
+        let is64 = insn.opsize == 8;
+        let size = if is64 { 8 } else { 4 };
+        let bit = if overflow { OF } else { CF }.trailing_zeros();
+        let (flags, carry) = (2, 3);
+        self.materialize_flags();
+        if insn.md == MODRM_MOD_REGISTER {
+            self.load_gpr(1, insn.rm);
+        } else {
+            self.effective_address(insn, next_rip, ADDRESS);
+            self.mem_load(0, size, false, insn_index, rip);
+            self.asm.mov(1, 0);
+        }
+        self.load_gpr(0, insn.reg);
+        self.asm.ldr(flags, CPU, EFLAGS_OFFSET);
+        self.asm.ubfx(carry, flags, bit, 1, true);
+        // Host C = carry (carry - 1 borrows exactly when carry is 0), then one add with carry.
+        self.asm.cmp_imm(carry, 1, true);
+        self.asm.adcs(0, 0, 1, is64);
+        self.asm.cset(carry, CS);
+        self.asm.bfi(flags, carry, bit, 1, true);
+        self.asm.str(flags, CPU, EFLAGS_OFFSET);
+        self.store_gpr(insn.reg, 0);
+        self.live = None;
+    }
+
+    /// movd/movq xmm, r/m (`to_vector`: the low 32 or 64 bits, the rest of the 128 cleared and
+    /// anything above left alone, as legacy SSE does) or r/m, xmm. A memory operand is one
+    /// naturally sized access through the TLB probe; a miss goes to the interpreter.
+    fn movd(
+        &mut self,
+        insn: &Insn,
+        to_vector: bool,
+        next_rip: u64,
+        insn_index: u32,
+        rip: u64,
+    ) -> bool {
+        let size: u8 = if insn.opsize == 8 { 8 } else { 4 };
+        let (slow, resume) = self.sse_entry(insn_index, rip);
+        let xmm = XMM_OFFSET + XMM_SIZE * insn.reg as u32;
+        let memory = insn.md != MODRM_MOD_REGISTER;
+        if memory {
+            let tag = if to_vector {
+                TLB_TAG_READ_OFFSET
+            } else {
+                TLB_TAG_WRITE_OFFSET
+            };
+            self.effective_address(insn, next_rip, ADDRESS);
+            self.tlb_probe(size, tag, slow);
+            self.asm.ldr(SCRATCH_B, SCRATCH_A, TLB_ADDEND_OFFSET);
+            self.asm.add(SCRATCH_B, ADDRESS, SCRATCH_B, true);
+        }
+        if to_vector {
+            if memory {
+                if self.ordered_memory {
+                    self.asm.ldar(VALUE, SCRATCH_B, size);
+                } else if size == 8 {
+                    self.asm.ldr(VALUE, SCRATCH_B, 0);
+                } else {
+                    self.asm.ldr_w(VALUE, SCRATCH_B, 0);
+                }
+            } else {
+                self.load_gpr(VALUE, insn.rm);
+                if size == 4 {
+                    self.asm.uxtw(VALUE, VALUE);
+                }
+            }
+            self.asm.str(VALUE, CPU, xmm);
+            self.asm.str(XZR, CPU, xmm + XMM_HALF);
+        } else {
+            self.asm.ldr(VALUE, CPU, xmm);
+            if size == 4 {
+                self.asm.uxtw(VALUE, VALUE);
+            }
+            if memory {
+                if self.ordered_memory {
+                    self.asm.stlr(VALUE, SCRATCH_B, size);
+                } else if size == 8 {
+                    self.asm.str(VALUE, SCRATCH_B, 0);
+                } else {
+                    self.asm.str_w(VALUE, SCRATCH_B, 0);
+                }
+            } else {
+                self.store_gpr(insn.rm, VALUE);
+            }
+        }
+        self.asm.bind(resume);
+        self.live = None;
+        memory && !to_vector
+    }
+
     /// blsr, blsmsk and blsi (`group` 1, 2 and 3): vvvv = r/m with its lowest set bit cleared,
     /// the mask up to and including it, or just it. Flags from the result; CF is set when the
     /// source is zero (blsr, blsmsk) or not zero (blsi).
@@ -2250,14 +3048,18 @@ impl<'a> Gen<'a> {
         let insn_index = index as u32;
         let retired = insn_index + 1;
         let operand_size = insn.opsize;
-        // No 67/66/LOCK prefix and a 32- or 64-bit operand size.
-        let wide_operand =
-            !insn.addr32 && !insn.lock && !insn.p66 && (operand_size == 4 || operand_size == 8);
         let is_memory = insn.md != MODRM_MOD_REGISTER;
+        // A 67 prefix only changes how a memory operand's address is formed, so a register form
+        // with one (compilers pad with it) is the same instruction.
+        let register_form = insn.has_modrm && !is_memory;
+        let addressing_ok = !insn.addr32 || register_form;
+        // No LOCK, 66 or effective 67 prefix and a 32- or 64-bit operand size.
+        let wide_operand =
+            addressing_ok && !insn.lock && !insn.p66 && (operand_size == 4 || operand_size == 8);
         let memory_ok = Self::memory_inlinable(&insn);
-        // No 67 or LOCK prefix, so memory operands can use the inline access path.
-        let plain = memory_ok;
-        let has_rex = insn.rex_present;
+        // No LOCK prefix, nor a 67 one on a memory operand, so memory operands can use the
+        // inline access path.
+        let plain = addressing_ok && !insn.lock;
         let mut is_store = false;
         match insn.op {
             // add/or/adc/sbb/and/sub/xor/cmp: r/m8,r8 (0), r/m,r (1), r8,r/m8 (2), r,r/m (3),
@@ -2327,6 +3129,167 @@ impl<'a> Gen<'a> {
                     insn_index,
                     rip,
                 );
+            }
+            // Memory read-modify-writes with LOCK (add/or/and/sub/xor, inc/dec, xadd, cmpxchg),
+            // xchg with memory (always locked), and cmpxchg/xadd with memory without one, at 32
+            // and 64 bits
+            _ if is_memory
+                && !insn.addr32
+                && !insn.p66
+                && matches!(operand_size, 4 | 8)
+                && Self::memory_rmw_op(&insn).is_some_and(|op| {
+                    insn.lock || matches!(op, RmwOp::Xadd | RmwOp::Xchg | RmwOp::Cmpxchg)
+                }) =>
+            {
+                let op = Self::memory_rmw_op(&insn).unwrap();
+                is_store = self.memory_rmw(&insn, op, next_rip, insn_index, rip);
+            }
+            // mov r/m, sreg: the selector, into a register at the operand size (zero-extended at
+            // 32 and 64 bits, merged at 16) or 2 bytes of memory
+            0x8c if insn.reg & 7 <= SEG_GS as u8 && plain => {
+                let selector = SEG_SELECTOR_OFFSET + SEG_STRIDE * (insn.reg & 7) as u32;
+                self.asm.ldrh(VALUE, CPU, selector);
+                if is_memory {
+                    self.effective_address(&insn, next_rip, ADDRESS);
+                    self.mem_store(2, insn_index, rip);
+                    is_store = true;
+                } else {
+                    self.write_reg(insn.rm, false, operand_size.max(2), VALUE);
+                }
+            }
+            // cld / std: only DF changes; the string instructions read it from `Cpu::eflags`
+            0xfc | 0xfd if !insn.lock => {
+                self.asm.ldr(SCRATCH_A, CPU, EFLAGS_OFFSET);
+                if insn.op == 0xfc {
+                    self.and_constant(SCRATCH_A, SCRATCH_A, !DF);
+                } else {
+                    self.asm.mov_imm(SCRATCH_B, DF);
+                    self.asm.orr(SCRATCH_A, SCRATCH_A, SCRATCH_B, true);
+                }
+                self.asm.str(SCRATCH_A, CPU, EFLAGS_OFFSET);
+            }
+            // pause (f3 90)
+            0x90 if insn.rep == PREFIX_F3 && insn.rex & REX_B == 0 && !insn.p66 => {
+                self.pause(insn_index, next_rip, rip);
+            }
+            // rdtsc, and rdtscp, which also reads IA32_TSC_AUX into ecx
+            0x131 => self.rdtsc(index, false, insn_index, rip),
+            0x101 if insn.modrm == MODRM_RDTSCP && !insn.lock => {
+                self.rdtsc(index, true, insn_index, rip)
+            }
+            // rdpkru: eax = PKRU, edx = 0. Without CR4.PKE (#UD) or with ecx not zero (#GP) the
+            // interpreter runs it.
+            0x101 if insn.modrm == MODRM_RDPKRU && !insn.lock => {
+                let (slow, resume) = self.exec_fallback(insn_index, rip);
+                self.asm.ldr(SCRATCH_A, CPU, CR4_OFFSET);
+                self.and_constant(SCRATCH_A, SCRATCH_A, CR4_PKE);
+                self.asm.cbz(SCRATCH_A, slow, true);
+                self.load_gpr(SCRATCH_A, RCX_INDEX);
+                self.asm.uxtw(SCRATCH_A, SCRATCH_A);
+                self.asm.cbnz(SCRATCH_A, slow, true);
+                self.load_cpu_field(VALUE, PKRU_OFFSET, 4);
+                self.store_gpr(RAX, VALUE);
+                self.store_gpr(RDX, XZR);
+                self.asm.bind(resume);
+            }
+            // pushf (64-bit operand)
+            0x9c if !insn.p66 => {
+                is_store = self.pushf(insn_index, rip);
+            }
+            // sti; it ends the block (`ends_block`), which `compile` does with an exit to the run
+            // loop, where a pending interrupt is taken once the shadow has passed
+            0xfb if !insn.lock => self.sti(insn_index, rip),
+            // vzeroupper / vzeroall: bits 511:128 (vzeroall: all) of zmm0-15 cleared
+            VZERO if insn.vex && insn.rep == 0 && !insn.p66 && insn.vex_v == 0 => {
+                let (_, resume) = self.evex_entry(VectorGate::Avx, insn_index, rip);
+                const VECTOR_REGISTERS: u32 = 16;
+                let lane = XMM_SIZE;
+                self.asm.vec_zero(VECTOR_TEMPORARY);
+                for register in 0..VECTOR_REGISTERS {
+                    self.asm
+                        .str_q(VECTOR_TEMPORARY, CPU, YMM_HI_OFFSET + lane * register);
+                    for half in 0..2 {
+                        self.asm.str_q(
+                            VECTOR_TEMPORARY,
+                            CPU,
+                            ZMM_HI_OFFSET + 2 * lane * register + lane * half,
+                        );
+                    }
+                    if insn.vex_l {
+                        self.asm
+                            .str_q(VECTOR_TEMPORARY, CPU, XMM_OFFSET + lane * register);
+                    }
+                }
+                self.asm.bind(resume);
+                self.live = None;
+            }
+            // kortest and ktest k, k
+            KORTEST | KTEST if insn.vex && insn.rep == 0 && !insn.vex_l && !is_memory => {
+                self.opmask_test(&insn, insn.op == KORTEST, insn_index, rip);
+            }
+            // cmpxchg16b m128 (REX.W 0f c7 /1), with or without LOCK
+            0x1c7 if is_memory && insn.reg & 7 == 1 && operand_size == 8 && !insn.addr32 => {
+                is_store = self.cmpxchg16b(&insn, next_rip, insn_index, rip);
+            }
+            // group 3 /6 div and /7 idiv r/m at 32 and 64 bits
+            0xf7 if wide_operand && plain && matches!(insn.reg & 7, GROUP3_DIV | GROUP3_IDIV) => {
+                self.divide(
+                    &insn,
+                    insn.reg & 7 == GROUP3_IDIV,
+                    next_rip,
+                    insn_index,
+                    rip,
+                );
+            }
+            // bt/bts/btr/btc r/m, r and r/m, imm8 at 32 and 64 bits
+            0x1a3 | 0x1ab | 0x1b3 | 0x1bb if wide_operand && plain => {
+                let operation = BIT_TEST_REGISTER_OFFSET
+                    .iter()
+                    .position(|&op| op == insn.op)
+                    .unwrap() as u8;
+                is_store = self.bit_test(&insn, operation, None, next_rip, insn_index, rip);
+            }
+            BIT_TEST_IMMEDIATE if wide_operand && plain && insn.reg & 7 >= GROUP8_FIRST_BIT_OP => {
+                let operation = (insn.reg & 7) - GROUP8_FIRST_BIT_OP;
+                let offset = insn.imm as u32 & (8 * operand_size as u32 - 1);
+                is_store = self.bit_test(&insn, operation, Some(offset), next_rip, insn_index, rip);
+            }
+            // leave: rsp = rbp, then pop rbp. The load comes first, so a faulting one changes
+            // neither register.
+            0xc9 if !insn.p66 => {
+                self.load_gpr(ADDRESS, RBP);
+                self.stack_load(VALUE, insn_index, rip);
+                self.asm.add_imm(ADDRESS, ADDRESS, PUSH_POP_SIZE, true);
+                self.store_gpr(RSP, ADDRESS);
+                self.store_gpr(RBP, VALUE);
+            }
+            // bswap r32 / r64 (the 16-bit form is undefined and stays in the interpreter)
+            0x1c8..=0x1cf if wide_operand => {
+                let reg = opcode_register(&insn);
+                self.load_gpr(VALUE, reg);
+                self.asm.rev(VALUE, VALUE, operand_size == 8);
+                self.store_gpr(reg, VALUE);
+            }
+            // xchg r, r (87 register form) and xchg rax, r (91..97, or 90 with REX.B) at 32 and
+            // 64 bits. The memory form is a locked access and stays in the interpreter.
+            0x87 | 0x90..=0x97
+                if wide_operand
+                    && (insn.op != 0x87 || !is_memory)
+                    && (insn.op != 0x90 || insn.rex & REX_B != 0) =>
+            {
+                let (first, second) = if insn.op == 0x87 {
+                    (insn.reg, insn.rm)
+                } else {
+                    (RAX, opcode_register(&insn))
+                };
+                self.load_gpr(0, first);
+                self.load_gpr(1, second);
+                if operand_size == 4 {
+                    self.asm.uxtw(0, 0);
+                    self.asm.uxtw(1, 1);
+                }
+                self.store_gpr(first, 1);
+                self.store_gpr(second, 0);
             }
             // group 3 /4 mul and /5 imul r/m, one operand, at 32 and 64 bits
             0xf7 if wide_operand && plain && matches!(insn.reg & 7, 4 | 5) => {
@@ -2652,13 +3615,10 @@ impl<'a> Gen<'a> {
                     self.effective_address(&insn, next_rip, ADDRESS);
                     self.mem_load(VALUE, source_size, signed, insn_index, rip);
                 } else {
-                    if source_size == 1
-                        && !has_rex
-                        && (FIRST_HIGH_BYTE_REG..=LAST_HIGH_BYTE_REG).contains(&insn.rm)
-                    {
-                        return false;
-                    }
-                    self.load_gpr(VALUE, insn.rm);
+                    // Without REX, byte registers 4..7 are ah, ch, dh and bh: `read_reg` brings
+                    // bits 15:8 down, already zero-extended.
+                    let (source, high) = Self::named_register(&insn, insn.rm, source_size);
+                    self.read_reg(VALUE, source, high);
                     match (source_size, signed) {
                         (1, false) => self.asm.uxtb(VALUE, VALUE),
                         (2, false) => self.asm.uxth(VALUE, VALUE),
@@ -2671,9 +3631,14 @@ impl<'a> Gen<'a> {
                 }
                 self.store_gpr(insn.reg, VALUE);
             }
-            // BMI1/BMI2 (VEX.LZ, map 0f38): shlx/shrx/sarx f7 with 66/F2/F3, bzhi f5, andn f2 and
-            // the blsr/blsmsk/blsi group f3. bextr and the rest go to the interpreter.
-            VEX_BMI_SHIFT_OR_BEXTR | VEX_BMI_BZHI_PEXT_PDEP | VEX_BMI_ANDN | VEX_BMI_GROUP17
+            // BMI1/BMI2 (VEX.LZ, map 0f38): shlx/shrx/sarx f7 with 66/F2/F3, bzhi f5, andn f2,
+            // the blsr/blsmsk/blsi group f3 and mulx f6. bextr, pdep and pext go to the
+            // interpreter.
+            VEX_BMI_SHIFT_OR_BEXTR
+            | VEX_BMI_BZHI_PEXT_PDEP
+            | VEX_BMI_ANDN
+            | VEX_BMI_GROUP17
+            | VEX_BMI_MULX
                 if insn.vex
                     && !insn.vex_l
                     && !insn.lock
@@ -2694,6 +3659,7 @@ impl<'a> Gen<'a> {
                         self.bzhi(&insn, next_rip, insn_index, rip)
                     }
                     (VEX_BMI_ANDN, 0, false) => self.andn(&insn, next_rip, insn_index, rip),
+                    (VEX_BMI_MULX, PREFIX_F2, false) => self.mulx(&insn, next_rip, insn_index, rip),
                     (VEX_BMI_GROUP17, 0, false)
                         if matches!(
                             insn.reg & 7,
@@ -2704,6 +3670,20 @@ impl<'a> Gen<'a> {
                     }
                     _ => return false,
                 }
+            }
+            // adcx (66) and adox (F3) r, r/m at 32 and 64 bits. The 66 is part of the opcode, so
+            // the operand size is 64 with REX.W and 32 otherwise.
+            ADCX_ADOX
+                if !insn.vex
+                    && !insn.evex
+                    && memory_ok
+                    && matches!((insn.p66, insn.rep), (true, 0) | (false, PREFIX_F3)) =>
+            {
+                self.add_carry_chain(&insn, insn.rep == PREFIX_F3, next_rip, insn_index, rip);
+            }
+            // movd/movq between an xmm register and a general register or memory
+            MOVD_TO_VECTOR | MOVD_FROM_VECTOR if plain && insn.p66 && insn.rep == 0 => {
+                is_store = self.movd(&insn, insn.op == MOVD_TO_VECTOR, next_rip, insn_index, rip);
             }
             // bsf/bsr (no prefix) and tzcnt/lzcnt (F3) at 32 and 64 bits
             0x1bc | 0x1bd if wide_operand && plain && matches!(insn.rep, 0 | 1) => {
@@ -2802,10 +3782,10 @@ impl<'a> Gen<'a> {
                 return true;
             }
             // movups/movupd, movaps/movapd, movdqa/movdqu
-            0x110 | 0x111 | 0x128 | 0x129 | 0x16f | 0x17f if plain => {
-                let Some(form) = vector_move(&insn) else {
-                    return false;
-                };
+            0x110 | 0x111 | 0x128 | 0x129 | 0x16f | 0x17f
+                if plain && vector_move(&insn).is_some() =>
+            {
+                let form = vector_move(&insn).unwrap();
                 is_store = self.vector_move(&insn, form, next_rip, insn_index, rip);
             }
             // pxor/por/pand/pandn, pcmpeq*, pminub/pmaxub, padd*, psub*, pmovmskb (66 prefix)
@@ -2841,12 +3821,15 @@ impl<'a> Gen<'a> {
             MOVQ_STORE if plain && is_movq_store(&insn) => {
                 is_store = self.movq_store(&insn, next_rip, insn_index, rip);
             }
-            // The SHA extensions (no prefix), pshufd, palignr and pshufb (66 prefix): see
-            // `whole_vector`
-            0x170 | 0x200 | 0x30f | 0x2c8..=0x2cd | 0x3cc if plain => {
-                let Some(form) = whole_vector(&insn) else {
-                    return false;
-                };
+            // movss/movsd, movlps/movlpd, movhps/movhpd and movq xmm, xmm/m64 (`partial_move`)
+            _ if plain && partial_move(&insn).is_some() => {
+                let form = partial_move(&insn).unwrap();
+                is_store = self.partial_move(&insn, form, next_rip, insn_index, rip);
+            }
+            // The SHA extensions, pshufd, palignr, pshufb, the SSE2 integer instructions that
+            // `vector_alu` leaves, pshuflw/pshufhw, pblendw, movhlps/movlhps: see `whole_vector`
+            _ if plain && whole_vector(&insn).is_some() => {
+                let form = whole_vector(&insn).unwrap();
                 is_store = self.whole_vector(&insn, form, next_rip, insn_index, rip);
             }
             // AVX and AVX-512 data movement, integer logic, arithmetic and compares, byte compares
@@ -3194,19 +4177,17 @@ impl<'a> Gen<'a> {
                     self.zero_vector_lanes(insn.reg, lanes);
                 } else {
                     self.evex_memory(insn, form.bytes, aligned, true, next_rip, slow);
+                    if self.ordered_memory {
+                        // A release (see `ordered_memory`) that, unlike `stlr`, takes the
+                        // unaligned vectors glibc stores.
+                        self.asm.dmb_ish();
+                    }
                     for lane in 0..lanes {
                         let register = lane_offset(insn.reg, lane);
                         self.asm.ldr(VALUE, CPU, register);
                         self.asm.ldr(SCRATCH_A, CPU, register + XMM_HALF);
-                        if self.ordered_memory {
-                            self.asm.stlr(VALUE, SCRATCH_B, 8);
-                            self.asm.add_imm(SCRATCH_B, SCRATCH_B, XMM_HALF, true);
-                            self.asm.stlr(SCRATCH_A, SCRATCH_B, 8);
-                            self.asm.add_imm(SCRATCH_B, SCRATCH_B, XMM_HALF, true);
-                        } else {
-                            self.asm
-                                .stp_off(VALUE, SCRATCH_A, SCRATCH_B, (lane * XMM_SIZE) as i32);
-                        }
+                        self.asm
+                            .stp_off(VALUE, SCRATCH_A, SCRATCH_B, (lane * XMM_SIZE) as i32);
                     }
                     is_store = true;
                 }
@@ -3362,19 +4343,15 @@ impl<'a> Gen<'a> {
             self.asm.ldr(VALUE, CPU, register);
             self.asm.ldr(SCRATCH_A, CPU, register + XMM_HALF);
             if self.ordered_memory {
-                self.asm.stlr(VALUE, SCRATCH_B, 8);
-                self.asm.add_imm(SCRATCH_B, SCRATCH_B, XMM_HALF, true);
-                self.asm.stlr(SCRATCH_A, SCRATCH_B, 8);
-            } else {
-                self.asm.stp_off(VALUE, SCRATCH_A, SCRATCH_B, 0);
+                // A release at any alignment (see `ordered_memory`).
+                self.asm.dmb_ish();
             }
+            self.asm.stp_off(VALUE, SCRATCH_A, SCRATCH_B, 0);
         } else {
+            self.asm.ldp_off(VALUE, SCRATCH_A, SCRATCH_B, 0);
             if self.ordered_memory {
-                self.asm.ldar(VALUE, SCRATCH_B, 8);
-                self.asm.add_imm(SCRATCH_B, SCRATCH_B, XMM_HALF, true);
-                self.asm.ldar(SCRATCH_A, SCRATCH_B, 8);
-            } else {
-                self.asm.ldp_off(VALUE, SCRATCH_A, SCRATCH_B, 0);
+                // An acquire at any alignment (see `ordered_memory`).
+                self.asm.dmb_ishld();
             }
             self.asm.str(VALUE, CPU, register);
             self.asm.str(SCRATCH_A, CPU, register + XMM_HALF);
@@ -3530,6 +4507,83 @@ impl<'a> Gen<'a> {
         memory
     }
 
+    /// A `PartialMove`: 4 or 8 bytes between part of an xmm register and memory (one access
+    /// through the TLB probe, any alignment that stays in the page) or another xmm register,
+    /// behind the SSE gate.
+    fn partial_move(
+        &mut self,
+        insn: &Insn,
+        form: PartialMove,
+        next_rip: u64,
+        insn_index: u32,
+        rip: u64,
+    ) -> bool {
+        let (slow, resume) = self.sse_entry(insn_index, rip);
+        let xmm = |reg: u8| XMM_OFFSET + XMM_SIZE * reg as u32;
+        let memory = insn.md != MODRM_MOD_REGISTER;
+        let bytes = form.bytes;
+        let part = xmm(insn.reg) + form.offset as u32;
+        let load = |this: &mut Self, rt: u32, base: u32, offset: u32| {
+            if bytes == 8 {
+                this.asm.ldr(rt, base, offset);
+            } else {
+                this.asm.ldr_w(rt, base, offset);
+            }
+        };
+        let store = |this: &mut Self, rt: u32, base: u32, offset: u32| {
+            if bytes == 8 {
+                this.asm.str(rt, base, offset);
+            } else {
+                this.asm.str_w(rt, base, offset);
+            }
+        };
+        if memory {
+            let tag = if form.from_register {
+                TLB_TAG_WRITE_OFFSET
+            } else {
+                TLB_TAG_READ_OFFSET
+            };
+            self.effective_address(insn, next_rip, ADDRESS);
+            // Plain accesses with barriers below, at any alignment: glibc's movlpd/movhpd and
+            // movsd operands often are not.
+            self.tlb_probe_any_alignment(bytes, tag, slow);
+            self.asm.ldr(SCRATCH_B, SCRATCH_A, TLB_ADDEND_OFFSET);
+            self.asm.add(SCRATCH_B, ADDRESS, SCRATCH_B, true);
+        }
+        if form.from_register {
+            load(self, VALUE, CPU, part);
+            if memory {
+                if self.ordered_memory {
+                    // A release (see `ordered_memory`).
+                    self.asm.dmb_ish();
+                }
+                store(self, VALUE, SCRATCH_B, 0);
+            } else {
+                store(self, VALUE, CPU, xmm(insn.rm));
+            }
+        } else {
+            if memory {
+                load(self, VALUE, SCRATCH_B, 0);
+                if self.ordered_memory {
+                    // An acquire (see `ordered_memory`).
+                    self.asm.dmb_ishld();
+                }
+            } else {
+                load(self, VALUE, CPU, xmm(insn.rm));
+            }
+            store(self, VALUE, CPU, part);
+            if form.zero_rest {
+                if bytes == 4 {
+                    self.asm.str_w(XZR, CPU, part + 4);
+                }
+                self.asm.str(XZR, CPU, xmm(insn.reg) + XMM_HALF);
+            }
+        }
+        self.asm.bind(resume);
+        self.live = None;
+        memory && form.from_register
+    }
+
     /// A `WholeVector` instruction (the SHA extensions, pshufd, palignr, pshufb), the source being
     /// a register or a 16-byte aligned memory operand with the fallbacks of `vector_alu`. palignr,
     /// pshufd and pshufb are one NEON permute; sha256msg1 and sha256msg2 are the host's own SHA-256
@@ -3575,14 +4629,13 @@ impl<'a> Gen<'a> {
                 self.asm.ldr(SOURCE_LOW_ARGUMENT, CPU, xmm(insn.rm));
                 self.asm
                     .ldr(SOURCE_HIGH_ARGUMENT, CPU, xmm(insn.rm) + XMM_HALF);
-            } else if self.ordered_memory {
-                // Acquires, as for `vector_move`.
-                self.asm.ldar(SOURCE_LOW_ARGUMENT, SCRATCH_B, 8);
-                self.asm.add_imm(SCRATCH_B, SCRATCH_B, XMM_HALF, true);
-                self.asm.ldar(SOURCE_HIGH_ARGUMENT, SCRATCH_B, 8);
             } else {
                 self.asm
                     .ldp_off(SOURCE_LOW_ARGUMENT, SOURCE_HIGH_ARGUMENT, SCRATCH_B, 0);
+                if self.ordered_memory {
+                    // An acquire, as for `vector_move`.
+                    self.asm.dmb_ishld();
+                }
             }
             self.asm.mov_imm(PACKED_ARGUMENT, form.packed(insn.reg));
             self.asm.mov(0, CPU);
@@ -3679,6 +4732,14 @@ impl<'a> Gen<'a> {
                 if is_inline_terminator(&self.insns[index])
                     && !(is_conditional_branch(&self.insns[index]) && index + 1 < count)
                 {
+                    self.emit_slows();
+                    return;
+                }
+                if terminal && !is_inline_terminator(&self.insns[index]) {
+                    // An inline instruction the run loop must see the effect of (sti): back to
+                    // it, not on to the next block.
+                    self.set_rip(next_rip);
+                    self.exit_ok(index as u32 + 1);
                     self.emit_slows();
                     return;
                 }
@@ -4104,6 +5165,9 @@ mod tests {
         cond: Stub::DUMMY,
         rotate_flags: Stub::DUMMY,
         whole_vector: Stub::DUMMY,
+        materialize_flags: Stub::DUMMY,
+        rdtsc: Stub::DUMMY,
+        pause: Stub::DUMMY,
         exit_ok: 0,
         exit_fail: 0,
         chain: 0,

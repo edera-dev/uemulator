@@ -1909,10 +1909,10 @@ mod tests {
             (&[0x48, 0xf7, 0xe1][..], 1),
             (&[0xf7, 0x2e], 1),
             (&[0xf7, 0xe1], 1),
-            // mul cx | mul cl | div rcx
+            // mul cx | mul cl | div cx
             (&[0x66, 0xf7, 0xe1], 0),
             (&[0xf6, 0xe1], 0),
-            (&[0x48, 0xf7, 0xf1], 0),
+            (&[0x66, 0xf7, 0xf1], 0),
         ] {
             assert_eq!(inlined_in(&[code, &[0xf4]].concat()), inlined, "{code:x?}");
         }
