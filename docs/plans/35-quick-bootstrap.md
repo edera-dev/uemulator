@@ -53,10 +53,10 @@ the three distros `quick create --install` already knows.
 | `--password TEXT` / `--ask-password` / `--password-file FILE` | Password | required, exactly one form | `--ask-password` prompts twice, with no echo |
 | `--root-password TEXT` / `--ask-root-password` / `--root-password-file FILE` | Root password (optional) | root locked | None of these means root has no password and the user's sudo is the way in |
 | `--hostname NAME` | Hostname | the machine name | |
-| `--ssh-key FILE` (repeatable) | SSH key (file picker) | none | Installs and enables the OpenSSH server, and authorizes the key(s) for the user |
+| `--ssh-key FILE` (repeatable) | SSH key (file picker) | none | Installs and enables the OpenSSH server, and authorizes the key(s) for the user. Each line must be an OpenSSH public key, `TYPE BASE64 [COMMENT]` with a type `ssh-keygen` writes (no `authorized_keys` options), which keeps a private key picked by mistake out of `machine.toml` and the guest; errors name the key by number and type, never its text |
 | `--timezone TZ` | Timezone | the host's | IANA name |
 | `--locale LOCALE` | Locale | the host's, else `en_US.UTF-8` | Alpine ignores it (musl) |
-| `--keymap MAP` | Keymap | the host's, else `us` | |
+| `--keymap MAP` | Keymap | the host's, else `us` | A layout name every installer takes, two or three lowercase letters (`de`, not `de-latin1`); `Answers::validate` checks it, for the app too |
 | `--package P` (repeatable) | Packages (space separated) | none | Added by the installer, by distro package name |
 
 The rest of `quick create`'s options (memory, disk size, display, TPM and so on) work on `quick
