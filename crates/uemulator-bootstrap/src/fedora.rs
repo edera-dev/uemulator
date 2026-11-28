@@ -12,9 +12,14 @@ const CMDLINE: &str = "inst.ks=file:/ks.cfg";
 const KICKSTART_PATH: &str = "ks.cfg";
 /// It carries a password hash.
 const KICKSTART_MODE: u32 = S_IFREG | 0o600;
-/// The same tree the CLI's `quick::Distro::Fedora` names in `inst.repo=`; bump them together.
+/// The same tree the CLI's `quick::Distro::Fedora` names in `inst.repo=`; bump them together,
+/// and `EVERYTHING_REPOSITORY` with them.
 const REPOSITORY: &str =
     "https://dl.fedoraproject.org/pub/fedora/linux/releases/44/Server/x86_64/os/";
+/// The release's full package set. The Server tree above holds only what Server installs, so a
+/// package asked for beyond it (htop, for one) needs this as well.
+const EVERYTHING_REPOSITORY: &str =
+    "https://dl.fedoraproject.org/pub/fedora/linux/releases/44/Everything/x86_64/os/";
 /// The installed system's first disk (virtio-blk), without `/dev/` as kickstart wants it.
 const DISK: &str = "vda";
 
@@ -49,6 +54,13 @@ fn kickstart(answers: &Answers) -> String {
     let _ = writeln!(out, "timezone {timezone} --utc");
     let _ = writeln!(out, "network --bootproto=dhcp --hostname={hostname}");
     let _ = writeln!(out, "url --url={REPOSITORY}");
+    // Only then: its metadata is a long download in an emulator.
+    if !answers.packages.is_empty() {
+        let _ = writeln!(
+            out,
+            "repo --name=everything --baseurl={EVERYTHING_REPOSITORY}"
+        );
+    }
     // Validation keeps hashes to `./$=` and alphanumerics, which kickstart's shlex-style parser
     // takes literally.
     let _ = writeln!(
@@ -120,6 +132,15 @@ mod tests {
             kickstart(&minimal()),
             include_str!("../testdata/fedora-minimal.ks")
         );
+    }
+
+    /// htop is not in the Server tree the installer boots from: Anaconda stopped at "No match
+    /// for argument: htop" on a real install.
+    #[test]
+    fn extra_packages_also_come_from_everything() {
+        let repo = format!("\nrepo --name=everything --baseurl={EVERYTHING_REPOSITORY}\n");
+        assert!(kickstart(&full()).contains(&repo));
+        assert!(!kickstart(&minimal()).contains("repo "));
     }
 
     #[test]
