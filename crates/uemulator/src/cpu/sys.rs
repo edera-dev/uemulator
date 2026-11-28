@@ -123,8 +123,8 @@ const CR3_MASK_LEGACY: u64 = 0xffff_f018;
 const CR3_MASK_PAE: u64 = 0xffff_ffe0 | 0x18;
 pub(super) const CR3_RESERVED_BITS: u64 = CR3_RESERVED;
 const CR3_RESERVED: u64 = !0u64 << PHYSICAL_ADDRESS_BITS;
-/// CR8 holds the 4-bit task priority; it is stored but no APIC consumes it. Higher bits are
-/// reserved.
+/// CR8 is the 4-bit task priority, an alias of the local APIC's TPR (MOV CR8 reads and writes
+/// it, or the SVM guest's V_TPR); higher bits are reserved.
 const CR8_MASK: u64 = 0xf;
 /// CR8 is TPR[7:4] (SDM 10.8.6.1).
 const CR8_TPR_SHIFT: u32 = 4;

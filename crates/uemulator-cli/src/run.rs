@@ -126,7 +126,7 @@ fn read_escape(chunk: &[u8], pending: &mut bool) -> Vec<Escape> {
 }
 
 /// The writable disks of `settings` and the nvram: what a checkpoint copies beside itself.
-fn machine_files(settings: &Settings, nvram: Option<&std::path::Path>) -> MachineFiles {
+pub(crate) fn machine_files(settings: &Settings, nvram: Option<&std::path::Path>) -> MachineFiles {
     let disks: Vec<std::path::PathBuf> = settings
         .disks
         .iter()
@@ -203,33 +203,10 @@ fn spawn_gateway(net: NetHandle) {
     });
 }
 
-fn build_config(
-    kernel: Vec<u8>,
-    initramfs: Option<Vec<u8>>,
-    settings: &Settings,
-    runtime: &RuntimeArgs,
-    files: &MachineFiles,
-) -> Result<MachineConfig, String> {
-    let mut cfg = MachineConfig::new()
-        .kernel(kernel)
-        .debug(runtime.debug)
-        .verify_jit(runtime.verify)
-        .check_dirty_tracking(runtime.check_dirty_tracking);
-    if let Some(path) = &runtime.suspend_to {
-        cfg = cfg.suspend_to(FileSnapshotSink::new(path));
-    }
-    match &runtime.resume_from {
-        // Before the disks are opened below: they go back to what the checkpoint saw.
-        Some(path) if checkpoints::is_checkpoint(path) => {
-            let chain = checkpoints::sources(path)?;
-            files.restore_from(path)?;
-            cfg = cfg.resume_from_chain(chain);
-        }
-        Some(path) => {
-            cfg = cfg.resume_from(FileSnapshotSource::open(path).map_err(|e| e.to_string())?);
-        }
-        None => {}
-    }
+/// The combinations of run options that are refused. Checked before a checkpoint's disks are
+/// copied back (here and in `machines::prepare_boot`): a resume that is refused must leave the
+/// disks as they are.
+pub(crate) fn refuse_runtime_conflicts(runtime: &RuntimeArgs) -> Result<(), String> {
     if runtime.checkpoint_every.is_some() && checkpoint_directory(runtime).is_none() {
         return Err("--checkpoint-every needs --checkpoint-dir".into());
     }
@@ -248,6 +225,39 @@ fn build_config(
             "--suspend-to: a .{} file is resumed as a checkpoint; use another name",
             checkpoints::EXTENSION
         ));
+    }
+    Ok(())
+}
+
+fn build_config(
+    kernel: Vec<u8>,
+    initramfs: Option<Vec<u8>>,
+    settings: &Settings,
+    runtime: &RuntimeArgs,
+    files: &MachineFiles,
+) -> Result<MachineConfig, String> {
+    let mut cfg = MachineConfig::new()
+        .kernel(kernel)
+        .debug(runtime.debug)
+        .verify_jit(runtime.verify)
+        .check_dirty_tracking(runtime.check_dirty_tracking);
+    if let Some(path) = &runtime.suspend_to {
+        cfg = cfg.suspend_to(FileSnapshotSink::new(path));
+    }
+    refuse_runtime_conflicts(runtime)?;
+    match &runtime.resume_from {
+        // Before the disks are opened below: they go back to what the checkpoint saw.
+        Some(path) if checkpoints::is_checkpoint(path) => {
+            let chain = checkpoints::sources(path)?;
+            if !runtime.checkpoint_files_restored {
+                files.restore_from(path)?;
+            }
+            cfg = cfg.resume_from_chain(chain);
+        }
+        Some(path) => {
+            cfg = cfg.resume_from(FileSnapshotSource::open(path).map_err(|e| e.to_string())?);
+        }
+        None => {}
     }
     if runtime.gdb.is_some() {
         cfg = cfg.gdb_stub(runtime.gdb_wait);
@@ -675,6 +685,7 @@ fn host_random_seed() -> u64 {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::fs;
 
     use super::*;
     use crate::test_support::TempDir;
@@ -748,6 +759,27 @@ mod tests {
             &runtime,
             &MachineFiles::default(),
         )
+    }
+
+    #[test]
+    fn a_refused_resume_leaves_the_disks_alone() {
+        // Every refusal comes before a checkpoint's disks are copied back: a resume that does not
+        // happen must not throw away what was written since.
+        let directory = TempDir::new("run-refused-resume");
+        let disk = directory.path().join("disk.img");
+        let checkpoint = directory.path().join("0001.checkpoint");
+        fs::write(&checkpoint, crate::test_support::snapshot_header(1, None)).unwrap();
+        fs::write(checkpoint.with_extension("disk-0"), b"then").unwrap();
+        fs::write(&disk, b"now").unwrap();
+        let checkpoint_arg = checkpoint.to_string_lossy().into_owned();
+        let (settings, runtime) =
+            boot_args(&["--resume-from", &checkpoint_arg, "--checkpoint-every", "0"]);
+        let files = MachineFiles::new(std::slice::from_ref(&disk), None);
+        let error = build_config(Vec::new(), None, &settings, &runtime, &files)
+            .err()
+            .unwrap();
+        assert!(error.contains("at least 1 second"), "{error}");
+        assert_eq!(fs::read(&disk).unwrap(), b"now");
     }
 
     /// What the library says about `cfg` before it looks at the kernel. The kernel is empty, so

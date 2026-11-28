@@ -199,7 +199,7 @@ impl GuestRam {
 }
 
 /// The longest view `GuestRam` hands out: the most a Rust slice may cover.
-const MAX_VIEW_BYTES: usize = isize::MAX as usize;
+pub(crate) const MAX_VIEW_BYTES: usize = isize::MAX as usize;
 
 /// `0..length` as ranges no longer than a view may be.
 fn views_covering(length: usize) -> impl Iterator<Item = Range<usize>> {

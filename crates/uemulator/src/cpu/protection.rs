@@ -71,8 +71,9 @@ impl Cpu {
         Ok(())
     }
 
-    /// 0F 01 C8. CPL 0 only. Nothing else can write guest RAM while the CPU waits except device
-    /// DMA, and the armed range is never consulted, so MWAIT below only wakes on interrupts.
+    /// 0F 01 C8. CPL 0 only. With one vCPU nothing but device DMA writes guest RAM while it
+    /// waits, so MWAIT only wakes on interrupts; with several, the armed line is watched
+    /// (`monitor_snapshot`, then `mwait_watch`) and a store to it by another vCPU wakes it.
     pub(super) fn monitor(&mut self) -> ExecResult<()> {
         self.need_cpl0()?;
         if self.gpr[RCX] != MONITOR_NO_EXTENSIONS

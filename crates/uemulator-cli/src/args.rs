@@ -390,6 +390,11 @@ pub struct RuntimeArgs {
     /// guest then writes its disks and the file no longer matches them
     #[arg(long, value_name = "FILE")]
     pub resume_from: Option<std::path::PathBuf>,
+    /// Set by `quick boot`, which puts a checkpoint's disks and nvram back itself before it
+    /// looks at the disk to choose between the installer and the install: the run must not
+    /// copy them a second time.
+    #[arg(skip)]
+    pub checkpoint_files_restored: bool,
     /// Take checkpoints of the running machine into DIR: Ctrl-] then c takes one (Ctrl-] then any
     /// other key stops as before). The first is a full snapshot, each later one a delta against
     /// the one before; the writable disks and the nvram are copied beside each. Resume one with
