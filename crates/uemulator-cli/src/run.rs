@@ -594,18 +594,18 @@ fn run_config(
     if let (Some(secs), Some(directory)) = (runtime.checkpoint_every, checkpoint_dir) {
         let handle = machine.stop_handle();
         let files = files.clone();
+        let ended = ended.clone();
         std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(Duration::from_secs(secs));
-                checkpoints::take(&handle, &directory, &files);
-            }
+            every_until_ended(Duration::from_secs(secs), &ended, || {
+                checkpoints::take(&handle, &directory, &files)
+            })
         });
     }
     if let Some(secs) = runtime.timeout {
         let stop = machine.stop_handle();
+        let ended = ended.clone();
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(secs));
-            end(&stop);
+            after_unless_ended(Duration::from_secs(secs), &ended, || end(&stop))
         });
     }
 
@@ -687,8 +687,59 @@ fn host_random_seed() -> u64 {
         .finish()
 }
 
+/// The `--checkpoint-every` timer. It must stop with its run: `quick bootstrap` runs a second
+/// machine in the same process, and a checkpoint of the ended installer fails, says so every
+/// interval over the installed system's console, and spends a checkpoint number.
+fn every_until_ended(interval: Duration, ended: &AtomicBool, mut action: impl FnMut()) {
+    loop {
+        std::thread::sleep(interval);
+        if ended.load(Ordering::Acquire) {
+            return;
+        }
+        action();
+    }
+}
+
+/// The `--timeout` timer, which does nothing once its run is over (see `every_until_ended`).
+fn after_unless_ended(delay: Duration, ended: &AtomicBool, action: impl FnOnce()) {
+    std::thread::sleep(delay);
+    if !ended.load(Ordering::Acquire) {
+        action();
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_timers_stop_when_their_run_ends() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::mpsc;
+        const TICK: Duration = Duration::from_millis(1);
+        let ended = Arc::new(AtomicBool::new(false));
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let (done, finished) = mpsc::channel();
+        let (ended_in, ticks_in) = (ended.clone(), ticks.clone());
+        std::thread::spawn(move || {
+            every_until_ended(TICK, &ended_in, || {
+                ticks_in.fetch_add(1, Ordering::Relaxed);
+            });
+            done.send(()).unwrap();
+        });
+        while ticks.load(Ordering::Relaxed) < 3 {
+            std::thread::yield_now();
+        }
+        ended.store(true, Ordering::Release);
+        finished
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the checkpoint timer outlived its run");
+        let mut fired = false;
+        after_unless_ended(TICK, &ended, || fired = true);
+        assert!(!fired, "the timeout fired after its run ended");
+        let running = AtomicBool::new(false);
+        after_unless_ended(TICK, &running, || fired = true);
+        assert!(fired);
+    }
+
     use std::cell::RefCell;
     use std::fs;
 
