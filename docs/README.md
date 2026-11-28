@@ -49,8 +49,8 @@ The design plans in [`plans/`](plans/README.md) are the source of truth for how 
 
 - [13-web.md](plans/13-web.md): the WebAssembly port and the browser page.
 - [28-apple.md](plans/28-apple.md): the SwiftUI app for macOS and iOS in `apple/` (milestones M0-M5 built): native engine, and the WebAssembly JIT run in a hidden WebKit view.
-- [35-quick-bootstrap.md](plans/35-quick-bootstrap.md): `quick bootstrap`, unattended distro installs from a few answers, in the CLI and the Apple app (proposal).
-- [35-quick-bootstrap-plan.md](plans/35-quick-bootstrap-plan.md): its implementation plan, task by task.
+- [35-quick-bootstrap.md](plans/35-quick-bootstrap.md): `quick bootstrap`, unattended distro installs from a few answers, in the CLI and the Apple app (implemented).
+- [35-quick-bootstrap-plan.md](plans/35-quick-bootstrap-plan.md): its implementation plan, task by task (done).
 - [12-uefi.md](plans/12-uefi.md): uemulator as a UEFI application, including the hardware-virtualization path.
 - [29-snapshots.md](plans/29-snapshots.md): suspending a machine to a snapshot and resuming it, on any host, keeping its disks consistent: how the app survives iOS ending it and moves a machine between engines.
 - [34-incremental-snapshots.md](plans/34-incremental-snapshots.md): dirty-page tracking, delta snapshots with page compression, and checkpoints of a running machine to go back to.

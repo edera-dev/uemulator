@@ -37,7 +37,7 @@ Index of the design plans, in reading order. Each file starts with a status line
 | 30-gdb-stub.md | GDB remote stub: the RSP engine in the library (sans-I/O), breakpoints, watchpoints and single-step through the interpreter's debug path, a thread per vCPU, `--gdb` on the CLI (implemented) |
 | 31-host-fpu.md | SSE/AVX/AVX-512 floating point on the host FPU (`x-ssefp`): when the host's result is exactly soft-float's, the exactness checks and the fallbacks, per host (implemented) |
 | 34-incremental-snapshots.md | dirty-page tracking, snapshot format 2 (deltas, LZ page compression), checkpoints of a running machine and resuming a chain (implemented) |
-| 35-quick-bootstrap.md | `quick bootstrap`: unattended Alpine, Debian and Fedora installs from a few answers (user, passwords, hostname, SSH key, locale, packages), the answer file appended to the installer's initramfs as a cpio, the Apple app's New Machine fields (proposal) |
-| 35-quick-bootstrap-plan.md | the task-by-task implementation plan for 35 (proposal) |
+| 35-quick-bootstrap.md | `quick bootstrap`: unattended Alpine, Debian and Fedora installs from a few answers (user, passwords, hostname, SSH key, locale, packages), the answer file appended to the installer's initramfs as a cpio, the Apple app's Install sheet (implemented; Alpine, Debian and Fedora installed for real through the CLI) |
+| 35-quick-bootstrap-plan.md | the task-by-task implementation plan for 35 (done) |
 
 Rules for implementers: `../ext/qemu-uplink` is read-only reference. Behaviour and algorithms are studied there; code is written fresh in Rust, not transliterated. Built with `--no-default-features` the library has no third-party dependencies on hosted targets (only the workspace's `uemulator-crypto` and `uemulator-snapshot-derive`; UEFI and wasm32 builds add `libm`).

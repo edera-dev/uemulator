@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** proposal (the plan for `35-quick-bootstrap.md`).
+**Status:** done (the plan for `35-quick-bootstrap.md`; what the real installs showed is recorded there, under "Checked").
 
 **Goal:** `uemulator quick bootstrap NAME --install DISTRO --user U --ask-password` and the Apple
 app's Install sheet install Alpine, Debian or Fedora unattended, then boot the installed system.
