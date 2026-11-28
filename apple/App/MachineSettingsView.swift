@@ -325,7 +325,9 @@ struct MachineSettingsView: View {
         }
     }
 
-    // Saves the draft and imports the picked files, then closes the sheet and runs `after`.
+    // Saves the draft and imports the picked files, then closes the sheet and runs `after`, but
+    // only if the import worked: `after` is Reinstall…, which would erase the disk on a
+    // half-applied configuration, and its `start()` would clear the import's error.
     private func done(after: (() -> Void)? = nil) {
         removeCreatedDisks(keeping: draft.disks.map(\.url))
         // Named before the save, so its command line is saved with it; the file follows.
@@ -341,14 +343,16 @@ struct MachineSettingsView: View {
         }
         saving = true
         Task {
+            var imported = true
             do {
                 try await model.importFiles(isos: isos, images: images, kernel: kernel, initrd: initrd, hypervisor: hypervisor)
             } catch {
                 model.problem = error.localizedDescription
+                imported = false
             }
             saving = false
             dismiss()
-            after?()
+            if imported { after?() }
         }
     }
 
