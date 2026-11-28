@@ -18,6 +18,16 @@ enum Distro: String, CaseIterable, Identifiable {
         }
     }
 
+    // What `ua_bootstrap_initrd` takes for it. The same spelling as the raw value today, but the
+    // raw value is machine.toml's and this is the C ABI's: they need not stay equal.
+    var bootstrapName: String {
+        switch self {
+        case .alpine: "alpine"
+        case .debian: "debian"
+        case .fedora: "fedora"
+        }
+    }
+
     struct Download {
         // The name under the machine's artifacts/, as the CLI saves it.
         let file: String
