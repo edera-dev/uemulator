@@ -39,8 +39,11 @@ const HYPERVISOR_FILE: &str = "hypervisor";
 const STAGING_DIR: &str = "artifacts.new";
 const MAX_NAME_LEN: usize = 64;
 const MIB_SHIFT: u32 = 20;
-/// The disk a machine gets when none was asked for.
-const DEFAULT_DISK_MIB: u64 = 8 * 1024;
+/// The disk a machine gets when none was asked for: sparse, so only what the guest writes takes
+/// room. Every quick machine is an installer's, and Debian 13's guided partitioning (UEFI, the
+/// `atomic` recipe) gives up on 8 GiB; 64 GiB is also what the Apple app makes
+/// (`Presets.easyDiskGib`).
+const DEFAULT_DISK_MIB: u64 = 64 * 1024;
 const MAX_DISK_LETTERS: usize = 26;
 
 /// Root of all CLI state: `$UEMULATOR_HOME`, else `~/.uemulator`. `HOME` is unix only, so named
@@ -154,6 +157,11 @@ impl Machine {
         write_atomically(Cursor::new(text.into_bytes()), &path)
             .map_err(|e| format!("write {}: {e}", path.display()))
     }
+}
+
+/// Whether `name` is taken, as `create` would find it.
+pub fn exists(home: &Path, name: &str) -> bool {
+    home.join(MACHINES_DIR).join(name).exists()
 }
 
 pub fn load(home: &Path, name: &str) -> Result<Machine, String> {
@@ -295,7 +303,7 @@ fn persist_disks(dir: &Path, steps: &[DiskStep]) -> Result<Vec<DiskSpec>, String
 }
 
 /// A new machine. Whatever the command line leaves out gets the `quick` defaults, saved so that
-/// `edit` can change them: one 8 GiB disk, one NAT NIC (the installers fetch packages over the
+/// `edit` can change them: one 64 GiB disk, one NAT NIC (the installers fetch packages over the
 /// network), one virtio console. Nothing is left behind if it fails. `bootstrap` is the record
 /// of a machine `quick bootstrap` installs.
 #[allow(clippy::too_many_arguments)]
@@ -1029,7 +1037,9 @@ mod tests {
         let dir = home.path().join("machines/m");
         assert_eq!(machine.dir, dir);
         assert!(dir.join(MACHINE_FILE).is_file());
-        assert_eq!(disk_size(&dir.join("disk-0.udisk")), DEFAULT_DISK_MIB * MIB);
+        // The app's size for an install (`Presets.easyDiskGib`). Debian 13's guided partitioning
+        // refused 8 GiB under UEFI ("Unable to satisfy all constraints on the partition").
+        assert_eq!(disk_size(&dir.join("disk-0.udisk")), 64 * 1024 * MIB);
         let settings = load(home.path(), "m").unwrap().settings;
         assert_eq!(
             settings.disks,
