@@ -242,6 +242,34 @@ fn change_hypervisor(
     Ok(args.hypervisor.clone())
 }
 
+/// Refuses an installer that is an EFI application (netboot.xyz) where it cannot run: under
+/// another firmware, or as a hypervisor's dom0. Checked before a machine is made or its artifacts
+/// are replaced, and again at every boot, since `quick edit` and a hand-edited file can change the
+/// firmware or the hypervisor later.
+fn installer_fits(
+    install: Distro,
+    firmware: Firmware,
+    name: &str,
+    hypervisor: bool,
+) -> Result<(), String> {
+    if install.needs_uefi() && firmware != Firmware::Uefi {
+        return Err(format!(
+            "the {} installer is an EFI application, and the machine's firmware is {}: \
+             `quick edit {name} --firmware uefi` first",
+            install.name(),
+            firmware.name(),
+        ));
+    }
+    if install.needs_uefi() && hypervisor {
+        return Err(format!(
+            "the {} installer is not a kernel the hypervisor can run as dom0: boot it without \
+             the hypervisor (--remove-hypervisor)",
+            install.name()
+        ));
+    }
+    Ok(())
+}
+
 /// Copies `source` in as the machine's hypervisor image, replacing any earlier one whole.
 fn install_hypervisor(machine: &Machine, source: &Path) -> Result<(), String> {
     let image =
@@ -371,7 +399,14 @@ pub fn create(
             settings,
             bootstrap,
         };
-        if let Some(source) = change_hypervisor(&mut machine, &linux.hypervisor, false)? {
+        let source = change_hypervisor(&mut machine, &linux.hypervisor, false)?;
+        installer_fits(
+            machine.install,
+            machine.firmware,
+            name,
+            machine.hypervisor.is_some(),
+        )?;
+        if let Some(source) = source {
             install_hypervisor(&machine, &source)?;
         }
         machine.save()?;
@@ -609,22 +644,12 @@ pub fn prepare_boot(
             settings,
         });
     }
-    if machine.install.needs_uefi() && machine.firmware != Firmware::Uefi {
-        return Err(format!(
-            "the {} installer is an EFI application, and the machine's firmware is {}: \
-             `quick edit {} --firmware uefi` first",
-            machine.install.name(),
-            machine.firmware.name(),
-            machine.name
-        ));
-    }
-    if machine.install.needs_uefi() && hypervisor.is_some() {
-        return Err(format!(
-            "the {} installer is not a kernel the hypervisor can run as dom0: boot it without \
-             the hypervisor (--remove-hypervisor)",
-            machine.install.name()
-        ));
-    }
+    installer_fits(
+        machine.install,
+        machine.firmware,
+        &machine.name,
+        hypervisor.is_some(),
+    )?;
     let artifacts = ensure_in(&machine.artifacts_dir(), machine.install, false, fetch)?;
     Ok(Launch {
         source: BootSource::Installer,
@@ -701,6 +726,14 @@ pub fn reinstall(
     if bootstrap.is_some() {
         machine.bootstrap = bootstrap;
     }
+    // Before anything changes: a refused reinstall leaves the machine, its boot and its artifacts
+    // as they were.
+    installer_fits(
+        machine.install,
+        machine.firmware,
+        name,
+        machine.hypervisor.is_some(),
+    )?;
     machine.boot_from = BootSource::Installer;
     machine.save()?;
     let artifacts = machine.artifacts_dir();
@@ -769,6 +802,12 @@ pub fn format_list(entries: &[Listing]) -> String {
         .map(|(name, _)| name.len())
         .max()
         .unwrap_or(0);
+    let distro_width = entries
+        .iter()
+        .filter_map(|(_, machine)| machine.as_ref().ok())
+        .map(|machine| machine.install.name().len())
+        .max()
+        .unwrap_or(0);
     let mut out = String::new();
     for (name, machine) in entries {
         let line = match machine {
@@ -778,7 +817,7 @@ pub fn format_list(entries: &[Listing]) -> String {
                     .memory
                     .unwrap_or(machine.install.default_memory_mib());
                 format!(
-                    "{:<8} {memory} MiB, {} disk(s), {} network(s)",
+                    "{:<distro_width$} {memory} MiB, {} disk(s), {} network(s)",
                     machine.install.name(),
                     settings.disks.len(),
                     settings.networks.len()
@@ -1531,17 +1570,19 @@ mod tests {
     fn a_netboot_xyz_installer_is_refused_without_the_uefi_firmware() {
         let home = TempDir::new("machines-netboot-xyz-bios");
         let (hardware, linux) = create_args(&[]);
-        let machine = create(
+        let mut machine = create(
             home.path(),
             "m",
             Distro::NetbootXyz,
             &hardware,
             &linux,
             None,
-            Some(Firmware::Bios),
+            None,
             None,
         )
         .unwrap();
+        // Only `quick edit` or a hand-edited file gets a machine here: `create` refuses it.
+        machine.firmware = Firmware::Bios;
         let (hardware, linux, remove) = boot_args(&[]);
         let fetcher = FakeFetcher::new();
         let error = prepare_boot(&machine, &hardware, &linux, &remove, None, None, |u, d| {
@@ -1555,6 +1596,50 @@ mod tests {
             0,
             "nothing fetched for a boot that cannot run"
         );
+    }
+
+    #[test]
+    fn creating_a_netboot_xyz_machine_without_the_uefi_firmware_leaves_nothing() {
+        let home = TempDir::new("machines-netboot-xyz-create");
+        for firmware in [Firmware::Bios, Firmware::None] {
+            let (hardware, linux) = create_args(&[]);
+            let error = create(
+                home.path(),
+                "m",
+                Distro::NetbootXyz,
+                &hardware,
+                &linux,
+                None,
+                Some(firmware),
+                None,
+            )
+            .err()
+            .unwrap();
+            assert!(error.contains("--firmware uefi"), "{error}");
+            assert!(!home.path().join("machines/m").exists());
+        }
+    }
+
+    #[test]
+    fn a_refused_reinstall_to_netboot_xyz_changes_nothing() {
+        let home = TempDir::new("machines-netboot-xyz-reinstall");
+        let mut machine = create_machine(home.path(), &[]);
+        machine.firmware = Firmware::Bios;
+        machine.save().unwrap();
+        let fetcher = FakeFetcher::new();
+        fetch_artifacts(&machine, |u, d| fetcher.fetch(u, d)).unwrap();
+        let before = fs::read_to_string(machine.dir.join(MACHINE_FILE)).unwrap();
+        let error = reinstall(home.path(), "m", Some(Distro::NetbootXyz), None, |u, d| {
+            fetcher.fetch(u, d)
+        })
+        .err()
+        .unwrap();
+        assert!(error.contains("--firmware uefi"), "{error}");
+        assert_eq!(
+            fs::read_to_string(machine.dir.join(MACHINE_FILE)).unwrap(),
+            before
+        );
+        assert!(machine.artifacts_dir().join("vmlinuz-virt").is_file());
     }
 
     #[test]
@@ -2184,6 +2269,32 @@ mod tests {
             .map(|(n, _)| n)
             .collect();
         assert_eq!(names, ["alpha", "zeta"]);
+    }
+
+    #[test]
+    fn list_keeps_its_columns_aligned_for_the_longest_distro_name() {
+        let home = TempDir::new("machines-list-aligned");
+        for (name, distro) in [("a", Distro::Debian), ("b", Distro::NetbootXyz)] {
+            let (hardware, linux) = create_args(&[]);
+            create(
+                home.path(),
+                name,
+                distro,
+                &hardware,
+                &linux,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        let text = format_list(&list(home.path()).unwrap());
+        // Distro names hold no digit, so the first one is where the memory column starts.
+        let columns: Vec<usize> = text
+            .lines()
+            .map(|l| l.find(|c: char| c.is_ascii_digit()).unwrap())
+            .collect();
+        assert_eq!(columns[0], columns[1], "{text}");
     }
 
     #[test]
