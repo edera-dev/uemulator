@@ -112,9 +112,11 @@ fn locale_from_lang(lang: Option<&str>) -> Option<String> {
     well_formed.then(|| lang.to_string())
 }
 
-/// The plain layout name every installer accepts (`Answers::keymap`): console keymaps such as
-/// `de-latin1-nodeadkeys` lose their variant; anything that is not then two or three lowercase
-/// letters (`dvorak`, `fr_CH`) is not a layout all three know.
+/// The plain layout name every installer accepts, as `Answers::validate` checks it: console
+/// keymaps such as `de-latin1-nodeadkeys` lose their variant; anything that is not then two or
+/// three lowercase letters (`dvorak`, `fr_CH`) is not a layout all three know. Change the two
+/// together.
+#[cfg(any(target_os = "linux", test))]
 fn keymap_layout(keymap: &str) -> Option<String> {
     let layout = keymap.split('-').next()?;
     let plain = (2..=3).contains(&layout.len()) && layout.chars().all(|c| c.is_ascii_lowercase());
@@ -336,15 +338,6 @@ pub fn resolve_answers(
             error
         }
     })?;
-    // `validate` takes any keymap-looking name, but a console keymap such as `de-latin1` is not
-    // a layout every installer knows, and an installer that does not know it stops and asks.
-    if keymap_layout(&answers.keymap).as_deref() != Some(answers.keymap.as_str()) {
-        return Err(format!(
-            "keymap {:?}: must be a layout name all the installers take, such as us, de or fr \
-             (de-latin1 is de)",
-            answers.keymap
-        ));
-    }
 
     let password_source =
         PasswordSource::given(&args.password, args.ask_password, &args.password_file);
@@ -838,6 +831,7 @@ mod tests {
             };
             let error = refused(resolve(&args, None));
             assert!(error.starts_with("keymap"), "{keymap}: {error}");
+            assert!(error.contains("such as us, de or fr"), "{keymap}: {error}");
         }
         let args = BootstrapArgs {
             keymap: Some("de".into()),

@@ -60,18 +60,12 @@ impl Answers {
             validate_password_hash("root password hash", hash)?;
         }
         validate_hostname(&self.hostname)?;
-        for key in &self.ssh_keys {
-            // Quoted where it is used; only a line break (or any control character) could
-            // escape that quoting or split the key across lines of authorized_keys.
-            if key.is_empty() || key.chars().any(char::is_control) {
-                return Err(format!(
-                    "ssh key {key:?}: must be one non-empty line with no control characters"
-                ));
-            }
+        for (index, key) in self.ssh_keys.iter().enumerate() {
+            validate_ssh_key(index + 1, key)?;
         }
         validate_setting("timezone", &self.timezone)?;
         validate_setting("locale", &self.locale)?;
-        validate_setting("keymap", &self.keymap)?;
+        validate_keymap(&self.keymap)?;
         for package in &self.packages {
             let allowed = |c: char| c.is_ascii_alphanumeric() || "+._-".contains(c);
             // A leading `-` would be read as an option by apt, dnf or apk.
@@ -197,6 +191,71 @@ fn validate_hostname(hostname: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// The key types OpenSSH writes to a `.pub` file (`ssh-keygen -t`, FIDO keys included).
+const SSH_KEY_TYPES: &[&str] = &[
+    "ssh-ed25519",
+    "ssh-rsa",
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+    "sk-ssh-ed25519@openssh.com",
+    "sk-ecdsa-sha2-nistp256@openssh.com",
+];
+
+/// One public key line, `<type> <base64> [comment]`: no authorized_keys options in front. This is
+/// what keeps a private key (or any other file picked by mistake) out of the guest and out of
+/// `machine.toml`, for the app as well as the CLI. The error names the key by its place in the
+/// list (1-based) and, when it is a known one, its type, never the rest of the line: a pasted
+/// private key must not end up in a message.
+fn validate_ssh_key(number: usize, key: &str) -> Result<(), String> {
+    let (key_type, rest) = key.split_once(' ').unwrap_or((key, ""));
+    let Some(key_type) = SSH_KEY_TYPES.iter().find(|known| **known == key_type) else {
+        return Err(format!(
+            "ssh key {number}: must be an OpenSSH public key line, TYPE BASE64 [COMMENT], with \
+             TYPE one of {}",
+            SSH_KEY_TYPES.join(", ")
+        ));
+    };
+    let rest = rest.trim_start_matches(' ');
+    let (data, comment) = rest.split_once(' ').unwrap_or((rest, ""));
+    let unpadded = data.trim_end_matches('=');
+    let base64 = |c: char| c.is_ascii_alphanumeric() || c == '+' || c == '/';
+    let padding = data.len() - unpadded.len();
+    if unpadded.is_empty() || padding > 2 || !unpadded.chars().all(base64) {
+        return Err(format!(
+            "ssh key {number} ({key_type}): the key must be base64 after the type"
+        ));
+    }
+    // Quoted where it is used; only a line break (or any control character) could escape that
+    // quoting or split the key across lines of authorized_keys.
+    if comment.chars().any(char::is_control) {
+        return Err(format!(
+            "ssh key {number} ({key_type}): must be one line with no control characters"
+        ));
+    }
+    Ok(())
+}
+
+/// A layout name all three installers take: two or three lowercase letters (`us`, `de`, `gb`).
+/// A console keymap such as `de-latin1` or a variant is not one every installer knows, and an
+/// installer that does not know it stops and asks, which stalls an unattended install.
+fn validate_keymap(keymap: &str) -> Result<(), String> {
+    let plain =
+        |name: &str| (2..=3).contains(&name.len()) && name.chars().all(|c| c.is_ascii_lowercase());
+    if plain(keymap) {
+        return Ok(());
+    }
+    validate_setting("keymap", keymap)?;
+    let hint = match keymap.split_once('-') {
+        Some((layout, _)) if plain(layout) => format!(" ({keymap} is {layout})"),
+        _ => " (de-latin1 is de)".to_string(),
+    };
+    Err(format!(
+        "keymap {keymap:?}: must be a layout name all the installers take, such as us, de or \
+         fr{hint}"
+    ))
 }
 
 /// Timezone, locale and keymap names: `Europe/Berlin`, `Etc/GMT+5`, `sr_RS.UTF-8@latin`,
@@ -435,7 +494,7 @@ mod tests {
         Answers {
             timezone: "America/Argentina/Buenos_Aires".into(),
             locale: "sr_RS.UTF-8@latin".into(),
-            keymap: "de-latin1".into(),
+            keymap: "gb".into(),
             ..minimal()
         }
         .validate()
@@ -449,10 +508,110 @@ mod tests {
     }
 
     #[test]
+    fn a_keymap_must_be_a_plain_layout_name() {
+        for keymap in ["de-latin1", "dvorak", "US", "fr_CH", "d", "deu1"] {
+            rejected(
+                &Answers {
+                    keymap: keymap.into(),
+                    ..minimal()
+                },
+                "keymap",
+            );
+        }
+        let error = Answers {
+            keymap: "de-latin1-nodeadkeys".into(),
+            ..minimal()
+        }
+        .validate()
+        .unwrap_err();
+        assert!(error.contains("(de-latin1-nodeadkeys is de)"), "{error}");
+        for keymap in ["us", "de", "jp", "gb"] {
+            Answers {
+                keymap: keymap.into(),
+                ..minimal()
+            }
+            .validate()
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn ssh_keys_must_be_openssh_public_key_lines() {
+        for key in [
+            "AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyOne",
+            "ssh-dss AAAAB3NzaC1kc3M alex@laptop",
+            "from=\"10.0.0.1\" ssh-ed25519 AAAAC3Nz alex@laptop",
+            "ssh-ed25519",
+            "ssh-ed25519 ",
+            "ssh-ed25519 AAAA$(reboot)",
+            "ssh-ed25519 AA===",
+            "ssh-ed25519 ==",
+        ] {
+            rejected(
+                &Answers {
+                    ssh_keys: vec![key.into()],
+                    ..minimal()
+                },
+                "ssh key 1",
+            );
+        }
+        for key in [
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyOne",
+            "ssh-rsa AAAAB3NzaC1yc2EAAAADAQAB+/== a comment with spaces",
+            "ecdsa-sha2-nistp256 AAAAE2VjZHNh  two spaces before it",
+            "ecdsa-sha2-nistp384 AAAAE2VjZHNh",
+            "ecdsa-sha2-nistp521 AAAAE2VjZHNh",
+            "sk-ssh-ed25519@openssh.com AAAAGnNr yubikey",
+            "sk-ecdsa-sha2-nistp256@openssh.com AAAAInNr",
+        ] {
+            Answers {
+                ssh_keys: vec![key.into()],
+                ..minimal()
+            }
+            .validate()
+            .unwrap_or_else(|error| panic!("{key}: {error}"));
+        }
+    }
+
+    /// A private key picked in place of the public one (the app's file picker takes any file):
+    /// every line of it is refused, and the message holds none of it.
+    #[test]
+    fn private_key_lines_are_refused_without_echoing_them() {
+        let private = [
+            "-----BEGIN OPENSSH PRIVATE KEY-----",
+            "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW",
+            "-----END OPENSSH PRIVATE KEY-----",
+        ];
+        for line in private {
+            let error = Answers {
+                ssh_keys: vec!["ssh-ed25519 AAAAC3Nz ok".into(), line.into()],
+                ..minimal()
+            }
+            .validate()
+            .unwrap_err();
+            assert!(error.starts_with("ssh key 2:"), "{error}");
+            assert!(!error.contains(line), "{error}");
+            assert!(!error.contains("b3Blbn"), "{error}");
+            assert!(!error.contains("PRIVATE"), "{error}");
+        }
+        // A known type names the key; its data still is not echoed.
+        let error = Answers {
+            ssh_keys: vec!["ssh-ed25519 secret!data".into()],
+            ..minimal()
+        }
+        .validate()
+        .unwrap_err();
+        assert!(error.starts_with("ssh key 1 (ssh-ed25519):"), "{error}");
+        assert!(!error.contains("secret"), "{error}");
+    }
+
+    #[test]
     fn rejects_multi_line_ssh_keys() {
         for key in [
             "ssh-ed25519 AAAA\nrm -rf /",
             "ssh-ed25519 AAAA\r",
+            "ssh-ed25519 AAAA comment\nrm -rf /",
+            "ssh-ed25519 AAAA comment\0",
             "",
             "ssh-ed25519 \0",
         ] {
