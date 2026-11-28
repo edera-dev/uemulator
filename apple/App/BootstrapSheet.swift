@@ -180,21 +180,39 @@ struct BootstrapSheet: View {
         _locale = State(initialValue: record?.locale ?? Self.deviceLocale)
         _keymap = State(initialValue: record?.keymap ?? Self.defaultKeymap)
         _packages = State(initialValue: record?.packages.joined(separator: " ") ?? "")
+        _rootHadPassword = State(initialValue: purpose == .reinstall && record?.rootPassword == true)
     }
 
-    // `de_DE.UTF-8` from the device's language and region; the fallback without a region.
+    // `de_DE.UTF-8` from the device's language and region, when that is a locale the installers
+    // list: a two- or three-letter language and a two-letter country, as the CLI's
+    // `locale_from_lang` takes them. Anything else (`es_419`, a region without a country) is the
+    // fallback, or the sheet would open with answers the core refuses.
     static var deviceLocale: String {
+        let languageLengths = 2...3
+        let countryLength = 2
         guard let language = Locale.current.language.languageCode?.identifier,
-              let region = Locale.current.region?.identifier
+              let region = Locale.current.region?.identifier,
+              languageLengths.contains(language.count), language.allSatisfy({ $0.isASCII && $0.isLowercase }),
+              region.count == countryLength, region.allSatisfy({ $0.isASCII && $0.isUppercase })
         else { return fallbackLocale }
         return "\(language)_\(region)\(localeEncoding)"
     }
+
+    // The core's errors start with the field's name; these are the fields behind "More".
+    private static let moreFields = ["timezone", "locale", "keymap", "package"]
 
     private static func keysTitle(_ count: Int) -> String {
         count == 1 ? "1 key" : "\(count) keys"
     }
 
     private var unattended: Bool { purpose == .reinstall || automatic }
+
+    // A reinstall of a machine whose root had a password asks for it again: left empty, the
+    // reinstalled root would quietly be locked.
+    @State private var rootHadPassword = false
+    // ... unless the user chooses to lock it this time.
+    @State private var lockRoot = false
+    private var rootPasswordRequired: Bool { rootHadPassword && !lockRoot }
 
     var body: some View {
         NavigationStack {
@@ -249,7 +267,7 @@ struct BootstrapSheet: View {
                     Button(purpose == .create ? "Create" : "Erase and Install", role: purpose == .create ? nil : .destructive) {
                         submit()
                     }
-                    .disabled(unattended && (user.isEmpty || password.isEmpty))
+                    .disabled(unattended && (user.isEmpty || password.isEmpty || (rootPasswordRequired && rootPassword.isEmpty)))
                 }
             }
         }
@@ -266,8 +284,13 @@ struct BootstrapSheet: View {
                 .textContentType(.username)
             SecureField("Password", text: $password)
                 .textContentType(.newPassword)
-            SecureField("Root password", text: $rootPassword, prompt: Text("optional"))
-                .textContentType(.newPassword)
+            if rootHadPassword {
+                Toggle("Lock root", isOn: $lockRoot)
+            }
+            if !lockRoot {
+                SecureField("Root password", text: $rootPassword, prompt: Text(rootPasswordRequired ? "required" : "optional"))
+                    .textContentType(.newPassword)
+            }
             TextField("Hostname", text: $hostname)
             LabeledContent("SSH key") {
                 HStack {
@@ -321,12 +344,15 @@ struct BootstrapSheet: View {
     private func submit() {
         var request: BootstrapRequest?
         if unattended {
+            // A typed password the user then locked root over is not used.
+            let root = lockRoot || rootPassword.isEmpty ? nil : rootPassword
             let record = BootstrapRecord(
                 user: user, hostname: hostname, sshKeys: sshKeys, timezone: timezone, locale: locale, keymap: keymap,
-                packages: packages.split(separator: " ").map(String.init), rootPassword: !rootPassword.isEmpty)
-            let answers = BootstrapRequest(record: record, password: password, rootPassword: rootPassword.isEmpty ? nil : rootPassword)
+                packages: packages.split(separator: " ").map(String.init), rootPassword: root != nil)
+            let answers = BootstrapRequest(record: record, password: password, rootPassword: root)
             if let invalid = answers.problem(for: distro) {
                 problem = invalid
+                if Self.moreFields.contains(where: invalid.hasPrefix) { showingMore = true }
                 return
             }
             request = answers
@@ -339,7 +365,8 @@ struct BootstrapSheet: View {
     }
 }
 
-// The machine settings' record of an unattended install, and Reinstall….
+// The machine settings' rows for a recorded unattended install's answers (Reinstall… is the
+// settings' own button).
 struct BootstrapRecordRows: View {
     let record: BootstrapRecord
 
