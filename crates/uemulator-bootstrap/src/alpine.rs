@@ -111,6 +111,9 @@ fn install_script(answers: &Answers) -> String {
          # Alpine Linux to {DISK}, sets up the user on the installed system and reboots into it.\n\
          set -e\n\
          exec > /dev/console 2>&1\n\
+         # Any failure (set -e) reboots without the completion marker, which ends the host's run\n\
+         # with an error instead of leaving the netboot system at a login prompt.\n\
+         trap reboot EXIT\n\
          \n\
          apk add alpine-conf e2fsprogs\n\
          setup-alpine -e -f /{ANSWERS_PATH}\n"
@@ -184,6 +187,7 @@ fn install_script(answers: &Answers) -> String {
          # installed system would install itself again on every boot.\n\
          rm -rf /mnt/{SCRIPT_PATH} /mnt/etc/runlevels/default/local /mnt/etc/bootstrap\n\
          umount /mnt\n\
+         trap - EXIT\n\
          {PRINT_COMPLETION_MARKER}\n\
          reboot\n"
     );
@@ -233,6 +237,29 @@ mod tests {
             text(&entries, "etc/bootstrap/answers"),
             include_str!("../testdata/alpine-minimal.answers")
         );
+    }
+
+    #[test]
+    fn a_failed_install_reboots_without_the_marker() {
+        for answers in [full(), minimal()] {
+            let entries = overlay(&answers);
+            let script = text(&entries, "etc/local.d/bootstrap.start");
+            let trap = script
+                .find("\ntrap reboot EXIT\n")
+                .expect("a failure must reboot");
+            assert!(
+                trap < script.find("\napk add").unwrap(),
+                "trap before the first step"
+            );
+            let disarmed_then_marker = format!(
+                "\ntrap - EXIT\n{}\nreboot\n",
+                crate::answers::PRINT_COMPLETION_MARKER
+            );
+            assert!(
+                script.ends_with(&disarmed_then_marker),
+                "success disarms the trap right before the marker"
+            );
+        }
     }
 
     #[test]

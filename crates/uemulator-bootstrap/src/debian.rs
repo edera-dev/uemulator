@@ -123,6 +123,8 @@ fn preseed(answers: &Answers) -> String {
         let _ = write!(include, " {package}");
     }
     line(&format!("d-i pkgsel/include string {include}"));
+    // pkgsel asks about unattended upgrades; answered so a priority change cannot bring it up.
+    line("d-i pkgsel/update-policy select none");
     line("popularity-contest popularity-contest/participate boolean false");
     line("d-i grub-installer/only_debian boolean true");
     // grub-installer picks grub-efi or grub-pc from how d-i itself was booted, so one preseed
@@ -187,6 +189,16 @@ mod tests {
             file(&payload, "bootstrap-late.sh"),
             include_str!("../testdata/debian-full.late.sh")
         );
+    }
+
+    #[test]
+    fn unattended_upgrades_question_is_answered() {
+        for answers in [full(), minimal()] {
+            assert!(
+                file(&render(&answers), "preseed.cfg")
+                    .contains("\nd-i pkgsel/update-policy select none\n")
+            );
+        }
     }
 
     #[test]
