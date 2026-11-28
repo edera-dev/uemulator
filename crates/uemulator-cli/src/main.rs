@@ -475,6 +475,42 @@ fn after_installer(reason: &ExitReason, marker_seen: bool) -> AfterInstaller {
     }
 }
 
+/// Everything `quick bootstrap` refuses, checked before the password prompt and before the
+/// machine is created: once it exists, a corrected rerun fails with "already exists", and the
+/// installer download it starts is wasted.
+fn refuse_bootstrap(
+    home: &std::path::Path,
+    name: &str,
+    hardware: &HardwareArgs,
+    linux: &LinuxArgs,
+    firmware: &FirmwareArgs,
+    uefi: &UefiBootArgs,
+    runtime: &RuntimeArgs,
+) -> Result<(), String> {
+    // Before anything else: `machines::exists` below would look outside the machines directory
+    // for a name such as `../x`.
+    machines::validate_name(name)?;
+    bootstrap::refuse_unbootable(firmware.firmware, &linux.hypervisor)?;
+    refuse_uefi_args(uefi, firmware.firmware.unwrap_or_default())?;
+    bootstrap::refuse_attached_first_disk(&hardware.disk_steps)?;
+    bootstrap::refuse_framebuffer_display(hardware.display)?;
+    run::refuse_runtime_conflicts(runtime)?;
+    if runtime.resume_from.is_some() {
+        return Err(format!(
+            "--resume-from: bootstrap makes a new machine; resume one with `uemulator quick boot \
+             {name} --resume-from FILE`"
+        ));
+    }
+    // `machines::create` still refuses a name that turns up meanwhile.
+    if machines::exists(home, name) {
+        return Err(format!(
+            "machine {name} already exists: `uemulator quick reinstall {name} --install DISTRO \
+             --user USER` installs it again unattended, erasing its disk"
+        ));
+    }
+    Ok(())
+}
+
 /// Installs `machine` unattended with `answers`, then boots the installed disk
 /// (`docs/plans/35-quick-bootstrap.md`, "After the install"). The disk boot is `quick boot`'s:
 /// the user's own reboot setting, `uefi`'s boot menu and timeout, and no marker watch.
@@ -706,27 +742,7 @@ fn quick_command(cmd: QuickCmd) -> Result<Option<ExitReason>, String> {
             uefi,
             mut runtime,
         } => {
-            // Before anything else, the password prompt included: `machines::exists` below
-            // would look outside the machines directory for a name such as `../x`.
-            machines::validate_name(&name)?;
-            bootstrap::refuse_unbootable(firmware.firmware, &linux.hypervisor)?;
-            bootstrap::refuse_attached_first_disk(&hardware.disk_steps)?;
-            bootstrap::refuse_framebuffer_display(hardware.display)?;
-            run::refuse_runtime_conflicts(&runtime)?;
-            if runtime.resume_from.is_some() {
-                return Err(format!(
-                    "--resume-from: bootstrap makes a new machine; resume one with `uemulator \
-                     quick boot {name} --resume-from FILE`"
-                ));
-            }
-            // Before the password is asked for, which would be wasted. `machines::create` still
-            // refuses a name that turns up meanwhile.
-            if machines::exists(&home, &name) {
-                return Err(format!(
-                    "machine {name} already exists: `uemulator quick reinstall {name} --install \
-                     DISTRO --user USER` installs it again unattended, erasing its disk"
-                ));
-            }
+            refuse_bootstrap(&home, &name, &hardware, &linux, &firmware, &uefi, &runtime)?;
             // Before the machine exists, so a mistyped password or a missing key file leaves
             // nothing behind.
             let (answers, record) = bootstrap::resolve_answers(
@@ -1642,6 +1658,55 @@ mod tests {
                 !home.path().join("machines/m").exists(),
                 "{extra:?} left a machine behind"
             );
+        }
+    }
+
+    /// Checked directly: through `execute` a missed refusal would go on to download an installer.
+    #[test]
+    fn bootstrap_refuses_uefi_args_without_uefi_before_creating() {
+        let home = crate::test_support::TempDir::new("main-bootstrap-uefi-args");
+        for (extra, refused) in [
+            (&["--firmware", "bios", "--boot-menu"][..], true),
+            (&["--firmware", "bios", "--boot-timeout", "5"][..], true),
+            (&["--firmware", "uefi", "--boot-menu"][..], false),
+            (&["--boot-timeout", "5"][..], false),
+        ] {
+            let mut args = vec!["--user", "alex", "--password", "pw"];
+            args.extend_from_slice(extra);
+            let Cmd::Quick {
+                cmd:
+                    QuickCmd::Bootstrap {
+                        name,
+                        hardware,
+                        linux,
+                        firmware,
+                        uefi,
+                        runtime,
+                        ..
+                    },
+            } = bootstrap_parse(&args).unwrap().cmd
+            else {
+                unreachable!()
+            };
+            let result = refuse_bootstrap(
+                home.path(),
+                &name,
+                &hardware,
+                &linux,
+                &firmware,
+                &uefi,
+                &runtime,
+            );
+            match result {
+                Err(error) if refused => {
+                    assert!(
+                        error.starts_with("--boot-menu and --boot-timeout"),
+                        "{error}"
+                    )
+                }
+                Ok(()) if !refused => {}
+                other => panic!("{extra:?}: {other:?}"),
+            }
         }
     }
 
