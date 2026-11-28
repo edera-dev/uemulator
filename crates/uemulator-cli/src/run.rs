@@ -534,7 +534,11 @@ fn run_config(
             }
         }
     });
-    console.on_output(|b| {
+    let marker_watch = runtime.marker_watch.clone();
+    console.on_output(move |b| {
+        if let Some(watch) = &marker_watch {
+            watch.feed(b);
+        }
         let mut out = std::io::stdout().lock();
         let _ = out.write_all(b);
         let _ = out.flush();
