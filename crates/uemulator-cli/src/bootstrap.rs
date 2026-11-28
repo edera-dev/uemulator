@@ -5,9 +5,10 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-use uemulator_bootstrap::{Answers, SALT_LEN, salt_from_bytes, sha512_crypt};
+use uemulator_bootstrap::{Answers, COMPLETION_MARKER, SALT_LEN, salt_from_bytes, sha512_crypt};
 
 use crate::args::{BootstrapArgs, Firmware, HypervisorArgs};
 use crate::term;
@@ -531,6 +532,54 @@ pub fn read_secret_from_terminal(prompt: &str) -> io::Result<String> {
         &mut io::stdin().lock(),
         &mut io::stderr(),
     )
+}
+
+/// Watches console output for `COMPLETION_MARKER`, which an installer prints once it has
+/// finished. Clones share one state: the console sink runs on another thread than the run loop
+/// that asks `seen`.
+#[derive(Clone, Default, Debug)]
+pub struct MarkerWatch(Arc<Mutex<MarkerState>>);
+
+#[derive(Default, Debug)]
+struct MarkerState {
+    /// The last `COMPLETION_MARKER.len() - 1` bytes already fed: enough to complete a marker
+    /// split across chunks, too short to hold a whole one, so a marker is never counted twice.
+    tail: Vec<u8>,
+    seen: bool,
+}
+
+impl MarkerWatch {
+    pub fn feed(&self, bytes: &[u8]) {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.seen {
+            return;
+        }
+        let marker = COMPLETION_MARKER.as_bytes();
+        let mut window = std::mem::take(&mut state.tail);
+        window.extend_from_slice(bytes);
+        if window
+            .windows(marker.len())
+            .any(|candidate| candidate == marker)
+        {
+            state.seen = true;
+            return;
+        }
+        let keep = marker.len() - 1;
+        let start = window.len().saturating_sub(keep);
+        state.tail = window.split_off(start);
+    }
+
+    // Only the tests read it until the install run stops on the marker.
+    #[allow(dead_code)]
+    pub fn seen(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .seen
+    }
 }
 
 #[cfg(test)]
@@ -1118,5 +1167,43 @@ mod tests {
         let error =
             read_secret_with("Password: ", |_| None, &mut &b"pw\r"[..], &mut output).unwrap_err();
         assert!(error.to_string().contains("--password-file"), "{error}");
+    }
+
+    fn marker_line() -> Vec<u8> {
+        format!("boot text\r\n{COMPLETION_MARKER}\r\n").into_bytes()
+    }
+
+    #[test]
+    fn marker_in_one_chunk() {
+        let watch = MarkerWatch::default();
+        assert!(!watch.seen());
+        watch.feed(&marker_line());
+        assert!(watch.seen());
+    }
+
+    #[test]
+    fn marker_split_at_every_byte() {
+        let line = marker_line();
+        for split in 0..=line.len() {
+            let watch = MarkerWatch::default();
+            watch.feed(&line[..split]);
+            watch.feed(&line[split..]);
+            assert!(watch.seen(), "split at {split}");
+        }
+    }
+
+    #[test]
+    fn partial_marker_is_not_seen() {
+        let watch = MarkerWatch::default();
+        watch.feed(&COMPLETION_MARKER.as_bytes()[..COMPLETION_MARKER.len() - 1]);
+        watch.feed(b"\r\nsomething else\r\n");
+        assert!(!watch.seen());
+    }
+
+    #[test]
+    fn marker_surrounded_by_ansi_noise() {
+        let watch = MarkerWatch::default();
+        watch.feed(format!("\x1b[0m\r\n{COMPLETION_MARKER}\r\n\x1b[2J").as_bytes());
+        assert!(watch.seen());
     }
 }

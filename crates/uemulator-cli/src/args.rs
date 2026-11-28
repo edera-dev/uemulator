@@ -448,6 +448,10 @@ pub struct RuntimeArgs {
     /// copy them a second time.
     #[arg(skip)]
     pub checkpoint_files_restored: bool,
+    /// Set by `quick` for a bootstrapped install: the console sink feeds it, and the run ends
+    /// when the installer's completion marker shows up.
+    #[arg(skip)]
+    pub marker_watch: Option<crate::bootstrap::MarkerWatch>,
     /// Take checkpoints of the running machine into DIR: Ctrl-] then c takes one (Ctrl-] then any
     /// other key stops as before). The first is a full snapshot, each later one a delta against
     /// the one before; the writable disks and the nvram are copied beside each. Resume one with
