@@ -132,6 +132,13 @@ const HISTOGRAM_REP_SHIFT: u32 = 20;
 const HISTOGRAM_P66_SHIFT: u32 = 22;
 const HISTOGRAM_VEX_SHIFT: u32 = 23;
 const HISTOGRAM_OPSIZE_SHIFT: u32 = 24;
+const HISTOGRAM_LOCK_SHIFT: u32 = 32;
+/// Set for a ModRM memory operand: the register and memory forms of one opcode are often lowered
+/// apart (bt, cmpxchg, adc into memory).
+const HISTOGRAM_MEMORY_SHIFT: u32 = 33;
+/// Set for a 67 prefix: the block compilers leave every form with one to the interpreter.
+const HISTOGRAM_ADDR32_SHIFT: u32 = 34;
+const HISTOGRAM_OPSIZE_MASK: u64 = 0xff;
 #[cfg(all(
     feature = "jit",
     any(
@@ -166,10 +173,13 @@ impl Insn {
             | (self.p66 as u64) << HISTOGRAM_P66_SHIFT
             | ((self.vex || self.evex) as u64) << HISTOGRAM_VEX_SHIFT
             | (self.opsize as u64) << HISTOGRAM_OPSIZE_SHIFT
+            | (self.lock as u64) << HISTOGRAM_LOCK_SHIFT
+            | ((self.has_modrm && self.md != MODRM_MOD_REGISTER) as u64) << HISTOGRAM_MEMORY_SHIFT
+            | (self.addr32 as u64) << HISTOGRAM_ADDR32_SHIFT
     }
 }
 
-/// `Insn::histogram_key` as text: `op=0x1ba/4 rep=1 p66 vex size=4`.
+/// `Insn::histogram_key` as text: `op=0x1ba/4 rep=1 p66 vex lock mem addr32 size=4`.
 pub(crate) fn histogram_label(key: u64) -> alloc::string::String {
     use alloc::format;
     let op = key & 0xffff;
@@ -191,7 +201,20 @@ pub(crate) fn histogram_label(key: u64) -> alloc::string::String {
     if (key >> HISTOGRAM_VEX_SHIFT) & 1 != 0 {
         label += " vex";
     }
-    label + &format!(" size={}", key >> HISTOGRAM_OPSIZE_SHIFT)
+    if (key >> HISTOGRAM_LOCK_SHIFT) & 1 != 0 {
+        label += " lock";
+    }
+    if (key >> HISTOGRAM_MEMORY_SHIFT) & 1 != 0 {
+        label += " mem";
+    }
+    if (key >> HISTOGRAM_ADDR32_SHIFT) & 1 != 0 {
+        label += " addr32";
+    }
+    label
+        + &format!(
+            " size={}",
+            (key >> HISTOGRAM_OPSIZE_SHIFT) & HISTOGRAM_OPSIZE_MASK
+        )
 }
 
 /// Marks an absent `base`/`index` register.
