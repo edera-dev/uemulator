@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use uemulator_bootstrap::{Answers, COMPLETION_MARKER, SALT_LEN, salt_from_bytes, sha512_crypt};
 
-use crate::args::{BootstrapArgs, Firmware, HypervisorArgs};
+use crate::args::{BootstrapArgs, DiskStep, DisplayArg, Firmware, HypervisorArgs};
 use crate::term;
 
 /// The non-secret answers, saved under `[bootstrap]` in `machine.toml`. It never holds a password
@@ -427,6 +427,50 @@ pub fn refuse_unbootable(
                     hypervisor, so bootstrap installs without one"
                 .into(),
         );
+    }
+    Ok(())
+}
+
+/// Every answer file installs to the first disk and erases it, and `quick bootstrap` never asks
+/// first (its disk is meant to be new). An image attached with `--disk` would be wiped without a
+/// question, so it may not come first; `quick create` and then `quick reinstall --user`, which
+/// asks before it erases, is the way to install onto one.
+pub fn refuse_attached_first_disk(steps: &[DiskStep]) -> Result<(), String> {
+    match steps.first() {
+        Some(DiskStep::Attach(disk)) => Err(format!(
+            "--disk {}: the install erases the first disk, and bootstrap does not ask before it \
+             erases: put --create-disk MIB first for the install, or `uemulator quick create` the \
+             machine with this disk and `uemulator quick reinstall NAME --user USER`, which asks",
+            disk.path.display()
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The answer files print the completion marker to `/dev/console`. With `--display framebuffer`
+/// that is the screen (the library adds `console=tty0` last), so the run, which watches the
+/// serial and virtio consoles, never sees it and reports a finished install as failed. `both`
+/// keeps the console on the terminal and still gives the machine its screen.
+const FRAMEBUFFER_CONSOLE: &str = "the install reports that it has finished on the console, which \
+     --display framebuffer moves to the screen where it cannot be watched";
+
+/// `quick bootstrap --display framebuffer`.
+pub fn refuse_framebuffer_display(display: Option<DisplayArg>) -> Result<(), String> {
+    if display == Some(DisplayArg::Framebuffer) {
+        return Err(format!(
+            "--display framebuffer: {FRAMEBUFFER_CONSOLE}; give --display both for a screen"
+        ));
+    }
+    Ok(())
+}
+
+/// `refuse_framebuffer_display` for `quick reinstall`, whose machine has its display saved.
+pub fn refuse_framebuffer_machine(display: Option<DisplayArg>, name: &str) -> Result<(), String> {
+    if display == Some(DisplayArg::Framebuffer) {
+        return Err(format!(
+            "{name} has display framebuffer: {FRAMEBUFFER_CONSOLE}; `uemulator quick edit {name} \
+             --display both` first"
+        ));
     }
     Ok(())
 }
@@ -1241,6 +1285,35 @@ mod tests {
         let watch = MarkerWatch::default();
         watch.feed(format!("\x1b[0m\r\n{COMPLETION_MARKER}\r\n\x1b[2J").as_bytes());
         assert!(watch.seen());
+    }
+
+    #[test]
+    fn an_attached_first_disk_is_refused_and_a_later_one_is_not() {
+        let attached = DiskStep::Attach(crate::args::DiskSpec {
+            path: PathBuf::from("/images/precious.img"),
+            read_only: false,
+        });
+        let created = DiskStep::Create { mib: 1024 };
+        let error = refuse_attached_first_disk(std::slice::from_ref(&attached)).unwrap_err();
+        assert!(error.starts_with("--disk /images/precious.img"), "{error}");
+        assert!(error.contains("--create-disk"), "{error}");
+        assert!(refuse_attached_first_disk(&[created, attached]).is_ok());
+        assert!(refuse_attached_first_disk(&[]).is_ok());
+    }
+
+    #[test]
+    fn a_framebuffer_display_is_refused_for_both() {
+        let error = refuse_framebuffer_display(Some(DisplayArg::Framebuffer)).unwrap_err();
+        assert!(error.contains("--display both"), "{error}");
+        for display in [None, Some(DisplayArg::Serial), Some(DisplayArg::Both)] {
+            assert!(refuse_framebuffer_display(display).is_ok());
+            assert!(refuse_framebuffer_machine(display, "m").is_ok());
+        }
+        let error = refuse_framebuffer_machine(Some(DisplayArg::Framebuffer), "m").unwrap_err();
+        assert!(
+            error.contains("uemulator quick edit m --display both"),
+            "{error}"
+        );
     }
 
     #[test]
